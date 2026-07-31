@@ -57,6 +57,11 @@ import {
 	setByPath,
 	withAtomicYamlConfigTransaction,
 } from "./atomic-yaml-patch";
+import {
+	type AutoroutingEffective,
+	validateAutoroutingEffective,
+	validateAutoroutingLocal,
+} from "./autorouting-contract";
 import { isModelSelectorValue, type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 
 import {
@@ -68,6 +73,7 @@ import {
 	reconcileSettingsSchema,
 	SETTINGS_SCHEMA,
 	type SettingPath,
+	type SettingsSchemaIssue,
 	type SettingsSchemaReport,
 	type SettingValue,
 } from "./settings-schema";
@@ -524,6 +530,9 @@ export class Settings implements NotificationSettingsReader {
 	#legacyCustomImageProviderDiagnosticLogged = false;
 
 	#schemaReport: SettingsSchemaReport = { issues: [], valid: true };
+
+	#autoroutingEffective: AutoroutingEffective = { active: false };
+	#autoroutingLocalIssues: SettingsSchemaIssue[] = [];
 	#schemaMigrationPending = false;
 	/** A newer config schema must never be rewritten by legacy migrations. */
 	#futureSchemaVersion = false;
@@ -692,7 +701,34 @@ export class Settings implements NotificationSettingsReader {
 
 	/** Diagnostics from schema reconciliation during the most recent load. */
 	getSchemaReport(): SettingsSchemaReport {
-		return structuredClone(this.#schemaReport);
+		const issues = [
+			...this.#schemaReport.issues.filter(
+				issue =>
+					!(
+						(issue.kind === "invalid" || issue.kind === "unknown") &&
+						(issue.path === "task.autorouting" || issue.path.startsWith("task.autorouting."))
+					),
+			),
+			...this.#autoroutingLocalIssues,
+			...(this.#autoroutingEffective.active || !this.#autoroutingEffective.issue
+				? []
+				: [
+						{
+							path: "task.autorouting",
+							kind: "invalid" as const,
+							detail: this.#autoroutingEffective.issue.detail,
+						},
+					]),
+		];
+		return {
+			issues: structuredClone(issues),
+			valid: !issues.some(issue => issue.kind === "invalid"),
+		};
+	}
+
+	/** Effective merged autorouting state shared by settings diagnostics and routing policy. */
+	getEffectiveAutorouting(): AutoroutingEffective {
+		return structuredClone(this.#autoroutingEffective);
 	}
 
 	onChanged(listener: (path: SettingPath) => void): () => void {
@@ -1066,6 +1102,9 @@ export class Settings implements NotificationSettingsReader {
 		});
 		cloned.#storage = this.#storage;
 		cloned.#schemaReport = structuredClone(this.#schemaReport);
+
+		cloned.#autoroutingEffective = structuredClone(this.#autoroutingEffective);
+		cloned.#autoroutingLocalIssues = structuredClone(this.#autoroutingLocalIssues);
 		cloned.#schemaMigrationPending = this.#schemaMigrationPending;
 		cloned.#futureSchemaVersion = this.#futureSchemaVersion;
 		cloned.#hasMalformedConfigRoot = this.#hasMalformedConfigRoot;
@@ -1600,6 +1639,15 @@ export class Settings implements NotificationSettingsReader {
 					});
 				}
 				setByPath(source, pathSegments, sanitized);
+			}
+
+			const tiersPath = ["task", "autorouting", "tiers"];
+			const tiers = getByPath(source, tiersPath);
+			if (tiers === undefined) continue;
+			if (!tiers || typeof tiers !== "object" || Array.isArray(tiers)) {
+				logger.warn("Settings: retained malformed autorouting tier record for schema diagnostics", {
+					path: tiersPath.join("."),
+				});
 			}
 		}
 	}
@@ -5860,6 +5908,18 @@ export class Settings implements NotificationSettingsReader {
 			throw error;
 		}
 	}
+	#recomputeAutoroutingDiagnostic(): void {
+		this.#autoroutingLocalIssues = [this.#global, this.#project, this.#overrides].flatMap(source => {
+			const fragment = getByPath(source, ["task", "autorouting"]);
+			return validateAutoroutingLocal(fragment).map(localIssue => ({
+				path: localIssue.path ? `task.autorouting.${localIssue.path}` : "task.autorouting",
+				kind: "invalid" as const,
+				detail: localIssue.detail,
+			}));
+		});
+		this.#autoroutingEffective = validateAutoroutingEffective(getByPath(this.#merged, ["task", "autorouting"]));
+	}
+
 	#rebuildMerged(): void {
 		const project = structuredClone(this.#project);
 		const overrides = structuredClone(this.#overrides);
@@ -5870,6 +5930,7 @@ export class Settings implements NotificationSettingsReader {
 		}
 		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), project);
 		this.#merged = this.#deepMerge(this.#merged, overrides);
+		this.#recomputeAutoroutingDiagnostic();
 	}
 
 	#fireAllHooks(): void {

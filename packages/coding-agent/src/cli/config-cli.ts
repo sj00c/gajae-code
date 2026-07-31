@@ -208,6 +208,7 @@ function getTypeDisplay(def: CliSettingDef): string {
 		case "array":
 			return "(array)";
 		case "record":
+		case "constrained-record":
 			return "(record)";
 		default:
 			return "(string)";
@@ -264,7 +265,8 @@ function parseAndSetValue(path: SettingPath, rawValue: string): void {
 			parsedValue = parsed;
 			break;
 		}
-		case "record": {
+		case "record":
+		case "constrained-record": {
 			let parsed: unknown;
 			try {
 				parsed = JSON.parse(trimmed);
@@ -581,6 +583,7 @@ function matchesSettingType(path: SettingPath, value: unknown): boolean {
 		case "array":
 			return Array.isArray(value);
 		case "record":
+		case "constrained-record":
 			return value !== null && typeof value === "object" && !Array.isArray(value);
 	}
 }
