@@ -164,6 +164,8 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 			);
 			return { type: "object", properties, additionalProperties: false };
 		}
+		case "optional-object":
+			return structuredClone(definition.jsonSchema);
 	}
 }
 

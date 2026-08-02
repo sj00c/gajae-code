@@ -210,6 +210,8 @@ function getTypeDisplay(def: CliSettingDef): string {
 		case "record":
 		case "constrained-record":
 			return "(record)";
+		case "optional-object":
+			return "(object)";
 		default:
 			return "(string)";
 	}
@@ -584,6 +586,8 @@ function matchesSettingType(path: SettingPath, value: unknown): boolean {
 			return Array.isArray(value);
 		case "record":
 		case "constrained-record":
+			return value !== null && typeof value === "object" && !Array.isArray(value);
+		case "optional-object":
 			return value !== null && typeof value === "object" && !Array.isArray(value);
 	}
 }
