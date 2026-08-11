@@ -2352,6 +2352,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showModelSelector(options);
 	}
 
+	setAutoroutingEnabled(enabled: boolean): Promise<void> {
+		return this.#selectorController.setAutoroutingEnabled(enabled);
+	}
+
 	showEffortSelector(): void {
 		this.#selectorController.showEffortSelector();
 	}
