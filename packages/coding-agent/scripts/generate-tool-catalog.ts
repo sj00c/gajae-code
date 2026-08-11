@@ -101,6 +101,8 @@ function makeSettings() {
 			return {};
 		},
 		getNotificationSettingsSnapshot: () => ({ enabled: false, telegram: {}, discord: {}, slack: {} }),
+		// The catalog documents the default configuration, where autorouting is off.
+		getEffectiveAutorouting: () => ({ active: false }),
 	};
 }
 
