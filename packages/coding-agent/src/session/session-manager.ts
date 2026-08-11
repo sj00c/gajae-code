@@ -19118,7 +19118,7 @@ export class SessionManager {
 		};
 		if (fs.existsSync(stagedSessionFile)) throw new Error("Staged session attempt already exists");
 		try {
-			await manager.#initSessionFile(stagedSessionFile);
+			await manager.#initSessionFile(stagedSessionFile, true);
 			const parentArtifacts = new ArtifactManager(finalPath.endsWith(".jsonl") ? finalPath.slice(0, -6) : finalPath);
 			manager.adoptArtifactManager(parentArtifacts.createAttemptStaging(attemptId), parentArtifacts);
 			return manager;
@@ -19157,7 +19157,7 @@ export class SessionManager {
 		const stagedSessionFile = path.join(stagedDir, `${attemptId}.jsonl`);
 		if (path.resolve(stagedSessionFile) === path.resolve(finalPath))
 			throw new Error("Staged session path collides with final transcript");
-		const stagedDestination = SessionManager.nestedManagedDestination(store, stagedDir);
+		const stagedDestination = SessionManager.nestedManagedDestination(stagingStore, stagedDir);
 		const manager = new SessionManager(getProjectDir(), stagedDir, true, storage, stagedDestination);
 		manager.#stagedPublication = {
 			finalSessionFile: finalPath,
@@ -19171,7 +19171,7 @@ export class SessionManager {
 		};
 		if (fs.existsSync(stagedSessionFile)) throw new Error("Staged session attempt already exists");
 		try {
-			await manager.#initSessionFile(stagedSessionFile);
+			await manager.#initSessionFile(stagedSessionFile, true);
 			const parentArtifacts = new ArtifactManager(store);
 			manager.adoptArtifactManager(parentArtifacts.createAttemptStaging(attemptId), parentArtifacts);
 			store.assertBound();
@@ -19293,7 +19293,7 @@ export class SessionManager {
 	/** Finalize a staged publication whose post-fence publisher completed successfully. */
 	finalizeStagedCommit(): void {
 		const staged = this.#stagedPublication;
-		if (!staged || !staged.committed || !staged.deferArtifactFinalize) return;
+		if (!staged?.committed || !staged.deferArtifactFinalize) return;
 		this.#stagedCommitArtifactParent?.finalizeLastAttemptCommit(staged.attemptId);
 		writeTerminalBreadcrumb(this.cwd, staged.finalSessionFile);
 		staged.deferArtifactFinalize = false;
@@ -19302,7 +19302,7 @@ export class SessionManager {
 	/** Roll back a staged publication when post-fence visibility setup fails. */
 	async rollbackCommittedStaged(): Promise<void> {
 		const staged = this.#stagedPublication;
-		if (!staged || !staged.committed) return;
+		if (!staged?.committed) return;
 		if (staged.managedParentStore) {
 			const current = staged.managedParentStore.readExpected(path.basename(staged.finalSessionFile));
 			if (
@@ -19320,7 +19320,7 @@ export class SessionManager {
 			}
 		} else if (staged.publishedFinalBytes) {
 			const current = await fs.promises.readFile(staged.finalSessionFile).catch(() => undefined);
-			if (current && current.equals(staged.publishedFinalBytes))
+			if (current?.equals(staged.publishedFinalBytes))
 				await fs.promises.rm(staged.finalSessionFile, { force: true });
 		}
 		await this.#stagedCommitArtifactParent?.rollbackLastAttemptCommit(staged.attemptId);
@@ -19332,7 +19332,7 @@ export class SessionManager {
 	/** Refresh the owned final snapshot after post-fence session metadata is appended. */
 	async refreshStagedCommitSnapshot(): Promise<void> {
 		const staged = this.#stagedPublication;
-		if (!staged || !staged.committed) return;
+		if (!staged?.committed) return;
 		if (staged.managedParentStore) {
 			staged.publishedFinalSnapshot =
 				staged.managedParentStore.readExpected(path.basename(staged.finalSessionFile)) ?? undefined;
