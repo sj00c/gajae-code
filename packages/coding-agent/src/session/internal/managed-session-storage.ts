@@ -176,6 +176,7 @@ function sameDirectoryTreeSnapshotAfterRename(
 	);
 }
 
+/** A managed move outcome that reports whether the mutation is known not to have committed. */
 export class ManagedTreeMoveOutcomeError extends Error {
 	constructor(
 		message: string,
