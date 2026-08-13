@@ -68,6 +68,11 @@
 - Fixed ACP `session/delete` retries so a durable artifact `cleanup_pending` result remains authoritative instead of re-closing the already-terminated session and misclassifying an unreaped Linux zombie as unverifiable SIGKILL uncertainty. Broker close now recognizes an identity-matching zombie as exited without weakening PID-reuse checks, and repeated deletes resume the authorized cleanup receipt idempotently.
 
 - Added `/extensions`, an interactive project/global `.gjc` manager for skills, hooks, MCPs, and explicit Claude Code/Codex imports with redacted previews and atomic rollback.
+### Changed
+- Removed `task.autorouting.preset`; preset-only autorouting configuration is now inactive until tiers are generated from the smart-routing setup.
+- Breaking public TypeScript contracts: removed `AutoroutingEffective.source`, `RoutingOutcome.source`, `AUTOROUTING_PRESETS`, `AutoroutingPresetId`, and `resolveTierMap` from `./config/*`, plus `TaskRoutingEvidence.source` from `./task/*`.
+- `/routing status` now labels settings-derived tiers as `hand-authored tiers`, `generated`, `generated, hand-edited`, or fail-closed `hand-authored tiers` when provenance is malformed.
+- Receipt and summary routing `note` values now use tier/fallback/resume components only; preset/source components are removed.
 
 ### Added
 - Added implicit discovery and keyless local support for oMLX (`http://127.0.0.1:8080/v1`) with `OMLX_BASE_URL` and `OMLX_API_KEY` configuration.

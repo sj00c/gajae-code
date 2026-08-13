@@ -1053,10 +1053,6 @@
 							"type": "boolean",
 							"default": false
 						},
-						"preset": {
-							"type": "string",
-							"default": ""
-						},
 						"tiers": {
 							"type": "object",
 							"properties": {
