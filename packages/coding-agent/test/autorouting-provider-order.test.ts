@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +10,7 @@ import {
 	projectCatalogProviderOrder,
 	projectProviderOrder,
 } from "@gajae-code/coding-agent/config/provider-selection-policy";
+import { resetSettingsForTest, settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 
 describe("projectProviderOrder", () => {
@@ -138,14 +139,27 @@ describe("projectCatalogProviderOrder (the accessor's own implementation)", () =
 
 describe("ModelRegistry.autoroutingProviderOrder (real instance)", () => {
 	// These call the real accessor, not a reimplementation. The configured-order and
-	// catalog-drop branches are covered by projectProviderOrder above and by the
-	// policy-derived golden fixture; here the global settings read legitimately
-	// yields no explicit order, so the catalog projection is what is exercised.
+	// catalog-drop branches are covered by projectCatalogProviderOrder above and by the
+	// policy-derived golden fixture; here the accessor's settings read yields no
+	// explicit order, so the catalog projection is what is exercised.
 	const cleanups: Array<() => void | Promise<void>> = [];
+
+	beforeEach(() => {
+		// Do not inherit whatever an earlier test left in the global settings
+		// singleton: a stray modelProviderOrder would silently reorder the expected
+		// catalog projection and make these assertions accidental.
+		resetSettingsForTest();
+	});
 
 	afterEach(async () => {
 		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 		vi.restoreAllMocks();
+		resetSettingsForTest();
+	});
+
+	test("reads no explicit provider order, so the catalog projection is what is asserted", () => {
+		// Makes the precondition explicit instead of assuming it.
+		expect(() => settings.getGlobal("modelProviderOrder")).toThrow();
 	});
 
 	async function registry(): Promise<ModelRegistry> {
