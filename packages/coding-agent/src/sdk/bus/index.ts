@@ -101,6 +101,7 @@ import {
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
+import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
 import {
@@ -3947,7 +3948,6 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
-		autoroutingInactive?: boolean;
 		ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
@@ -6429,7 +6429,6 @@ export function createNotificationsExtension(
 		}
 
 		sdkRuntime = new SessionSdkSessionRuntime({
-			autoroutingInactive: options.autoroutingInactive,
 			transport: {
 				sessionId: id,
 				stateRoot,
@@ -6714,6 +6713,7 @@ export function createNotificationsExtension(
 				return { type: "query_response", ...response };
 			},
 		});
+		if (isAutoroutingInactive(api)) markAutoroutingInactive(sdkRuntime.host);
 		host = sdkRuntime.host;
 
 		// Install the runtime before either transport can expose the host. session_start
