@@ -177,6 +177,7 @@ export interface ForkContextSeedOptions {
 	signal?: AbortSignal;
 }
 
+import { readdir as fsReaddir } from "node:fs/promises";
 import type { AuthCredentialSelector } from "@gajae-code/ai/core";
 import type { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
@@ -300,6 +301,7 @@ import {
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
+	sessionPlansDir,
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
 import {
@@ -309,6 +311,14 @@ import {
 	registerCoordinatorRuntimeStateFinalizer,
 	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
+import {
+	isWorkflowRecoveryStalled,
+	projectRalplanFinalRun,
+	projectUltragoalRun,
+	trackWorkflowRecoveryZeroProgress,
+	type WorkflowRecoveryProjection,
+	type WorkflowRecoveryZeroProgressMemory,
+} from "../gjc-runtime/workflow-recovery-projection";
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -484,7 +494,13 @@ import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { YieldQueue } from "./yield-queue";
 
+/**
+ * #4560: structured workflow recovery projection from canonical durable
+ * Ralplan/Ultragoal state, consumed by the compaction summary context and
+ * the post-compaction continuation prompt.
+ */
 interface CompactionStateSnapshot {
+	workflowRecovery?: WorkflowRecoveryProjection;
 	goal: { objective: string; status: Goal["status"]; enabled: boolean } | undefined;
 	openTodos: string[];
 	activeSkills: Array<{ skill: string; phase: string }>;
@@ -558,6 +574,89 @@ function collectRecentFileMutations(messages: readonly AgentMessage[]): string[]
 		if (paths.length >= MAX_RECENT_FILE_MUTATIONS) break;
 	}
 	return paths;
+}
+
+/**
+ * #4560: render the structured workflow recovery projection as bounded
+ * compaction-context lines. Scope lines mark accepted scope and non-goals so
+ * post-compaction continuation reloads the accepted contract instead of
+ * re-deriving (and potentially expanding) it from summary prose.
+ */
+function renderWorkflowRecoveryContext(recovery: WorkflowRecoveryProjection): string[] {
+	const lines: string[] = [];
+	const objective = sanitizeCompactionStateText(recovery.objective, 200);
+	lines.push(`Workflow contract (${recovery.skill}): ${objective}`);
+	const accepted = recovery.scope.filter(item => item.kind === "accepted").slice(0, 8);
+	if (accepted.length > 0) {
+		lines.push(`Accepted scope: ${accepted.map(item => sanitizeCompactionStateText(item.text, 120)).join("; ")}`);
+	}
+	const nonGoals = recovery.scope.filter(item => item.kind === "non_goal").slice(0, 6);
+	if (nonGoals.length > 0) {
+		lines.push(`Non-goals: ${nonGoals.map(item => sanitizeCompactionStateText(item.text, 120)).join("; ")}`);
+	}
+	if (recovery.acceptanceCriteria.length > 0) {
+		lines.push(
+			`Acceptance criteria: ${recovery.acceptanceCriteria.map(item => sanitizeCompactionStateText(item, 120)).join("; ")}`,
+		);
+	}
+	if (recovery.currentGoal) {
+		const goal = recovery.currentGoal;
+		lines.push(
+			`Current goal: ${sanitizeCompactionStateText(goal.goalId, 40)} status=${sanitizeCompactionStateText(goal.status, 40)} ${sanitizeCompactionStateText(goal.objective, 120)}`,
+		);
+	}
+	const progress = recovery.progress;
+	const progressParts: string[] = [];
+	if (progress.totalGoals !== undefined) {
+		progressParts.push(`goals ${progress.completedGoals ?? 0}/${progress.totalGoals}`);
+	}
+	if (progress.outstandingGoals !== undefined) progressParts.push(`outstanding ${progress.outstandingGoals}`);
+	if (progress.latestCohortSourceHash) progressParts.push(`sourceHash ${progress.latestCohortSourceHash}`);
+	if (progressParts.length > 0) lines.push(`Progress: ${progressParts.join(", ")}`);
+	lines.push(
+		`Next action: ${recovery.nextAction.actionClass}${recovery.nextAction.goalId ? ` (${recovery.nextAction.goalId})` : ""}`,
+	);
+	if (recovery.provenance.sha256) lines.push(`Contract digest: ${recovery.provenance.sha256}`);
+	return lines;
+}
+
+/**
+ * #4560: post-compaction continuation for recognized active workflows.
+ * Returns undefined when no structured projection exists (generic
+ * auto-continue is preserved) or when every active workflow skill is
+ * continuation-inert (paused/terminal/unknown stay inert). The prompt keeps
+ * latest-user-intent supremacy and forbids silent scope expansion: any work
+ * beyond the accepted contract must be classified and recorded, never assumed.
+ */
+function buildWorkflowRecoveryContinuationPrompt(
+	recovery: WorkflowRecoveryProjection | undefined,
+	activeSkills: ReadonlyArray<{ skill: string; phase: string }>,
+): string | undefined {
+	if (!recovery) return undefined;
+	const recognized = activeSkills.some(
+		entry => entry.skill === recovery.skill && !isWorkflowContinuationInert(entry.skill, entry.phase),
+	);
+	if (!recognized) return undefined;
+	const lines = [
+		"Compaction removed earlier conversation history. Resume the active workflow from its durable contract below — do not re-derive or expand scope from the summary.",
+		"",
+		"<workflow-recovery>",
+		...renderWorkflowRecoveryContext(recovery),
+		"</workflow-recovery>",
+		"",
+		"Rules:",
+		"- Reload this contract before acting; the durable workflow state (.gjc session state, plans, goals, ledger receipts) is authoritative over any summary prose.",
+		"- Resume the stated next action class unless the user's latest message supersedes it; user intent always wins.",
+		"- Do not expand accepted scope. Work beyond the accepted scope/non-goals must be classified as new scope and explicitly recorded (durable blocker or steering), never silently accepted.",
+		"- Do not repeat already-verified review generations when the recorded source hash and evidence basis are unchanged; continue from recorded progress instead.",
+		"- If the same next action has already been attempted with no measurable progress (same source hash, no completed obligations, same blocker state), record a durable blocker/escalation note instead of looping.",
+	];
+	if (recovery.zeroProgress?.stalled) {
+		lines.push(
+			`STALLED: durable progress has not changed across ${recovery.zeroProgress.unchangedObservations + 1} compaction recoveries. Do not repeat the same next action again. Record a durable blocker or escalate to the operator now.`,
+		);
+	}
+	return lines.join("\n");
 }
 
 /** Escape XML-ish metacharacters and flatten newlines so state text cannot break compaction prompt framing. */
@@ -6324,14 +6423,24 @@ export class AgentSession {
 								return;
 							}
 							if (!(await continuationAuthorized(signal))) return;
+							// #4560: recognized active workflows resume from their
+							// durable structured contract instead of the generic
+							// prompt; unknown/paused/terminal workflows keep the
+							// generic continuation and latest-user-intent supremacy.
+							const recoverySnapshot = await this.#compactionStateSnapshot();
+							const recoveryPrompt = buildWorkflowRecoveryContinuationPrompt(
+								recoverySnapshot.workflowRecovery,
+								recoverySnapshot.activeSkills,
+							);
+							const promptText = recoveryPrompt ?? autoContinuePrompt;
 							await this.#promptWithMessage(
 								{
 									role: "developer",
-									content: [{ type: "text", text: autoContinuePrompt }],
+									content: [{ type: "text", text: promptText }],
 									attribution: "agent",
 									timestamp: Date.now(),
 								},
-								autoContinuePrompt,
+								promptText,
 								{
 									skipPostPromptRecoveryWait: true,
 									skipCompactionCheck: true,
@@ -11966,8 +12075,37 @@ export class AgentSession {
 				.filter(entry => entry.active !== false)
 				.slice(0, 5)
 				.map(entry => ({ skill: entry.skill, phase: entry.phase ?? "unknown" }));
+			this.#lastCompactionActiveSkills = snapshot.activeSkills;
 		} catch (error) {
 			logger.warn("Failed to read workflow state for compaction snapshot", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		try {
+			// #4560: reload the durable workflow contract for recognized
+			// Ralplan/Ultragoal runs so compaction carries a structured
+			// recovery projection instead of summary prose alone. Degrades
+			// safely: malformed/stale/tampered durable state leaves the
+			snapshot.workflowRecovery = await this.#projectWorkflowRecovery();
+			// #4560: track measurable durable progress across compaction
+			// observations so a stalled continuation loop is detected and
+			// escalated instead of running forever.
+			if (snapshot.workflowRecovery) {
+				this.#workflowRecoveryMemory = trackWorkflowRecoveryZeroProgress(
+					this.#workflowRecoveryMemory,
+					snapshot.workflowRecovery,
+				);
+				snapshot.workflowRecovery = {
+					...snapshot.workflowRecovery,
+					zeroProgress: {
+						...snapshot.workflowRecovery.zeroProgress,
+						unchangedObservations: this.#workflowRecoveryMemory.unchangedObservations,
+						stalled: isWorkflowRecoveryStalled(this.#workflowRecoveryMemory),
+					},
+				};
+			}
+		} catch (error) {
+			logger.warn("Failed to project workflow recovery state for compaction snapshot", {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
@@ -12000,6 +12138,47 @@ export class AgentSession {
 		return snapshot;
 	}
 
+	/**
+	 * #4560: derive the structured workflow recovery projection for an
+	 * active recognized workflow from its canonical durable state. Returns
+	 * undefined for inactive/unrecognized workflows (generic behavior is
+	 * preserved) and for malformed durable state (safe degradation).
+	 */
+	async #projectWorkflowRecovery(): Promise<WorkflowRecoveryProjection | undefined> {
+		const entries = this.#lastCompactionActiveSkills ?? [];
+		const cwd = this.sessionManager.getCwd();
+		// Ultragoal runs own the live execution contract; prefer their plan.
+		if (entries.some(entry => entry.skill === "ultragoal")) {
+			const projection = await projectUltragoalRun({ cwd, sessionId: this.sessionId }).catch(() => undefined);
+			if (projection) return projection;
+		}
+		if (entries.some(entry => entry.skill === "ralplan")) {
+			const runId = await this.#latestRalplanRunId(cwd);
+			if (runId) {
+				const projection = await projectRalplanFinalRun({ cwd, sessionId: this.sessionId, runId }).catch(
+					() => undefined,
+				);
+				if (projection) return projection;
+			}
+		}
+		return undefined;
+	}
+	/** #4560: zero-progress memory across compaction observations. */
+	#workflowRecoveryMemory: WorkflowRecoveryZeroProgressMemory | undefined;
+	/** #4560: active skills observed by the latest compaction snapshot. */
+	#lastCompactionActiveSkills: Array<{ skill: string; phase: string }> = [];
+
+	async #latestRalplanRunId(cwd: string): Promise<string | undefined> {
+		try {
+			const dir = sessionPlansDir(cwd, this.sessionId);
+			const entries = await fsReaddir(path.join(dir, "ralplan"));
+			const runs = entries.filter(name => name.length > 0).sort();
+			return runs.at(-1);
+		} catch {
+			return undefined;
+		}
+	}
+
 	#compactionStateContext(snapshot: CompactionStateSnapshot): string[] {
 		const context: string[] = [];
 		const goal = snapshot.goal;
@@ -12023,6 +12202,8 @@ export class AgentSession {
 			const files = snapshot.recentFileMutations.map(filePath => sanitizeCompactionStateText(filePath, 120));
 			context.push(`Recent file mutations: ${files.join("; ")}`);
 		}
+		const recovery = snapshot.workflowRecovery;
+		if (recovery) context.push(...renderWorkflowRecoveryContext(recovery));
 		return context;
 	}
 

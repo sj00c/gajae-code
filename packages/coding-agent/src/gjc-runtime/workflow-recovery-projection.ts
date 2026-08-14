@@ -1,0 +1,415 @@
+/**
+ * Structured workflow recovery projection for compaction (#4560).
+ *
+ * Compaction previously preserved only a thin best-effort state projection
+ * (active goal objective/status, workflow phase, open todos) plus a generic
+ * continuation prompt. Long Ralplan/Ultragoal runs could therefore lose the
+ * precise accepted scope/progress/evidence contract, then drift or spin in
+ * zero-progress continuation loops after compaction.
+ *
+ * This module derives a bounded structured projection from the canonical
+ * durable state — Ralplan `final`/`index.jsonl` run artifacts and Ultragoal
+ * `goals.json` + `ledger.jsonl` — through read-only filesystem access. It
+ * never mutates workflow state and degrades safely (undefined) on malformed,
+ * stale, or tampered durable state so compaction falls back to the previous
+ * thin projection rather than failing.
+ */
+import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { sessionPlansDir } from "./session-layout";
+import { getUltragoalPaths, readUltragoalLedger, readUltragoalPlan } from "./ultragoal-runtime";
+
+/** Skills whose durable state can produce a structured recovery projection. */
+export type WorkflowRecoverySkill = "ralplan" | "ultragoal";
+
+export interface WorkflowRecoveryScopeItem {
+	kind: "accepted" | "non_goal";
+	text: string;
+}
+
+export interface WorkflowRecoveryProjection {
+	skill: WorkflowRecoverySkill;
+	/** Canonical durable state that produced this projection. */
+	source: "ralplan-final" | "ralplan-run" | "ultragoal-plan";
+	/** Bounded accepted objective for the current work contract. */
+	objective: string;
+	/** Bounded accepted scope + explicit non-goals (scope reload, not expansion). */
+	scope: WorkflowRecoveryScopeItem[];
+	/** Bounded acceptance criteria / verification obligations. */
+	acceptanceCriteria: string[];
+	/** Unresolved decisions carried from the durable contract, bounded. */
+	unresolved: string[];
+	/** Durable identity + integrity digest of the source state. */
+	provenance: {
+		planPath?: string;
+		runId?: string;
+		stage?: string;
+		sha256?: string;
+	};
+	/** Current goal + measurable progress counters from canonical state. */
+	currentGoal?: {
+		goalId: string;
+		status: string;
+		objective: string;
+	};
+	progress: {
+		totalGoals?: number;
+		completedGoals?: number;
+		outstandingGoals?: number;
+		/** Latest boundary review generation recorded in the ledger. */
+		latestReviewGeneration?: number;
+		/** Frozen source hash of the latest joined review cohort, if any. */
+		latestCohortSourceHash?: string;
+		/** Ledger event id of the newest event backing this projection. */
+		latestLedgerEventId?: string;
+	};
+	/** Exact next bounded action class for resumption. */
+	nextAction: {
+		actionClass:
+			| "continue-current-goal"
+			| "start-next-goal"
+			| "resolve-review-blockers"
+			| "run-boundary-cohort"
+			| "final-aggregate-checkpoint"
+			| "awaiting-approval"
+			| "unknown";
+		goalId?: string;
+		detail?: string;
+	};
+	/** #4560: measurable-progress basis for bounding zero-progress cycles. */
+	zeroProgress: {
+		fingerprint: string;
+		unchangedObservations: number;
+		stalled: boolean;
+	};
+}
+/** #4560: compaction-observation memory for zero-progress bounding. */
+export interface WorkflowRecoveryZeroProgressMemory {
+	/** Last observed progress fingerprint per skill. */
+	lastFingerprint?: string;
+	/** Consecutive compaction observations with an unchanged fingerprint. */
+	unchangedObservations: number;
+}
+
+/** #4560: bound repeated zero-progress continuation cycles (#4560). */
+export const ZERO_PROGRESS_STALL_THRESHOLD = 2;
+
+export function trackWorkflowRecoveryZeroProgress(
+	memory: WorkflowRecoveryZeroProgressMemory | undefined,
+	projection: WorkflowRecoveryProjection,
+): WorkflowRecoveryZeroProgressMemory {
+	const fingerprint = hashWorkflowRecoveryProjection(projection);
+	if (!memory) return { lastFingerprint: fingerprint, unchangedObservations: 0 };
+	const unchanged = memory.lastFingerprint === fingerprint ? memory.unchangedObservations + 1 : 0;
+	return { lastFingerprint: fingerprint, unchangedObservations: unchanged };
+}
+
+export function isWorkflowRecoveryStalled(memory: WorkflowRecoveryZeroProgressMemory | undefined): boolean {
+	return (memory?.unchangedObservations ?? 0) >= ZERO_PROGRESS_STALL_THRESHOLD;
+}
+
+const MAX_OBJECTIVE_CHARS = 600;
+const MAX_ITEM_CHARS = 240;
+const MAX_SCOPE_ITEMS = 12;
+const MAX_CRITERIA_ITEMS = 12;
+const MAX_UNRESOLVED_ITEMS = 8;
+
+function boundText(value: unknown, maxChars: number): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	if (trimmed.length === 0) return undefined;
+	return trimmed.length > maxChars ? `${trimmed.slice(0, maxChars - 1)}…` : trimmed;
+}
+
+function sha256File(filePath: string): Promise<string | undefined> {
+	return fs
+		.readFile(filePath)
+		.then(buffer => `sha256:${crypto.createHash("sha256").update(buffer).digest("hex")}`)
+		.catch(() => undefined);
+}
+
+interface ParsedHeadingSection {
+	title: string;
+	lines: string[];
+}
+
+/** Split a markdown artifact into bounded `## `-level sections. */
+function parseMarkdownSections(markdown: string): ParsedHeadingSection[] {
+	const sections: ParsedHeadingSection[] = [];
+	let current: ParsedHeadingSection | undefined;
+	for (const rawLine of markdown.split(/\r?\n/)) {
+		const heading = /^##\s+(.*)$/.exec(rawLine);
+		if (heading) {
+			current = { title: heading[1].trim(), lines: [] };
+			sections.push(current);
+		} else if (current) {
+			current.lines.push(rawLine);
+		}
+	}
+	return sections.slice(0, 24);
+}
+
+/** Extract bounded list items from a section body (normalizes nested bullets). */
+function sectionListItems(section: ParsedHeadingSection | undefined, maxItems: number): string[] {
+	if (!section) return [];
+	const items: string[] = [];
+	for (const line of section.lines) {
+		const bullet = /^\s*(?:[-*+]|\d+[.)])\s+(.*)$/.exec(line);
+		const text = boundText(bullet ? bullet[1] : line.trim().length > 0 ? line : undefined, MAX_ITEM_CHARS);
+		if (text) items.push(text);
+		if (items.length >= maxItems) break;
+	}
+	return items;
+}
+
+function findSection(sections: ParsedHeadingSection[], needles: readonly string[]): ParsedHeadingSection | undefined {
+	const normalized = needles.map(needle => needle.toLowerCase());
+	return sections.find(section => normalized.some(needle => section.title.toLowerCase().includes(needle)));
+}
+
+/**
+ * Extract the bounded objective from a Ralplan final plan artifact. The
+ * objective is the first non-empty prose line of the document (before the
+ * first `##` heading), which is the durable plan statement of intent.
+ */
+function objectiveFromMarkdown(markdown: string): string | undefined {
+	for (const rawLine of markdown.split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (line.startsWith("#")) continue;
+		if (line.length === 0) continue;
+		return boundText(line, MAX_OBJECTIVE_CHARS);
+	}
+	return undefined;
+}
+
+export interface RalplanFinalProjectionInput {
+	cwd: string;
+	sessionId: string;
+	runId: string;
+}
+
+/**
+ * Build a recovery projection from the newest complete Ralplan `final` stage
+ * row of a run. Returns undefined when no parseable final artifact exists —
+ * compaction then degrades to the thin projection instead of guessing.
+ */
+export async function projectRalplanFinalRun(
+	input: RalplanFinalProjectionInput,
+): Promise<WorkflowRecoveryProjection | undefined> {
+	const runDir = path.join(sessionPlansDir(input.cwd, input.sessionId), "ralplan", input.runId);
+	let rows: Array<{ stage: string; stage_n?: number; path?: string; sha256?: string }> = [];
+	try {
+		const text = await fs.readFile(path.join(runDir, "index.jsonl"), "utf8");
+		rows = text
+			.split(/\r?\n/)
+			.map(line => line.trim())
+			.filter(line => line.length > 0)
+			.map(line => {
+				try {
+					return JSON.parse(line) as { stage: string; stage_n?: number; path?: string; sha256?: string };
+				} catch {
+					return undefined;
+				}
+			})
+			.filter(
+				(row): row is { stage: string; stage_n?: number; path?: string; sha256?: string } => row !== undefined,
+			);
+	} catch {
+		return undefined;
+	}
+	const finalRow = [...rows].reverse().find(row => row.stage === "final");
+	if (!finalRow?.path) return undefined;
+	const artifactPath = path.isAbsolute(finalRow.path) ? finalRow.path : path.join(runDir, finalRow.path);
+	let markdown: string;
+	try {
+		markdown = await fs.readFile(artifactPath, "utf8");
+	} catch {
+		return undefined;
+	}
+	const objective = objectiveFromMarkdown(markdown);
+	if (!objective) return undefined;
+	const sections = parseMarkdownSections(markdown);
+	const acceptance =
+		sectionListItems(
+			findSection(sections, ["acceptance criteria", "verification", "test plan"]),
+			MAX_CRITERIA_ITEMS,
+		) || sectionListItems(findSection(sections, ["acceptance"]), MAX_CRITERIA_ITEMS);
+	const nonGoals =
+		sectionListItems(findSection(sections, ["non-goals", "non goals", "out of scope"]), MAX_SCOPE_ITEMS) ||
+		sectionListItems(findSection(sections, ["non-goal"]), MAX_SCOPE_ITEMS);
+	const unresolved =
+		sectionListItems(
+			findSection(sections, ["intent reconciliation", "open confirmation", "unresolved"]),
+			MAX_UNRESOLVED_ITEMS,
+		) || [];
+	const scope: WorkflowRecoveryScopeItem[] = sectionListItems(
+		findSection(sections, ["scope", "accepted scope"]),
+		MAX_SCOPE_ITEMS,
+	).map(text => ({ kind: "accepted" as const, text }));
+	for (const text of nonGoals) scope.push({ kind: "non_goal" as const, text });
+	const sha256 = (await sha256File(artifactPath)) ?? finalRow.sha256;
+	const projection: Omit<WorkflowRecoveryProjection, "zeroProgress"> = {
+		skill: "ralplan",
+		source: "ralplan-final",
+		objective,
+		scope,
+		acceptanceCriteria: acceptance,
+		unresolved,
+		provenance: { planPath: artifactPath, runId: input.runId, stage: "final", sha256 },
+		progress: {},
+		nextAction: { actionClass: "awaiting-approval" },
+	};
+	return withZeroProgress(projection);
+}
+/**
+ * Build a recovery projection from Ultragoal canonical durable state. The
+ * accepted contract is the aggregate objective plus the goal list; progress
+ * and next action are derived from `goals.json` status plus the newest ledger
+ * receipts, never from conversation memory.
+ */
+export async function projectUltragoalRun(input: {
+	cwd: string;
+	sessionId: string;
+}): Promise<WorkflowRecoveryProjection | undefined> {
+	const plan = await readUltragoalPlan(input.cwd, input.sessionId).catch(() => null);
+	if (!plan?.goals?.length) return undefined;
+	const ledger = await readUltragoalLedger(input.cwd, input.sessionId).catch(() => []);
+	const paths = getUltragoalPaths(input.cwd, input.sessionId);
+	const schedulable = plan.goals.filter(goal => goal.status !== "complete" && goal.status !== "superseded");
+	const currentGoal = plan.goals.find(goal => goal.status === "active" || goal.status === "failed") ?? schedulable[0];
+	const reviewBlocked = plan.goals.find(goal => goal.status === "review_blocked");
+	const lastCheckpoint = [...ledger]
+		.reverse()
+		.find(event => event.event === "goal_checkpointed" && event.status === "complete");
+	// Newest joined cohort generation/sourceHash across all complete checkpoints.
+	let latestReviewGeneration: number | undefined;
+	let latestCohortSourceHash: string | undefined;
+	for (const event of ledger) {
+		if (event.event !== "goal_checkpointed" || event.status !== "complete") continue;
+		const cohort = readCohortFromLedgerEvent(event);
+		if (!cohort) continue;
+		if (latestReviewGeneration === undefined || cohort.reviewGeneration >= latestReviewGeneration) {
+			latestReviewGeneration = cohort.reviewGeneration;
+			latestCohortSourceHash = cohort.sourceHash;
+		}
+	}
+	const outstanding = schedulable.length;
+	const scope: WorkflowRecoveryScopeItem[] = [
+		{
+			kind: "accepted",
+			text: boundText(plan.gjcObjective, MAX_OBJECTIVE_CHARS) ?? "Ultragoal aggregate run",
+		},
+	];
+	for (const goal of plan.goals.slice(0, MAX_SCOPE_ITEMS - 1)) {
+		const text = boundText(goal.title || goal.objective, MAX_ITEM_CHARS);
+		if (text) scope.push({ kind: "accepted", text: `goal ${goal.id}: ${text}` });
+	}
+	const acceptance: string[] = [];
+	for (const goal of plan.goals.slice(0, MAX_CRITERIA_ITEMS)) {
+		// Acceptance = per-goal completion evidence currently recorded durably.
+		const evidence = boundText(goal.evidence, MAX_ITEM_CHARS);
+		if (goal.status === "complete" && evidence) acceptance.push(`${goal.id} complete: ${evidence}`);
+	}
+	let nextAction: WorkflowRecoveryProjection["nextAction"] = { actionClass: "unknown" };
+	if (reviewBlocked) {
+		nextAction = {
+			actionClass: "resolve-review-blockers",
+			goalId: reviewBlocked.id,
+			detail: boundText(reviewBlocked.objective, MAX_ITEM_CHARS),
+		};
+	} else if (outstanding === 0) {
+		nextAction = { actionClass: "final-aggregate-checkpoint" };
+	} else if (currentGoal) {
+		nextAction = {
+			actionClass: currentGoal.status === "active" ? "continue-current-goal" : "start-next-goal",
+			goalId: currentGoal.id,
+			detail: boundText(currentGoal.objective, MAX_ITEM_CHARS),
+		};
+	}
+	const projection: Omit<WorkflowRecoveryProjection, "zeroProgress"> = {
+		skill: "ultragoal",
+		source: "ultragoal-plan",
+		objective: boundText(plan.gjcObjective, MAX_OBJECTIVE_CHARS) ?? "Ultragoal aggregate run",
+		scope,
+		acceptanceCriteria: acceptance,
+		unresolved: reviewBlocked
+			? [`review blockers open on ${reviewBlocked.id}`]
+			: schedulable
+					.filter(goal => goal.status === "blocked" || goal.status === "failed")
+					.slice(0, MAX_UNRESOLVED_ITEMS)
+					.map(goal =>
+						`${goal.id} ${goal.status}: ${boundText(goal.evidence ?? "", MAX_ITEM_CHARS) ?? ""}`.trim(),
+					),
+		provenance: { planPath: paths.goalsPath },
+		currentGoal: currentGoal
+			? {
+					goalId: currentGoal.id,
+					status: currentGoal.status,
+					objective: boundText(currentGoal.objective, MAX_OBJECTIVE_CHARS) ?? "",
+				}
+			: undefined,
+		progress: {
+			totalGoals: plan.goals.length,
+			completedGoals: plan.goals.filter(goal => goal.status === "complete").length,
+			outstandingGoals: outstanding,
+			latestReviewGeneration,
+			latestCohortSourceHash,
+			latestLedgerEventId: lastCheckpoint?.eventId ?? [...ledger].at(-1)?.eventId,
+		},
+		nextAction,
+	};
+	return withZeroProgress(projection);
+}
+
+/** Attach a fresh zero-progress fingerprint to a built projection. */
+function withZeroProgress(projection: Omit<WorkflowRecoveryProjection, "zeroProgress">): WorkflowRecoveryProjection {
+	const fingerprint = hashWorkflowRecoveryProjection(projection as WorkflowRecoveryProjection);
+	return {
+		...projection,
+		zeroProgress: { fingerprint, unchangedObservations: 0, stalled: false },
+	};
+}
+
+function readCohortFromLedgerEvent(
+	event: UltragoalLedgerLike,
+): { reviewGeneration: number; sourceHash: string } | undefined {
+	const gate = event.qualityGateJson;
+	if (!gate || typeof gate !== "object" || Array.isArray(gate)) return undefined;
+	const iteration = (gate as { iteration?: unknown }).iteration;
+	if (!iteration || typeof iteration !== "object" || Array.isArray(iteration)) return undefined;
+	const cohort = (iteration as { reviewCohort?: unknown }).reviewCohort;
+	if (!cohort || typeof cohort !== "object" || Array.isArray(cohort)) return undefined;
+	const reviewGeneration = (cohort as { reviewGeneration?: unknown }).reviewGeneration;
+	const sourceHash = (cohort as { sourceHash?: unknown }).sourceHash;
+	if (typeof reviewGeneration !== "number" || typeof sourceHash !== "string") return undefined;
+	return { reviewGeneration, sourceHash };
+}
+
+interface UltragoalLedgerLike {
+	event?: string;
+	status?: string;
+	eventId?: string;
+	qualityGateJson?: unknown;
+}
+
+/** Stable digest over the projection's contract-relevant fields. */
+export function hashWorkflowRecoveryProjection(projection: WorkflowRecoveryProjection): string {
+	const basis = {
+		skill: projection.skill,
+		source: projection.source,
+		objective: projection.objective,
+		scope: projection.scope,
+		acceptanceCriteria: projection.acceptanceCriteria,
+		provenance: projection.provenance,
+		currentGoal: projection.currentGoal,
+		progressBasis: {
+			totalGoals: projection.progress.totalGoals,
+			completedGoals: projection.progress.completedGoals,
+			outstandingGoals: projection.progress.outstandingGoals,
+			latestCohortSourceHash: projection.progress.latestCohortSourceHash,
+		},
+		nextAction: projection.nextAction,
+	};
+	return `sha256:${crypto.createHash("sha256").update(JSON.stringify(basis)).digest("hex")}`;
+}

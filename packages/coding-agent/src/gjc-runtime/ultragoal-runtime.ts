@@ -62,6 +62,10 @@ import {
 	writeArtifact,
 	writeGuardedJsonAtomic,
 } from "./state-writer";
+import {
+	resolveUltragoalValidationApplicability,
+	type UltragoalValidationApplicability,
+} from "./ultragoal-validation-policy";
 import { resolveWorkflowSetting } from "./workflow-settings";
 
 export {
@@ -2500,6 +2504,94 @@ function validateDeferredCompletionQualityGate(
 			"deferredToBatch.changeSet.changeSetHash does not match declared paths; omit changeSetHash and the runtime computes it",
 		);
 }
+/** #4560: declared lane-selection proof shape on the quality gate. */
+interface DeclaredValidationLaneSelection {
+	riskClass: string;
+	reasons: string[];
+	omittedLanes: string[];
+}
+
+function readDeclaredValidationLaneSelection(gate: JsonObject): DeclaredValidationLaneSelection | undefined {
+	const declared = qualityGateObject(gate.validationLaneSelection);
+	if (!declared) return undefined;
+	const riskClass = nonEmptyString(declared.riskClass);
+	const reasons = stringArray(declared.reasons);
+	const omittedLanes = stringArray(declared.omittedLanes);
+	if (!riskClass || !reasons || !omittedLanes) {
+		throw new Error(
+			"validationLaneSelection must carry riskClass, reasons, and omittedLanes string arrays mirroring the runtime selection",
+		);
+	}
+	return { riskClass, reasons, omittedLanes };
+}
+
+/**
+ * #4560: validate a declared low-risk lane reduction against the
+ * runtime-computed applicability. The runtime selection is authoritative: a
+ * declaration that disagrees with the computed risk class, reasons, or
+ * omitted-lane set fails closed and the full cohort stays mandatory.
+ */
+function validateDeclaredValidationLaneSelection(
+	declared: DeclaredValidationLaneSelection,
+	applicability: UltragoalValidationApplicability,
+	found: QualityGateDiagnostics,
+): boolean {
+	if (applicability.riskClass !== "low") {
+		found.add(
+			"validationLaneSelection",
+			"reduction_not_applicable",
+			"validationLaneSelection lane reduction is not applicable: the runtime computed a high-risk boundary; the full cohort is mandatory",
+		);
+		return false;
+	}
+	if (declared.riskClass !== applicability.riskClass) {
+		found.add(
+			"validationLaneSelection",
+			"selection_mismatch",
+			"declared validationLaneSelection riskClass does not match the runtime-computed risk class",
+		);
+		return false;
+	}
+	const expectedOmitted = (["cleaner", "architect"] as const).filter(lane => !applicability.lanes[lane].applicable);
+	const declaredOmitted = new Set(declared.omittedLanes);
+	if (declaredOmitted.has("qa")) {
+		found.add(
+			"validationLaneSelection",
+			"qa_lane_mandatory",
+			"validationLaneSelection can never omit the qa lane; verification is mandatory at every boundary",
+		);
+		return false;
+	}
+	if (declaredOmitted.size !== expectedOmitted.length || expectedOmitted.some(lane => !declaredOmitted.has(lane))) {
+		found.add(
+			"validationLaneSelection",
+			"omitted_lanes_mismatch",
+			"declared validationLaneSelection omittedLanes must exactly mirror the runtime-computed inapplicable lanes",
+		);
+		return false;
+	}
+	return true;
+}
+
+/** #4560: newest joined cohort (generation + frozen sourceHash) in the ledger. */
+function latestJoinedCohortSourceHash(
+	ledger: readonly UltragoalLedgerEvent[],
+): { reviewGeneration: number; sourceHash: string } | undefined {
+	let latest: { reviewGeneration: number; sourceHash: string } | undefined;
+	for (const event of ledger) {
+		if (event.event !== "goal_checkpointed" || event.status !== "complete") continue;
+		const cohort = qualityGateObject(
+			qualityGateObject(event.qualityGateJson)?.iteration as JsonObject | undefined,
+		)?.reviewCohort;
+		const record = qualityGateObject(cohort);
+		if (!record) continue;
+		const reviewGeneration = record.reviewGeneration;
+		const sourceHash = nonEmptyString(record.sourceHash);
+		if (typeof reviewGeneration !== "number" || !sourceHash) continue;
+		if (!latest || reviewGeneration >= latest.reviewGeneration) latest = { reviewGeneration, sourceHash };
+	}
+	return latest;
+}
 const COHORT_LANE_KEYS = ["cleaner", "architect", "qa"] as const;
 
 /**
@@ -2509,7 +2601,11 @@ const COHORT_LANE_KEYS = ["cleaner", "architect", "qa"] as const;
  * generations are delta-only. Cohort state rides the existing `iteration` gate key so
  * no new top-level quality-gate key is introduced.
  */
-function validateReviewCohort(gate: JsonObject, iteration: JsonObject): void {
+function validateReviewCohort(
+	gate: JsonObject,
+	iteration: JsonObject,
+	options: { lowRiskReduced?: boolean } = {},
+): void {
 	const cohort = qualityGateObject(iteration.reviewCohort);
 	if (!cohort) throw new Error("qualityGate iteration.reviewCohort is required at the review boundary");
 	const generation = cohort.reviewGeneration;
@@ -2524,7 +2620,15 @@ function validateReviewCohort(gate: JsonObject, iteration: JsonObject): void {
 	const unsupportedLanes = Object.keys(lanes).filter(key => !(COHORT_LANE_KEYS as readonly string[]).includes(key));
 	if (unsupportedLanes.length > 0)
 		throw new Error(`iteration.reviewCohort.lanes contains unsupported lanes: ${unsupportedLanes.join(", ")}`);
-	for (const lane of COHORT_LANE_KEYS) {
+	// #4560: on a runtime-selected low-risk single-goal boundary, cleaner and
+	// architect may be omitted only through the deterministic
+	// validationLaneSelection proof validated by the caller; the QA lane and
+	// the frozen source hash stay mandatory, and cohort parallelism is
+	// untouched whenever lanes do run.
+	const requiredLanes: readonly (typeof COHORT_LANE_KEYS)[number][] = options.lowRiskReduced
+		? COHORT_LANE_KEYS.filter(lane => lane === "qa")
+		: [...COHORT_LANE_KEYS];
+	for (const lane of requiredLanes) {
 		if (Array.isArray(lanes[lane]))
 			throw new Error(`iteration.reviewCohort.lanes.${lane} must be one lane per generation, not a list`);
 		const record = qualityGateObject(lanes[lane]);
@@ -2618,6 +2722,7 @@ async function validateCompletionQualityGate(
 			"executorQa",
 			"iteration",
 			"validationBatchClose",
+			"validationLaneSelection",
 			"criticReview",
 		]);
 		const unsupportedKeys = Object.keys(gate).filter(key => !allowedKeys.has(key));
@@ -2643,8 +2748,15 @@ async function validateCompletionQualityGate(
 	}
 	const allowedKeys = new Set(
 		batchMode
-			? ["architectReview", "executorQa", "iteration", "validationBatchClose", "criticReview"]
-			: ["architectReview", "executorQa", "iteration", "criticReview"],
+			? [
+					"architectReview",
+					"executorQa",
+					"iteration",
+					"validationBatchClose",
+					"criticReview",
+					"validationLaneSelection",
+				]
+			: ["architectReview", "executorQa", "iteration", "criticReview", "validationLaneSelection"],
 	);
 	const unsupportedKeys = Object.keys(gate).filter(key => !allowedKeys.has(key));
 	if (unsupportedKeys.length > 0) {
@@ -2654,6 +2766,26 @@ async function validateCompletionQualityGate(
 			`qualityGate contains unsupported keys: ${unsupportedKeys.join(", ")}`,
 		);
 	}
+	// #4560: deterministic risk/applicability selection for expensive boundary
+	// lanes. The runtime — never free-form model prose — decides whether a
+	// low-risk single-goal boundary may omit redundant review ceremony
+	// (cleaner/architect/terminal-critic). QA/targeted verification and the
+	// hash/receipt/join guarantees always remain mandatory. Anything risky or
+	// unprovable keeps today's full heavyweight cohort unchanged. The current
+	// frozen source under review is the gate's own cohort sourceHash.
+	const gateIteration = qualityGateObject(gate.iteration);
+	const gateCohortSourceHash = nonEmptyString(qualityGateObject(gateIteration?.reviewCohort)?.sourceHash);
+	const applicability = resolveUltragoalValidationApplicability({
+		changeSet: options.changeSet,
+		totalGoals: options.plan?.goals.length,
+		completedGoals: options.plan?.goals.filter(goal => goal.status === "complete").length,
+		hasOpenReviewBlockers: options.plan?.goals.some(goal => goal.status === "review_blocked") ?? false,
+		latestCohortSourceHash: options.ledger ? latestJoinedCohortSourceHash(options.ledger)?.sourceHash : undefined,
+		currentSourceHash: gateCohortSourceHash ?? undefined,
+	});
+	const laneSelection = readDeclaredValidationLaneSelection(gate);
+	const lowRiskReduced =
+		laneSelection !== undefined && validateDeclaredValidationLaneSelection(laneSelection, applicability, found);
 	const architectReview = qualityGateObject(gate.architectReview);
 	const executorQa = qualityGateObject(gate.executorQa);
 	const iteration = qualityGateObject(gate.iteration);
@@ -2678,8 +2810,16 @@ async function validateCompletionQualityGate(
 				"checkpoint --status complete blocked: terminal-critic ceiling reached; requires human/leader gjc ultragoal record-critic-gate-override before completion",
 			);
 		}
+		// #4560: terminal-critic proportionality. The critic verdict is
+		// mandatory on multi-goal/boundary, high-risk, or evidence-uncertain
+		// runs. A single-goal low-risk run whose joined cohort is clean and
+		// whose immutable source basis is unchanged may satisfy the terminus
+		// through the runtime-verified validationLaneSelection proof instead
+		// of duplicating the already-joined review with another read pass.
 		const criticReview = qualityGateObject(gate.criticReview);
-		if (criticReview?.verdict !== "OKAY") {
+		const criticProportionallySatisfied =
+			lowRiskReduced && applicability.basisUnchanged && !applicability.hasOpenReviewBlockers;
+		if (criticReview?.verdict !== "OKAY" && !criticProportionallySatisfied) {
 			found.add(
 				"criticReview.verdict",
 				"critic_verdict_not_okay",
@@ -2763,7 +2903,9 @@ async function validateCompletionQualityGate(
 	found.check("iteration.blockers", "non_empty_blockers", () =>
 		requireEmptyBlockers(iteration.blockers, "iteration.blockers"),
 	);
-	found.check("iteration.reviewCohort", "review_cohort_invalid", () => validateReviewCohort(gate, iteration));
+	found.check("iteration.reviewCohort", "review_cohort_invalid", () =>
+		validateReviewCohort(gate, iteration, { lowRiskReduced }),
+	);
 	if (batchMode && options.goal && options.plan && options.ledger) {
 		found.check("validationBatchClose", "batch_close_invalid", () =>
 			validateBatchCloseQualityGate(gate, options.plan!, batchMode, options.ledger!, options.changeSet),
