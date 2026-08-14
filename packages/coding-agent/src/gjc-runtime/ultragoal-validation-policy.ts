@@ -35,8 +35,6 @@ export interface UltragoalValidationApplicabilityInput {
 	latestCohortSourceHash?: string;
 	/** Current frozen source hash the boundary would review. */
 	currentSourceHash?: string;
-	/** Ledger evidence of a prior verified boundary generation. */
-	priorVerifiedGeneration?: number;
 }
 
 export interface UltragoalValidationApplicability {

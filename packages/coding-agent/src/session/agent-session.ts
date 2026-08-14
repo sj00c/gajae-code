@@ -12170,10 +12170,19 @@ export class AgentSession {
 
 	async #latestRalplanRunId(cwd: string): Promise<string | undefined> {
 		try {
-			const dir = sessionPlansDir(cwd, this.sessionId);
-			const entries = await fsReaddir(path.join(dir, "ralplan"));
-			const runs = entries.filter(name => name.length > 0).sort();
-			return runs.at(-1);
+			const dir = path.join(sessionPlansDir(cwd, this.sessionId), "ralplan");
+			// Pick the most recently modified run directory, not a lexicographic
+			// name sort: run ids are not guaranteed monotonic, and recovery must
+			// project the run the session actually touched last.
+			const entries = await fsReaddir(dir, { withFileTypes: true });
+			const runDirs = entries.filter(entry => entry.isDirectory());
+			if (runDirs.length === 0) return undefined;
+			let newest: { id: string; mtimeMs: number } | undefined;
+			for (const entry of runDirs) {
+				const mtimeMs = (await fs.promises.stat(path.join(dir, entry.name))).mtimeMs;
+				if (!newest || mtimeMs > newest.mtimeMs) newest = { id: entry.name, mtimeMs };
+			}
+			return newest?.id;
 		} catch {
 			return undefined;
 		}
