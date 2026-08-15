@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+	computeCheckpointChangeSet,
+	computeUltragoalReviewSourceHash,
 	createUltragoalPlan,
 	validateUltragoalQualityGateReadOnly,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
@@ -20,9 +22,14 @@ async function seedGitRepo(root: string, files: Record<string, string>): Promise
 	await $`git init`.cwd(root).quiet();
 	await $`git config user.email test@example.com`.cwd(root).quiet();
 	await $`git config user.name test`.cwd(root).quiet();
-	await $`git commit --allow-empty -m base`.cwd(root).quiet();
-	for (const [file, content] of Object.entries(files)) {
+	await Bun.write(path.join(root, ".gitignore"), ".gjc/\nartifacts/\n");
+	for (const file of Object.keys(files)) {
 		await fs.mkdir(path.dirname(path.join(root, file)), { recursive: true });
+		await Bun.write(path.join(root, file), "// base\n");
+	}
+	await $`git add .`.cwd(root).quiet();
+	await $`git commit -m base`.cwd(root).quiet();
+	for (const [file, content] of Object.entries(files)) {
 		await Bun.write(path.join(root, file), content);
 	}
 }
@@ -122,6 +129,13 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		await Bun.write(path.join(root, "artifacts", "report.json"), JSON.stringify({ ok: true }));
 	}
 
+	async function sourceHash(): Promise<string> {
+		const changeSet = await computeCheckpointChangeSet(root);
+		const hash = computeUltragoalReviewSourceHash(changeSet);
+		if (!hash) throw new Error("expected an authoritative source hash");
+		return hash;
+	}
+
 	/** Append a prior verified complete-checkpoint cohort with `sourceHash`. */
 	async function seedPriorCohort(sourceHash: string): Promise<void> {
 		const ledgerPath = path.join(root, ".gjc", `_session-${TEST_SESSION_ID}`, "ultragoal", "ledger.jsonl");
@@ -139,8 +153,9 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 
 	it("accepts a QA-only cohort with a matching low-risk lane-selection proof", async () => {
 		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
-		await seedPriorCohort("sha256:frozen1");
-		const gate = baseGate("sha256:frozen1", { qa: lane("sha256:frozen1") });
+		const frozen = await sourceHash();
+		await seedPriorCohort(frozen);
+		const gate = baseGate(frozen, { qa: lane(frozen) });
 		gate.validationLaneSelection = { riskClass: "low", reasons: [], omittedLanes: ["cleaner", "architect"] };
 		const result = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
@@ -153,7 +168,8 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 
 	it("rejects the reduced cohort when the runtime computes high risk", async () => {
 		await seedPlan(1, { "packages/coding-agent/src/sdk/session.ts": "export const y = 2;\n" });
-		const gate = baseGate("sha256:frozen2", { qa: lane("sha256:frozen2") });
+		const frozen = await sourceHash();
+		const gate = baseGate(frozen, { qa: lane(frozen) });
 		gate.validationLaneSelection = { riskClass: "low", reasons: [], omittedLanes: ["cleaner", "architect"] };
 		const result = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
@@ -168,7 +184,8 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 
 	it("rejects a reduced cohort without any lane-selection proof", async () => {
 		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
-		const gate = baseGate("sha256:frozen3", { qa: lane("sha256:frozen3") });
+		const frozen = await sourceHash();
+		const gate = baseGate(frozen, { qa: lane(frozen) });
 		const result = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
 			qualityGateJson: JSON.stringify(gate),
@@ -180,7 +197,7 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 
 	it("rejects a selection proof that tries to omit the QA lane", async () => {
 		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
-		const gate = baseGate("sha256:frozen4", {});
+		const gate = baseGate(await sourceHash(), {});
 		gate.validationLaneSelection = { riskClass: "low", reasons: [], omittedLanes: ["cleaner", "architect", "qa"] };
 		const result = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
@@ -193,10 +210,11 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 
 	it("keeps the full cohort mandatory for multi-goal runs even with a declared proof", async () => {
 		await seedPlan(2, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
-		const gate = baseGate("sha256:frozen5", {
-			cleaner: lane("sha256:frozen5", "CLEAR"),
-			architect: lane("sha256:frozen5", "CLEAR"),
-			qa: lane("sha256:frozen5"),
+		const frozen = await sourceHash();
+		const gate = baseGate(frozen, {
+			cleaner: lane(frozen, "CLEAR"),
+			architect: lane(frozen, "CLEAR"),
+			qa: lane(frozen),
 		});
 		const full = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
@@ -205,7 +223,7 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		});
 		// Full cohort on a multi-goal run validates (structural pass expected).
 		expect(full.errors.filter(e => e.code === "review_cohort_invalid")).toEqual([]);
-		const reduced = baseGate("sha256:frozen5", { qa: lane("sha256:frozen5") });
+		const reduced = baseGate(frozen, { qa: lane(frozen) });
 		reduced.validationLaneSelection = { riskClass: "low", reasons: [], omittedLanes: ["cleaner", "architect"] };
 		const rejected = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
@@ -214,5 +232,40 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		});
 		expect(rejected.valid).toBe(false);
 		expect(rejected.errors.some(e => e.code === "reduction_not_applicable")).toBe(true);
+	});
+
+	it("rejects a reused self-declared cohort hash after the source changes", async () => {
+		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
+		const frozen = await sourceHash();
+		await seedPriorCohort(frozen);
+		await Bun.write(path.join(root, "packages/utils/src/helper.ts"), "export const x = 2;\n");
+		const gate = baseGate(frozen, { qa: lane(frozen) });
+		gate.validationLaneSelection = { riskClass: "low", reasons: [], omittedLanes: ["cleaner", "architect"] };
+		const result = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			qualityGateJson: JSON.stringify(gate),
+			goalId: "G001",
+		});
+		expect(result.valid).toBe(false);
+		expect(result.errors.some(error => error.code === "source_hash_mismatch")).toBe(true);
+		expect(result.errors.some(error => error.code === "critic_verdict_not_okay")).toBe(true);
+	});
+
+	it("rejects fabricated low-risk selection reasons", async () => {
+		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
+		const frozen = await sourceHash();
+		const gate = baseGate(frozen, { qa: lane(frozen) });
+		gate.validationLaneSelection = {
+			riskClass: "low",
+			reasons: ["model-says-safe"],
+			omittedLanes: ["cleaner", "architect"],
+		};
+		const result = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			qualityGateJson: JSON.stringify(gate),
+			goalId: "G001",
+		});
+		expect(result.valid).toBe(false);
+		expect(result.errors.some(error => error.code === "reasons_mismatch")).toBe(true);
 	});
 });

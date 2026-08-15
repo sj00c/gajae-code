@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
@@ -151,6 +152,27 @@ describe("AgentSession workflow recovery continuation (#4560)", () => {
 		);
 	}
 
+	async function seedRalplanReview(): Promise<void> {
+		const runId = "review-run";
+		const runDir = path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "plans", "ralplan", runId);
+		const plan = `Plan the durable recovery contract.\n\n## Accepted Scope\n- recovery projection\n\n## Non-Goals\n- unrelated UI changes\n\n## Acceptance Criteria\n- forced compaction resumes plan review\n`;
+		const artifactPath = path.join(runDir, "stage-01-planner.md");
+		await Bun.write(artifactPath, plan);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({
+				stage: "planner",
+				stage_n: 1,
+				path: artifactPath,
+				sha256: crypto.createHash("sha256").update(plan).digest("hex"),
+			})}\n`,
+		);
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: runId, current_phase: "planner", active: true }),
+		);
+	}
+
 	it("continues from the structured workflow contract after compaction", async () => {
 		await seedActiveSkillState("active");
 		await seedUltragoalPlan();
@@ -177,6 +199,38 @@ describe("AgentSession workflow recovery continuation (#4560)", () => {
 		expect(text).toContain("continue-current-goal");
 		expect(text).toContain("G002");
 		expect(text).toContain("Accepted scope");
+		expect(text).not.toContain("STALLED:");
+	});
+
+	it("counts zero progress once per compaction rather than once per snapshot", async () => {
+		await seedActiveSkillState("active");
+		await seedUltragoalPlan();
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		await compact("length");
+		expect(JSON.stringify(promptSpy.mock.calls.at(-1))).not.toContain("STALLED:");
+		await compact("length");
+		expect(JSON.stringify(promptSpy.mock.calls.at(-1))).not.toContain("STALLED:");
+		await compact("length");
+		expect(JSON.stringify(promptSpy.mock.calls.at(-1))).toContain("STALLED:");
+	});
+
+	it("keeps terminal workflow phases continuation-inert", async () => {
+		await seedActiveSkillState("handoff");
+		await seedUltragoalPlan();
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		await compact("length");
+		expect(JSON.stringify(promptSpy.mock.calls)).not.toContain("workflow-recovery");
+	});
+
+	it("resumes the exact ralplan review action after forced compaction", async () => {
+		await seedActiveSkillState("planner", "ralplan");
+		await seedRalplanReview();
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		await compact("length");
+		const text = JSON.stringify(promptSpy.mock.calls);
+		expect(text).toContain("workflow-recovery");
+		expect(text).toContain("run-plan-review");
+		expect(text).toContain("recovery projection");
 	});
 
 	it("keeps the generic prompt when no durable workflow state exists", async () => {

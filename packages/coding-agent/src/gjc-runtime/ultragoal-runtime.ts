@@ -63,10 +63,46 @@ import {
 	writeGuardedJsonAtomic,
 } from "./state-writer";
 import {
+	categorizeComputerChangePath,
+	ciDevChangedPathRows,
+	computeCheckpointChangeSet,
+	computeUltragoalReviewSourceHash,
+	mergeChangeSetPaths,
+	normalizeChangeSetPath,
+	parseGitNameStatus,
+	parseGitUntrackedPaths,
+	parseUnifiedDiffPaths,
+	resolveGitBase,
+	spawnText,
+	type UltragoalChangeCategory,
+	type UltragoalChangeSet,
+	type UltragoalChangeSetPath,
+	type UltragoalChangeStatus,
+} from "./ultragoal-change-set";
+import {
 	resolveUltragoalValidationApplicability,
 	type UltragoalValidationApplicability,
 } from "./ultragoal-validation-policy";
 import { resolveWorkflowSetting } from "./workflow-settings";
+
+export {
+	categorizeComputerChangePath,
+	ciDevChangedPathRows,
+	computeCheckpointChangeSet,
+	computeUltragoalReviewSourceHash,
+	mergeChangeSetPaths,
+	normalizeChangeSetPath,
+	normalizeRepoPath,
+	parseGitNameStatus,
+	parseGitUntrackedPaths,
+	parseUnifiedDiffPaths,
+	resolveGitBase,
+	spawnText,
+	type UltragoalChangeCategory,
+	type UltragoalChangeSet,
+	type UltragoalChangeSetPath,
+	type UltragoalChangeStatus,
+} from "./ultragoal-change-set";
 
 export {
 	captureUltragoalRecoverySnapshot,
@@ -1530,33 +1566,6 @@ function formatExpectedKindWords(words: string[]): string {
 
 export type SurfaceFamily = "web" | "cli" | "native" | "api-package" | "algorithm-math" | "unknown";
 
-export type UltragoalChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "unknown";
-export type UltragoalChangeCategory =
-	| "code"
-	| "generated-binding"
-	| "tool"
-	| "settings-registry"
-	| "prompt-doc-behavior"
-	| "docs-static"
-	| "other";
-export interface UltragoalChangeSetPath extends JsonObject {
-	path: string;
-	status: UltragoalChangeStatus;
-	oldPath?: string;
-	category?: UltragoalChangeCategory;
-}
-export interface UltragoalChangeSet extends JsonObject {
-	source: "checkpoint-git" | "review-pr" | "review-branch" | "review-worktree" | "review-spec";
-	baseRef?: string;
-	headRef?: string;
-	mergeBase?: string;
-	paths: UltragoalChangeSetPath[];
-	rawDiffStat?: string;
-	rawDiff?: string;
-	captureIncomplete?: boolean;
-	trusted: true;
-}
-
 const MANDATORY_COMPUTER_CASE_IDS = [
 	"kill-switch-bypass",
 	"suspended-enforcement",
@@ -1566,40 +1575,6 @@ const MANDATORY_COMPUTER_CASE_IDS = [
 	"runaway-loop-halt",
 	"blast-radius",
 ] as const;
-const TOOLS_INDEX_PATH = "packages/coding-agent/src/tools/index.ts";
-
-export function normalizeRepoPath(value: string): string {
-	return value.replaceAll("\\\\", "/").replace(/^\.\//, "");
-}
-
-export function normalizeChangeSetPath(value: string): string {
-	return value.replace(/^\.\//, "");
-}
-
-export function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
-	const normalized = normalizeRepoPath(value);
-	if (normalized.startsWith("crates/pi-natives/src/computer/")) return "code";
-	if (/^packages\/natives\/native\/index\.(?:d\.ts|js)$/.test(normalized)) return "generated-binding";
-	if (
-		normalized === "packages/coding-agent/src/tools/computer.ts" ||
-		normalized.startsWith("packages/coding-agent/src/tools/computer/")
-	)
-		return "tool";
-	if (
-		normalized === TOOLS_INDEX_PATH ||
-		normalized === "packages/coding-agent/src/tools/renderers.ts" ||
-		normalized === "packages/coding-agent/src/config/settings-schema.ts"
-	)
-		return "settings-registry";
-	if (
-		normalized === "packages/coding-agent/src/prompts/tools/computer.md" ||
-		normalized === "packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md" ||
-		normalized === "packages/coding-agent/src/prompts/agents/executor.md"
-	)
-		return "prompt-doc-behavior";
-	if (normalized === "docs/tools/computer.md" || normalized === "docs/computer-use/README.md") return "docs-static";
-	return "other";
-}
 
 function isComputerControlSurfaceCategory(category: UltragoalChangeCategory): boolean {
 	// Shared behavior registries are intentionally conservative: a path-only or
@@ -2552,6 +2527,14 @@ function validateDeclaredValidationLaneSelection(
 		);
 		return false;
 	}
+	if (declared.reasons.length !== 0) {
+		found.add(
+			"validationLaneSelection.reasons",
+			"reasons_mismatch",
+			"declared validationLaneSelection reasons must exactly mirror the runtime-computed low-risk reason set",
+		);
+		return false;
+	}
 	const expectedOmitted = (["cleaner", "architect"] as const).filter(lane => !applicability.lanes[lane].applicable);
 	const declaredOmitted = new Set(declared.omittedLanes);
 	if (declaredOmitted.has("qa")) {
@@ -2775,6 +2758,14 @@ async function validateCompletionQualityGate(
 	// frozen source under review is the gate's own cohort sourceHash.
 	const gateIteration = qualityGateObject(gate.iteration);
 	const gateCohortSourceHash = nonEmptyString(qualityGateObject(gateIteration?.reviewCohort)?.sourceHash);
+	const authoritativeSourceHash = computeUltragoalReviewSourceHash(options.changeSet);
+	if (gateCohortSourceHash && authoritativeSourceHash && gateCohortSourceHash !== authoritativeSourceHash) {
+		found.add(
+			"iteration.reviewCohort.sourceHash",
+			"source_hash_mismatch",
+			"iteration.reviewCohort.sourceHash must equal the runtime-computed digest of the authoritative current source basis",
+		);
+	}
 	const applicability = resolveUltragoalValidationApplicability({
 		changeSet: options.changeSet,
 		totalGoals: options.plan?.goals.length,
@@ -2782,8 +2773,12 @@ async function validateCompletionQualityGate(
 		hasOpenReviewBlockers: options.plan?.goals.some(goal => goal.status === "review_blocked") ?? false,
 		latestCohortSourceHash: options.ledger ? latestJoinedCohortSourceHash(options.ledger)?.sourceHash : undefined,
 		currentSourceHash: gateCohortSourceHash ?? undefined,
+		authoritativeSourceHash,
 	});
-	const laneSelection = readDeclaredValidationLaneSelection(gate);
+	let laneSelection: DeclaredValidationLaneSelection | undefined;
+	found.check("validationLaneSelection", "selection_invalid", () => {
+		laneSelection = readDeclaredValidationLaneSelection(gate);
+	});
 	const lowRiskReduced =
 		laneSelection !== undefined && validateDeclaredValidationLaneSelection(laneSelection, applicability, found);
 	const architectReview = qualityGateObject(gate.architectReview);
@@ -4353,28 +4348,6 @@ async function readOptionalExecutorQa(cwd: string, value: string | undefined): P
 	}
 	return structured as JsonObject;
 }
-
-import {
-	ciDevChangedPathRows,
-	computeCheckpointChangeSet,
-	mergeChangeSetPaths,
-	parseGitNameStatus,
-	parseGitUntrackedPaths,
-	parseUnifiedDiffPaths,
-	resolveGitBase,
-	spawnText,
-} from "./ultragoal-change-set";
-
-export {
-	ciDevChangedPathRows,
-	computeCheckpointChangeSet,
-	mergeChangeSetPaths,
-	parseGitNameStatus,
-	parseGitUntrackedPaths,
-	parseUnifiedDiffPaths,
-	resolveGitBase,
-	spawnText,
-};
 
 function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | undefined {
 	const kind = nonEmptyString(source.kind);

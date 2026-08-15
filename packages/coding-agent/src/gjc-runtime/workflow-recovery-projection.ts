@@ -17,7 +17,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { sessionPlansDir } from "./session-layout";
+import { modeStatePath, sessionPlansDir } from "./session-layout";
 import { getUltragoalPaths, readUltragoalLedger, readUltragoalPlan } from "./ultragoal-runtime";
 
 /** Skills whose durable state can produce a structured recovery projection. */
@@ -71,6 +71,9 @@ export interface WorkflowRecoveryProjection {
 			| "start-next-goal"
 			| "resolve-review-blockers"
 			| "run-boundary-cohort"
+			| "run-plan-review"
+			| "revise-plan"
+			| "reconcile-intent"
 			| "final-aggregate-checkpoint"
 			| "awaiting-approval"
 			| "unknown";
@@ -168,6 +171,27 @@ function findSection(sections: ParsedHeadingSection[], needles: readonly string[
 	return sections.find(section => normalized.some(needle => section.title.toLowerCase().includes(needle)));
 }
 
+function findSectionExact(
+	sections: ParsedHeadingSection[],
+	titles: readonly string[],
+): ParsedHeadingSection | undefined {
+	const normalized = new Set(titles.map(title => title.toLowerCase()));
+	return sections.find(section => normalized.has(section.title.toLowerCase()));
+}
+
+async function resolveRalplanArtifactPath(runDir: string, recordedPath: string): Promise<string | undefined> {
+	const candidate = path.isAbsolute(recordedPath) ? recordedPath : path.resolve(runDir, recordedPath);
+	try {
+		const [runReal, artifactReal] = await Promise.all([fs.realpath(runDir), fs.realpath(candidate)]);
+		const relative = path.relative(runReal, artifactReal);
+		if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
+		const stat = await fs.stat(artifactReal);
+		return stat.isFile() ? artifactReal : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Extract the bounded objective from a Ralplan final plan artifact. The
  * objective is the first non-empty prose line of the document (before the
@@ -189,16 +213,22 @@ export interface RalplanFinalProjectionInput {
 	runId: string;
 }
 
+interface RalplanProjectionInput extends RalplanFinalProjectionInput {
+	lastReviewVerdict?: string;
+	lastReviewVerdictLane?: string;
+}
+
 /**
  * Build a recovery projection from the newest complete Ralplan `final` stage
  * row of a run. Returns undefined when no parseable final artifact exists —
  * compaction then degrades to the thin projection instead of guessing.
  */
-export async function projectRalplanFinalRun(
-	input: RalplanFinalProjectionInput,
+async function projectRalplanRunInternal(
+	input: RalplanProjectionInput,
+	finalOnly: boolean,
 ): Promise<WorkflowRecoveryProjection | undefined> {
 	const runDir = path.join(sessionPlansDir(input.cwd, input.sessionId), "ralplan", input.runId);
-	let rows: Array<{ stage: string; stage_n?: number; path?: string; sha256?: string }> = [];
+	let rows: Array<{ stage?: unknown; stage_n?: unknown; path?: unknown; sha256?: unknown }> = [];
 	try {
 		const text = await fs.readFile(path.join(runDir, "index.jsonl"), "utf8");
 		rows = text
@@ -207,20 +237,26 @@ export async function projectRalplanFinalRun(
 			.filter(line => line.length > 0)
 			.map(line => {
 				try {
-					return JSON.parse(line) as { stage: string; stage_n?: number; path?: string; sha256?: string };
+					const parsed = JSON.parse(line) as unknown;
+					return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+						? (parsed as { stage?: unknown; stage_n?: unknown; path?: unknown; sha256?: unknown })
+						: undefined;
 				} catch {
 					return undefined;
 				}
 			})
-			.filter(
-				(row): row is { stage: string; stage_n?: number; path?: string; sha256?: string } => row !== undefined,
+			.filter((row): row is { stage?: unknown; stage_n?: unknown; path?: unknown; sha256?: unknown } =>
+				Boolean(row),
 			);
 	} catch {
 		return undefined;
 	}
 	const finalRow = [...rows].reverse().find(row => row.stage === "final");
-	if (!finalRow?.path) return undefined;
-	const artifactPath = path.isAbsolute(finalRow.path) ? finalRow.path : path.join(runDir, finalRow.path);
+	const planRow = [...rows].reverse().find(row => row.stage === "revision" || row.stage === "planner");
+	const artifactRow = finalOnly ? finalRow : (finalRow ?? planRow);
+	if (typeof artifactRow?.path !== "string" || artifactRow.path.trim().length === 0) return undefined;
+	const artifactPath = await resolveRalplanArtifactPath(runDir, artifactRow.path);
+	if (!artifactPath) return undefined;
 	let markdown: string;
 	try {
 		markdown = await fs.readFile(artifactPath, "utf8");
@@ -230,37 +266,133 @@ export async function projectRalplanFinalRun(
 	const objective = objectiveFromMarkdown(markdown);
 	if (!objective) return undefined;
 	const sections = parseMarkdownSections(markdown);
+	const primaryAcceptance = sectionListItems(
+		findSection(sections, ["acceptance criteria", "verification", "test plan"]),
+		MAX_CRITERIA_ITEMS,
+	);
 	const acceptance =
-		sectionListItems(
-			findSection(sections, ["acceptance criteria", "verification", "test plan"]),
-			MAX_CRITERIA_ITEMS,
-		) || sectionListItems(findSection(sections, ["acceptance"]), MAX_CRITERIA_ITEMS);
-	const nonGoals =
-		sectionListItems(findSection(sections, ["non-goals", "non goals", "out of scope"]), MAX_SCOPE_ITEMS) ||
-		sectionListItems(findSection(sections, ["non-goal"]), MAX_SCOPE_ITEMS);
-	const unresolved =
-		sectionListItems(
-			findSection(sections, ["intent reconciliation", "open confirmation", "unresolved"]),
-			MAX_UNRESOLVED_ITEMS,
-		) || [];
+		primaryAcceptance.length > 0
+			? primaryAcceptance
+			: sectionListItems(findSectionExact(sections, ["acceptance"]), MAX_CRITERIA_ITEMS);
+	const nonGoals = sectionListItems(
+		findSectionExact(sections, ["non-goals", "non goals", "non-goal", "out of scope"]),
+		MAX_SCOPE_ITEMS,
+	);
+	const unresolved = sectionListItems(
+		findSection(sections, ["intent reconciliation", "open confirmation", "unresolved"]),
+		MAX_UNRESOLVED_ITEMS,
+	);
 	const scope: WorkflowRecoveryScopeItem[] = sectionListItems(
-		findSection(sections, ["scope", "accepted scope"]),
+		findSectionExact(sections, ["scope", "accepted scope"]),
 		MAX_SCOPE_ITEMS,
 	).map(text => ({ kind: "accepted" as const, text }));
 	for (const text of nonGoals) scope.push({ kind: "non_goal" as const, text });
-	const sha256 = (await sha256File(artifactPath)) ?? finalRow.sha256;
+	const sha256 = await sha256File(artifactPath);
+	if (!sha256) return undefined;
+	if (typeof artifactRow.sha256 === "string") {
+		const recorded = artifactRow.sha256.startsWith("sha256:") ? artifactRow.sha256 : `sha256:${artifactRow.sha256}`;
+		if (recorded !== sha256) return undefined;
+	}
+	const stage = typeof artifactRow.stage === "string" ? artifactRow.stage : "unknown";
+	const latestStage = typeof rows.at(-1)?.stage === "string" ? rows.at(-1)?.stage : undefined;
+	let nextAction: WorkflowRecoveryProjection["nextAction"];
+	if (stage === "final") {
+		nextAction = { actionClass: "awaiting-approval" };
+	} else if (latestStage === "critic") {
+		nextAction =
+			input.lastReviewVerdictLane === "critic" && input.lastReviewVerdict === "OKAY"
+				? { actionClass: "reconcile-intent" }
+				: { actionClass: "revise-plan" };
+	} else {
+		nextAction = { actionClass: "run-plan-review" };
+	}
 	const projection: Omit<WorkflowRecoveryProjection, "zeroProgress"> = {
 		skill: "ralplan",
-		source: "ralplan-final",
+		source: stage === "final" ? "ralplan-final" : "ralplan-run",
 		objective,
 		scope,
 		acceptanceCriteria: acceptance,
 		unresolved,
-		provenance: { planPath: artifactPath, runId: input.runId, stage: "final", sha256 },
+		provenance: { planPath: artifactPath, runId: input.runId, stage, sha256 },
 		progress: {},
-		nextAction: { actionClass: "awaiting-approval" },
+		nextAction,
 	};
 	return withZeroProgress(projection);
+}
+
+export async function projectRalplanFinalRun(
+	input: RalplanFinalProjectionInput,
+): Promise<WorkflowRecoveryProjection | undefined> {
+	return await projectRalplanRunInternal(input, true);
+}
+
+export async function projectRalplanRun(
+	input: RalplanProjectionInput,
+): Promise<WorkflowRecoveryProjection | undefined> {
+	return await projectRalplanRunInternal(input, false);
+}
+
+function isSafeRunId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.trim().length > 0 &&
+		value === value.trim() &&
+		path.basename(value) === value &&
+		value !== "." &&
+		value !== ".."
+	);
+}
+
+/**
+ * Project the active Ralplan run recorded in durable mode state. When legacy
+ * state has no run id, fall back to complete runs ordered by index freshness,
+ * skipping unfinished or malformed candidates instead of letting them shadow
+ * the newest usable final contract.
+ */
+export async function projectLatestRalplanRun(input: {
+	cwd: string;
+	sessionId: string;
+}): Promise<WorkflowRecoveryProjection | undefined> {
+	const root = path.join(sessionPlansDir(input.cwd, input.sessionId), "ralplan");
+	try {
+		const stateText = await fs.readFile(modeStatePath(input.cwd, input.sessionId, "ralplan"), "utf8");
+		const state = JSON.parse(stateText) as {
+			run_id?: unknown;
+			last_review_verdict?: unknown;
+			last_review_verdict_lane?: unknown;
+		};
+		if (isSafeRunId(state.run_id)) {
+			return await projectRalplanRun({
+				...input,
+				runId: state.run_id,
+				lastReviewVerdict: typeof state.last_review_verdict === "string" ? state.last_review_verdict : undefined,
+				lastReviewVerdictLane:
+					typeof state.last_review_verdict_lane === "string" ? state.last_review_verdict_lane : undefined,
+			});
+		}
+	} catch {
+		// Legacy or malformed mode state falls back to bounded run discovery.
+	}
+	try {
+		const entries = await fs.readdir(root, { withFileTypes: true });
+		const candidates = await Promise.all(
+			entries
+				.filter(entry => entry.isDirectory() && isSafeRunId(entry.name))
+				.map(async entry => ({
+					runId: entry.name,
+					mtimeMs:
+						(await fs.stat(path.join(root, entry.name, "index.jsonl")).catch(() => undefined))?.mtimeMs ?? -1,
+				})),
+		);
+		candidates.sort((left, right) => right.mtimeMs - left.mtimeMs || left.runId.localeCompare(right.runId));
+		for (const candidate of candidates) {
+			const projection = await projectRalplanRun({ ...input, runId: candidate.runId });
+			if (projection) return projection;
+		}
+	} catch {
+		return undefined;
+	}
+	return undefined;
 }
 /**
  * Build a recovery projection from Ultragoal canonical durable state. The
@@ -274,7 +406,8 @@ export async function projectUltragoalRun(input: {
 }): Promise<WorkflowRecoveryProjection | undefined> {
 	const plan = await readUltragoalPlan(input.cwd, input.sessionId).catch(() => null);
 	if (!plan?.goals?.length) return undefined;
-	const ledger = await readUltragoalLedger(input.cwd, input.sessionId).catch(() => []);
+	const ledger = await readUltragoalLedger(input.cwd, input.sessionId).catch(() => null);
+	if (!ledger) return undefined;
 	const paths = getUltragoalPaths(input.cwd, input.sessionId);
 	const schedulable = plan.goals.filter(goal => goal.status !== "complete" && goal.status !== "superseded");
 	const currentGoal = plan.goals.find(goal => goal.status === "active" || goal.status === "failed") ?? schedulable[0];

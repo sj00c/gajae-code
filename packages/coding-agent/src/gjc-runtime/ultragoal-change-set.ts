@@ -1,10 +1,105 @@
-import {
-	categorizeComputerChangePath,
-	normalizeChangeSetPath,
-	type UltragoalChangeSet,
-	type UltragoalChangeSetPath,
-	type UltragoalChangeStatus,
-} from "./ultragoal-runtime";
+import * as crypto from "node:crypto";
+import * as path from "node:path";
+
+export type UltragoalChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "unknown";
+export type UltragoalChangeCategory =
+	| "code"
+	| "generated-binding"
+	| "tool"
+	| "settings-registry"
+	| "prompt-doc-behavior"
+	| "docs-static"
+	| "other";
+
+export interface UltragoalChangeSetPath {
+	path: string;
+	status: UltragoalChangeStatus;
+	oldPath?: string;
+	category?: UltragoalChangeCategory;
+	[key: string]: unknown;
+}
+
+export interface UltragoalChangeSet {
+	source: "checkpoint-git" | "review-pr" | "review-branch" | "review-worktree" | "review-spec";
+	baseRef?: string;
+	headRef?: string;
+	mergeBase?: string;
+	paths: UltragoalChangeSetPath[];
+	rawDiffStat?: string;
+	rawDiff?: string;
+	untrackedContentHash?: string;
+	captureIncomplete?: boolean;
+	trusted: true;
+	[key: string]: unknown;
+}
+
+export function normalizeRepoPath(value: string): string {
+	return value.replaceAll("\\", "/").replace(/^\.\//, "");
+}
+
+export function normalizeChangeSetPath(value: string): string {
+	return value.replace(/^\.\//, "");
+}
+
+export function categorizeComputerChangePath(pathValue: string): UltragoalChangeCategory {
+	const normalized = normalizeRepoPath(pathValue);
+	if (normalized.startsWith("crates/pi-natives/src/computer/")) return "code";
+	if (/^packages\/natives\/native\/index\.(?:d\.ts|js)$/.test(normalized)) return "generated-binding";
+	if (
+		normalized === "packages/coding-agent/src/tools/computer.ts" ||
+		normalized.startsWith("packages/coding-agent/src/tools/computer/")
+	)
+		return "tool";
+	if (
+		normalized === "packages/coding-agent/src/config/settings-schema.ts" ||
+		normalized === "packages/coding-agent/src/tools/index.ts" ||
+		normalized === "packages/coding-agent/src/tools/renderers.ts"
+	)
+		return "settings-registry";
+	if (
+		normalized === "packages/coding-agent/src/prompts/tools/computer.md" ||
+		normalized === "packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md" ||
+		normalized === "packages/coding-agent/src/prompts/agents/executor.md"
+	)
+		return "prompt-doc-behavior";
+	if (normalized === "docs/tools/computer.md" || normalized === "docs/computer-use/README.md") return "docs-static";
+	return "other";
+}
+
+export function computeUltragoalReviewSourceHash(changeSet: UltragoalChangeSet | undefined): string | undefined {
+	if (!changeSet?.trusted || changeSet.captureIncomplete || changeSet.rawDiff === undefined) return undefined;
+	if (changeSet.paths.some(row => row.status === "unknown")) return undefined;
+	const basis = {
+		source: changeSet.source,
+		baseRef: changeSet.baseRef,
+		headRef: changeSet.headRef,
+		mergeBase: changeSet.mergeBase,
+		paths: changeSet.paths.map(row => ({
+			path: normalizeRepoPath(row.path),
+			status: row.status,
+			oldPath: row.oldPath ? normalizeRepoPath(row.oldPath) : undefined,
+		})),
+		rawDiff: changeSet.rawDiff,
+		untrackedContentHash: changeSet.untrackedContentHash,
+	};
+	return `sha256:${crypto.createHash("sha256").update(JSON.stringify(basis)).digest("hex")}`;
+}
+
+async function hashUntrackedFiles(cwd: string, paths: readonly UltragoalChangeSetPath[]): Promise<string | undefined> {
+	if (paths.length === 0) return undefined;
+	try {
+		const hasher = crypto.createHash("sha256");
+		for (const row of [...paths].sort((left, right) => left.path.localeCompare(right.path))) {
+			hasher.update(row.path);
+			hasher.update("\0");
+			hasher.update(Buffer.from(await Bun.file(path.join(cwd, row.path)).arrayBuffer()));
+			hasher.update("\0");
+		}
+		return `sha256:${hasher.digest("hex")}`;
+	} catch {
+		return undefined;
+	}
+}
 
 export async function spawnText(
 	command: string[],
@@ -177,11 +272,13 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 			trusted: true,
 		};
 	}
+	const untrackedPaths = parseGitUntrackedPaths(untracked.stdout);
+	const untrackedContentHash = await hashUntrackedFiles(cwd, untrackedPaths);
 	const paths = mergeChangeSetPaths([
 		parseGitNameStatus(committed.stdout),
 		parseGitNameStatus(unstaged.stdout),
 		parseGitNameStatus(staged.stdout),
-		parseGitUntrackedPaths(untracked.stdout),
+		untrackedPaths,
 		ciChangedPaths,
 	]);
 	return {
@@ -195,6 +292,13 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 			committedDiff.ok && unstagedDiff.ok && stagedDiff.ok
 				? [committedDiff.stdout, unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join("\n")
 				: undefined,
+		...(untrackedContentHash ? { untrackedContentHash } : {}),
+		captureIncomplete:
+			!stat.ok ||
+			!committedDiff.ok ||
+			!unstagedDiff.ok ||
+			!stagedDiff.ok ||
+			(untrackedPaths.length > 0 && !untrackedContentHash),
 		trusted: true,
 	};
 }

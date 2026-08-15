@@ -17,9 +17,10 @@
  */
 import {
 	categorizeComputerChangePath,
+	normalizeRepoPath,
 	type UltragoalChangeSet,
 	type UltragoalChangeSetPath,
-} from "./ultragoal-runtime";
+} from "./ultragoal-change-set";
 
 export type UltragoalValidationLane = "cleaner" | "architect" | "qa" | "terminal-critic";
 
@@ -35,6 +36,8 @@ export interface UltragoalValidationApplicabilityInput {
 	latestCohortSourceHash?: string;
 	/** Current frozen source hash the boundary would review. */
 	currentSourceHash?: string;
+	/** Runtime-computed digest of the authoritative current source basis. */
+	authoritativeSourceHash?: string;
 }
 
 export interface UltragoalValidationApplicability {
@@ -54,10 +57,17 @@ export interface UltragoalValidationApplicability {
 
 const HIGH_RISK_PATH_PREFIXES = [
 	// Security/auth surfaces
-	"packages/coding-agent/src/session/auth",
-	"packages/coding-agent/src/auth",
+	"packages/coding-agent/src/session/auth-storage.ts",
+	"packages/coding-agent/src/session/secure-token-file.ts",
+	"packages/coding-agent/src/session/startup-auth-config.ts",
+	"packages/coding-agent/src/runtime-api-key.ts",
+	"packages/coding-agent/src/runtime-credential-selector.ts",
+	"packages/coding-agent/src/secrets",
 	"crates/pi-natives/src",
 	"crates/git-daemon",
+	// Workflow enforcement surfaces must never grade their own weakening as low-risk.
+	"packages/coding-agent/src/gjc-runtime",
+	"packages/coding-agent/src/session/agent-session.ts",
 	// Public contract / SDK surfaces
 	"packages/coding-agent/src/sdk",
 	"packages/coding-agent/src/extensibility",
@@ -69,8 +79,9 @@ const HIGH_RISK_PATH_PREFIXES = [
 ] as const;
 
 const MIGRATION_PATH_PREFIXES = [
-	"packages/coding-agent/src/gjc-runtime/state-migrations",
-	"packages/coding-agent/src/session/session-manager",
+	"packages/coding-agent/src/gjc-runtime/state-migrations.ts",
+	"packages/coding-agent/src/session/session-manager.ts",
+	"packages/coding-agent/src/session/session-manager-internal.ts",
 	"scripts",
 ] as const;
 
@@ -79,7 +90,9 @@ function changePaths(changeSet: UltragoalChangeSet | undefined): UltragoalChange
 }
 
 export function isHighRiskChangePath(row: UltragoalChangeSetPath): boolean {
-	const candidates = [row.path, row.oldPath].filter((value): value is string => typeof value === "string");
+	const candidates = [row.path, row.oldPath]
+		.filter((value): value is string => typeof value === "string")
+		.map(normalizeRepoPath);
 	for (const candidate of candidates) {
 		for (const prefix of HIGH_RISK_PATH_PREFIXES) {
 			if (candidate === prefix || candidate.startsWith(`${prefix}/`)) return true;
@@ -89,7 +102,9 @@ export function isHighRiskChangePath(row: UltragoalChangeSetPath): boolean {
 }
 
 export function isMigrationChangePath(row: UltragoalChangeSetPath): boolean {
-	const candidates = [row.path, row.oldPath].filter((value): value is string => typeof value === "string");
+	const candidates = [row.path, row.oldPath]
+		.filter((value): value is string => typeof value === "string")
+		.map(normalizeRepoPath);
 	for (const candidate of candidates) {
 		for (const prefix of MIGRATION_PATH_PREFIXES) {
 			if (candidate === prefix || candidate.startsWith(`${prefix}/`)) return true;
@@ -127,6 +142,7 @@ export function resolveUltragoalValidationApplicability(
 	const reasons: string[] = [];
 	if (!input.changeSet?.trusted) reasons.push("change-set-untrusted-or-missing");
 	if (input.changeSet?.captureIncomplete) reasons.push("capture-incomplete");
+	if (!input.authoritativeSourceHash) reasons.push("source-basis-unverified");
 	if (multiGoal) reasons.push("multiple-outstanding-goals");
 	if (input.hasOpenReviewBlockers) reasons.push("open-review-blockers");
 	if (highRiskPaths.length > 0) reasons.push("high-risk-paths");
@@ -144,7 +160,9 @@ export function resolveUltragoalValidationApplicability(
 	// frozen source hash this boundary would review, and no blockers reopened.
 	const basisUnchanged =
 		Boolean(input.latestCohortSourceHash) &&
+		Boolean(input.authoritativeSourceHash) &&
 		input.currentSourceHash === input.latestCohortSourceHash &&
+		input.currentSourceHash === input.authoritativeSourceHash &&
 		!input.hasOpenReviewBlockers;
 	const lanes: UltragoalValidationApplicability["lanes"] = {
 		cleaner: lane(heavyweight, heavyweight ? reasons : ["low-risk-single-goal"]),

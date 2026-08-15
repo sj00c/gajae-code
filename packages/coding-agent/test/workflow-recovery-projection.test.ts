@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as crypto from "node:crypto";
 import * as path from "node:path";
 import {
 	isHighRiskChangePath,
@@ -8,6 +9,7 @@ import {
 import {
 	hashWorkflowRecoveryProjection,
 	isWorkflowRecoveryStalled,
+	projectLatestRalplanRun,
 	projectRalplanFinalRun,
 	projectUltragoalRun,
 	trackWorkflowRecoveryZeroProgress,
@@ -56,9 +58,10 @@ describe("workflow recovery projection (#4560)", () => {
 
 	it("projects a ralplan final run with scope, non-goals, AC, and digest", async () => {
 		const runDir = ralplanRunDir(tempDir.path(), "run-1");
+		const digest = crypto.createHash("sha256").update(FINAL_PLAN).digest("hex");
 		await Bun.write(
 			path.join(runDir, "index.jsonl"),
-			`${JSON.stringify({ stage: "planner", stage_n: 1, path: "stage-01-planner.md", sha256: "aa" })}\n${JSON.stringify({ stage: "final", stage_n: 2, path: "stage-02-final.md", sha256: "bb" })}\n`,
+			`${JSON.stringify({ stage: "planner", stage_n: 1, path: "stage-01-planner.md", sha256: "aa" })}\n${JSON.stringify({ stage: "final", stage_n: 2, path: "stage-02-final.md", sha256: digest })}\n`,
 		);
 		await Bun.write(path.join(runDir, "stage-02-final.md"), FINAL_PLAN);
 		const projection = await projectRalplanFinalRun({ cwd: tempDir.path(), sessionId: SESSION_ID, runId: "run-1" });
@@ -70,6 +73,50 @@ describe("workflow recovery projection (#4560)", () => {
 		expect(projection?.provenance.sha256).toMatch(/^sha256:/);
 		expect(projection?.zeroProgress.fingerprint).toMatch(/^sha256:/);
 		expect(projection?.zeroProgress.stalled).toBe(false);
+	});
+
+	it("rejects escaped, non-string, and digest-mismatched ralplan artifacts", async () => {
+		const outsidePath = path.join(tempDir.path(), "outside.md");
+		await Bun.write(outsidePath, "secret outside contract\n");
+		for (const [runId, artifactPath, sha256] of [
+			["absolute", outsidePath, undefined],
+			["relative", "../../../../../outside.md", undefined],
+			["typed", 123, undefined],
+			["digest", "stage-01-final.md", "0".repeat(64)],
+		] as const) {
+			const runDir = ralplanRunDir(tempDir.path(), runId);
+			await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
+			await Bun.write(
+				path.join(runDir, "index.jsonl"),
+				`${JSON.stringify({ stage: "final", stage_n: 1, path: artifactPath, sha256 })}\n`,
+			);
+			await expect(
+				projectRalplanFinalRun({ cwd: tempDir.path(), sessionId: SESSION_ID, runId }),
+			).resolves.toBeUndefined();
+		}
+	});
+
+	it("uses the durable active ralplan run and skips unfinished legacy candidates", async () => {
+		const validDir = ralplanRunDir(tempDir.path(), "valid-run");
+		await Bun.write(path.join(validDir, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(validDir, "index.jsonl"),
+			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md" })}\n`,
+		);
+		const unfinishedDir = ralplanRunDir(tempDir.path(), "unfinished-run");
+		await Bun.write(
+			path.join(unfinishedDir, "index.jsonl"),
+			`${JSON.stringify({ stage: "planner", stage_n: 1, path: "stage-01-planner.md" })}\n`,
+		);
+		const discovered = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(discovered?.provenance.runId).toBe("valid-run");
+
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: "unfinished-run" }),
+		);
+		const activeUnfinished = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(activeUnfinished).toBeUndefined();
 	});
 
 	it("degrades safely for malformed ralplan index (no final row)", async () => {
@@ -124,7 +171,16 @@ describe("workflow recovery projection (#4560)", () => {
 		);
 		await Bun.write(
 			path.join(dir, "ledger.jsonl"),
-			`${JSON.stringify({ eventId: "e1", event: "goal_checkpointed", goalId: "G001", status: "complete", evidence: "done" })}\n`,
+			`${JSON.stringify({
+				eventId: "e1",
+				event: "goal_checkpointed",
+				goalId: "G001",
+				status: "complete",
+				evidence: "parallel executor work joined before boundary review",
+				qualityGateJson: {
+					iteration: { reviewCohort: { reviewGeneration: 2, sourceHash: "sha256:frozen", joined: true } },
+				},
+			})}\n`,
 		);
 		const projection = await projectUltragoalRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
 		expect(projection?.skill).toBe("ultragoal");
@@ -132,8 +188,40 @@ describe("workflow recovery projection (#4560)", () => {
 		expect(projection?.progress.totalGoals).toBe(2);
 		expect(projection?.progress.completedGoals).toBe(1);
 		expect(projection?.progress.outstandingGoals).toBe(1);
+		expect(projection?.progress.latestReviewGeneration).toBe(2);
+		expect(projection?.progress.latestCohortSourceHash).toBe("sha256:frozen");
 		expect(projection?.nextAction.actionClass).toBe("continue-current-goal");
 		expect(projection?.nextAction.goalId).toBe("G002");
+	});
+
+	it("recovers blocker-fix re-review as the exact next action", async () => {
+		const dir = ultragoalDir(tempDir.path());
+		const now = new Date().toISOString();
+		await Bun.write(
+			path.join(dir, "goals.json"),
+			JSON.stringify({
+				version: 1,
+				brief: "b",
+				gjcGoalMode: "aggregate",
+				gjcObjective: "Ship recovery",
+				goals: [
+					{
+						id: "G001",
+						title: "Ship",
+						objective: "Ship",
+						status: "review_blocked",
+						createdAt: now,
+						updatedAt: now,
+						evidence: "joined cohort found a blocker",
+					},
+				],
+				createdAt: now,
+				updatedAt: now,
+			}),
+		);
+		const projection = await projectUltragoalRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(projection?.nextAction).toMatchObject({ actionClass: "resolve-review-blockers", goalId: "G001" });
+		expect(projection?.unresolved).toContain("review blockers open on G001");
 	});
 
 	it("degrades safely for tampered ultragoal plan", async () => {
@@ -141,6 +229,25 @@ describe("workflow recovery projection (#4560)", () => {
 		await Bun.write(path.join(dir, "goals.json"), "{not json");
 		const projection = await projectUltragoalRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
 		expect(projection).toBeUndefined();
+	});
+
+	it("degrades safely for a truncated ultragoal ledger", async () => {
+		const dir = ultragoalDir(tempDir.path());
+		const now = new Date().toISOString();
+		await Bun.write(
+			path.join(dir, "goals.json"),
+			JSON.stringify({
+				version: 1,
+				brief: "b",
+				gjcGoalMode: "aggregate",
+				gjcObjective: "Ship parser fix",
+				goals: [{ id: "G001", title: "Fix", objective: "Fix", status: "active", createdAt: now, updatedAt: now }],
+				createdAt: now,
+				updatedAt: now,
+			}),
+		);
+		await Bun.write(path.join(dir, "ledger.jsonl"), '{"event":"goal_started"}\n{"event":');
+		await expect(projectUltragoalRun({ cwd: tempDir.path(), sessionId: SESSION_ID })).resolves.toBeUndefined();
 	});
 
 	it("bounds zero-progress cycles by durable fingerprint", () => {
@@ -183,6 +290,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 			changeSet: lowRiskChangeSet,
 			totalGoals: 1,
 			completedGoals: 0,
+			authoritativeSourceHash: "sha256:current",
 		});
 		expect(applicability.riskClass).toBe("low");
 		expect(applicability.lanes.qa.applicable).toBe(true);
@@ -228,6 +336,21 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 			completedGoals: 0,
 		});
 		expect(migration.riskClass).toBe("high");
+		expect(
+			isHighRiskChangePath({ path: "packages/coding-agent/src/session/auth-storage.ts", status: "modified" }),
+		).toBe(true);
+		expect(
+			isHighRiskChangePath({
+				path: "./packages/coding-agent/src/gjc-runtime/ultragoal-runtime.ts",
+				status: "modified",
+			}),
+		).toBe(true);
+		expect(
+			isMigrationChangePath({
+				path: "packages\\coding-agent\\src\\session\\session-manager.ts",
+				status: "modified",
+			}),
+		).toBe(true);
 	});
 
 	it("fails closed on missing/untrusted change set and multi-goal runs", () => {
@@ -249,6 +372,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 			completedGoals: 0,
 			latestCohortSourceHash: "sha256:abc",
 			currentSourceHash: "sha256:abc",
+			authoritativeSourceHash: "sha256:abc",
 		});
 		expect(unchanged.basisUnchanged).toBe(true);
 		const changed = resolveUltragoalValidationApplicability({
@@ -257,6 +381,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 			completedGoals: 0,
 			latestCohortSourceHash: "sha256:abc",
 			currentSourceHash: "sha256:xyz",
+			authoritativeSourceHash: "sha256:xyz",
 		});
 		expect(changed.basisUnchanged).toBe(false);
 		const blocked = resolveUltragoalValidationApplicability({
@@ -265,6 +390,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 			completedGoals: 0,
 			latestCohortSourceHash: "sha256:abc",
 			currentSourceHash: "sha256:abc",
+			authoritativeSourceHash: "sha256:abc",
 			hasOpenReviewBlockers: true,
 		});
 		expect(blocked.basisUnchanged).toBe(false);

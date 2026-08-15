@@ -177,7 +177,6 @@ export interface ForkContextSeedOptions {
 	signal?: AbortSignal;
 }
 
-import { readdir as fsReaddir } from "node:fs/promises";
 import type { AuthCredentialSelector } from "@gajae-code/ai/core";
 import type { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
@@ -301,7 +300,6 @@ import {
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
-	sessionPlansDir,
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
 import {
@@ -313,7 +311,7 @@ import {
 } from "../gjc-runtime/session-state-sidecar";
 import {
 	isWorkflowRecoveryStalled,
-	projectRalplanFinalRun,
+	projectLatestRalplanRun,
 	projectUltragoalRun,
 	trackWorkflowRecoveryZeroProgress,
 	type WorkflowRecoveryProjection,
@@ -12037,7 +12035,9 @@ export class AgentSession {
 		this.setTodoPhases(phases.filter(p => p.tasks.length > 0));
 	}
 
-	async #compactionStateSnapshot(): Promise<CompactionStateSnapshot> {
+	async #compactionStateSnapshot(
+		options: { trackWorkflowRecoveryProgress?: boolean } = {},
+	): Promise<CompactionStateSnapshot> {
 		const snapshot: CompactionStateSnapshot = {
 			goal: undefined,
 			openTodos: [],
@@ -12086,15 +12086,18 @@ export class AgentSession {
 			// Ralplan/Ultragoal runs so compaction carries a structured
 			// recovery projection instead of summary prose alone. Degrades
 			// safely: malformed/stale/tampered durable state leaves the
-			snapshot.workflowRecovery = await this.#projectWorkflowRecovery();
+			snapshot.workflowRecovery =
+				snapshot.goal?.status === "paused" ? undefined : await this.#projectWorkflowRecovery();
 			// #4560: track measurable durable progress across compaction
 			// observations so a stalled continuation loop is detected and
 			// escalated instead of running forever.
-			if (snapshot.workflowRecovery) {
+			if (snapshot.workflowRecovery && options.trackWorkflowRecoveryProgress) {
 				this.#workflowRecoveryMemory = trackWorkflowRecoveryZeroProgress(
 					this.#workflowRecoveryMemory,
 					snapshot.workflowRecovery,
 				);
+			}
+			if (snapshot.workflowRecovery && this.#workflowRecoveryMemory) {
 				snapshot.workflowRecovery = {
 					...snapshot.workflowRecovery,
 					zeroProgress: {
@@ -12145,7 +12148,9 @@ export class AgentSession {
 	 * preserved) and for malformed durable state (safe degradation).
 	 */
 	async #projectWorkflowRecovery(): Promise<WorkflowRecoveryProjection | undefined> {
-		const entries = this.#lastCompactionActiveSkills ?? [];
+		const entries = (this.#lastCompactionActiveSkills ?? []).filter(
+			entry => !isWorkflowContinuationInert(entry.skill, entry.phase),
+		);
 		const cwd = this.sessionManager.getCwd();
 		// Ultragoal runs own the live execution contract; prefer their plan.
 		if (entries.some(entry => entry.skill === "ultragoal")) {
@@ -12153,13 +12158,8 @@ export class AgentSession {
 			if (projection) return projection;
 		}
 		if (entries.some(entry => entry.skill === "ralplan")) {
-			const runId = await this.#latestRalplanRunId(cwd);
-			if (runId) {
-				const projection = await projectRalplanFinalRun({ cwd, sessionId: this.sessionId, runId }).catch(
-					() => undefined,
-				);
-				if (projection) return projection;
-			}
+			const projection = await projectLatestRalplanRun({ cwd, sessionId: this.sessionId }).catch(() => undefined);
+			if (projection) return projection;
 		}
 		return undefined;
 	}
@@ -12167,26 +12167,6 @@ export class AgentSession {
 	#workflowRecoveryMemory: WorkflowRecoveryZeroProgressMemory | undefined;
 	/** #4560: active skills observed by the latest compaction snapshot. */
 	#lastCompactionActiveSkills: Array<{ skill: string; phase: string }> = [];
-
-	async #latestRalplanRunId(cwd: string): Promise<string | undefined> {
-		try {
-			const dir = path.join(sessionPlansDir(cwd, this.sessionId), "ralplan");
-			// Pick the most recently modified run directory, not a lexicographic
-			// name sort: run ids are not guaranteed monotonic, and recovery must
-			// project the run the session actually touched last.
-			const entries = await fsReaddir(dir, { withFileTypes: true });
-			const runDirs = entries.filter(entry => entry.isDirectory());
-			if (runDirs.length === 0) return undefined;
-			let newest: { id: string; mtimeMs: number } | undefined;
-			for (const entry of runDirs) {
-				const mtimeMs = (await fs.promises.stat(path.join(dir, entry.name))).mtimeMs;
-				if (!newest || mtimeMs > newest.mtimeMs) newest = { id: entry.name, mtimeMs };
-			}
-			return newest?.id;
-		} catch {
-			return undefined;
-		}
-	}
 
 	#compactionStateContext(snapshot: CompactionStateSnapshot): string[] {
 		const context: string[] = [];
@@ -15360,7 +15340,7 @@ export class AgentSession {
 			const compactionAbortController = new AbortController();
 			this.#compactionAbortController = compactionAbortController;
 			// Take this invocation's state snapshot for the summarizer context.
-			const compactionStateSnapshot = await this.#compactionStateSnapshot();
+			const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
 
 			try {
 				if (!this.model) {
@@ -17415,7 +17395,7 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 			await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
 			if (autoCompactionSignal.aborted) return await emitAborted();
-			const compactionStateSnapshot = await this.#compactionStateSnapshot();
+			const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
 			if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
 				return await emitAborted();
 			}

@@ -1,12 +1,16 @@
 # Workflow recovery and risk-proportional validation (#4560)
 
-Long `ralplan -> ultragoal` runs can compact mid-flight. Before #4560, compaction preserved only a thin best-effort projection (active goal objective/status, workflow phase, open todos) plus a generic continuation prompt, and boundary validation applied the full review cohort unconditionally. This document describes the two mechanisms #4560 adds: a **structured workflow recovery projection** consumed by compaction, and a **deterministic validation-applicability policy** for Ultragoal boundary lanes.
+Long `ralplan -> ultragoal` runs can compact mid-flight. Before #4560, compaction preserved only a thin best-effort projection (active goal objective/status, workflow phase, open todos) plus a generic continuation prompt, material intent was reconciled only after expensive consensus, and boundary validation applied the full review cohort unconditionally. This document describes the three mechanisms #4560 adds: **pre-consensus material-intent reconciliation**, a **structured workflow recovery projection** consumed by compaction, and a **deterministic validation-applicability policy** for Ultragoal boundary lanes.
+
+## Pre-consensus material-intent reconciliation
+
+Ralplan now persists an `intent` stage after the Planner artifact and before Architect/Critic review. The leader cross-checks the draft against current user constraints, relevant deep-interview specs, prior plans, and explicit non-goals. Only material decisions that can change objective, scope, acceptance criteria, architecture, or verification trigger an `ask`; a plan with no material open items proceeds without empty interview ceremony. Any material correction is incorporated into a persisted Planner `revision` before review, and the review lanes receive both the reconciled plan receipt and the `intent` receipt. The existing post-consensus interview remains as a delta gate for assumptions first introduced or exposed by review, rather than re-asking already settled decisions.
 
 ## Structured workflow recovery projection
 
 `packages/coding-agent/src/gjc-runtime/workflow-recovery-projection.ts` derives a bounded projection from canonical durable state through read-only filesystem access:
 
-- **Ralplan**: the newest complete `final` stage row of a run's `index.jsonl` resolves the persisted plan artifact; objective/scope/non-goals/acceptance criteria/unresolved decisions are parsed from its bounded `##` sections, with a `sha256` digest over the artifact bytes.
+- **Ralplan**: durable mode state selects the active run. During consensus, the latest confined `planner`/`revision` artifact supplies objective/scope/non-goals/acceptance criteria and the exact next action (`run-plan-review`, `revise-plan`, or `reconcile-intent`); after finalization the `final` artifact yields `awaiting-approval`. Legacy discovery orders runs by `index.jsonl` freshness and skips unfinished/malformed candidates. Artifact paths are realpath-confined to the run directory and their recorded SHA-256 must match the bytes read.
 - **Ultragoal**: `goals.json` + `ledger.jsonl` produce the aggregate objective, per-goal accepted scope, completed-goal acceptance evidence, the current goal (active/failed or first schedulable), measurable progress counters (total/completed/outstanding goals, latest joined cohort generation + frozen `sourceHash`, newest ledger event id), and the exact next action class (`continue-current-goal`, `start-next-goal`, `resolve-review-blockers`, `final-aggregate-checkpoint`, ...).
 
 Safety properties:
@@ -24,7 +28,7 @@ Safety properties:
 
 ### Bounded zero-progress cycles
 
-Each compaction observation fingerprints the projection's contract-relevant fields (`hashWorkflowRecoveryProjection`). `trackWorkflowRecoveryZeroProgress` counts consecutive observations with an unchanged fingerprint; at `ZERO_PROGRESS_STALL_THRESHOLD` (2) the continuation prompt carries an explicit `STALLED` directive ordering a durable blocker/escalation instead of repeating the same next action. Any measurable durable progress (completed obligations, changed blocker disposition, changed source hash, goal status change) resets the counter. This bounds — but does not claim to eliminate — post-compaction continuation loops.
+Each actual compaction fingerprints the projection's contract-relevant fields (`hashWorkflowRecoveryProjection`). Snapshot reads performed by authorization and prompt assembly reuse the same counter state and do not increment it. `trackWorkflowRecoveryZeroProgress` counts consecutive compactions with an unchanged fingerprint; at `ZERO_PROGRESS_STALL_THRESHOLD` (2) the third unchanged recovery carries an explicit `STALLED` directive ordering a durable blocker/escalation instead of repeating the same next action. Any measurable durable progress (completed obligations, changed blocker disposition, changed source hash, goal status change) resets the counter. This bounds — but does not claim to eliminate — post-compaction continuation loops.
 
 ## Ultragoal validation-applicability policy
 
@@ -32,10 +36,10 @@ Each compaction observation fingerprints the projection's contract-relevant fiel
 
 Low-risk eligibility (the only case where redundant lanes may be omitted) requires **all** of:
 
-- a trusted, completely captured change set,
+- a trusted, completely captured change set with a runtime-computed source-basis digest,
 - exactly one outstanding goal,
 - no open review blockers,
-- no high-risk path (auth/security, native crates, SDK/extensibility public contract, agent-wire protocol, shared behavior registries), migration path, or computer-control-surface path.
+- no high-risk path (workflow enforcement itself, auth/security, native crates, SDK/extensibility public contract, agent-wire protocol, shared behavior registries), migration path, or computer-control-surface path.
 
 Everything else — including a missing or untrusted change set — is high risk and keeps the full heavyweight cohort (`cleaner || architect || qa`, join-before-repair, terminal critic).
 
@@ -47,7 +51,21 @@ Omission mechanics:
 
 ### Unchanged-basis rerun avoidance
 
-`basisUnchanged` is true only when the newest ledger-recorded joined cohort source hash equals the current frozen cohort source hash under review and no review blockers reopened. A changed source, a review fix, an integration-base change, incomplete capture, or invalidated evidence forces a full rerun exactly as before; cohort parallelism and the frozen-source-hash lane binding are untouched whenever lanes run.
+`basisUnchanged` is true only when the newest ledger-recorded joined cohort source hash and the gate's current cohort hash both equal the runtime-computed digest of the authoritative change-set basis, and no review blockers reopened. The digest binds integration base, merge base, normalized path/status rows, and the captured diff. A changed source, a review fix, an integration-base change, untracked or incompletely captured content, or invalidated evidence forces a full rerun exactly as before; cohort parallelism and the frozen-source-hash lane binding are untouched whenever lanes run.
+
+## Comparative and forced-compaction evidence
+
+The regression matrix is deterministic evidence, not a claim of identical model outputs:
+
+| Scenario | Baseline risk | Candidate assertion |
+|---|---|---|
+| Low-risk single-goal boundary | Unconditional cleaner + architect + terminal critic duplicated already-joined evidence | Runtime-authenticated lane selection may omit cleaner/architect; QA and source binding remain mandatory; critic omission additionally requires the unchanged authoritative digest |
+| Multi-goal, workflow-enforcement, auth, migration, SDK/public-contract, native, computer/shared-registry, incomplete capture | A reduction could hide defects | Classified high-risk and retains the complete cohort plus terminal critic |
+| Forced compaction during Ralplan review | Generic prose could lose the reviewed plan and next review action | Active run, confined plan artifact, digest, accepted/non-goal scope, and `run-plan-review`/`revise-plan`/`reconcile-intent` are restored |
+| Forced compaction during Ultragoal execution and parallel executor work | Current goal and completed work could be reconstructed from stale conversation memory | Canonical goals/ledger restore current goal, completion counters, joined cohort generation/hash, and the next bounded action |
+| Forced compaction during boundary review or blocker-fix re-review | Duplicate generations or scope drift | Joined cohort evidence and `resolve-review-blockers` survive compaction; zero-progress escalation counts actual compactions only |
+
+The focused suites covering this matrix are `workflow-recovery-projection.test.ts`, `agent-session-workflow-recovery-continuation.test.ts`, and `ultragoal-validation-lanes.test.ts`. Broader compaction, Ralplan runtime, Ultragoal runtime/review/critic, type, and visible-definition gates remain the merge boundary.
 
 ## Guarantees preserved
 
