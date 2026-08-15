@@ -82,6 +82,7 @@ describe("workflow recovery projection (#4560)", () => {
 			["absolute", outsidePath, undefined],
 			["relative", "../../../../../outside.md", undefined],
 			["typed", 123, undefined],
+			["missing-digest", "stage-01-final.md", undefined],
 			["digest", "stage-01-final.md", "0".repeat(64)],
 		] as const) {
 			const runDir = ralplanRunDir(tempDir.path(), runId);
@@ -99,9 +100,10 @@ describe("workflow recovery projection (#4560)", () => {
 	it("uses the durable active ralplan run and skips unfinished legacy candidates", async () => {
 		const validDir = ralplanRunDir(tempDir.path(), "valid-run");
 		await Bun.write(path.join(validDir, "stage-01-final.md"), FINAL_PLAN);
+		const validDigest = crypto.createHash("sha256").update(FINAL_PLAN).digest("hex");
 		await Bun.write(
 			path.join(validDir, "index.jsonl"),
-			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md" })}\n`,
+			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md", sha256: validDigest })}\n`,
 		);
 		const unfinishedDir = ralplanRunDir(tempDir.path(), "unfinished-run");
 		await Bun.write(
@@ -117,6 +119,45 @@ describe("workflow recovery projection (#4560)", () => {
 		);
 		const activeUnfinished = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
 		expect(activeUnfinished).toBeUndefined();
+	});
+
+	it("keeps planning-stuck recovery terminal instead of reopening review", async () => {
+		const runDir = ralplanRunDir(tempDir.path(), "stuck-run");
+		await Bun.write(path.join(runDir, "stage-01-planner.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({
+				stage: "planner",
+				stage_n: 1,
+				path: "stage-01-planner.md",
+				sha256: crypto.createHash("sha256").update(FINAL_PLAN).digest("hex"),
+			})}\n${JSON.stringify({ event: "planning_stuck", planning_stuck: true })}\n`,
+		);
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: "stuck-run" }),
+		);
+		const projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(projection?.nextAction).toEqual({ actionClass: "awaiting-approval", detail: "planning-stuck" });
+	});
+
+	it("does not fall back to another run when ralplan mode state is tampered", async () => {
+		const runDir = ralplanRunDir(tempDir.path(), "valid-run");
+		await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({
+				stage: "final",
+				stage_n: 1,
+				path: "stage-01-final.md",
+				sha256: crypto.createHash("sha256").update(FINAL_PLAN).digest("hex"),
+			})}\n`,
+		);
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			"{not-json",
+		);
+		await expect(projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID })).resolves.toBeUndefined();
 	});
 
 	it("degrades safely for malformed ralplan index (no final row)", async () => {

@@ -855,6 +855,11 @@
         "verb": "write-artifact"
       },
       {
+        "from": "planner",
+        "to": "architect",
+        "verb": "write-artifact"
+      },
+      {
         "from": "intent",
         "to": "architect",
         "verb": "write-artifact"

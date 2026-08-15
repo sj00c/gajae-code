@@ -229,6 +229,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		terminalStates: ["final", "handoff"],
 		transitions: [
 			{ from: "planner", to: "intent", verb: "write-artifact" },
+			// Legacy in-flight runs may have persisted planner before the intent stage existed.
+			{ from: "planner", to: "architect", verb: "write-artifact" },
 			{ from: "intent", to: "architect", verb: "write-artifact" },
 			{ from: "intent", to: "revision", verb: "write-artifact" },
 			{ from: "architect", to: "critic", verb: "write-artifact" },

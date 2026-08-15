@@ -218,6 +218,15 @@ interface RalplanProjectionInput extends RalplanFinalProjectionInput {
 	lastReviewVerdictLane?: string;
 }
 
+interface RalplanProjectionRow {
+	stage?: unknown;
+	stage_n?: unknown;
+	path?: unknown;
+	sha256?: unknown;
+	event?: unknown;
+	planning_stuck?: unknown;
+}
+
 /**
  * Build a recovery projection from the newest complete Ralplan `final` stage
  * row of a run. Returns undefined when no parseable final artifact exists —
@@ -228,33 +237,27 @@ async function projectRalplanRunInternal(
 	finalOnly: boolean,
 ): Promise<WorkflowRecoveryProjection | undefined> {
 	const runDir = path.join(sessionPlansDir(input.cwd, input.sessionId), "ralplan", input.runId);
-	let rows: Array<{ stage?: unknown; stage_n?: unknown; path?: unknown; sha256?: unknown }> = [];
+	const rows: RalplanProjectionRow[] = [];
 	try {
 		const text = await fs.readFile(path.join(runDir, "index.jsonl"), "utf8");
-		rows = text
-			.split(/\r?\n/)
-			.map(line => line.trim())
-			.filter(line => line.length > 0)
-			.map(line => {
-				try {
-					const parsed = JSON.parse(line) as unknown;
-					return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-						? (parsed as { stage?: unknown; stage_n?: unknown; path?: unknown; sha256?: unknown })
-						: undefined;
-				} catch {
-					return undefined;
-				}
-			})
-			.filter((row): row is { stage?: unknown; stage_n?: unknown; path?: unknown; sha256?: unknown } =>
-				Boolean(row),
-			);
+		for (const line of text.split(/\r?\n/).map(value => value.trim())) {
+			if (line.length === 0) continue;
+			const parsed = JSON.parse(line) as unknown;
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+			rows.push(parsed as RalplanProjectionRow);
+		}
 	} catch {
 		return undefined;
 	}
 	const finalRow = [...rows].reverse().find(row => row.stage === "final");
 	const planRow = [...rows].reverse().find(row => row.stage === "revision" || row.stage === "planner");
 	const artifactRow = finalOnly ? finalRow : (finalRow ?? planRow);
-	if (typeof artifactRow?.path !== "string" || artifactRow.path.trim().length === 0) return undefined;
+	if (
+		typeof artifactRow?.path !== "string" ||
+		artifactRow.path.trim().length === 0 ||
+		typeof artifactRow.sha256 !== "string"
+	)
+		return undefined;
 	const artifactPath = await resolveRalplanArtifactPath(runDir, artifactRow.path);
 	if (!artifactPath) return undefined;
 	let markdown: string;
@@ -289,14 +292,15 @@ async function projectRalplanRunInternal(
 	for (const text of nonGoals) scope.push({ kind: "non_goal" as const, text });
 	const sha256 = await sha256File(artifactPath);
 	if (!sha256) return undefined;
-	if (typeof artifactRow.sha256 === "string") {
-		const recorded = artifactRow.sha256.startsWith("sha256:") ? artifactRow.sha256 : `sha256:${artifactRow.sha256}`;
-		if (recorded !== sha256) return undefined;
-	}
+	const recorded = artifactRow.sha256.startsWith("sha256:") ? artifactRow.sha256 : `sha256:${artifactRow.sha256}`;
+	if (!/^sha256:[0-9a-f]{64}$/.test(recorded) || recorded !== sha256) return undefined;
 	const stage = typeof artifactRow.stage === "string" ? artifactRow.stage : "unknown";
 	const latestStage = typeof rows.at(-1)?.stage === "string" ? rows.at(-1)?.stage : undefined;
+	const planningStuck = rows.some(row => row.event === "planning_stuck" && row.planning_stuck === true);
 	let nextAction: WorkflowRecoveryProjection["nextAction"];
-	if (stage === "final") {
+	if (planningStuck) {
+		nextAction = { actionClass: "awaiting-approval", detail: "planning-stuck" };
+	} else if (stage === "final") {
 		nextAction = { actionClass: "awaiting-approval" };
 	} else if (latestStage === "critic") {
 		nextAction =
@@ -354,13 +358,26 @@ export async function projectLatestRalplanRun(input: {
 	sessionId: string;
 }): Promise<WorkflowRecoveryProjection | undefined> {
 	const root = path.join(sessionPlansDir(input.cwd, input.sessionId), "ralplan");
+	let stateText: string | undefined;
 	try {
-		const stateText = await fs.readFile(modeStatePath(input.cwd, input.sessionId, "ralplan"), "utf8");
-		const state = JSON.parse(stateText) as {
+		stateText = await fs.readFile(modeStatePath(input.cwd, input.sessionId, "ralplan"), "utf8");
+	} catch (error) {
+		if (!(typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")) {
+			return undefined;
+		}
+	}
+	if (stateText !== undefined) {
+		let state: {
 			run_id?: unknown;
 			last_review_verdict?: unknown;
 			last_review_verdict_lane?: unknown;
 		};
+		try {
+			state = JSON.parse(stateText) as typeof state;
+		} catch {
+			return undefined;
+		}
+		if (state.run_id !== undefined && !isSafeRunId(state.run_id)) return undefined;
 		if (isSafeRunId(state.run_id)) {
 			return await projectRalplanRun({
 				...input,
@@ -370,8 +387,6 @@ export async function projectLatestRalplanRun(input: {
 					typeof state.last_review_verdict_lane === "string" ? state.last_review_verdict_lane : undefined,
 			});
 		}
-	} catch {
-		// Legacy or malformed mode state falls back to bounded run discovery.
 	}
 	try {
 		const entries = await fs.readdir(root, { withFileTypes: true });
@@ -534,6 +549,7 @@ export function hashWorkflowRecoveryProjection(projection: WorkflowRecoveryProje
 		objective: projection.objective,
 		scope: projection.scope,
 		acceptanceCriteria: projection.acceptanceCriteria,
+		unresolved: projection.unresolved,
 		provenance: projection.provenance,
 		currentGoal: projection.currentGoal,
 		progressBasis: {

@@ -28,7 +28,7 @@ Safety properties:
 
 ### Bounded zero-progress cycles
 
-Each actual compaction fingerprints the projection's contract-relevant fields (`hashWorkflowRecoveryProjection`). Snapshot reads performed by authorization and prompt assembly reuse the same counter state and do not increment it. `trackWorkflowRecoveryZeroProgress` counts consecutive compactions with an unchanged fingerprint; at `ZERO_PROGRESS_STALL_THRESHOLD` (2) the third unchanged recovery carries an explicit `STALLED` directive ordering a durable blocker/escalation instead of repeating the same next action. Any measurable durable progress (completed obligations, changed blocker disposition, changed source hash, goal status change) resets the counter. This bounds — but does not claim to eliminate — post-compaction continuation loops.
+Each compaction attempt fingerprints the projection's contract-relevant fields (`hashWorkflowRecoveryProjection`). Snapshot reads performed by authorization and prompt assembly reuse the same counter state and do not increment it. `trackWorkflowRecoveryZeroProgress` counts consecutive attempts with an unchanged fingerprint; at `ZERO_PROGRESS_STALL_THRESHOLD` (2) the third unchanged recovery attempt carries an explicit `STALLED` directive ordering a durable blocker/escalation instead of repeating the same next action. An attempt that aborts after its tracked snapshot still consumes one observation; any measurable durable progress (completed obligations, changed blocker disposition, changed source hash, goal status change) resets the counter. This bounds — but does not claim to eliminate — post-compaction continuation loops.
 
 ## Ultragoal validation-applicability policy
 
@@ -46,12 +46,12 @@ Everything else — including a missing or untrusted change set — is high risk
 Omission mechanics:
 
 - The **QA lane can never be omitted**. Targeted verification and real-surface evidence stay mandatory at every boundary.
-- A leader presenting a reduced cohort must carry a top-level `validationLaneSelection` proof (`riskClass`, `reasons`, `omittedLanes`) that exactly mirrors the runtime-computed selection. Mismatches fail closed with typed diagnostics (`reduction_not_applicable`, `selection_mismatch`, `omitted_lanes_mismatch`, `qa_lane_mandatory`) and the full cohort requirement stays in force.
+- A leader presenting a reduced cohort must carry a top-level `validationLaneSelection` proof (`riskClass`, `reasons`, `omittedLanes`) that exactly mirrors the runtime-computed selection. Mismatches fail closed with typed diagnostics (`reduction_not_applicable`, `selection_mismatch`, `reasons_mismatch`, `omitted_lanes_mismatch`, `qa_lane_mandatory`, `selection_invalid`, `source_hash_mismatch`) and the full cohort requirement stays in force.
 - The **terminal critic** is proportional: `criticReview.verdict: OKAY` remains mandatory for final aggregates except when the run is single-goal, low-risk, blocker-free, **and** the immutable source basis is unchanged (`basisUnchanged`), in which case the already-joined cohort evidence satisfies the terminus without a duplicate critic read pass.
 
 ### Unchanged-basis rerun avoidance
 
-`basisUnchanged` is true only when the newest ledger-recorded joined cohort source hash and the gate's current cohort hash both equal the runtime-computed digest of the authoritative change-set basis, and no review blockers reopened. The digest binds integration base, merge base, normalized path/status rows, and the captured diff. A changed source, a review fix, an integration-base change, untracked or incompletely captured content, or invalidated evidence forces a full rerun exactly as before; cohort parallelism and the frozen-source-hash lane binding are untouched whenever lanes run.
+Run `gjc ultragoal quality-gate source-hash --json` on the clean frozen snapshot to obtain the only accepted cohort hash. `basisUnchanged` is true only when the newest ledger-recorded joined cohort source hash and the gate's current cohort hash both equal that runtime-computed digest, and no review blockers reopened. The digest binds integration base, merge base, normalized path/status rows, captured diff, and the identity/content of untracked files without following symlink targets. A changed source, a review fix, an integration-base change, incompletely captured content, or invalidated evidence forces a full rerun exactly as before; cohort parallelism and the frozen-source-hash lane binding are untouched whenever lanes run.
 
 ## Comparative and forced-compaction evidence
 

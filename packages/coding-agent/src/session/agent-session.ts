@@ -12088,9 +12088,6 @@ export class AgentSession {
 			// safely: malformed/stale/tampered durable state leaves the
 			snapshot.workflowRecovery =
 				snapshot.goal?.status === "paused" ? undefined : await this.#projectWorkflowRecovery();
-			// #4560: track measurable durable progress across compaction
-			// observations so a stalled continuation loop is detected and
-			// escalated instead of running forever.
 			if (snapshot.workflowRecovery && options.trackWorkflowRecoveryProgress) {
 				this.#workflowRecoveryMemory = trackWorkflowRecoveryZeroProgress(
 					this.#workflowRecoveryMemory,
@@ -15449,7 +15446,6 @@ export class AgentSession {
 				if (compactionAbortController.signal.aborted) {
 					throw new CompactionCancelledError();
 				}
-
 				const compactionEntryId = this.sessionManager.appendCompaction(
 					summary,
 					shortSummary,

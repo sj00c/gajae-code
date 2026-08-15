@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 export type UltragoalChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "unknown";
@@ -89,10 +90,23 @@ async function hashUntrackedFiles(cwd: string, paths: readonly UltragoalChangeSe
 	if (paths.length === 0) return undefined;
 	try {
 		const hasher = crypto.createHash("sha256");
+		const root = path.resolve(cwd);
 		for (const row of [...paths].sort((left, right) => left.path.localeCompare(right.path))) {
+			const filePath = path.resolve(root, row.path);
+			const relative = path.relative(root, filePath);
+			if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
+			const stat = await fs.lstat(filePath);
 			hasher.update(row.path);
 			hasher.update("\0");
-			hasher.update(Buffer.from(await Bun.file(path.join(cwd, row.path)).arrayBuffer()));
+			if (stat.isSymbolicLink()) {
+				hasher.update("symlink\0");
+				hasher.update(await fs.readlink(filePath));
+			} else if (stat.isFile()) {
+				hasher.update("file\0");
+				hasher.update(Buffer.from(await Bun.file(filePath).arrayBuffer()));
+			} else {
+				return undefined;
+			}
 			hasher.update("\0");
 		}
 		return `sha256:${hasher.digest("hex")}`;

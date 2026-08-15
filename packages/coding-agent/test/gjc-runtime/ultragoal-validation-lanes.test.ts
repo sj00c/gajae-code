@@ -7,6 +7,7 @@ import {
 	computeCheckpointChangeSet,
 	computeUltragoalReviewSourceHash,
 	createUltragoalPlan,
+	runNativeUltragoalCommand,
 	validateUltragoalQualityGateReadOnly,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 
@@ -130,11 +131,34 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 	}
 
 	async function sourceHash(): Promise<string> {
-		const changeSet = await computeCheckpointChangeSet(root);
-		const hash = computeUltragoalReviewSourceHash(changeSet);
-		if (!hash) throw new Error("expected an authoritative source hash");
-		return hash;
+		const result = await runNativeUltragoalCommand(["quality-gate", "source-hash", "--json"], root);
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}") as { sourceHash?: unknown };
+		if (typeof payload.sourceHash !== "string") throw new Error("expected an authoritative source hash");
+		return payload.sourceHash;
 	}
+
+	it("prints the same authoritative source hash through the supported CLI surface", async () => {
+		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
+		const cliHash = await sourceHash();
+		const internalHash = computeUltragoalReviewSourceHash(await computeCheckpointChangeSet(root));
+		if (!internalHash) throw new Error("expected internal authoritative source hash");
+		expect(cliHash).toBe(internalHash);
+	});
+
+	it("hashes an untracked symlink by link identity without reading its external target", async () => {
+		if (process.platform === "win32") return;
+		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
+		const outside = await tempDir();
+		cleanup.push(outside);
+		const target = path.join(outside, "secret.txt");
+		await Bun.write(target, "first secret\n");
+		await fs.symlink(target, path.join(root, "external-link"));
+		const before = await sourceHash();
+		await Bun.write(target, "changed secret\n");
+		const after = await sourceHash();
+		expect(after).toBe(before);
+	});
 
 	/** Append a prior verified complete-checkpoint cohort with `sourceHash`. */
 	async function seedPriorCohort(sourceHash: string): Promise<void> {

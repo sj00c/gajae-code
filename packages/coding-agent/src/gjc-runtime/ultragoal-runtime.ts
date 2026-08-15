@@ -4837,6 +4837,7 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 			"",
 			"USAGE",
 			"  $ gjc ultragoal quality-gate init [--surface <name> ...] --out <path>",
+			"  $ gjc ultragoal quality-gate source-hash [--json]",
 			"  $ gjc ultragoal quality-gate validate --quality-gate-json <json-or-path> [--goal-id <id>] [--json]",
 			"",
 			"FLAGS",
@@ -4848,6 +4849,7 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 			"",
 			"EXAMPLES",
 			"  $ gjc ultragoal quality-gate init --surface web --surface api --out ./quality-gate.json",
+			"  $ gjc ultragoal quality-gate source-hash --json",
 			"  $ gjc ultragoal quality-gate validate --quality-gate-json ./quality-gate.json --json",
 			"",
 		].join("\n");
@@ -4871,6 +4873,7 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		"  record-critic-verdict",
 		"  record-critic-gate-override",
 		"  quality-gate init",
+		"  quality-gate source-hash",
 		"  quality-gate validate",
 
 		"",
@@ -5256,6 +5259,27 @@ async function dispatchUltragoalCommand(
 			case "quality-gate": {
 				const positional = args.filter(arg => !arg.startsWith("-"));
 				const subcommand = positional[1];
+				if (subcommand === "source-hash") {
+					const changeSet = await computeCheckpointChangeSet(cwd);
+					const sourceHash = computeUltragoalReviewSourceHash(changeSet);
+					if (!sourceHash) {
+						return {
+							status: 1,
+							stderr:
+								"Unable to compute an authoritative source hash: change-set capture is incomplete, untrusted, or contains unknown-status paths.\n",
+						};
+					}
+					const payload = {
+						sourceHash,
+						baseRef: changeSet?.baseRef,
+						mergeBase: changeSet?.mergeBase,
+						headRef: changeSet?.headRef,
+						pathCount: changeSet?.paths.length ?? 0,
+					};
+					return json
+						? { status: 0, stdout: `${JSON.stringify(payload, null, 2)}\n` }
+						: { status: 0, stdout: `${sourceHash}\n` };
+				}
 				if (subcommand === "init") {
 					const out = flagValue(args, "--out");
 					if (!out?.trim()) {
@@ -5279,7 +5303,7 @@ async function dispatchUltragoalCommand(
 				if (subcommand !== "validate") {
 					return {
 						status: 1,
-						stderr: `Unknown gjc ultragoal quality-gate subcommand: ${subcommand ?? "(missing)"}; supported: init, validate\n`,
+						stderr: `Unknown gjc ultragoal quality-gate subcommand: ${subcommand ?? "(missing)"}; supported: init, source-hash, validate\n`,
 					};
 				}
 				const qualityGateJson = flagValue(args, "--quality-gate-json");

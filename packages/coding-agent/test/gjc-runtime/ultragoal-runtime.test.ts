@@ -2289,7 +2289,7 @@ describe("native GJC ultragoal runtime", () => {
 
 		const unknown = await runNativeUltragoalCommand(["quality-gate", "collect"], root);
 		expect(unknown.status).toBe(1);
-		expect(unknown.stderr).toContain("supported: init, validate");
+		expect(unknown.stderr).toContain("supported: init, source-hash, validate");
 
 		const missing = await runNativeUltragoalCommand(["quality-gate", "validate"], root);
 		expect(missing.status).toBe(1);
