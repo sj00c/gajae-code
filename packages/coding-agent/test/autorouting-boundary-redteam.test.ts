@@ -1301,6 +1301,41 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 		expect(pass).toBe(true);
 	});
 
+	it("B2 one-shot credential lookup faults reach authoritative preflight", async () => {
+		const catalog = [model("enabled", "present")];
+		const settings = {
+			"task.autorouting.enabled": true,
+			"task.autorouting.tiers": { fast: ["enabled/present"] },
+		};
+		let calls = 0;
+		let preflightErrors: Map<string, unknown> | undefined;
+		const discover = vi
+			.spyOn(discoveryModule, "discoverAgents")
+			.mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+		AsyncJobManager.setInstance(new AsyncJobManager({ maxRunningJobs: 4, onJobComplete: async () => {} }));
+		const tool = await TaskTool.create(
+			taskSession(settings, catalog, async () => {
+				calls++;
+				if (calls === 1) throw new Error("one-shot keychain failure");
+				return "key";
+			}),
+			{
+				runSubprocess: async options => {
+					preflightErrors = options.autoroutingPreflightErrors;
+					return successResult(options);
+				},
+			},
+		);
+		await tool.execute("gen2-one-shot-credential-fault", {
+			agent: "task",
+			tasks: [{ id: "one", description: "one", assignment: "run", tier: "fast" }],
+		} as never);
+		await AsyncJobManager.instance()!.waitForAll();
+		discover.mockRestore();
+		expect(calls).toBe(1);
+		expect(preflightErrors?.get("enabled/present")).toBeInstanceOf(Error);
+	});
+
 	it("B3 varied: rejects traversal encodings, absolute/separator ids, unicode ids, and overlong ids before any writer/path effect", async () => {
 		const invalidIds = [
 			"",
