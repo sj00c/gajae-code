@@ -664,6 +664,49 @@ describe("autorouting preflight contract", () => {
 		expect(result.routing?.terminal).toBe("preflight_exhausted");
 	});
 
+	it("resolves preflight credentials in the parent credential session", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "gjc-real-preflight-credential-session-"));
+		const model = {
+			provider: "test",
+			id: "model",
+			name: "model",
+			api: "openai-completions",
+			baseUrl: "https://example.invalid",
+			contextWindow: 128_000,
+			maxTokens: 4_096,
+			input: [],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			headers: {},
+			compat: {},
+		} as never;
+		const credentialSessionIds: Array<string | undefined> = [];
+		await runSubprocess({
+			cwd: root,
+			agent,
+			task: "credential session",
+			assignment: "credential session",
+			index: 0,
+			id: "credential-session",
+			runMode: "initial",
+			settings: Settings.isolated(),
+			modelRegistry: {
+				authStorage: {},
+				getAvailable: () => [model],
+				getApiKey: async (_model: unknown, sessionId?: string) => {
+					credentialSessionIds.push(sessionId);
+					return "key";
+				},
+			} as never,
+			autoroutingPreflight: true,
+			autoroutingCandidates: ["test/model"],
+			parentSessionId: "execution-session",
+			parentCredentialSessionId: "credential-session",
+			routing,
+			sessionFile: path.join(root, "candidate.jsonl"),
+		});
+		expect(credentialSessionIds).toContain("credential-session");
+	});
+
 	it("preserves terminal evidence when every candidate is skipped before execution", async () => {
 		const result = await runSubprocess({
 			cwd: process.cwd(),

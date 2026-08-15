@@ -1737,7 +1737,9 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 				typeof modelRegistry.getApiKey === "function"
 			) {
 				preflightOperation = "auth_resolve";
-				const exactKey = await awaitAbortable(modelRegistry.getApiKey(model, options.parentSessionId));
+				const exactKey = await awaitAbortable(
+					modelRegistry.getApiKey(model, options.parentCredentialSessionId ?? options.parentSessionId),
+				);
 				if (!exactKey)
 					throw Object.assign(new Error("autorouting credential unavailable"), {
 						transient: false,
