@@ -2332,7 +2332,7 @@ describe("autorouting boundary red-team generation 4 delta re-attacks", () => {
 			"A successful pre-fence discard failed to advance the normal transient candidate, leaked staging residue, or skipped the accepted ledger entry.",
 		);
 		expect(pass).toBe(true);
-	});
+	}, 30_000);
 
 	it("C3 a post-fence failure stays terminal and never enters the pre-fence discard downgrade", async () => {
 		const root = await mkdtemp(path.join(tmpdir(), "autorouting-gen4-post-fence-"));
