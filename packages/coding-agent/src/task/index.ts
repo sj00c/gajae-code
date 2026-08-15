@@ -2068,7 +2068,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					try {
 						const key = await registry.getApiKey(
 							model,
-							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.(),
+							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
 						);
 						if (key) authenticated.push(selector);
 						else skips.push({ selector, code: "credential_unavailable" });
