@@ -2065,12 +2065,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						skips.push({ selector, code: "snapshot_missing" });
 						continue;
 					}
-					const key = await registry.getApiKey(
-						model,
-						this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.(),
-					);
-					if (key) authenticated.push(selector);
-					else skips.push({ selector, code: "credential_unavailable" });
+					try {
+						const key = await registry.getApiKey(
+							model,
+							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.(),
+						);
+						if (key) authenticated.push(selector);
+						else skips.push({ selector, code: "credential_unavailable" });
+					} catch {
+						// Preserve the candidate for executor preflight, which records the
+						// terminal lookup failure in the routing ledger.
+						authenticated.push(selector);
+					}
 				}
 				return { candidates: authenticated, skips };
 			};
