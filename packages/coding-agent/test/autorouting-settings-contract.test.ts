@@ -151,6 +151,9 @@ describe("autorouting typed settings contract", () => {
 		expect(
 			validateSettingPatch({ "task.autorouting.provenance": { ...provenance, generatedAt: "forbidden" } }),
 		).toEqual([expect.objectContaining({ path: "task.autorouting.provenance" })]);
+		expect(validateSettingPatch({ "task.autorouting.tiers": { fast: ["bare-model"] } })).toEqual([
+			expect.objectContaining({ path: "task.autorouting.tiers.fast.0" }),
+		]);
 	});
 
 	it("emits closed nested JSON schemas for setup and provenance", async () => {

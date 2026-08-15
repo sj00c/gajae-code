@@ -4162,6 +4162,16 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 			issues.push({ path, detail });
 			continue;
 		}
+		if (definition.type === "constrained-record" && path === "task.autorouting.tiers") {
+			for (const issue of validateAutoroutingLocal({ tiers: value })) {
+				const nestedPath = issue.path.replace(/^tiers\./u, "");
+				issues.push({
+					path: nestedPath ? `task.autorouting.tiers.${nestedPath}` : "task.autorouting.tiers",
+					detail: issue.detail,
+				});
+			}
+			continue;
+		}
 		if (definition.type === "record" && "valueSchema" in definition && definition.valueSchema) {
 			for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
 				if (!validRecordValue(definition.valueSchema, entry)) {
