@@ -2773,8 +2773,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	for (const selector of candidates) {
 		if (consumed.has(selector) || consumed.size >= 3) continue;
 		consumed.add(selector);
-		const preflightError = options.autoroutingPreflightErrors?.get(selector);
-		if (preflightError !== undefined) {
+		if (options.autoroutingPreflightErrors?.has(selector)) {
+			const preflightError = options.autoroutingPreflightErrors.get(selector);
 			const failure = classifyAutoroutingPreflightFailure(preflightError, "auth_resolve");
 			const { code } = autoroutingAttemptDisposition(failure);
 			attempts.push({ selector, phase: "probe", code });

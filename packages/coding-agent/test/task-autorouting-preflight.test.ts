@@ -615,7 +615,7 @@ describe("autorouting preflight contract", () => {
 		}
 	});
 
-	it("terminalizes the ledger when the credential lookup itself throws, instead of advancing as if credentials were absent", async () => {
+	it("terminalizes a captured undefined credential fault instead of retrying it as absent", async () => {
 		const root = await mkdtemp(path.join(tmpdir(), "gjc-real-preflight-credential-error-"));
 		const jobs = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: async () => {} });
 		AsyncJobManager.setInstance(jobs);
@@ -653,6 +653,7 @@ describe("autorouting preflight contract", () => {
 			} as never,
 			autoroutingPreflight: true,
 			autoroutingCandidates: ["test/model", "test/second"],
+			autoroutingPreflightErrors: new Map([["test/model", undefined]]),
 			routing,
 			sessionFile: path.join(root, "candidate.jsonl"),
 		});
