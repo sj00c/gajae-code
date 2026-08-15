@@ -4,12 +4,66 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	computeCheckpointChangeSet,
+	computeUltragoalReviewSourceHash,
+	mergeChangeSetPaths,
 	parseGitNameStatus,
 	parseGitUntrackedPaths,
 	spawnText,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-change-set";
 
 describe("ultragoal change-set extraction", () => {
+	it("keeps authoritative Git status when CI path metadata only knows the pathname", () => {
+		expect(
+			mergeChangeSetPaths([
+				[{ path: "packages/utils/src/helper.ts", status: "modified" }],
+				[{ path: "packages/utils/src/helper.ts", status: "unknown" }],
+			]),
+		).toEqual([{ path: "packages/utils/src/helper.ts", status: "modified" }]);
+	});
+
+	it("ignores outer-workspace CI paths for an independent repo but binds canonical workspace evidence", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-ci-workspace-"));
+		const root = await fs.mkdtemp(path.join(workspace, "nested-independent-"));
+		const savedWorkspace = process.env.GITHUB_WORKSPACE;
+		const savedChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		try {
+			expect(await Bun.spawn(["git", "init"], { cwd: root, stdout: "ignore", stderr: "ignore" }).exited).toBe(0);
+			await Bun.write(path.join(root, "tracked.txt"), "baseline\n");
+			expect(
+				await Bun.spawn(["git", "add", "tracked.txt"], { cwd: root, stdout: "ignore", stderr: "ignore" }).exited,
+			).toBe(0);
+			expect(
+				await Bun.spawn(
+					["git", "-c", "user.name=GJC Test", "-c", "user.email=test@example.invalid", "commit", "-m", "baseline"],
+					{ cwd: root, stdout: "ignore", stderr: "ignore" },
+				).exited,
+			).toBe(0);
+			expect(
+				await Bun.spawn(["git", "branch", "dev"], { cwd: root, stdout: "ignore", stderr: "ignore" }).exited,
+			).toBe(0);
+			await Bun.write(path.join(root, "tracked.txt"), "changed\n");
+			process.env.GITHUB_WORKSPACE = workspace;
+			process.env.CI_DEV_CHANGED_PATHS = "outer-only.ts";
+			const independent = await computeCheckpointChangeSet(root);
+			expect(independent?.paths.map(row => row.path)).toEqual(["tracked.txt"]);
+			expect(computeUltragoalReviewSourceHash(independent)).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+			process.env.GITHUB_WORKSPACE = root;
+			const canonical = await computeCheckpointChangeSet(root);
+			expect(canonical?.paths).toContainEqual({ path: "outer-only.ts", status: "unknown", category: "other" });
+			expect(computeUltragoalReviewSourceHash(canonical)).toBeUndefined();
+		} finally {
+			if (savedWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
+			else process.env.GITHUB_WORKSPACE = savedWorkspace;
+			if (savedChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+			else process.env.CI_DEV_CHANGED_PATHS = savedChangedPaths;
+			await Promise.all([
+				fs.rm(workspace, { recursive: true, force: true }),
+				fs.rm(root, { recursive: true, force: true }),
+			]);
+		}
+	});
+
 	it("preserves rename paths and categories", () => {
 		expect(parseGitNameStatus("R100\told.ts\tpackages/coding-agent/src/tools/computer.ts\n")).toEqual([
 			{

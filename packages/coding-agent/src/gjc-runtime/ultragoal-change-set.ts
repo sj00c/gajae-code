@@ -243,13 +243,25 @@ export function ciDevChangedPathRows(): UltragoalChangeSetPath[] {
 
 export function mergeChangeSetPaths(groups: UltragoalChangeSetPath[][]): UltragoalChangeSetPath[] {
 	const byKey = new Map<string, UltragoalChangeSetPath>();
-	for (const row of groups.flat()) byKey.set(`${row.oldPath ?? ""}\u0000${row.path}`, row);
+	for (const row of groups.flat()) {
+		const key = `${row.oldPath ?? ""}\u0000${row.path}`;
+		const existing = byKey.get(key);
+		if (existing && existing.status !== "unknown" && row.status === "unknown") continue;
+		byKey.set(key, row);
+	}
 	return [...byKey.values()];
 }
 
 export async function computeCheckpointChangeSet(cwd: string): Promise<UltragoalChangeSet | undefined> {
-	const ciChangedPaths = ciDevChangedPathRows();
+	let ciChangedPaths = ciDevChangedPathRows();
 	const inGit = await spawnText(["git", "rev-parse", "--is-inside-work-tree"], { cwd, timeoutMs: 3000 });
+	const workspace = process.env.GITHUB_WORKSPACE?.trim();
+	if (workspace) {
+		const topLevel = inGit.ok
+			? await spawnText(["git", "rev-parse", "--show-toplevel"], { cwd, timeoutMs: 3000 })
+			: undefined;
+		if (!topLevel?.ok || path.resolve(topLevel.stdout.trim()) !== path.resolve(workspace)) ciChangedPaths = [];
+	}
 	if (!inGit.ok || inGit.stdout.trim() !== "true") {
 		if (ciChangedPaths.length === 0)
 			return { source: "checkpoint-git", paths: [], captureIncomplete: true, trusted: true };
