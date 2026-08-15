@@ -530,7 +530,7 @@ export class ModelSelectorComponent extends Container {
 
 		// Advisory drift only, and only while the smart-routing panel is mounted. This
 		// must not call refreshState: that would discard the user's unsaved draft.
-		this.#unsubscribeProviderOrderChanged = this.#settings.onChanged(path => {
+		this.#unsubscribeProviderOrderChanged = this.#settings.onChanged?.(path => {
 			if (this.#disposed || path !== "modelProviderOrder") return;
 			if (this.#viewMode !== "smart-routing") return;
 			const panel = this.#smartRoutingPanel;
