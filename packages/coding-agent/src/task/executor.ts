@@ -228,6 +228,7 @@ export interface ExecutorOptions {
 	/** Ordered, normalized autorouting candidates for the cross-phase preflight ledger. */
 	autoroutingCandidates?: string[];
 	autoroutingSkips?: Array<{ selector: string; code: import("../config/autorouting-contract").AutoroutingReasonCode }>;
+	autoroutingPreflightErrors?: Map<string, unknown>;
 	autoroutingPreflight?: boolean;
 	autoroutingAttemptId?: string;
 	preflightProbe?: boolean;
@@ -2772,6 +2773,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	for (const selector of candidates) {
 		if (consumed.has(selector) || consumed.size >= 3) continue;
 		consumed.add(selector);
+		const preflightError = options.autoroutingPreflightErrors?.get(selector);
+		if (preflightError !== undefined) {
+			const failure = classifyAutoroutingPreflightFailure(preflightError, "auth_resolve");
+			const { code } = autoroutingAttemptDisposition(failure);
+			attempts.push({ selector, phase: "probe", code });
+			return preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "preflight_exhausted");
+		}
 		const probe = await runSubprocessOnce({
 			...options,
 			autoroutingPreflight: false,

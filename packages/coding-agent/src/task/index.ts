@@ -2047,10 +2047,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			): Promise<{
 				candidates: string[];
 				skips: Array<{ selector: string; code: AutoroutingReasonCode }>;
+				preflightErrors: Map<string, unknown>;
 			}> => {
 				const candidates = [...(routingCandidatesByIndex.get(index) ?? [])];
 				const skips = [...(routingSkipsByIndex.get(index) ?? [])];
-				if (!registry?.getApiKey || !routingSnapshot) return { candidates, skips };
+				const preflightErrors = new Map<string, unknown>();
+				if (!registry?.getApiKey || !routingSnapshot) return { candidates, skips, preflightErrors };
 				const authenticated: string[] = [];
 				for (const selector of candidates) {
 					const slash = selector.indexOf("/");
@@ -2072,13 +2074,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						);
 						if (key) authenticated.push(selector);
 						else skips.push({ selector, code: "credential_unavailable" });
-					} catch {
+					} catch (error) {
 						// Preserve the candidate for executor preflight, which records the
 						// terminal lookup failure in the routing ledger.
+						preflightErrors.set(selector, error);
 						authenticated.push(selector);
 					}
 				}
-				return { candidates: authenticated, skips };
+				return { candidates: authenticated, skips, preflightErrors };
 			};
 			const effectivePatterns = (index: number): string | string[] => {
 				const outcome = routingByIndex.get(index);
@@ -2224,8 +2227,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					(effectiveRunMode ?? "initial") === "initial" && routingOutcome && routingOutcome.kind !== "disabled"
 						? routingOutcome.kind === "routed"
 							? await resolveAutoroutingCandidates(index)
-							: { candidates: undefined, skips: [...(routingSkipsByIndex.get(index) ?? [])] }
-						: { candidates: undefined, skips: undefined };
+							: {
+									candidates: undefined,
+									skips: [...(routingSkipsByIndex.get(index) ?? [])],
+									preflightErrors: new Map(),
+								}
+						: { candidates: undefined, skips: undefined, preflightErrors: new Map() };
 				const routingForRun = routeEvidence(
 					routingOutcome,
 					effectiveRunMode === "resume" || effectiveRunMode === "message",
@@ -2278,6 +2285,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						routing: routingForRun,
 						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
 						autoroutingSkips: autoroutingInitial ? autoroutingData.skips : undefined,
+						autoroutingPreflightErrors: autoroutingInitial ? autoroutingData.preflightErrors : undefined,
 						autoroutingPreflight: autoroutingInitial,
 
 						onProgress: progress => {
@@ -2362,6 +2370,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						routing: routingForRun,
 						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
 						autoroutingSkips: autoroutingInitial ? autoroutingData.skips : undefined,
+						autoroutingPreflightErrors: autoroutingInitial ? autoroutingData.preflightErrors : undefined,
 						autoroutingPreflight: autoroutingInitial,
 						onProgress: progress => {
 							progressMap.set(index, {
