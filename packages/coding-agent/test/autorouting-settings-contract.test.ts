@@ -25,6 +25,7 @@ import {
 	SETTINGS_SCHEMA,
 	type SettingDef,
 	type SettingValue,
+	validateSettingPatch,
 } from "../src/config/settings-schema";
 
 const fingerprint = (value: unknown): string => createHash("sha256").update(canonicalJsonBytes(value)).digest("hex");
@@ -140,6 +141,16 @@ describe("autorouting typed settings contract", () => {
 		});
 		expect(noTiers.report.issues.some(issue => issue.path === "task.autorouting.setup.providers")).toBe(true);
 		expect(noTiers.report.issues.some(issue => issue.path === "task.autorouting.provenance.generatedAt")).toBe(true);
+	});
+
+	it("rejects malformed nested autorouting objects at SDK patch ingress", () => {
+		expect(validateSettingPatch({ "task.autorouting.setup": setup })).toEqual([]);
+		expect(validateSettingPatch({ "task.autorouting.setup": { schema: 1, providers: [] } })).toEqual([
+			expect.objectContaining({ path: "task.autorouting.setup" }),
+		]);
+		expect(
+			validateSettingPatch({ "task.autorouting.provenance": { ...provenance, generatedAt: "forbidden" } }),
+		).toEqual([expect.objectContaining({ path: "task.autorouting.provenance" })]);
 	});
 
 	it("emits closed nested JSON schemas for setup and provenance", async () => {

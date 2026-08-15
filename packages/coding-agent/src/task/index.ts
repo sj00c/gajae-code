@@ -2051,28 +2051,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const candidates = [...(routingCandidatesByIndex.get(index) ?? [])];
 				const skips = [...(routingSkipsByIndex.get(index) ?? [])];
 				if (!registry?.getApiKey || !routingSnapshot) return { candidates, skips };
-				const authenticated: string[] = [];
-				for (const selector of candidates) {
-					const slash = selector.indexOf("/");
-					const provider = selector.slice(0, slash).toLowerCase();
-					const modelId = selector.slice(slash + 1);
-					const model = routingSnapshot.find(
-						candidate =>
-							candidate.provider.toLowerCase() === provider &&
-							(modelId === candidate.id || modelId.startsWith(`${candidate.id}:`)),
-					);
-					if (!model) {
-						skips.push({ selector, code: "snapshot_missing" });
-						continue;
-					}
-					try {
-						if (await registry.getApiKey(model)) authenticated.push(selector);
-						else skips.push({ selector, code: "credential_unavailable" });
-					} catch {
-						skips.push({ selector, code: "credential_unavailable" });
-					}
-				}
-				return { candidates: authenticated, skips };
+				// Credential classification belongs to executor preflight, where only an
+				// explicit missing-credential signal may advance to another candidate.
+				return { candidates, skips };
 			};
 			const effectivePatterns = (index: number): string | string[] => {
 				const outcome = routingByIndex.get(index);

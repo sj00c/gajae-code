@@ -4106,12 +4106,15 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 			(definition.values as readonly string[]).includes(value)) ||
 		(definition.type === "array" &&
 			validArraySettingValue(value, "items" in definition ? definition.items?.enum : undefined)) ||
-		((definition.type === "record" ||
-			definition.type === "constrained-record" ||
-			definition.type === "optional-object") &&
+		((definition.type === "record" || definition.type === "constrained-record") &&
 			!!value &&
 			typeof value === "object" &&
-			!Array.isArray(value))
+			!Array.isArray(value)) ||
+		(definition.type === "optional-object" &&
+			!!value &&
+			typeof value === "object" &&
+			!Array.isArray(value) &&
+			definition.validate(value).length === 0)
 	);
 }
 

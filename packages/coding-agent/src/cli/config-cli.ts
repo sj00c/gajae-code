@@ -11,6 +11,11 @@ import { APP_NAME, getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import chalk from "chalk";
 import { AtomicYamlReplaceError, AtomicYamlRetargetError } from "../config/atomic-yaml-patch";
+import {
+	validateAutoroutingLocal,
+	validateAutoroutingProvenance,
+	validateAutoroutingSetup,
+} from "../config/autorouting-contract";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { mergeModelProfiles } from "../config/model-profiles";
 import { ModelsConfigFile } from "../config/model-registry";
@@ -268,7 +273,8 @@ function parseAndSetValue(path: SettingPath, rawValue: string): void {
 			break;
 		}
 		case "record":
-		case "constrained-record": {
+		case "constrained-record":
+		case "optional-object": {
 			let parsed: unknown;
 			try {
 				parsed = JSON.parse(trimmed);
@@ -283,6 +289,17 @@ function parseAndSetValue(path: SettingPath, rawValue: string): void {
 		}
 		default:
 			parsedValue = trimmed;
+	}
+	const issues =
+		path === "task.autorouting.tiers"
+			? validateAutoroutingLocal({ tiers: parsedValue })
+			: path === "task.autorouting.setup"
+				? validateAutoroutingSetup(parsedValue)
+				: path === "task.autorouting.provenance"
+					? validateAutoroutingProvenance(parsedValue)
+					: [];
+	if (issues.length > 0) {
+		throw new Error(`Invalid value for ${path}: ${issues.map(issue => `${issue.path}: ${issue.detail}`).join("; ")}`);
 	}
 
 	settings.set(path, parsedValue as SettingValue<typeof path>);

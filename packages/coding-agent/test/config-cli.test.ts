@@ -6,7 +6,7 @@ import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { inspectConfigFile, runConfigCommand } from "../src/cli/config-cli";
 import { FileLockTestHooks } from "../src/config/file-lock";
-import { resetSettingsForTest } from "../src/config/settings";
+import { resetSettingsForTest, settings } from "../src/config/settings";
 
 let testAgentDir = "";
 const originalAgentDir = process.env.GJC_CODING_AGENT_DIR;
@@ -76,6 +76,12 @@ describe("config CLI schema coverage", () => {
 		expect(parsed.key).toBe("enabledModels");
 		expect(parsed.type).toBe("array");
 		expect(parsed.value).toEqual(["claude-opus-4-6", "gpt-5.3-codex"]);
+	});
+
+	it("parses and validates optional autorouting objects as JSON", async () => {
+		const setup = '{"schema":1,"providers":["anthropic"]}';
+		await runConfigCommand({ action: "set", key: "task.autorouting.setup", value: setup, flags: { json: true } });
+		expect(settings.get("task.autorouting.setup")).toEqual({ schema: 1, providers: ["anthropic"] });
 	});
 
 	it("sets and gets deep-interview ambiguity threshold", async () => {
