@@ -7525,7 +7525,6 @@ export class SessionManager {
 		// Note: call _initSession() or _initSessionFile() after construction
 	}
 
-
 	#residentBlobStores(): ResidentBlobStores {
 		return {
 			textStore: this.#residentTextBlobStore,
