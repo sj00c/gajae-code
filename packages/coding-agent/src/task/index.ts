@@ -1982,7 +1982,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				| {
 						getAvailable?: () => Model[];
 						getAll?: () => Model[];
-						getApiKey?: (model: Model) => Promise<string | undefined>;
+						getApiKey?: (model: Model, credentialSessionId?: string) => Promise<string | undefined>;
 				  }
 				| undefined;
 			const routingSnapshot = registry?.getAll?.() ?? registry?.getAvailable?.();
@@ -2051,9 +2051,28 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const candidates = [...(routingCandidatesByIndex.get(index) ?? [])];
 				const skips = [...(routingSkipsByIndex.get(index) ?? [])];
 				if (!registry?.getApiKey || !routingSnapshot) return { candidates, skips };
-				// Credential classification belongs to executor preflight, where only an
-				// explicit missing-credential signal may advance to another candidate.
-				return { candidates, skips };
+				const authenticated: string[] = [];
+				for (const selector of candidates) {
+					const slash = selector.indexOf("/");
+					const provider = selector.slice(0, slash).toLowerCase();
+					const modelId = selector.slice(slash + 1);
+					const model = routingSnapshot.find(
+						candidate =>
+							candidate.provider.toLowerCase() === provider &&
+							(modelId === candidate.id || modelId.startsWith(`${candidate.id}:`)),
+					);
+					if (!model) {
+						skips.push({ selector, code: "snapshot_missing" });
+						continue;
+					}
+					const key = await registry.getApiKey(
+						model,
+						this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.(),
+					);
+					if (key) authenticated.push(selector);
+					else skips.push({ selector, code: "credential_unavailable" });
+				}
+				return { candidates: authenticated, skips };
 			};
 			const effectivePatterns = (index: number): string | string[] => {
 				const outcome = routingByIndex.get(index);
