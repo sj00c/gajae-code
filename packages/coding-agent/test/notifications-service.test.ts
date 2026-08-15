@@ -956,6 +956,39 @@ describe("notification-service recovery", () => {
 		expect(store.has(malformedEndpoint)).toBe(true);
 	});
 
+	// A daemon that finished its shutdown but never exited stays alive holding the
+	// lock. Recovery read that owner's own `stoppedAt` marker and still reported
+	// `left-active`, so the wedged owner was protected forever and every operator
+	// surface insisted a live daemon owned the lock.
+	test("clears the lock of a retired owner whose process never exited", async () => {
+		const { fs, unlinked } = mockFs({
+			[paths.state]: daemonStateJson({ pid: 1000, stoppedAt: 2_000 }),
+			[paths.lock]: "lock",
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.action).toBe("cleared-dead-owner-lock");
+		expect(report.daemon.detail).toContain("retired owner pid 1000");
+		expect(unlinked).toContain(paths.lock);
+	});
+
+	test("still protects a live owner that has not published a stop marker", async () => {
+		const { fs, unlinked } = mockFs({
+			[paths.state]: daemonStateJson({ pid: 1000 }),
+			[paths.lock]: "lock",
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.action).toBe("left-active");
+		expect(unlinked).not.toContain(paths.lock);
+	});
+
 	test("clears the lock of a confirmed-dead owner", async () => {
 		const { fs, unlinked } = mockFs({
 			[paths.state]: daemonStateJson({ pid: 555 }),

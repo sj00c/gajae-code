@@ -1655,7 +1655,7 @@ async function forceDetachBlockedTransitionMarker(input: {
  * primitive re-checks ownership while holding the same steal-mutex the daemon's
  * own takeover path uses ({@link DaemonPaths.steal}), so the two are mutually
  * exclusive, and unlinks only when the recorded owner is still the same
- * confirmed-dead process.
+ * confirmed-dead — or self-retired — process.
  */
 async function removeDeadOwnerLock(
 	fs: NotificationServiceFs,
@@ -1694,7 +1694,9 @@ async function removeDeadOwnerLock(
 	try {
 		const current = await readDaemonStateFile(fs, paths.state);
 		if (!current || current.ownerId !== expected.ownerId || current.pid !== expected.pid) return "superseded";
-		if (pidAlive(current.pid)) return "now-alive";
+		// A live pid that already published its own stop marker has relinquished
+		// serving; only a live owner without one is still protected here.
+		if (pidAlive(current.pid) && current.stoppedAt === undefined) return "now-alive";
 		if (!(await daemonTransitionLockIsHeld({ fs, path: paths.steal, lock: transition }))) return "contended";
 		try {
 			await fs.unlink(paths.lock);
@@ -1711,10 +1713,11 @@ async function removeDeadOwnerLock(
  * Ownership-protected cleanup. Removes only DEAD-owner artifacts:
  * per-session endpoint files with positive proof of death (a stale tombstone or
  * a dead recorded pid), and a daemon lock whose recorded owner is confirmed
- * dead. A PID-less endpoint is treated as unknown (not dead) and kept. The
+ * dead or has published its own `stoppedAt` marker. A PID-less endpoint is
+ * treated as unknown (not dead) and kept. The
  * daemon lock is removed through {@link removeDeadOwnerLock}, an owner-bound
  * primitive that re-checks ownership under the daemon steal-mutex so it can
- * never race a concurrent takeover. Never removes a live owner's lock, never
+ * never race a concurrent takeover. Never removes a still-serving owner's lock, never
  * deletes unreadable files, and never kills a process.
  */
 export async function recoverNotifications(opts: RecoveryOptions): Promise<NotificationRecoveryReport> {
@@ -1793,7 +1796,11 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 		}
 	}
 
-	// Daemon lock: clear only when the recorded owner process is dead.
+	// Daemon lock: clear when the recorded owner process is dead, or when that
+	// owner already wrote its own stop marker. A wedged owner that recorded
+	// `stoppedAt` and then failed to exit is alive but no longer serving: the
+	// acquisition path already refuses to treat that tombstone as a live owner,
+	// so recovery must not report it as one and leave the lock behind forever.
 	const paths = daemonPaths(opts.settings.getAgentDir());
 	let daemonFiles: string[] = [];
 	try {
@@ -1813,7 +1820,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 					pid: undefined,
 				}
 			: { action: "none", detail: "no daemon ownership record", ownerId: undefined, pid: undefined };
-	} else if (pidAlive(state.pid)) {
+	} else if (pidAlive(state.pid) && state.stoppedAt === undefined) {
 		daemon = {
 			action: "left-active",
 			detail: `live daemon owned by pid ${state.pid} left untouched`,
@@ -1842,7 +1849,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 							: "orphan-lock-left";
 		const detail =
 			outcome === "cleared"
-				? `cleared lock of dead owner pid ${state.pid}`
+				? `cleared lock of ${state.stoppedAt === undefined ? "dead" : "retired"} owner pid ${state.pid}`
 				: outcome === "now-alive"
 					? `owner pid ${state.pid} became live during recovery; lock left untouched`
 					: outcome === "superseded"
