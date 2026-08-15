@@ -74,6 +74,78 @@ export const CURATED_TIER_LABELS = {
 
 /** Generated from packages/ai/src/models.json at feature land: 3917 in-scope baseline skips. */
 export const TIER_MAP_SKIP_LIST = {
+	"cloudflare-ai-gateway/openai/gpt-4.1": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-4.1-mini": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-4.1-nano": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-5-mini": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-5-nano": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-5-pro": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-5.2-chat-latest": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/openai/gpt-5.2-pro": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-5.3-chat-latest": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/openai/gpt-5.3-codex-spark": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/openai/gpt-5.4-mini": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-5.4-nano": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-5.4-pro": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-5.5-pro": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/gpt-5.6": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/openai/o1-pro": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cloudflare-ai-gateway/workers-ai/@cf/google/gemma-4-26b-a4b-it": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/workers-ai/@cf/ibm-granite/granite-4.0-h-micro": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/workers-ai/@cf/meta/llama-4-scout-17b-16e-instruct": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/workers-ai/@cf/mistralai/mistral-small-3.1-24b-instruct": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.7-code": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/workers-ai/@cf/openai/gpt-oss-120b": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/workers-ai/@cf/openai/gpt-oss-20b": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cloudflare-ai-gateway/workers-ai/@cf/qwen/qwen3-30b-a3b-fp8": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"deepinfra/Qwen/Qwen3-30B-A3B": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"deepinfra/deepseek-ai/DeepSeek-V3-0324": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"github-copilot/gemini-3.7-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"google/gemini-3.7-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"kilo/google/gemini-3.7-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"opencode-go/glm-5.3": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"opencode-zen/gemini-3.7-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"opencode-zen/muse-spark-1.2": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"openrouter/google/gemini-3.7-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"openrouter/google/gemini-3.7-flash:batch": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"openrouter/nvidia/nemotron-3.5-lightning": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"venice/deepseek-v4-pro-0813": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"venice/gemini-3-7-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"venice/nvidia-nemotron-3-5-lightning-30b-a3b": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"venice/qwen-3-8-2-4t-a95b": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"vercel-ai-gateway/alibaba/qwen3.8-2.4t-a95b": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"vercel-ai-gateway/google/gemini-3.7-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"zai/glm-5.3": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"alibaba-token-plan/MiniMax-M2.5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"alibaba-token-plan/deepseek-v3.2": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"alibaba-token-plan/deepseek-v4-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
