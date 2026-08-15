@@ -11,6 +11,7 @@ import {
 	createFixtureBrokerEnvironment,
 	createFixtureRootCleanup,
 	type FixtureRootCleanup,
+	registerFixtureRuntime,
 	withFixtureBrokerEnvironment,
 } from "./helpers/fixture-broker-cleanup";
 
@@ -36,9 +37,13 @@ function thoughtText(update: SessionNotification): string | undefined {
 	return content?.type === "text" && typeof content.text === "string" ? content.text : undefined;
 }
 
-async function runAutoroutingSession(
-	config: string,
-): Promise<{ updates: SessionNotification[]; sessionId: string; cwd: string; agent: AcpAgent; close: () => void }> {
+async function runAutoroutingSession(config: string): Promise<{
+	updates: SessionNotification[];
+	sessionId: string;
+	cwd: string;
+	agent: AcpAgent;
+	close: () => Promise<void>;
+}> {
 	const root = await mkdtemp(path.join(tmpdir(), "gjc-acp-autorouting-notice-"));
 	const cwd = path.join(root, "workspace");
 	const agentDir = path.join(root, "agent");
@@ -65,23 +70,37 @@ async function runAutoroutingSession(
 		} as unknown as AgentSideConnection,
 		{ agentDir },
 	);
+	let sessionId: string | undefined;
+	let closedSession = false;
+	const close = async (): Promise<void> => {
+		if (closedSession) return;
+		closedSession = true;
+		try {
+			if (sessionId) await agent.closeSession({ sessionId });
+		} finally {
+			controller.abort();
+			closed.resolve();
+		}
+	};
+	registerFixtureRuntime(cleanup, {
+		key: "acp-agent",
+		requiredOwner: "runtime-and-broker",
+		shutdown: close,
+	});
 
 	try {
 		await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
 		const created = await waitForSession(agent, cwd);
+		sessionId = created.sessionId;
 		return {
 			updates,
-			sessionId: created.sessionId,
+			sessionId,
 			cwd,
 			agent,
-			close: () => {
-				controller.abort();
-				closed.resolve();
-			},
+			close,
 		};
 	} catch (error) {
-		controller.abort();
-		closed.resolve();
+		await close();
 		throw error;
 	}
 }
@@ -135,9 +154,9 @@ test("AC10b: ACP newSession receives one replayed inactive-autorouting warning t
 			.filter(Boolean);
 		expect(thoughts).toEqual([warningText]);
 	} finally {
-		close();
+		await close();
 	}
-});
+}, 30_000);
 
 test("AC10c: usable autorouting tiers and disabled autorouting produce no thought warning", async () => {
 	for (const config of [activeConfig, disabledConfig]) {
@@ -151,7 +170,7 @@ test("AC10c: usable autorouting tiers and disabled autorouting produce no though
 					.filter(Boolean),
 			).toEqual([]);
 		} finally {
-			close();
+			await close();
 		}
 	}
-});
+}, 30_000);
