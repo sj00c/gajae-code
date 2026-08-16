@@ -552,7 +552,7 @@ function parseDaemonState(raw: string): NormalizedDaemonState | undefined {
 		chatId: typeof rec.chatId === "string" ? rec.chatId : undefined,
 		startedAt: finiteNonNegativeNumber(rec.startedAt),
 		heartbeatAt: finiteNonNegativeNumber(rec.heartbeatAt),
-		stoppedAt: finiteNonNegativeNumber(rec.stoppedAt),
+		stoppedAt: safeNonNegativeInteger(rec.stoppedAt),
 		roots: stringArray(rec.roots),
 		generation,
 		generationStatus,
@@ -1655,7 +1655,7 @@ async function forceDetachBlockedTransitionMarker(input: {
  * primitive re-checks ownership while holding the same steal-mutex the daemon's
  * own takeover path uses ({@link DaemonPaths.steal}), so the two are mutually
  * exclusive, and unlinks only when the recorded owner is still the same
- * confirmed-dead — or self-retired — process.
+ * confirmed-dead — or self-retired by a canonical `stoppedAt` marker — process.
  */
 async function removeDeadOwnerLock(
 	fs: NotificationServiceFs,
@@ -1696,6 +1696,9 @@ async function removeDeadOwnerLock(
 		if (!current || current.ownerId !== expected.ownerId || current.pid !== expected.pid) return "superseded";
 		// A live pid that already published its own stop marker has relinquished
 		// serving; only a live owner without one is still protected here.
+		// `stoppedAt` is normalized with the same safe-integer rule the daemon's
+		// own shape predicate uses, so only a marker a canonical owner could have
+		// written counts as consent.
 		if (pidAlive(current.pid) && current.stoppedAt === undefined) return "now-alive";
 		if (!(await daemonTransitionLockIsHeld({ fs, path: paths.steal, lock: transition }))) return "contended";
 		try {
@@ -1713,8 +1716,9 @@ async function removeDeadOwnerLock(
  * Ownership-protected cleanup. Removes only DEAD-owner artifacts:
  * per-session endpoint files with positive proof of death (a stale tombstone or
  * a dead recorded pid), and a daemon lock whose recorded owner is confirmed
- * dead or has published its own `stoppedAt` marker. A PID-less endpoint is
- * treated as unknown (not dead) and kept. The
+ * dead or has published its own `stoppedAt` marker (normalized with the
+ * daemon's safe-integer rule, so only a canonical marker counts as consent).
+ * A PID-less endpoint is treated as unknown (not dead) and kept. The
  * daemon lock is removed through {@link removeDeadOwnerLock}, an owner-bound
  * primitive that re-checks ownership under the daemon steal-mutex so it can
  * never race a concurrent takeover. Never removes a still-serving owner's lock, never
@@ -1801,6 +1805,8 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	// `stoppedAt` and then failed to exit is alive but no longer serving: the
 	// acquisition path already refuses to treat that tombstone as a live owner,
 	// so recovery must not report it as one and leave the lock behind forever.
+	// The marker is normalized with the daemon's own safe-integer rule, so only
+	// consent a canonical owner could have written unlocks a live pid.
 	const paths = daemonPaths(opts.settings.getAgentDir());
 	let daemonFiles: string[] = [];
 	try {

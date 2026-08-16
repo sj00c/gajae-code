@@ -691,7 +691,10 @@ describe("notification-service health", () => {
 		expect(report.daemon.heartbeatAt).toBeUndefined();
 		expect(report.daemon.heartbeatAgeMs).toBeUndefined();
 		expect(report.daemon.heartbeatFresh).toBe(false);
-		expect(report.daemon.stopped).toBe(true);
+		// A fractional stoppedAt is not a marker a canonical owner could write;
+		// health normalizes it with the same safe-integer rule and reports the
+		// owner as not stopped rather than trusting a non-canonical tombstone.
+		expect(report.daemon.stopped).toBe(false);
 	});
 
 	test("treats malformed modern owner identity metadata as stale", async () => {
@@ -978,6 +981,20 @@ describe("notification-service recovery", () => {
 	test("still protects a live owner that has not published a stop marker", async () => {
 		const { fs, unlinked } = mockFs({
 			[paths.state]: daemonStateJson({ pid: 1000 }),
+			[paths.lock]: "lock",
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.action).toBe("left-active");
+		expect(unlinked).not.toContain(paths.lock);
+	});
+
+	test("still protects a live owner whose stop marker is not canonical", async () => {
+		const { fs, unlinked } = mockFs({
+			[paths.state]: daemonStateJson({ pid: 1000, stoppedAt: 1.5 }),
 			[paths.lock]: "lock",
 		});
 		const report = await recoverNotifications({
