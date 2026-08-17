@@ -466,6 +466,160 @@ describe("default launch worktrees", () => {
 		expect(plan?.newSessionArgs).toContain(launch.cwd);
 	});
 });
+describe("launch worktree node_modules isolation (#4620)", () => {
+	async function createWorkspaceRepo(prefix: string): Promise<string> {
+		const repo = await createRepo(prefix);
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "packages", "app", "package.json"),
+			JSON.stringify({ name: "@scope/app", version: "1.0.0" }, null, "\t"),
+		);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "workspace"], repo);
+		return repo;
+	}
+
+	it("does not share node_modules when workspace self-links resolve into the source repo", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-workspace-");
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(path.join(originModules, "@scope"), { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(originModules, "@scope", "app"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect(await Bun.file(worktreeModules).exists()).toBe(false);
+		// The worktree must never resolve the origin checkout's live sources.
+		expect(() => fsSync.realpathSync(path.join(launched.cwd, "node_modules"))).toThrow();
+		// The origin checkout's install stays untouched.
+		expect((await fs.lstat(path.join(originModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+	});
+
+	it("still shares node_modules when links resolve outside the source repo", async () => {
+		const repo = await createRepo("gjc-launch-worktree-external-links-");
+		const originModules = path.join(repo, "node_modules");
+		const external = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-store-"));
+		cleanupPaths.push(external);
+		await fs.mkdir(path.join(originModules, ".store"), { recursive: true });
+		await fs.symlink(path.join(external, "pkg"), path.join(originModules, ".store", "pkg"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(worktreeModules)).toBe(await fs.realpath(originModules));
+	});
+
+	it("remediates an already-contaminated worktree node_modules symlink", async () => {
+		const repo = await createRepo("gjc-launch-worktree-remediate-");
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(originModules);
+
+		const contaminated = prepareLaunchWorktree(repo, ["--worktree"]);
+		expect((await fs.lstat(path.join(contaminated.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
+
+		const remediated = prepareLaunchWorktree(repo, ["--worktree"]);
+		expect(await Bun.file(path.join(remediated.cwd, "node_modules")).exists()).toBe(false);
+		// The origin's own node_modules survives remediation.
+		expect((await fs.stat(originModules)).isDirectory()).toBe(true);
+	});
+
+	it("leaves a real worktree node_modules directory untouched", async () => {
+		const repo = await createRepo("gjc-launch-worktree-owned-modules-");
+		// No origin node_modules: the worktree never gets a symlink, so the
+		// directory below stays genuinely worktree-owned.
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "owned-modules"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect(await Bun.file(worktreeModules).exists()).toBe(false);
+		await fs.mkdir(worktreeModules, { recursive: true });
+		await Bun.write(path.join(worktreeModules, "marker.txt"), "user-owned\n");
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "owned-modules"]);
+		expect(await Bun.file(path.join(reused.cwd, "node_modules", "marker.txt")).text()).toBe("user-owned\n");
+	});
+
+	it("never creates a node_modules symlink when the source repo has none", async () => {
+		const repo = await createRepo("gjc-launch-worktree-no-modules-");
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
+	});
+
+	it("detects bun isolated-linker workspace layouts under node_modules/.bun", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-isolated-store-");
+		const originModules = path.join(repo, "node_modules");
+		const storeModules = path.join(originModules, ".bun", "node_modules", "@scope");
+		await fs.mkdir(storeModules, { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(storeModules, "app"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
+	});
+	it("detects pnpm scoped workspace layouts at deeper nesting (.pnpm depth 5)", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-pnpm-store-");
+		const originModules = path.join(repo, "node_modules");
+		const storeModules = path.join(originModules, ".pnpm", "@scope+app@1.0.0", "node_modules", "@scope");
+		await fs.mkdir(storeModules, { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(storeModules, "app"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
+	});
+
+	it("detects the origin node_modules root itself linking into the source repo", async () => {
+		const repo = await createRepo("gjc-launch-worktree-rootlink-");
+		// A vendored node_modules directory inside the repo, with the root
+		// node_modules symlink pointing at it.
+		const vendored = path.join(repo, ".vendor", "node_modules");
+		await fs.mkdir(vendored, { recursive: true });
+		await fs.symlink(vendored, path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
+	});
+
+	it("does not throw when the worktree carries a dangling node_modules symlink", async () => {
+		const repo = await createRepo("gjc-launch-worktree-dangling-modules-");
+		await fs.mkdir(path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "dangling-modules"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// The launch already created a shared symlink (plain-repo origin); replace
+		// it with a dangling one the way a stale cross-checkout link would look.
+		await fs.rm(worktreeModules);
+		await fs.symlink(path.join(launched.cwd, "does-not-exist"), worktreeModules, "dir");
+
+		// A dangling link occupies the name without existing; the launch must not
+		// crash trying to create a symlink over it (EEXIST) and must not follow it.
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "dangling-modules"]);
+		expect((await fs.lstat(path.join(reused.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
+	});
+
+	it("never shares an origin node_modules symlinked outside the repo (parent workspace hoist)", async () => {
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-parent-hoist-"));
+		cleanupPaths.push(parent);
+		const repo = path.join(parent, "repo");
+		await fs.mkdir(repo);
+		run("git", ["init"], repo);
+		run("git", ["config", "user.email", "test@example.com"], repo);
+		run("git", ["config", "user.name", "Test User"], repo);
+		await Bun.write(path.join(repo, "README.md"), "hello\n");
+		run("git", ["add", "README.md"], repo);
+		run("git", ["commit", "-m", "init"], repo);
+		// Parent workspace hoists its own packages into parent/node_modules.
+		await fs.mkdir(path.join(parent, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(parent, "node_modules", "@scope"), { recursive: true });
+		await fs.symlink(path.join(parent, "packages", "app"), path.join(parent, "node_modules", "@scope", "app"));
+		// The nested repo borrows the parent's tree.
+		await fs.symlink(path.join(parent, "node_modules"), path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect(await Bun.file(worktreeModules).exists()).toBe(false);
+	});
+});
 
 describe("GJC_WORKTREE_DIR path red-team", () => {
 	it("fails closed when a {repo}-less template points two repos at one worktree path", async () => {

@@ -450,13 +450,135 @@ export function ensureLaunchWorktree(
 	};
 }
 
-export function ensureReusableNodeModules(sourceRoot: string, worktreePath: string): "symlink" | "present" | "missing" {
+export type NodeModulesReuse = "symlink" | "present" | "missing" | "isolated";
+
+/**
+ * Depth cap for the workspace self-link scan in {@link nodeModulesLinksInto}.
+ *
+ * Package managers lay workspace links out at bounded depth: bun/npm hoist them
+ * directly under `node_modules/<scope>/<pkg>` (depth 2), bun's isolated linker
+ * under `node_modules/.bun/node_modules/<scope>/<pkg>` (depth 3), and pnpm's
+ * scoped layout under `node_modules/.pnpm/<scope>+<pkg>@<ver>/node_modules/<scope>/<pkg>`
+ * (depth 5). The cap covers that deepest real layout with margin while keeping
+ * the scan bounded and cycle-safe.
+ */
+const NODE_MODULES_SCAN_DEPTH = 6;
+
+/** Filesystem error codes that mean "this link resolves nowhere", not "unreadable". */
+const BROKEN_LINK_CODES = new Set(["ENOENT", "ENOTDIR", "ELOOP", "EDEADLK"]);
+
+/**
+ * Detects whether a `node_modules` tree links back into the repository checkout
+ * that owns it (#4620).
+ *
+ * Workspace installs (bun, npm workspaces, pnpm) create symlinks whose targets
+ * resolve inside the repo — `node_modules/@scope/pkg -> ../../packages/pkg` for
+ * hoisted layouts, or equivalents under `.bun/node_modules` / `.pnpm` for
+ * isolated ones. Reusing such a tree from a sibling checkout makes every
+ * workspace import resolve the *origin's* live sources, and installs run inside
+ * the worktree mutate the origin's tree. `node_modules` links that resolve
+ * outside the repo (external registries, global stores) carry no such coupling
+ * and remain safe to share. The scan never descends through a symlink that
+ * resolves outside `node_modules` itself: workspace self-links always live
+ * inside the tree, and chasing arbitrary external targets would make the scan
+ * unbounded.
+ *
+ * Fails closed: a link whose target cannot be resolved for any reason other
+ * than the link being broken is treated as self-linked, because an unreadable
+ * link can never be proven safe to share.
+ */
+export function nodeModulesLinksInto(nodeModulesPath: string, sourceRoot: string): boolean {
+	const sourceReal = fs.realpathSync(sourceRoot);
+	// The node_modules root itself may be a symlink (some setups point it at a
+	// vendored directory inside the repo); its own resolution is checked first.
+	if (resolvesInside(fs.lstatSync(nodeModulesPath), nodeModulesPath, sourceReal)) return true;
+	const stack: Array<{ dir: string; depth: number }> = [{ dir: nodeModulesPath, depth: 0 }];
+	while (stack.length > 0) {
+		const { dir, depth } = stack.pop() as { dir: string; depth: number };
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			const entryPath = path.join(dir, entry.name);
+			if (resolvesInside(entry, entryPath, sourceReal)) return true;
+			if (entry.isDirectory() && depth + 1 < NODE_MODULES_SCAN_DEPTH) {
+				stack.push({ dir: entryPath, depth: depth + 1 });
+			}
+		}
+	}
+	return false;
+}
+
+/**
+ * Returns true when `entry` is a symlink whose target provably resolves inside
+ * `sourceReal`, or whose resolution fails in a way that cannot rule that out.
+ * A symlink whose target resolves to nowhere (broken or looping) resolves
+ * nowhere and cannot pull origin sources in.
+ */
+function resolvesInside(entry: fs.Stats | fs.Dirent, entryPath: string, sourceReal: string): boolean {
+	if (!entry.isSymbolicLink()) return false;
+	let target: string;
+	try {
+		target = fs.realpathSync(entryPath);
+	} catch (error) {
+		return !BROKEN_LINK_CODES.has((error as NodeJS.ErrnoException).code ?? "");
+	}
+	return target === sourceReal || target.startsWith(`${sourceReal}${path.sep}`);
+}
+
+/**
+ * Isolates launch-worktree dependency resolution (#4620).
+ *
+ * Reusing the origin checkout's `node_modules` is only safe when the tree links
+ * back into nothing inside the origin repository. Workspace installs violate
+ * that: their `@scope/pkg -> packages/pkg` links make worktree imports resolve
+ * the origin checkout's live sources and let worktree-side installs rewrite the
+ * origin's links. When self-links are detected the worktree is left without a
+ * `node_modules` — never a cross-checkout symlink — so the worktree either gets
+ * its own install or runs without one, always against its own commit.
+ *
+ * Already-contaminated worktrees (a `node_modules` symlink pointing into the
+ * source checkout) are remediated on reuse: the link is removed so the worktree
+ * stops resolving origin sources. A real `node_modules` directory is always
+ * user-owned and left untouched. An origin `node_modules` that is itself a
+ * symlink resolving outside the repo (nested-repo-in-parent-workspace layouts)
+ * is never shared either: its entries belong to another checkout's install.
+ */
+export function ensureReusableNodeModules(sourceRoot: string, worktreePath: string): NodeModulesReuse {
 	const target = path.join(worktreePath, "node_modules");
-	if (fs.existsSync(target)) return "present";
+	const targetStat = tryLstat(target);
+	if (targetStat) {
+		if (targetStat.isSymbolicLink()) {
+			// existsSync follows the link; a dangling link reports false but still
+			// occupies the name, so it must be handled here rather than below.
+			if (resolvesInside(targetStat, target, fs.realpathSync(sourceRoot))) {
+				fs.rmSync(target, { force: true });
+				return "isolated";
+			}
+		}
+		return "present";
+	}
 	const source = path.join(sourceRoot, "node_modules");
-	if (!fs.existsSync(source)) return "missing";
+	if (!fs.existsSync(source) || nodeModulesLinksInto(source, sourceRoot)) return "missing";
+	// A node_modules root symlinked outside the repo belongs to another
+	// checkout's install graph (nested repo in a parent workspace); its entries
+	// resolve that parent's live sources, so it is never shared either.
+	const sourceStat = fs.lstatSync(source);
+	if (sourceStat.isSymbolicLink()) return "missing";
 	fs.symlinkSync(source, target, "junction");
 	return "symlink";
+}
+
+/** `lstat` that returns null instead of throwing for a missing path. */
+function tryLstat(target: string): fs.Stats | null {
+	try {
+		return fs.lstatSync(target);
+	} catch {
+		return null;
+	}
 }
 
 /** Result of {@link prepareLaunchWorktree}: the effective working directory, remaining args, and resolved worktree plan. */
