@@ -184,16 +184,19 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			if (step2.changed) changed.push(deps.paths.orchestrationPreferences);
 		}
 
-		// Step 3: the symlink bridge.
+		// Step 3: the symlink bridge. Install converges the bridge to the current
+		// source (create missing, prune stale), so the ledger records the entry
+		// set that exists afterwards, not just what this run happened to create.
 		const bridge = await installSkillsBridge(bridgePreflight);
-		if (bridge.createdEntries.length > 0 || bridge.bridgeDirCreated) {
+		if (bridge.createdEntries.length > 0 || bridge.prunedEntries.length > 0 || bridge.bridgeDirCreated) {
 			changed.push(deps.paths.bridgeDir);
 			const ledger = await readProvenance(deps.paths.provenanceLedger);
 			await writeProvenance(deps.paths.provenanceLedger, {
 				...ledger,
 				bridgePath: deps.paths.bridgeDir,
-				bridgeEntries: [...bridge.createdEntries],
+				bridgeEntries: Object.keys(bridgePreflight.entries),
 				bridgeDirCreated: bridge.bridgeDirCreated,
+				...(bridge.sourceDir !== undefined ? { bridgeSourceDir: bridge.sourceDir } : {}),
 			});
 			completed.push({
 				label: deps.paths.bridgeDir,

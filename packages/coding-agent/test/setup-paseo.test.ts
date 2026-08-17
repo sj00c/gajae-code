@@ -26,7 +26,7 @@ import {
 	writeIntent,
 	writeProvenance,
 } from "../src/setup/paseo/paseo-ownership";
-import { assertUsableFlags, PaseoSetupUsageError } from "../src/setup/paseo/paseo-setup";
+import { assertUsableFlags, PaseoSetupUsageError, runPaseoSetup } from "../src/setup/paseo/paseo-setup";
 import {
 	buildProviderEntry,
 	hasProviderConflict,
@@ -35,12 +35,14 @@ import {
 	resolveGjcCommand,
 } from "../src/setup/paseo/provider-config";
 import { removePaseoSetup } from "../src/setup/paseo/remove";
-import { checkExitCode, type SetupCheckStatus } from "../src/setup/paseo/result-types";
+import { checkExitCode, type SetupCheckResult, type SetupCheckStatus } from "../src/setup/paseo/result-types";
 import {
 	type PaseoLsOutcome,
 	type PaseoPaths,
 	type PaseoSetupDependencies,
 	parseProviderLs,
+	paseoAppSkillsCandidates,
+	resolvePaseoSkillsSource,
 } from "../src/setup/paseo/setup-deps";
 import { installSkillsBridge, preflightSkillsBridge, SkillsBridgeError } from "../src/setup/paseo/skills-bridge";
 
@@ -105,6 +107,8 @@ async function makeFixture(outcome: PaseoLsOutcome = { kind: "timeout", timeoutM
 
 	const probes: number[] = [];
 	const spawned: string[][] = [];
+	// The skills source is injected, never discovered: a developer machine that
+	// happens to carry ~/.agents/skills or a Paseo.app must not leak into a test.
 	const deps: PaseoSetupDependencies = {
 		paths,
 		runProviderLs: async timeoutMs => {
@@ -112,6 +116,7 @@ async function makeFixture(outcome: PaseoLsOutcome = { kind: "timeout", timeoutM
 			return outcome;
 		},
 		now: () => new Date("2026-01-01T00:00:00.000Z"),
+		skillsSource: async () => ({ dir: agentsSkills, origin: "user" }),
 	};
 	return { root, paths, deps, probes, spawned };
 }
@@ -125,9 +130,11 @@ async function seedConfig(paths: PaseoPaths, providers: Record<string, unknown> 
 }
 
 async function seedSkills(paths: PaseoPaths, extra: string[] = []): Promise<void> {
+	const sourceDir = paths.agentsSkillsDir;
+	if (sourceDir === undefined) throw new Error("fixture carries no skills source");
 	for (const name of [...SKILL_NAMES, ...extra]) {
-		await fs.mkdir(path.join(paths.agentsSkillsDir, name), { recursive: true });
-		await fs.writeFile(path.join(paths.agentsSkillsDir, name, "SKILL.md"), `# ${name}\n`);
+		await fs.mkdir(path.join(sourceDir, name), { recursive: true });
+		await fs.writeFile(path.join(sourceDir, name, "SKILL.md"), `# ${name}\n`);
 	}
 }
 
@@ -404,7 +411,10 @@ describe("four-state check (AC-16, AC-17, AC-18)", () => {
 		await seedSkills(fixture.paths);
 		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
 		for (const name of SKILL_NAMES) {
-			await fs.symlink(path.join(fixture.paths.agentsSkillsDir, name), path.join(fixture.paths.bridgeDir, name));
+			await fs.symlink(
+				path.join(fixture.paths.agentsSkillsDir as string, name),
+				path.join(fixture.paths.bridgeDir, name),
+			);
 		}
 		const resolution = resolveGjcCommand();
 		const command = resolution.ok ? resolution.command : [process.execPath, "acp"];
@@ -495,22 +505,34 @@ describe("four-state check (AC-16, AC-17, AC-18)", () => {
 });
 
 describe("skills bridge", () => {
-	test("links exactly the five allowlisted skills and excludes context-search (AC-6)", async () => {
+	test("links every paseo-prefixed source skill except the denylist (AC-6, #4638)", async () => {
 		const fixture = await makeFixture();
-		await seedSkills(fixture.paths, ["context-search"]);
+		await seedSkills(fixture.paths, ["context-search", "paseo-help", "unrelated-skill"]);
 		const preflight = await preflightSkillsBridge(fixture.deps);
 		await installSkillsBridge(preflight);
 
 		const linked = (await fs.readdir(fixture.paths.bridgeDir)).sort();
-		expect(linked).toEqual([...SKILL_NAMES].sort());
+		expect(linked).toEqual([...SKILL_NAMES, "paseo-help"].sort());
 		expect(linked).not.toContain("context-search");
+		expect(linked).not.toContain("unrelated-skill");
 	});
 
-	test("a foreign file at an allowlisted name refuses before any mutation", async () => {
+	test("a foreign file at a bridged name refuses before any mutation", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);
 		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
 		await fs.writeFile(path.join(fixture.paths.bridgeDir, "paseo"), "user file\n");
+		const before = await snapshotTree(fixture.paths.bridgeDir);
+
+		await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
+	});
+
+	test("a foreign file squatting on a name the source no longer carries refuses too", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		await fs.writeFile(path.join(fixture.paths.bridgeDir, "paseo-retired"), "user file\n");
 		const before = await snapshotTree(fixture.paths.bridgeDir);
 
 		await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
@@ -532,7 +554,10 @@ describe("skills bridge", () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);
 		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
-		await fs.symlink(path.join(fixture.paths.agentsSkillsDir, "paseo"), path.join(fixture.paths.bridgeDir, "paseo"));
+		await fs.symlink(
+			path.join(fixture.paths.agentsSkillsDir as string, "paseo"),
+			path.join(fixture.paths.bridgeDir, "paseo"),
+		);
 
 		const preflight = await preflightSkillsBridge(fixture.deps);
 		const result = await installSkillsBridge(preflight);
@@ -540,19 +565,280 @@ describe("skills bridge", () => {
 		expect(result.createdEntries.length).toBe(SKILL_NAMES.length - 1);
 	});
 
+	test("a source entry that is a file, not a directory, is never linked", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await fs.writeFile(path.join(fixture.paths.agentsSkillsDir as string, "paseo-file"), "not a skill\n");
+		const preflight = await preflightSkillsBridge(fixture.deps);
+		await installSkillsBridge(preflight);
+		expect(await fs.readdir(fixture.paths.bridgeDir)).not.toContain("paseo-file");
+	});
+
+	test("install converges the bridge after a Paseo release adds and drops skills (#4638)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await installSkillsBridge(await preflightSkillsBridge(fixture.deps));
+
+		// Paseo 0.4.0: paseo-loop is gone, paseo-help is new.
+		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
+		await fs.mkdir(path.join(fixture.paths.agentsSkillsDir as string, "paseo-help"), { recursive: true });
+		await fs.writeFile(
+			path.join(fixture.paths.agentsSkillsDir as string, "paseo-help", "SKILL.md"),
+			"# paseo-help\n",
+		);
+
+		const second = await installSkillsBridge(await preflightSkillsBridge(fixture.deps));
+		expect(second.prunedEntries).toEqual(["paseo-loop"]);
+		expect(second.createdEntries).toEqual(["paseo-help"]);
+		const linked = (await fs.readdir(fixture.paths.bridgeDir)).sort();
+		expect(linked).toEqual([...SKILL_NAMES.slice(0, 4), "paseo-help"].sort());
+		// No dangling links survive the release change.
+		for (const name of linked) {
+			const stat = await fs.stat(path.join(fixture.paths.bridgeDir, name));
+			expect(stat.isDirectory()).toBe(true);
+		}
+	});
+
+	test("a re-run after a source skill is deleted prunes the dead link instead of leaving it (#4638)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await installSkillsBridge(await preflightSkillsBridge(fixture.deps));
+		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-committee"), { recursive: true });
+
+		const result = await installSkillsBridge(await preflightSkillsBridge(fixture.deps));
+		expect(result.prunedEntries).toEqual(["paseo-committee"]);
+		await expect(fs.lstat(path.join(fixture.paths.bridgeDir, "paseo-committee"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	});
+
 	test("both protected skill trees are byte-identical across install and check (AC-8, AC-19)", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths, ["context-search"]);
 		await fs.writeFile(path.join(fixture.paths.gjcSkillsDir, "mine.md"), "# mine\n");
 
-		const agentsBefore = await snapshotTree(fixture.paths.agentsSkillsDir);
+		const agentsBefore = await snapshotTree(fixture.paths.agentsSkillsDir as string);
 		const gjcBefore = await snapshotTree(fixture.paths.gjcSkillsDir);
 
 		await installSkillsBridge(await preflightSkillsBridge(fixture.deps));
 		await checkPaseoSetup(fixture.deps);
 
-		expect(await snapshotTree(fixture.paths.agentsSkillsDir)).toBe(agentsBefore);
+		expect(await snapshotTree(fixture.paths.agentsSkillsDir as string)).toBe(agentsBefore);
 		expect(await snapshotTree(fixture.paths.gjcSkillsDir)).toBe(gjcBefore);
+	});
+});
+
+describe("skills source discovery (#4638)", () => {
+	async function discoveryRoot(): Promise<string> {
+		const root = await makeRoot();
+		return root;
+	}
+
+	test("PASEO_SKILLS_DIR wins when it points at a real directory", async () => {
+		const root = await discoveryRoot();
+		const home = path.join(root, "home");
+		const relocated = path.join(root, "Elsewhere", "Paseo.app", "Contents", "Resources", "skills");
+		await fs.mkdir(relocated, { recursive: true });
+		const prior = process.env.PASEO_SKILLS_DIR;
+		process.env.PASEO_SKILLS_DIR = relocated;
+		try {
+			await expect(resolvePaseoSkillsSource(home)).resolves.toEqual({ dir: relocated, origin: "app-bundle" });
+		} finally {
+			if (prior === undefined) delete process.env.PASEO_SKILLS_DIR;
+			else process.env.PASEO_SKILLS_DIR = prior;
+		}
+	});
+
+	test("a stale or relative PASEO_SKILLS_DIR is ignored, never linked into", async () => {
+		const root = await discoveryRoot();
+		const home = path.join(root, "home");
+		const userDir = path.join(home, ".agents", "skills");
+		await fs.mkdir(userDir, { recursive: true });
+		for (const value of [path.join(root, "gone"), "relative/skills"]) {
+			const prior = process.env.PASEO_SKILLS_DIR;
+			process.env.PASEO_SKILLS_DIR = value;
+			try {
+				await expect(resolvePaseoSkillsSource(home)).resolves.toEqual({ dir: userDir, origin: "user" });
+			} finally {
+				if (prior === undefined) delete process.env.PASEO_SKILLS_DIR;
+				else process.env.PASEO_SKILLS_DIR = prior;
+			}
+		}
+	});
+
+	test("~/.agents/skills wins over an app bundle; nothing resolvable means undefined", async () => {
+		const root = await discoveryRoot();
+		const home = path.join(root, "home");
+		const userDir = path.join(home, ".agents", "skills");
+		await fs.mkdir(userDir, { recursive: true });
+		await expect(resolvePaseoSkillsSource(home)).resolves.toEqual({ dir: userDir, origin: "user" });
+		// A home with no ~/.agents/skills and no bundle resolves to nothing. The
+		// bundle candidates are platform-bounded, so this holds everywhere.
+		await expect(resolvePaseoSkillsSource(path.join(root, "empty-home"))).resolves.toBeUndefined();
+	});
+
+	test("app bundle candidates are bounded and platform-shaped", () => {
+		const home = "/Users/tester";
+		const candidates = paseoAppSkillsCandidates(home);
+		if (process.platform === "darwin") {
+			expect(candidates.length).toBe(6);
+			expect(candidates[0]).toBe(path.join("/Applications", "Paseo.app", "Contents", "Resources", "skills"));
+			expect(candidates).toContain(path.join(home, "Applications", "Paseo.app", "Contents", "Resources", "skills"));
+		} else {
+			expect(candidates).toEqual([]);
+		}
+	});
+});
+
+describe("desktop app install (#4638)", () => {
+	const APP_SKILLS = ["paseo", "paseo-advisor", "paseo-committee", "paseo-handoff", "paseo-help"];
+
+	/** `runPaseoSetup` narrowed to the check arm, for readable assertions. */
+	async function check(deps: PaseoSetupDependencies): Promise<SetupCheckResult> {
+		const outcome = await runPaseoSetup({ check: true }, deps);
+		if (outcome.kind !== "check") throw new Error("expected a check outcome");
+		return outcome.result;
+	}
+
+	/** The reported machine: Paseo.app 0.4.0 ships paseo-help, not paseo-loop, and there is no ~/.agents/skills. */
+	async function appFixture(skillNames: readonly string[]): Promise<Fixture> {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await fs.rm(fixture.paths.agentsSkillsDir as string, { recursive: true });
+		const bundle = path.join(fixture.root, "Applications", "Paseo.app", "Contents", "Resources", "skills");
+		for (const name of skillNames) {
+			await fs.mkdir(path.join(bundle, name), { recursive: true });
+			await fs.writeFile(path.join(bundle, name, "SKILL.md"), `# ${name}\n`);
+		}
+		const deps: PaseoSetupDependencies = {
+			...fixture.deps,
+			skillsSource: async () => ({ dir: bundle, origin: "app-bundle" }),
+		};
+		return { ...fixture, deps };
+	}
+
+	test("install bridges the bundle's skills and check reaches pass", async () => {
+		const fixture = await appFixture(APP_SKILLS);
+		await seedConfig(fixture.paths);
+
+		const install = await runPaseoSetup({}, fixture.deps);
+		expect(install.kind).toBe("install");
+
+		const result = await check(fixture.deps);
+		expect(result.status).toBe("pass");
+		expect(checkExitCode(result)).toBe(0);
+
+		// The exact set the app ships is bridged -- nothing more, nothing less.
+		const linked = (await fs.readdir(fixture.paths.bridgeDir)).sort();
+		expect(linked).toEqual([...APP_SKILLS].sort());
+		for (const name of linked) {
+			const target = await fs.readlink(path.join(fixture.paths.bridgeDir, name));
+			expect(path.dirname(target)).toBe(
+				path.join(fixture.root, "Applications", "Paseo.app", "Contents", "Resources", "skills"),
+			);
+		}
+	});
+
+	test("a missing source directory skips the bridge, creates nothing, and reports it once", async () => {
+		const fixture = await appFixture([]);
+		const deps: PaseoSetupDependencies = {
+			...fixture.deps,
+			skillsSource: async () => undefined,
+		};
+		await seedConfig(fixture.paths);
+
+		const install = await runPaseoSetup({}, deps);
+		expect(install.kind).toBe("install");
+		await expect(fs.stat(deps.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+
+		const result = await check(deps);
+		expect(result.status).toBe("drift");
+		const codes = result.reasons.map(reason => reason.code);
+		expect(codes).toContain("missing-skills-directory");
+		expect(codes).not.toContain("missing-bridge-link");
+		expect(codes).not.toContain("orphan-skill");
+	});
+
+	test("a source skill with no bridge link is drift, and re-running setup repairs it", async () => {
+		const fixture = await appFixture(SKILL_NAMES);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		await fs.rm(path.join(fixture.paths.bridgeDir, "paseo-advisor"));
+
+		const drifted = await check(fixture.deps);
+		expect(drifted.status).toBe("drift");
+		expect(drifted.reasons).toEqual([
+			{
+				code: "missing-bridge-link",
+				subject: path.join(fixture.paths.bridgeDir, "paseo-advisor"),
+				detail: expect.any(String),
+			},
+		]);
+
+		await runPaseoSetup({}, fixture.deps);
+		expect((await check(fixture.deps)).status).toBe("pass");
+	});
+
+	test("a Paseo release adding a skill never turns check red", async () => {
+		const fixture = await appFixture(APP_SKILLS);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+
+		// The app updates underneath GJC and ships one extra skill.
+		const bundle = path.join(fixture.root, "Applications", "Paseo.app", "Contents", "Resources", "skills");
+		await fs.mkdir(path.join(bundle, "paseo-brand-new"));
+
+		const result = await check(fixture.deps);
+		expect(result.status).toBe("pass");
+		expect(checkExitCode(result)).toBe(0);
+	});
+
+	test("repeated install, check, and remove converge and preserve the foreign provider", async () => {
+		const fixture = await appFixture(APP_SKILLS);
+		await seedConfig(fixture.paths);
+
+		await runPaseoSetup({}, fixture.deps);
+		const again = await runPaseoSetup({}, fixture.deps);
+		expect(again.kind).toBe("install");
+		let result = await check(fixture.deps);
+		expect(result.status).toBe("pass");
+
+		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("removed");
+		await expect(fs.stat(fixture.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+
+		// The foreign provider entry survives every pass untouched.
+		const config = JSON.parse(await fs.readFile(fixture.paths.configJson, "utf8")) as Record<string, unknown>;
+		const providers = (config.agents as { providers: Record<string, unknown> }).providers;
+		expect(Object.keys(providers).sort()).toEqual(["claude"]);
+
+		// And a fresh install on top of the rolled-back state is green again.
+		await runPaseoSetup({}, fixture.deps);
+		result = await check(fixture.deps);
+		expect(result.status).toBe("pass");
+	});
+
+	test("remove still cleans the bridge after Paseo itself is uninstalled (#4638)", async () => {
+		const fixture = await appFixture(APP_SKILLS);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+
+		// Paseo disappears entirely: the app bundle is gone, so every bridge link
+		// dangles and no source can be discovered anymore.
+		await fs.rm(path.join(fixture.root, "Applications"), { recursive: true });
+		const deps: PaseoSetupDependencies = {
+			...fixture.deps,
+			skillsSource: async () => undefined,
+		};
+
+		const remove = await runPaseoSetup({ remove: true }, deps);
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("removed");
+		await expect(fs.stat(deps.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+
+		const config = JSON.parse(await fs.readFile(deps.paths.configJson, "utf8")) as Record<string, unknown>;
+		const providers = (config.agents as { providers: Record<string, unknown> }).providers;
+		expect(Object.keys(providers).sort()).toEqual(["claude"]);
 	});
 });
 

@@ -30,6 +30,8 @@ export interface ProvenanceLedger {
 	readonly seededOrchestrationKeys: Record<string, string>;
 	/** Bridge directory path GJC created, when it created it. */
 	readonly bridgePath?: string;
+	/** Source directory the bridge entries were linked from, so `--remove` can verify targets. */
+	readonly bridgeSourceDir?: string;
 	/** Bridge entries GJC created, so the inverse removes exactly those. */
 	readonly bridgeEntries?: readonly string[];
 	/** True when GJC created the bridge directory itself (as opposed to populating an existing one). */
@@ -57,6 +59,7 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 			providerKeys: isStringRecord(parsed.providerKeys) ? parsed.providerKeys : {},
 			seededOrchestrationKeys: isStringRecord(parsed.seededOrchestrationKeys) ? parsed.seededOrchestrationKeys : {},
 			...(typeof parsed.bridgePath === "string" ? { bridgePath: parsed.bridgePath } : {}),
+			...(typeof parsed.bridgeSourceDir === "string" ? { bridgeSourceDir: parsed.bridgeSourceDir } : {}),
 			...(Array.isArray(parsed.bridgeEntries)
 				? { bridgeEntries: parsed.bridgeEntries.filter((entry): entry is string => typeof entry === "string") }
 				: {}),

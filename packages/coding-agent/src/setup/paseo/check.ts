@@ -21,10 +21,10 @@ import * as fs from "node:fs/promises";
 import { recoverIntent } from "./install-saga";
 import { PaseoPublishError, readTarget } from "./json-publisher";
 import { createOrchestrationSeed } from "./orchestration-preferences";
-import { readIntent } from "./paseo-ownership";
+import { readIntent, readProvenance } from "./paseo-ownership";
 import { buildProviderEntry, hasProviderConflict, providerKeyFor, resolveGjcCommand } from "./provider-config";
 import type { DriftReason, SetupCheckResult } from "./result-types";
-import { INSTALL_SKILL_NAMES, type PaseoSetupDependencies } from "./setup-deps";
+import type { PaseoSetupDependencies } from "./setup-deps";
 import { scanSkillsBridgeDrift } from "./skills-bridge";
 
 const PROBE_TIMEOUT_MS = 5_000;
@@ -139,18 +139,18 @@ async function collectL1(deps: PaseoSetupDependencies, options: CheckOptions): P
 		}
 	}
 
-	for (const name of INSTALL_SKILL_NAMES) {
-		const link = `${deps.paths.bridgeDir}/${name}`;
-		const linked = await fs
-			.lstat(link)
-			.then(stat => stat.isSymbolicLink())
-			.catch(() => false);
-		if (!linked) {
-			reasons.push({ code: "missing-bridge-link", subject: link, detail: "bridge symlink is missing" });
-		}
+	const source = await (deps.skillsSource?.() ?? Promise.resolve(undefined));
+	if (source === undefined) {
+		reasons.push({
+			code: "missing-skills-directory",
+			subject: "paseo skills source",
+			detail:
+				"no Paseo skills directory found; the skills bridge is skipped (supported: ~/.agents/skills, a Paseo.app bundle)",
+		});
 	}
 
-	reasons.push(...(await scanSkillsBridgeDrift(deps)));
+	const ledger = await readProvenance(deps.paths.provenanceLedger);
+	reasons.push(...(await scanSkillsBridgeDrift(deps, ledger.bridgeEntries)));
 	return reasons;
 }
 

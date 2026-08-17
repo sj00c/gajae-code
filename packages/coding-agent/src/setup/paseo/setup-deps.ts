@@ -3,25 +3,77 @@
  *
  * Every module in this directory takes `PaseoSetupDependencies` explicitly so
  * tests can substitute paths, the Paseo CLI probe, and the clock without
- * `mock.module()`. Production wiring calls `createDefaultPaseoSetupDependencies()`.
+ * module-scope mocks.
  */
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 
-/** The five Paseo skills this setup links. `context-search` is deliberately excluded. */
-export const INSTALL_SKILL_NAMES = [
-	"paseo",
-	"paseo-advisor",
-	"paseo-committee",
-	"paseo-handoff",
-	"paseo-loop",
-] as const;
-
-export type InstallSkillName = (typeof INSTALL_SKILL_NAMES)[number];
-
 /** Prefix used to enumerate Paseo-owned skills when scanning for drift. */
 export const PASEO_SKILL_PREFIX = "paseo";
+
+/** Skill names GJC never bridges: `context-search` duplicates GJC's own tools. */
+export const UNBRIDGED_SKILL_NAMES = ["context-search"] as const;
+
+/**
+ * Where Paseo keeps its skills.
+ *
+ * A CLI install materializes `~/.agents/skills`; a desktop app ships them inside
+ * the app bundle. The bridge reads whichever exists and never writes either.
+ */
+export interface PaseoSkillSource {
+	/** Absolute directory holding Paseo's skill folders. */
+	readonly dir: string;
+	/** `"user"` (`~/.agents/skills`) or `"app-bundle"` (inside a Paseo.app). */
+	readonly origin: "user" | "app-bundle";
+}
+
+/** Default Paseo desktop app names, both install roots, in order. */
+const PASEO_APP_NAMES = ["Paseo.app", "Paseo Beta.app", "Paseo Nightly.app"] as const;
+
+/** Every app-bundle skills directory to probe. Bounded: a fixed list, never a search. */
+export function paseoAppSkillsCandidates(home: string = os.homedir()): readonly string[] {
+	const roots = process.platform === "darwin" ? ["/Applications", path.join(home, "Applications")] : [];
+	const candidates: string[] = [];
+	for (const root of roots) {
+		for (const app of PASEO_APP_NAMES) {
+			candidates.push(path.join(root, app, "Contents", "Resources", "skills"));
+		}
+	}
+	return candidates;
+}
+
+/**
+ * Resolve the directory Paseo's skills live in.
+ *
+ * `PASEO_SKILLS_DIR` overrides discovery for relocated bundles and tests; it is
+ * honored only when absolute and present, so a stale variable can never produce
+ * dangling bridge links. `~/.agents/skills` wins over an app bundle because it
+ * is the user-visible location GJC documented. Returns `undefined` when no
+ * source directory exists at all -- the bridge is skipped, never guessed at.
+ */
+export async function resolvePaseoSkillsSource(home: string = os.homedir()): Promise<PaseoSkillSource | undefined> {
+	const override = process.env.PASEO_SKILLS_DIR;
+	if (override !== undefined && path.isAbsolute(override) && (await isDirectory(override))) {
+		return { dir: path.resolve(override), origin: "app-bundle" };
+	}
+	const userDir = path.join(home, ".agents", "skills");
+	if (await isDirectory(userDir)) return { dir: userDir, origin: "user" };
+	for (const candidate of paseoAppSkillsCandidates(home)) {
+		if (await isDirectory(candidate)) return { dir: candidate, origin: "app-bundle" };
+	}
+	return undefined;
+}
+
+async function isDirectory(candidate: string): Promise<boolean> {
+	try {
+		return (await fs.stat(candidate)).isDirectory();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+}
 
 /** Base provider key written into `agents.providers`. */
 export const PROVIDER_KEY = "gjc";
@@ -42,8 +94,12 @@ export interface PaseoPaths {
 	readonly configJson: string;
 	/** `~/.paseo/orchestration-preferences.json` */
 	readonly orchestrationPreferences: string;
-	/** `~/.agents/skills` -- READ-ONLY, never written by this setup. */
-	readonly agentsSkillsDir: string;
+	/**
+	 * Paseo's skills directory -- READ-ONLY, never written by this setup.
+	 * Resolved per run via `resolvePaseoSkillsSource`: `~/.agents/skills` for a
+	 * CLI install, the app bundle for a desktop install, `undefined` when absent.
+	 */
+	readonly agentsSkillsDir?: string;
 	/** `<agentDir>/paseo-skills` -- the bridge directory this setup owns. */
 	readonly bridgeDir: string;
 	/** `<agentDir>/paseo/provenance.json` -- GJC-side ownership ledger. */
@@ -70,10 +126,16 @@ export type PaseoLsOutcome =
 	| { readonly kind: "nonzero-exit"; readonly exitCode: number; readonly detail: string };
 
 export interface PaseoSetupDependencies {
-	readonly paths: PaseoPaths;
+	readonly paths: Omit<PaseoPaths, "agentsSkillsDir">;
 	/** Bounded probe of the Paseo daemon. MUST enforce `timeoutMs` and kill the child on expiry. */
 	runProviderLs(timeoutMs: number): Promise<PaseoLsOutcome>;
 	now(): Date;
+	/**
+	 * Resolve Paseo's skills directory. Injectable so tests stay hermetic;
+	 * defaults to the real discovery order (`PASEO_SKILLS_DIR`, `~/.agents/skills`,
+	 * a Paseo.app bundle).
+	 */
+	readonly skillsSource?: () => Promise<PaseoSkillSource | undefined>;
 }
 
 export function createDefaultPaseoPaths(agentDir: string = getAgentDir(), home: string = os.homedir()): PaseoPaths {
@@ -81,7 +143,6 @@ export function createDefaultPaseoPaths(agentDir: string = getAgentDir(), home: 
 	return {
 		configJson: path.join(paseoHome, "config.json"),
 		orchestrationPreferences: path.join(paseoHome, "orchestration-preferences.json"),
-		agentsSkillsDir: path.join(home, ".agents", "skills"),
 		bridgeDir: path.join(agentDir, "paseo-skills"),
 		provenanceLedger: path.join(agentDir, "paseo", "provenance.json"),
 		intentRecord: path.join(agentDir, "paseo", "intent.json"),
@@ -171,5 +232,6 @@ export function createDefaultPaseoSetupDependencies(): PaseoSetupDependencies {
 		paths: createDefaultPaseoPaths(),
 		runProviderLs,
 		now: () => new Date(),
+		skillsSource: () => resolvePaseoSkillsSource(),
 	};
 }

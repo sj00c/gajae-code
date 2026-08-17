@@ -52,8 +52,11 @@ gjc setup paseo --remove         # roll back only what GJC itself created
 ```
 
 `--remove` deletes a key only when GJC's own provenance ledger recorded creating it *and* the value
-still matches what GJC wrote, so a hand-edited entry always survives. `~/.agents/skills` is treated as
-read-only.
+still matches what GJC wrote, so a hand-edited entry always survives. Paseo's skills directory is
+treated as read-only: GJC bridges `~/.agents/skills` when a CLI install materialized it, the Paseo.app
+bundle's `Contents/Resources/skills` on a desktop install, or an explicit `PASEO_SKILLS_DIR` — and
+derives the bridged skill names from whichever directory actually exists, so a Paseo release that
+ships a different skill set (or no skills directory at all) cannot wedge `--check` permanently red.
 
 ### Extra providers for model profiles
 
@@ -96,6 +99,7 @@ GJC owns, add to the provider's `env` entry and restart the Paseo daemon:
 | `gjc` reads `error` in `paseo provider ls` | daemon still holds the pre-install config | `paseo daemon restart` |
 | `gjc setup paseo --check` reports `stale` | config is correct, daemon has not reloaded | `paseo daemon restart` |
 | `gjc setup paseo --check` reports `drift` | the entry was edited by hand or by another tool | reconcile manually, or `--remove` then re-install |
+| `gjc setup paseo --check` reports `missing-skills-directory` | Paseo's skills moved or were uninstalled; the bridge is skipped, not faked | point `PASEO_SKILLS_DIR` at the real directory, or re-run `gjc setup paseo` after reinstalling Paseo |
 | `failed to create agent` in `~/.paseo/daemon.log` | `gjc` not resolvable from the daemon's PATH | re-run `gjc setup paseo` so the absolute path is rewritten |
 | Permission-gated tools never prompt | `GJC_ACP_PERMISSION_MODE` overridden | set it back to `prompt` in the provider `env` |
 

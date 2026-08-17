@@ -10,6 +10,8 @@
  * that cannot be undone safely halts the rest, so the result is an
  * interpretable prefix rather than a scattered mix.
  */
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { planPublish, publishPlan, readTarget } from "./json-publisher";
 import { removeSeededRoles } from "./orchestration-preferences";
 import {
@@ -22,7 +24,7 @@ import {
 } from "./paseo-ownership";
 import { type PaseoProviderEntry, providerEntryHash } from "./provider-config";
 import type { PartialRemovalEvidence, PaseoRemoveResult } from "./result-types";
-import { INSTALL_SKILL_NAMES, type InstallSkillName, type PaseoSetupDependencies } from "./setup-deps";
+import type { PaseoSetupDependencies } from "./setup-deps";
 import { inverseSkillsBridge, SkillsBridgeError } from "./skills-bridge";
 
 export interface RemoveOptions {
@@ -69,17 +71,37 @@ export async function removePaseoSetup(
 	// Step 3 inverse: the symlink bridge.
 	if (ledger.bridgeEntries && ledger.bridgeEntries.length > 0) {
 		try {
-			// Only names the locked allowlist knows are undone; a ledger carrying an
-			// unknown name is ignored rather than trusted into a filesystem removal.
-			const createdEntries = ledger.bridgeEntries.filter((name): name is InstallSkillName =>
-				(INSTALL_SKILL_NAMES as readonly string[]).includes(name),
-			);
+			// The ledger once filtered entries through a compiled-in name
+			// allowlist; ownership is now proven by the entry itself being a
+			// symlink that still resolves into the source directory the ledger
+			// recorded when the link was created. A name Paseo no longer ships
+			// is still removed, because the record -- not today's source
+			// contents -- is what proves GJC created it.
+			const bridgeDir = ledger.bridgePath ?? deps.paths.bridgeDir;
+			const createdEntries: string[] = [];
+			for (const name of ledger.bridgeEntries) {
+				if (path.basename(name) !== name || name.includes("/")) continue;
+				const destination = path.join(bridgeDir, name);
+				const stat = await fs.lstat(destination).catch(() => undefined);
+				if (stat?.isSymbolicLink() === true) createdEntries.push(name);
+			}
+			// A recorded source directory is trusted even after it disappears
+			// (Paseo uninstalled): link-text verification does not need it on
+			// disk, and the links are inside GJC's own bridge directory.
+			const sourceDir = ledger.bridgeSourceDir ?? (await deps.skillsSource?.())?.dir;
+			if (sourceDir === undefined) {
+				throw new SkillsBridgeError(
+					`Cannot prove ownership of Paseo skill bridge entries: no source directory recorded and none resolvable (${bridgeDir})`,
+				);
+			}
 			await inverseSkillsBridge(deps, {
 				createdEntries,
+				prunedEntries: [],
 				bridgeDirCreated: ledger.bridgeDirCreated ?? false,
+				sourceDir,
 			});
-			removed.push(deps.paths.bridgeDir);
-			nextLedger = { ...nextLedger, bridgeEntries: [], bridgeDirCreated: false };
+			removed.push(bridgeDir);
+			nextLedger = { ...nextLedger, bridgeEntries: [], bridgeDirCreated: false, bridgeSourceDir: undefined };
 		} catch (error) {
 			const detail = error instanceof SkillsBridgeError ? error.message : String(error);
 			remaining.push(deps.paths.bridgeDir);

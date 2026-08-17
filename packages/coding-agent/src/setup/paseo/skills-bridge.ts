@@ -1,3 +1,16 @@
+/**
+ * Paseo skills bridge.
+ *
+ * The bridge mirrors Paseo's own skills into GJC skill discovery with symlinks.
+ * Bridged names are derived from what the resolved source directory actually
+ * contains (#4638): a Paseo release that adds or drops an orchestration skill can
+ * no longer wedge `--check` into a permanently red verdict, an install whose
+ * skills live inside the Paseo.app bundle is bridged the same way as one whose
+ * skills live in `~/.agents/skills`, and a missing source directory skips the
+ * bridge instead of publishing dangling links. Install converges the bridge to
+ * the current source: it creates missing links, prunes links whose target is
+ * gone, and never replaces a non-symlink entry.
+ */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
@@ -5,16 +18,24 @@ import type { RawSettings, Settings } from "../../config/settings";
 import type { SettingPath } from "../../config/settings-schema";
 import type { DriftReason } from "./result-types";
 import {
-	INSTALL_SKILL_NAMES,
-	type InstallSkillName,
 	PASEO_SKILL_PREFIX,
 	type PaseoSetupDependencies,
+	type PaseoSkillSource,
+	UNBRIDGED_SKILL_NAMES,
 } from "./setup-deps";
+
+/**
+ * Resolve the skills source through the injectable seam, so tests never touch a
+ * real `~/.agents/skills` or app bundle. Production always supplies the default.
+ */
+async function resolveSource(deps: PaseoSetupDependencies): Promise<PaseoSkillSource | undefined> {
+	return deps.skillsSource !== undefined ? deps.skillsSource() : undefined;
+}
 
 type BridgeEntryAction = "create" | "noop" | "prune-and-recreate";
 
 type BridgeEntryPlan = {
-	readonly name: InstallSkillName;
+	readonly name: string;
 	readonly action: BridgeEntryAction;
 	readonly linkPath: string;
 	readonly targetPath: string;
@@ -22,17 +43,32 @@ type BridgeEntryPlan = {
 	readonly danglingTarget?: string;
 };
 
+/** A bridge link that no longer mirrors the source and is removed, never recreated. */
+type BridgePrunePlan = {
+	readonly name: string;
+	readonly linkPath: string;
+	/** Captured link text; the unlink is refused if it changed in between. */
+	readonly linkTarget: string;
+};
+
 /** Immutable preflight evidence consumed by the install saga and its inverse. */
 export interface SkillsBridgePreflight {
 	readonly bridgeDir: string;
 	readonly bridgeDirCreated: boolean;
-	readonly entries: Readonly<Record<InstallSkillName, BridgeEntryPlan>>;
+	/** Source directory the entries were derived from, absent when the bridge is skipped. */
+	readonly sourceDir?: string;
+	readonly entries: Readonly<Record<string, BridgeEntryPlan>>;
+	/** Stale bridge links to remove so a re-run converges instead of accumulating drift. */
+	readonly prunes: readonly BridgePrunePlan[];
 }
 
-/** What the forward operation actually created, rather than what preflight intended to create. */
+/** What the forward operation actually did, rather than what preflight intended to do. */
 export interface SkillsBridgeInstallResult {
-	readonly createdEntries: readonly InstallSkillName[];
+	readonly createdEntries: readonly string[];
+	readonly prunedEntries: readonly string[];
 	readonly bridgeDirCreated: boolean;
+	/** Directory the created links point at; absent when nothing was created. */
+	readonly sourceDir?: string;
 }
 
 export class SkillsBridgeError extends Error {
@@ -42,11 +78,28 @@ export class SkillsBridgeError extends Error {
 	}
 }
 
-function expectedTarget(deps: PaseoSetupDependencies, name: InstallSkillName): string {
-	return path.resolve(deps.paths.agentsSkillsDir, name);
+/**
+ * Entry names the bridge mirrors, derived from the source directory's own
+ * contents: every `paseo`-prefixed directory except the denylist. Non-directory
+ * entries (files, symlinks) yield nothing -- the bridge links directories only.
+ */
+export async function sourceBridgeEntries(sourceDir: string): Promise<readonly string[]> {
+	const entries = await fs.readdir(sourceDir, { withFileTypes: true }).catch(error => {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	});
+	const names: string[] = [];
+	for (const entry of entries) {
+		if (!entry.name.startsWith(PASEO_SKILL_PREFIX)) continue;
+		if ((UNBRIDGED_SKILL_NAMES as readonly string[]).includes(entry.name)) continue;
+		if (!entry.isDirectory()) continue;
+		names.push(entry.name);
+	}
+	names.sort();
+	return names;
 }
 
-function linkPath(deps: PaseoSetupDependencies, name: InstallSkillName): string {
+function linkPath(deps: PaseoSetupDependencies, name: string): string {
 	return path.join(deps.paths.bridgeDir, name);
 }
 
@@ -81,6 +134,22 @@ async function entryState(
 	}
 }
 
+/** A bridge symlink that points anywhere other than `expected`. */
+async function foreignSymlinkState(
+	destination: string,
+): Promise<
+	{ readonly kind: "absent" } | { readonly kind: "symlink"; readonly link: string } | { readonly kind: "conflict" }
+> {
+	try {
+		const stat = await fs.lstat(destination);
+		if (!stat.isSymbolicLink()) return { kind: "conflict" };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+		throw error;
+	}
+	return { kind: "symlink", link: await fs.readlink(destination) };
+}
+
 async function bridgeDirectoryState(bridgeDir: string): Promise<"absent" | "directory" | "conflict"> {
 	try {
 		const stat = await fs.lstat(bridgeDir);
@@ -92,17 +161,42 @@ async function bridgeDirectoryState(bridgeDir: string): Promise<"absent" | "dire
 }
 
 /**
- * Classify every allowlisted bridge entry without mutating either skill tree.
+ * Classify every bridge entry without mutating either skill tree.
  * All conflicts are accumulated so the caller can report them together.
+ *
+ * Two groups are planned:
+ * - `entries`: one per source skill that should have a link (`create`, `noop`,
+ *   or `prune-and-recreate` when only the link text rotted).
+ * - `prunes`: stale `paseo`-prefixed symlinks whose name the source no longer
+ *   carries. They are removed so a re-run converges; the compensation inverse
+ *   does not restore them because their target is gone by definition.
+ *
+ * A non-symlink occupying a `paseo`-prefixed bridge name is a conflict and
+ * refuses the whole plan, exactly as before.
  */
 export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promise<SkillsBridgePreflight> {
 	const directory = await bridgeDirectoryState(deps.paths.bridgeDir);
-	const conflicts: string[] = directory === "conflict" ? [deps.paths.bridgeDir] : [];
-	const entries = {} as Record<InstallSkillName, BridgeEntryPlan>;
+	if (directory === "conflict") {
+		throw new SkillsBridgeError(
+			`Refusing to modify Paseo skills bridge; conflicting entries: ${deps.paths.bridgeDir}`,
+		);
+	}
+	const conflicts: string[] = [];
+	const entries: Record<string, BridgeEntryPlan> = {};
+	const prunes: BridgePrunePlan[] = [];
+	const source = await resolveSource(deps);
+	if (source === undefined) {
+		// No source directory anywhere: the bridge is skipped entirely. Creating
+		// links into a directory that does not exist is worse than not bridging.
+		return { bridgeDir: deps.paths.bridgeDir, bridgeDirCreated: directory === "absent", entries, prunes };
+	}
+	const sourceDir = source.dir;
+	const names = await sourceBridgeEntries(sourceDir);
+	const wanted = new Set(names);
 
-	for (const name of INSTALL_SKILL_NAMES) {
+	for (const name of names) {
 		const destination = linkPath(deps, name);
-		const target = expectedTarget(deps, name);
+		const target = path.resolve(sourceDir, name);
 		const state = directory === "absent" ? { kind: "absent" as const } : await entryState(destination, target);
 		if (state.kind === "conflict") {
 			conflicts.push(destination);
@@ -116,12 +210,38 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 			...(state.kind === "dangling" ? { danglingTarget: state.link } : {}),
 		};
 	}
+
+	if (directory !== "absent") {
+		const present = await fs.readdir(deps.paths.bridgeDir, { withFileTypes: true });
+		for (const entry of present) {
+			if (!entry.name.startsWith(PASEO_SKILL_PREFIX)) continue;
+			if (wanted.has(entry.name)) continue;
+			const destination = path.join(deps.paths.bridgeDir, entry.name);
+			const state = await foreignSymlinkState(destination);
+			if (state.kind === "conflict") {
+				conflicts.push(destination);
+				continue;
+			}
+			if (state.kind === "absent") continue;
+			// Only symlinks are pruned, and only names the source no longer
+			// carries. A live user symlink is still removed here because the
+			// bridge directory is GJC-owned and mirrors Paseo's skills exactly.
+			prunes.push({ name: entry.name, linkPath: destination, linkTarget: state.link });
+		}
+	}
+
 	if (conflicts.length > 0) {
 		throw new SkillsBridgeError(
 			`Refusing to modify Paseo skills bridge; conflicting entries: ${conflicts.join(", ")}`,
 		);
 	}
-	return { bridgeDir: deps.paths.bridgeDir, bridgeDirCreated: directory === "absent", entries };
+	return {
+		bridgeDir: deps.paths.bridgeDir,
+		bridgeDirCreated: directory === "absent",
+		...(source ? { sourceDir: source.dir } : {}),
+		entries,
+		prunes,
+	};
 }
 
 async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<void> {
@@ -155,37 +275,65 @@ async function createNoReplace(entry: BridgeEntryPlan): Promise<void> {
 	}
 }
 
+async function pruneStale(plan: BridgePrunePlan): Promise<void> {
+	const state = await foreignSymlinkState(plan.linkPath);
+	if (state.kind !== "symlink" || state.link !== plan.linkTarget) {
+		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before pruning: ${plan.linkPath}`);
+	}
+	await fs.unlink(plan.linkPath);
+}
+
 /** Create only preflight-approved bridge links; symlink publication never replaces an existing entry. */
 export async function installSkillsBridge(preflight: SkillsBridgePreflight): Promise<SkillsBridgeInstallResult> {
+	const hasWork = Object.keys(preflight.entries).length > 0 || preflight.prunes.length > 0;
 	let bridgeDirCreated = false;
-	if (preflight.bridgeDirCreated) {
+	if (preflight.bridgeDirCreated && hasWork) {
 		await createBridgeDirectory(preflight);
 		bridgeDirCreated = true;
 	}
-	const createdEntries: InstallSkillName[] = [];
-	for (const name of INSTALL_SKILL_NAMES) {
-		const entry = preflight.entries[name];
+	const createdEntries: string[] = [];
+	const prunedEntries: string[] = [];
+	for (const plan of preflight.prunes) {
+		await pruneStale(plan);
+		prunedEntries.push(plan.name);
+	}
+	for (const entry of Object.values(preflight.entries)) {
 		if (entry.action === "noop") continue;
 		if (entry.action === "prune-and-recreate") await pruneRecordedDangling(entry);
 		await createNoReplace(entry);
-		createdEntries.push(name);
+		createdEntries.push(entry.name);
 	}
-	return { createdEntries, bridgeDirCreated };
+	return createdEntries.length > 0 || prunedEntries.length > 0
+		? {
+				createdEntries,
+				prunedEntries,
+				bridgeDirCreated,
+				...(preflight.sourceDir ? { sourceDir: preflight.sourceDir } : {}),
+			}
+		: { createdEntries, prunedEntries, bridgeDirCreated };
 }
 
 /**
  * Undo exactly the links this run created. A changed link is reported as a
  * conflict rather than being deleted; this makes compensation safe after edits.
+ * Pruned stale links are deliberately not restored: their target is gone.
  */
 export async function inverseSkillsBridge(
 	deps: PaseoSetupDependencies,
 	result: SkillsBridgeInstallResult,
 ): Promise<void> {
+	if (result.sourceDir === undefined) {
+		throw new SkillsBridgeError("Refusing to undo Paseo skill bridge entries without a recorded source directory");
+	}
 	const diverged: string[] = [];
 	for (const name of result.createdEntries) {
 		const destination = linkPath(deps, name);
-		const state = await entryState(destination, expectedTarget(deps, name));
-		if (state.kind !== "expected" || state.link !== expectedTarget(deps, name)) diverged.push(destination);
+		const target = path.resolve(result.sourceDir, name);
+		const state = await entryState(destination, target);
+		// `dangling` still carries link text pointing exactly where we wrote it;
+		// the source went away (Paseo uninstalled or updated), and a dead link in
+		// GJC's own bridge directory is safe -- and correct -- to remove.
+		if (state.kind !== "expected" && state.kind !== "dangling") diverged.push(destination);
 	}
 	if (diverged.length > 0) {
 		throw new SkillsBridgeError(`Refusing to remove diverged Paseo skill bridge entries: ${diverged.join(", ")}`);
@@ -201,34 +349,77 @@ export async function inverseSkillsBridge(
 	}
 }
 
-/** Find Paseo-prefixed bridge or source entries that the locked install allowlist does not repair. */
-export async function scanSkillsBridgeDrift(deps: PaseoSetupDependencies): Promise<readonly DriftReason[]> {
+/**
+ * Drift inside GJC's own installation. Two honest signals only:
+ *
+ * - `orphan-skill`: a `paseo`-prefixed bridge entry that is not a live symlink
+ *   into the current source. Real drift; a re-run repairs it.
+ * - `missing-bridge-link`: a bridge entry the ledger says GJC created is gone
+ *   from the bridge directory. Real drift in GJC's own mirror.
+ *
+ * A skill Paseo ships that GJC never bridged is NOT drift (#4638): the bridge
+ * mirrors what GJC chose to bridge at install time, and a Paseo release adding
+ * a skill must not turn `--check` red. Provenance decides what `--remove`
+ * touches, not this scan.
+ */
+export async function scanSkillsBridgeDrift(
+	deps: PaseoSetupDependencies,
+	recordedEntries?: readonly string[],
+): Promise<readonly DriftReason[]> {
 	const reasons: DriftReason[] = [];
+	const source = await resolveSource(deps);
 	const bridgeEntries = await fs.readdir(deps.paths.bridgeDir, { withFileTypes: true }).catch(error => {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
 		throw error;
 	});
+	const liveNames = new Set(bridgeEntries.map(entry => entry.name));
+	for (const entry of bridgeEntries) {
+		if (!entry.name.startsWith(PASEO_SKILL_PREFIX)) continue;
+		const destination = path.join(deps.paths.bridgeDir, entry.name);
+		if (entry.isSymbolicLink()) {
+			try {
+				await fs.stat(destination);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				reasons.push({
+					code: "orphan-skill",
+					subject: destination,
+					detail: "bridge symlink target no longer exists",
+				});
+			}
+			continue;
+		}
+		reasons.push({
+			code: "orphan-skill",
+			subject: destination,
+			detail: "bridge entry is not a symlink; remove it or re-run gjc setup paseo",
+		});
+	}
+	if (source === undefined) return reasons;
+	// A live bridge entry pointing outside the source is drift: the bridge
+	// mirrors Paseo's skills exactly, so a foreign target is a hand edit.
 	for (const entry of bridgeEntries) {
 		if (!entry.name.startsWith(PASEO_SKILL_PREFIX) || !entry.isSymbolicLink()) continue;
 		const destination = path.join(deps.paths.bridgeDir, entry.name);
-		try {
-			await fs.stat(destination);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			reasons.push({ code: "orphan-skill", subject: destination, detail: "bridge symlink target no longer exists" });
+		const expected = path.resolve(source.dir, entry.name);
+		const state = await foreignSymlinkState(destination);
+		if (state.kind === "symlink" && resolvedLinkTarget(state.link, destination) !== expected) {
+			reasons.push({
+				code: "orphan-skill",
+				subject: destination,
+				detail: `bridge symlink does not point into Paseo's skills directory (${source.dir})`,
+			});
 		}
 	}
-	const sourceEntries = await fs.readdir(deps.paths.agentsSkillsDir, { withFileTypes: true }).catch(error => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw error;
-	});
-	for (const entry of sourceEntries) {
-		if (!entry.name.startsWith(PASEO_SKILL_PREFIX) || (INSTALL_SKILL_NAMES as readonly string[]).includes(entry.name))
-			continue;
+	// Only entries GJC recorded creating can be "missing". A source skill GJC
+	// never bridged is Paseo's own surface, not a hole in GJC's installation.
+	for (const name of recordedEntries ?? []) {
+		if (liveNames.has(name)) continue;
+		if (!(await sourceBridgeEntries(source.dir)).includes(name)) continue;
 		reasons.push({
-			code: "unlinked-skill",
-			subject: path.join(deps.paths.agentsSkillsDir, entry.name),
-			detail: "Paseo skill is outside GJC's locked bridge allowlist",
+			code: "missing-bridge-link",
+			subject: path.join(deps.paths.bridgeDir, name),
+			detail: "bridge symlink is missing",
 		});
 	}
 	return reasons;
