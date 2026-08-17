@@ -620,19 +620,46 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		expect(await Bun.file(worktreeModules).exists()).toBe(false);
 	});
 
-	it("fails closed when a scan directory is unreadable", async () => {
+	it("fails closed when the scan cannot read a traversal directory", async () => {
 		const repo = await createWorkspaceRepo("gjc-launch-worktree-unreadable-scan-");
 		const originModules = path.join(repo, "node_modules");
-		// A self-link hidden behind a directory the scanner cannot read.
-		const hidden = path.join(originModules, "@scope");
-		await fs.mkdir(hidden, { recursive: true });
-		await fs.symlink(path.join(repo, "packages", "app"), path.join(hidden, "app"));
-		await fs.chmod(hidden, 0o000);
+		// A self-link that the fault-injected scan cannot see past.
+		const scoped = path.join(originModules, "@scope");
+		await fs.mkdir(scoped, { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(scoped, "app"));
+
+		// Fault-inject EACCES deterministically: chmod is unreliable under root,
+		// so the regression must not depend on filesystem permission bits.
+		const readdirSpy = spyOn(fsSync, "readdirSync").mockImplementationOnce((dir: fsSync.PathLike) => {
+			expect(String(dir)).toBe(scoped);
+			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+		});
 		try {
 			const launched = prepareLaunchWorktree(repo, ["--worktree"]);
 			expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
 		} finally {
-			await fs.chmod(hidden, 0o755);
+			readdirSpy.mockRestore();
+		}
+	});
+
+	it("isolates a stale worktree link when identity resolution fails with EACCES", async () => {
+		const repo = await createRepo("gjc-launch-worktree-hoist-eacces-");
+		await fs.mkdir(path.join(repo, "node_modules"));
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "hoist-eacces"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
+
+		// The stale-link identity check cannot prove the link is unrelated when
+		// resolution fails; it must fail closed and remove the link.
+		const throwing: typeof fsSync.realpathSync = (() => {
+			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+		}) as unknown as typeof fsSync.realpathSync;
+		const realpathSpy = spyOn(fsSync, "realpathSync").mockImplementationOnce(throwing);
+		try {
+			const reused = prepareLaunchWorktree(repo, ["--worktree", "hoist-eacces"]);
+			expect(await Bun.file(path.join(reused.cwd, "node_modules")).exists()).toBe(false);
+		} finally {
+			realpathSpy.mockRestore();
 		}
 	});
 

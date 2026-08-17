@@ -561,8 +561,16 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 		if (targetStat.isSymbolicLink()) {
 			// existsSync follows the link; a dangling link reports false but still
 			// occupies the name, so it must be handled here rather than below.
-			const sourceReal = fs.realpathSync(sourceRoot);
-			if (resolvesInside(targetStat, target, sourceReal) || resolvesToSourceModules(target, sourceRoot)) {
+			let sourceReal: string | null;
+			try {
+				sourceReal = fs.realpathSync(sourceRoot);
+			} catch {
+				sourceReal = null;
+			}
+			if (
+				(sourceReal !== null && resolvesInside(targetStat, target, sourceReal)) ||
+				resolvesToSourceModules(target, sourceRoot)
+			) {
 				fs.rmSync(target, { force: true });
 				return "isolated";
 			}
@@ -582,9 +590,12 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 
 /**
  * Returns true when `target` resolves to the source checkout's own
- * `node_modules`. This catches stale cross-checkout links whose destination is
- * a parent-workspace hoist — outside the repo entirely — that the
- * resolves-inside-source check cannot see.
+ * `node_modules`, or when that identity cannot be ruled out because resolution
+ * failed for any reason other than a proven-broken link. This catches stale
+ * cross-checkout links whose destination is a parent-workspace hoist — outside
+ * the repo entirely — that the resolves-inside-source check cannot see, and
+ * fails closed on unreadable trees so a permission-restricted hoist can never
+ * keep a contaminated link classified as safe.
  */
 function resolvesToSourceModules(target: string, sourceRoot: string): boolean {
 	let resolvedTarget: string;
@@ -592,8 +603,8 @@ function resolvesToSourceModules(target: string, sourceRoot: string): boolean {
 	try {
 		resolvedTarget = fs.realpathSync(target);
 		resolvedSourceModules = fs.realpathSync(path.join(sourceRoot, "node_modules"));
-	} catch {
-		return false;
+	} catch (error) {
+		return !BROKEN_LINK_CODES.has((error as NodeJS.ErrnoException).code ?? "");
 	}
 	return resolvedTarget === resolvedSourceModules;
 }
