@@ -35,6 +35,13 @@ function testSlug(value: string): string {
 	return `${prefix}-${digest}`;
 }
 
+/** Asserts the exact directory-entry state at `entryPath`: "missing" | "dir" | "symlink". */
+async function expectEntryState(entryPath: string, expected: "missing" | "dir" | "symlink"): Promise<void> {
+	const stat = await fs.lstat(entryPath).catch(() => null);
+	const actual = stat === null ? "missing" : stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "dir" : "other";
+	expect(actual).toBe(expected);
+}
+
 /** Runs `body` with the bucket override applied, restoring the caller's environment. */
 function withWorktreeBucketDir<T>(value: string, body: () => T): T {
 	const previous = process.env.GJC_WORKTREE_DIR;
@@ -526,7 +533,7 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		expect((await fs.lstat(path.join(contaminated.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
 
 		const remediated = prepareLaunchWorktree(repo, ["--worktree"]);
-		expect(await Bun.file(path.join(remediated.cwd, "node_modules")).exists()).toBe(false);
+		await expectEntryState(path.join(remediated.cwd, "node_modules"), "missing");
 		// The origin's own node_modules survives remediation.
 		expect((await fs.stat(originModules)).isDirectory()).toBe(true);
 	});
@@ -549,7 +556,7 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		const repo = await createRepo("gjc-launch-worktree-no-modules-");
 
 		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
-		expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
+		await expectEntryState(path.join(launched.cwd, "node_modules"), "missing");
 	});
 
 	it("detects bun isolated-linker workspace layouts under node_modules/.bun", async () => {
@@ -560,7 +567,7 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		await fs.symlink(path.join(repo, "packages", "app"), path.join(storeModules, "app"));
 
 		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
-		expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
+		await expectEntryState(path.join(launched.cwd, "node_modules"), "dir");
 	});
 	it("detects pnpm scoped workspace layouts at deeper nesting (.pnpm depth 5)", async () => {
 		const repo = await createWorkspaceRepo("gjc-launch-worktree-pnpm-store-");
@@ -570,7 +577,7 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		await fs.symlink(path.join(repo, "packages", "app"), path.join(storeModules, "app"));
 
 		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
-		expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
+		await expectEntryState(path.join(launched.cwd, "node_modules"), "dir");
 	});
 
 	it("detects the origin node_modules root itself linking into the source repo", async () => {
@@ -582,7 +589,8 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		await fs.symlink(vendored, path.join(repo, "node_modules"));
 
 		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
-		expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
+		// Plain repo (no declaration): nothing is shared and no boundary exists.
+		await expectEntryState(path.join(launched.cwd, "node_modules"), "missing");
 	});
 
 	it("does not throw when the worktree carries a dangling node_modules symlink", async () => {
@@ -596,13 +604,13 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		await fs.rm(worktreeModules);
 		await fs.symlink(path.join(launched.cwd, "does-not-exist"), worktreeModules, "dir");
 
-		// A proven-dangling link is removed: the launch must neither crash with
-		// EEXIST nor continue through a boundary that resolves nothing. For this
-		// non-workspace repo no boundary directory is created, so nothing may
-		// remain at the path at all.
-		const reused = prepareLaunchWorktree(repo, ["--worktree", "dangling-modules"]);
-		const replaced = path.join(reused.cwd, "node_modules");
-		expect(await Bun.file(replaced).exists()).toBe(false);
+		// A dangling link's ownership can never be proven, so the launch refuses
+		// instead of deleting it or continuing through it; the link is preserved
+		// for the user.
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "dangling-modules"])).toThrow(
+			/worktree_node_modules_unverified/,
+		);
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
 	});
 
 	it("never shares an origin node_modules symlinked outside the repo (parent workspace hoist)", async () => {
@@ -629,7 +637,12 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 	});
 
 	it("fails closed when the scan cannot read a traversal directory", async () => {
-		const repo = await createWorkspaceRepo("gjc-launch-worktree-unreadable-scan-");
+		// A plain repo (no workspace declaration): sharing is decided by the
+		// origin-tree scan, which is exactly the path this fault exercises.
+		const repo = await createRepo("gjc-launch-worktree-unreadable-scan-");
+		// The origin tree carries a resolvable workspace-style self-link; the repo
+		// itself declares no workspaces, so sharing is decided by the scan.
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
 		const originModules = path.join(repo, "node_modules");
 		// A self-link that the fault-injected scan cannot see past.
 		const scoped = path.join(originModules, "@scope");
@@ -655,9 +668,9 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		try {
 			const launched = prepareLaunchWorktree(repo, ["--worktree"]);
 			expect(reachedScopedDir).toBe(true);
-			const worktreeModules = path.join(launched.cwd, "node_modules");
-			// The scan failed closed: no shared symlink exists.
-			expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(false);
+			// The scan failed closed: the origin tree is never shared (a plain
+			// repo without a declaration gets no boundary directory at all).
+			await expectEntryState(path.join(launched.cwd, "node_modules"), "missing");
 		} finally {
 			readdirSpy.mockRestore();
 		}
@@ -899,6 +912,63 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 
 		const reused = prepareLaunchWorktree(repo, ["--worktree", "user-dir"]);
 		expect(await Bun.file(path.join(reused.cwd, "node_modules", "ms", "marker.txt")).text()).toBe("user-owned\n");
+	});
+
+	it("preserves package-manager-installed links inside a marker-owned boundary", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-pkg-replaced-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "pkg-replaced"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+
+		// Simulate a package-manager install replacing the boundary links with
+		// real entries while the marker happens to survive.
+		await fs.rm(path.join(worktreeModules, "@scope"), { recursive: true, force: true });
+		await fs.mkdir(path.join(worktreeModules, "ms"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "ms", "index.js"), "// installed\n");
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "pkg-replaced"]);
+		const reusedModules = path.join(reused.cwd, "node_modules");
+		// The installed entry survives; the launcher does not manage the tree.
+		expect(await Bun.file(path.join(reusedModules, "ms", "index.js")).text()).toBe("// installed\n");
+	});
+
+	it("reconciles a stale boundary to empty after the workspace declaration disappears", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-decl-gone-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "decl-gone"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+
+		// Drop the workspace declaration (workspace -> non-workspace transition).
+		await Bun.write(path.join(launched.cwd, "package.json"), '{"name":"root","private":true}\n');
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "decl-gone"]);
+		const reusedModules = path.join(reused.cwd, "node_modules");
+		// Stale member link is pruned and the launcher no longer claims the dir.
+		expect(await fs.lstat(path.join(reusedModules, "@scope", "app")).catch(() => null)).toBe(null);
+		expect(await fs.lstat(path.join(reusedModules, ".gjc-node-modules-boundary")).catch(() => null)).toBe(null);
+	});
+
+	it("rejects symlinked parents that resolve outside the boundary", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-symlinked-parent-");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-outside-checkout-"));
+		cleanupPaths.push(outside);
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "symlinked-parent"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// An attacker-controlled @scope directory that is a symlink outside.
+		await fs.rm(path.join(worktreeModules, "@scope"), { recursive: true, force: true });
+		await fs.symlink(outside, path.join(worktreeModules, "@scope"));
+
+		// Reconciliation must refuse to create links through the symlinked parent
+		// instead of writing into the outside directory.
+		let message = "";
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "symlinked-parent"]);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toMatch(/worktree_workspace_link_outside|worktree_workspace_member_outside/);
+		// The outside sentinel directory was not populated.
+		expect(await fs.readdir(outside)).toEqual([]);
 	});
 });
 
