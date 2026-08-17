@@ -530,7 +530,11 @@ function resolvesInside(entry: fs.Stats | fs.Dirent, entryPath: string, sourceRe
 	} catch (error) {
 		return !BROKEN_LINK_CODES.has((error as NodeJS.ErrnoException).code ?? "");
 	}
-	return target === sourceReal || target.startsWith(`${sourceReal}${path.sep}`);
+	return (
+		sameFileSystemPath(target, sourceReal) ||
+		(caseInsensitiveFs() && target.toLowerCase().startsWith(`${sourceReal.toLowerCase()}${path.sep}`)) ||
+		target.startsWith(`${sourceReal}${path.sep}`)
+	);
 }
 
 /**
@@ -561,6 +565,11 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 		if (targetStat.isSymbolicLink()) {
 			// existsSync follows the link; a dangling link reports false but still
 			// occupies the name, so it must be handled here rather than below.
+			//
+			// Removal requires positive proof of contamination: an unresolvable
+			// link (EACCES/EPERM/EIO, transient network failure) is left in place
+			// for the user to inspect rather than deleted on suspicion, because
+			// its target could be a user-owned external store.
 			let sourceReal: string | null;
 			try {
 				sourceReal = fs.realpathSync(sourceRoot);
@@ -568,48 +577,155 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 				sourceReal = null;
 			}
 			if (
-				(sourceReal !== null && resolvesInside(targetStat, target, sourceReal)) ||
-				resolvesToSourceModules(target, sourceRoot)
+				(sourceReal !== null && positivelyResolvesInside(target, sourceReal)) ||
+				positivelyResolvesToSourceModules(target, sourceRoot)
 			) {
 				fs.rmSync(target, { force: true });
+				ensureWorkspaceSelfLinkBoundary(worktreePath);
 				return "isolated";
 			}
 		}
 		return "present";
 	}
 	const source = path.join(sourceRoot, "node_modules");
-	if (!fs.existsSync(source) || nodeModulesLinksInto(source, sourceRoot)) return "missing";
+	if (!fs.existsSync(source) || nodeModulesLinksInto(source, sourceRoot)) {
+		ensureWorkspaceSelfLinkBoundary(worktreePath);
+		return "missing";
+	}
 	// A node_modules root symlinked outside the repo belongs to another
 	// checkout's install graph (nested repo in a parent workspace); its entries
 	// resolve that parent's live sources, so it is never shared either.
 	const sourceStat = fs.lstatSync(source);
-	if (sourceStat.isSymbolicLink()) return "missing";
+	if (sourceStat.isSymbolicLink()) {
+		ensureWorkspaceSelfLinkBoundary(worktreePath);
+		return "missing";
+	}
 	fs.symlinkSync(source, target, "junction");
 	return "symlink";
 }
 
 /**
- * Returns true when `target` resolves to the source checkout's own
- * `node_modules`, or when that identity cannot be ruled out because resolution
- * failed for any reason other than a proven-broken link. This catches stale
- * cross-checkout links whose destination is a parent-workspace hoist — outside
- * the repo entirely — that the resolves-inside-source check cannot see, and
- * fails closed on unreadable trees so a permission-restricted hoist can never
- * keep a contaminated link classified as safe.
+ * Creates a worktree-local resolution boundary for workspace packages.
+ *
+ * `ensureReusableNodeModules` refuses to share the source tree for workspace
+ * repos, but refusal alone does not isolate resolution: launch worktrees are
+ * siblings under the repository's parent, so when that parent (or any other
+ * ancestor) carries its own `node_modules` — the nested-repo-in-parent-workspace
+ * layout — Node/Bun resolution walks up and binds the worktree to the ancestor's
+ * live workspace sources anyway. An empty `node_modules` directory does not stop
+ * that walk-up; only entries in the worktree's own `node_modules` do.
+ *
+ * This links each workspace member declared by the worktree's own root
+ * `package.json` into `worktree/node_modules/<name> -> <worktree member>`,
+ * mirroring what a worktree-local install would create for the workspace
+ * packages themselves: offline, deterministic, and pointing only at the
+ * worktree's own commit. External dependencies are not fabricated — the user's
+ * own `bun install` (or npm/pnpm) in the worktree remains the way to obtain
+ * them, and it is free to replace these links.
  */
-function resolvesToSourceModules(target: string, sourceRoot: string): boolean {
+function ensureWorkspaceSelfLinkBoundary(worktreePath: string): boolean {
+	interface WorkspaceManifest {
+		workspaces?: string[] | { packages?: string[] };
+	}
+	let manifest: WorkspaceManifest;
+	try {
+		manifest = JSON.parse(fs.readFileSync(path.join(worktreePath, "package.json"), "utf8")) as WorkspaceManifest;
+	} catch {
+		return false;
+	}
+	const rawPatterns = Array.isArray(manifest.workspaces) ? manifest.workspaces : manifest.workspaces?.packages;
+	if (!rawPatterns || rawPatterns.length === 0) return false;
+	// Workspace patterns address package directories; append the manifest name so
+	// one glob both finds members and keeps the pattern shape package managers use.
+	const patterns = rawPatterns.map(pattern => path.posix.join(pattern, "package.json"));
+	const members: Array<{ name: string; dir: string }> = [];
+	for (const pattern of patterns) {
+		for (const match of new Bun.Glob(pattern).scanSync({ cwd: worktreePath, dot: false, onlyFiles: true })) {
+			const manifestPath = path.join(worktreePath, match);
+			try {
+				const member = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { name?: string };
+				if (typeof member.name === "string" && member.name.length > 0) {
+					members.push({ name: member.name, dir: path.dirname(manifestPath) });
+				}
+			} catch {
+				// A member manifest that cannot be read is skipped; its link is the
+				// user's install to create.
+			}
+		}
+	}
+	if (members.length === 0) return false;
+	const modules = path.join(worktreePath, "node_modules");
+	fs.mkdirSync(modules, { recursive: true });
+	for (const member of members) {
+		const linkPath = path.join(modules, ...member.name.split("/"));
+		fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+		try {
+			fs.symlinkSync(member.dir, linkPath, "junction");
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code ?? "";
+			if (code !== "EEXIST") throw error;
+		}
+	}
+	return true;
+}
+
+/**
+ * Positive-proof variant of {@link resolvesInside} for the destructive
+ * remediation path: true only when the link's target provably resolves inside
+ * the source checkout. Unprovable resolutions return false so the link is kept.
+ */
+function positivelyResolvesInside(target: string, sourceReal: string): boolean {
+	try {
+		const resolved = fs.realpathSync(target);
+		return (
+			sameFileSystemPath(resolved, sourceReal) ||
+			(caseInsensitiveFs() && resolved.toLowerCase().startsWith(`${sourceReal.toLowerCase()}${path.sep}`)) ||
+			resolved.startsWith(`${sourceReal}${path.sep}`)
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Positively verifies that `target` resolves to the source checkout's own
+ * `node_modules`. Unlike the fail-closed scan helpers, this returns true only on
+ * a proven identity match, because its caller removes the link: an unknown
+ * resolution (EACCES, EPERM, EIO, transient network failure) must never
+ * authorize deleting a possibly user-owned link. Unproven links are left in
+ * place for the user to inspect.
+ */
+function positivelyResolvesToSourceModules(target: string, sourceRoot: string): boolean {
 	let resolvedTarget: string;
 	let resolvedSourceModules: string;
 	try {
 		resolvedTarget = fs.realpathSync(target);
 		resolvedSourceModules = fs.realpathSync(path.join(sourceRoot, "node_modules"));
-	} catch (error) {
-		return !BROKEN_LINK_CODES.has((error as NodeJS.ErrnoException).code ?? "");
+	} catch {
+		return false;
 	}
-	return resolvedTarget === resolvedSourceModules;
+	return sameFileSystemPath(resolvedTarget, resolvedSourceModules);
 }
 
+/**
+ * Case-insensitive path equality on platforms whose filesystems match that way,
+ * so an alias-spelled or differently-cased identity is still recognized as the
+ * same physical path instead of being classified as unrelated.
+ */
+function sameFileSystemPath(a: string, b: string): boolean {
+	if (a === b) return true;
+	return caseInsensitiveFs() && a.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * True on platforms whose filesystems match paths case-insensitively, where the
+ * same physical path can be returned with different casing or alias spelling.
+ */
+function caseInsensitiveFs(): boolean {
+	return process.platform === "win32" || process.platform === "darwin";
+}
 /** `lstat` that returns null instead of throwing for a missing path. */
+
 function tryLstat(target: string): fs.Stats | null {
 	try {
 		return fs.lstatSync(target);

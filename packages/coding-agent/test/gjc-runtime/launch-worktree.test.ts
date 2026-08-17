@@ -491,9 +491,14 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 
 		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
 		const worktreeModules = path.join(launched.cwd, "node_modules");
-		expect(await Bun.file(worktreeModules).exists()).toBe(false);
-		// The worktree must never resolve the origin checkout's live sources.
-		expect(() => fsSync.realpathSync(path.join(launched.cwd, "node_modules"))).toThrow();
+		// No shared symlink: what exists (if anything) is a worktree-local
+		// boundary, never a link to the origin checkout's tree.
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(false);
+		expect(await fs.realpath(worktreeModules)).toBe(worktreeModules);
+		// The worktree-local boundary resolves the worktree's own workspace source.
+		const boundaryLink = path.join(worktreeModules, "@scope", "app");
+		expect((await fs.lstat(boundaryLink)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(boundaryLink)).toBe(path.join(launched.cwd, "packages", "app"));
 		// The origin checkout's install stays untouched.
 		expect((await fs.lstat(path.join(originModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
 	});
@@ -628,36 +633,58 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		await fs.mkdir(scoped, { recursive: true });
 		await fs.symlink(path.join(repo, "packages", "app"), path.join(scoped, "app"));
 
-		// Fault-inject EACCES deterministically: chmod is unreliable under root,
-		// so the regression must not depend on filesystem permission bits.
-		const readdirSpy = spyOn(fsSync, "readdirSync").mockImplementationOnce((dir: fsSync.PathLike) => {
-			expect(String(dir)).toBe(scoped);
-			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
-		});
+		// Fault-inject EACCES deterministically at the scoped directory only.
+		// chmod is unreliable under root, and an untargeted first-call spy would
+		// be consumed by the scan's read of the node_modules root before ever
+		// reaching the traversal directory the fail-closed branch guards.
+		const realReaddir = fsSync.readdirSync.bind(fsSync) as unknown as (...args: unknown[]) => unknown;
+		let reachedScopedDir = false;
+		const readdirSpy = spyOn(fsSync, "readdirSync").mockImplementation(((
+			dir: fsSync.PathLike,
+			options?: fsSync.ObjectEncodingOptions & { withFileTypes?: boolean; recursive?: boolean },
+		) => {
+			if (path.resolve(String(dir)) === scoped) {
+				reachedScopedDir = true;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realReaddir(dir, options);
+		}) as unknown as typeof fsSync.readdirSync);
 		try {
 			const launched = prepareLaunchWorktree(repo, ["--worktree"]);
-			expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
+			expect(reachedScopedDir).toBe(true);
+			const worktreeModules = path.join(launched.cwd, "node_modules");
+			// The scan failed closed: no shared symlink exists.
+			expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(false);
 		} finally {
 			readdirSpy.mockRestore();
 		}
 	});
 
-	it("isolates a stale worktree link when identity resolution fails with EACCES", async () => {
+	it("keeps an unprovable stale link present instead of deleting it (identity EACCES)", async () => {
 		const repo = await createRepo("gjc-launch-worktree-hoist-eacces-");
 		await fs.mkdir(path.join(repo, "node_modules"));
 		const launched = prepareLaunchWorktree(repo, ["--worktree", "hoist-eacces"]);
 		const worktreeModules = path.join(launched.cwd, "node_modules");
 		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
 
-		// The stale-link identity check cannot prove the link is unrelated when
-		// resolution fails; it must fail closed and remove the link.
-		const throwing: typeof fsSync.realpathSync = (() => {
-			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
-		}) as unknown as typeof fsSync.realpathSync;
-		const realpathSpy = spyOn(fsSync, "realpathSync").mockImplementationOnce(throwing);
+		// Target the identity-resolution branch specifically: the outer
+		// sourceRoot realpath must still succeed, and only the worktree link's
+		// resolution fails. Identity is then unprovable — the launcher must not
+		// delete a possibly user-owned link on an unproven identity.
+		const realRealpath = fsSync.realpathSync.bind(fsSync);
+		let reachedLinkResolution = false;
+		const realpathSpy = spyOn(fsSync, "realpathSync").mockImplementation(((pathArg: fsSync.PathLike) => {
+			if (path.resolve(String(pathArg)) === path.resolve(worktreeModules)) {
+				reachedLinkResolution = true;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realRealpath(pathArg);
+		}) as unknown as typeof fsSync.realpathSync);
 		try {
 			const reused = prepareLaunchWorktree(repo, ["--worktree", "hoist-eacces"]);
-			expect(await Bun.file(path.join(reused.cwd, "node_modules")).exists()).toBe(false);
+			expect(reachedLinkResolution).toBe(true);
+			// Unproven identity: the link survives; the launch reports present.
+			expect((await fs.lstat(path.join(reused.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
 		} finally {
 			realpathSpy.mockRestore();
 		}
@@ -667,12 +694,19 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-stale-hoist-"));
 		cleanupPaths.push(parent);
 		const repo = path.join(parent, "repo");
-		await fs.mkdir(repo);
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }),
+		);
+		await Bun.write(
+			path.join(repo, "packages", "app", "package.json"),
+			'{"name":"@scope/app","exports":{".":"./src/index.ts"}}\n',
+		);
 		run("git", ["init"], repo);
 		run("git", ["config", "user.email", "test@example.com"], repo);
 		run("git", ["config", "user.name", "Test User"], repo);
-		await Bun.write(path.join(repo, "README.md"), "hello\n");
-		run("git", ["add", "README.md"], repo);
+		run("git", ["add", "-A"], repo);
 		run("git", ["commit", "-m", "init"], repo);
 		// Parent workspace hoist borrowed by the nested repo.
 		await fs.mkdir(path.join(parent, "node_modules"), { recursive: true });
@@ -680,15 +714,100 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 
 		const launched = prepareLaunchWorktree(repo, ["--worktree", "stale-hoist"]);
 		const worktreeModules = path.join(launched.cwd, "node_modules");
-		expect(await Bun.file(worktreeModules).exists()).toBe(false);
+		// Not a shared symlink; the worktree owns its boundary directory.
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(false);
 		// Simulate the pre-fix contaminated state: the worktree's node_modules is a
 		// symlink to the repo's (hoisted, outside-sourceRoot) node_modules.
+		await fs.rm(worktreeModules, { recursive: true, force: true });
 		await fs.symlink(path.join(repo, "node_modules"), worktreeModules);
 
 		const reused = prepareLaunchWorktree(repo, ["--worktree", "stale-hoist"]);
-		expect(await Bun.file(path.join(reused.cwd, "node_modules")).exists()).toBe(false);
+		expect((await fs.lstat(path.join(reused.cwd, "node_modules"))).isSymbolicLink()).toBe(false);
 		// The parent's own tree survives remediation.
 		expect((await fs.stat(path.join(parent, "node_modules"))).isDirectory()).toBe(true);
+	});
+
+	it("keeps the worktree resolving its own workspace sources beside a parent workspace hoist", async () => {
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-resolve-hoist-"));
+		cleanupPaths.push(parent);
+		// Parent workspace with its own live (divergent) copy of the package.
+		await fs.mkdir(path.join(parent, "packages", "app", "src"), { recursive: true });
+		await Bun.write(
+			path.join(parent, "packages", "app", "package.json"),
+			'{"name":"@scope/app","exports":{".":"./src/index.ts"}}\n',
+		);
+		await Bun.write(
+			path.join(parent, "packages", "app", "src", "index.ts"),
+			'export const marker = "parent-live-source";\n',
+		);
+		await fs.mkdir(path.join(parent, "node_modules", "@scope"), { recursive: true });
+		await fs.symlink(path.join(parent, "packages", "app"), path.join(parent, "node_modules", "@scope", "app"));
+		// Nested repo inside that parent, with its own workspace member.
+		const repo = path.join(parent, "repo");
+		await fs.mkdir(path.join(repo, "packages", "app", "src"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }),
+		);
+		await Bun.write(
+			path.join(repo, "packages", "app", "package.json"),
+			'{"name":"@scope/app","exports":{".":"./src/index.ts"}}\n',
+		);
+		await Bun.write(
+			path.join(repo, "packages", "app", "src", "index.ts"),
+			'export const marker = "worktree-own-source";\n',
+		);
+		run("git", ["init"], repo);
+		run("git", ["config", "user.email", "test@example.com"], repo);
+		run("git", ["config", "user.name", "Test User"], repo);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "init"], repo);
+		// The nested repo borrows the parent's tree — the exact #4620 shape.
+		await fs.symlink(path.join(parent, "node_modules"), path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "resolve-hoist"]);
+		// The worktree is a sibling of repo inside parent, so the parent's
+		// node_modules is an ancestor module root. Module resolution inside the
+		// worktree must still bind to the worktree's own commit, not the parent's
+		// live sources.
+		const probe = Bun.spawnSync(["bun", "-e", 'import { marker } from "@scope/app"; console.log(marker)'], {
+			cwd: launched.cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(probe.stderr.toString()).toBe("");
+		expect(probe.stdout.toString().trim()).toBe("worktree-own-source");
+	});
+
+	it("does not delete an unresolvable user-owned external node_modules link", async () => {
+		const repo = await createRepo("gjc-launch-worktree-unresolvable-link-");
+		const external = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-external-store-"));
+		cleanupPaths.push(external);
+		await fs.mkdir(path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "unresolvable-link"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.symlink(path.join(external, "store"), worktreeModules, "dir");
+
+		// Identity resolution fails only for permission reasons: the link target is
+		// a user-owned external store, not the source checkout. The launch must
+		// keep the link (classify present) instead of deleting user data.
+		const denied: typeof fsSync.realpathSync = (() => {
+			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+		}) as unknown as typeof fsSync.realpathSync;
+		const realpathSpy = spyOn(fsSync, "realpathSync");
+		realpathSpy.mockImplementationOnce(((pathArg: fsSync.PathLike) => {
+			if (String(pathArg) === worktreeModules) return denied(pathArg);
+			return fsSync.realpathSync(pathArg);
+		}) as unknown as typeof fsSync.realpathSync);
+		try {
+			const reused = prepareLaunchWorktree(repo, ["--worktree", "unresolvable-link"]);
+			expect((await fs.lstat(path.join(reused.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
+			expect(await fs.readlink(path.join(reused.cwd, "node_modules"))).toBe(path.join(external, "store"));
+		} finally {
+			realpathSpy.mockRestore();
+		}
 	});
 });
 
