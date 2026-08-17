@@ -596,10 +596,13 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		await fs.rm(worktreeModules);
 		await fs.symlink(path.join(launched.cwd, "does-not-exist"), worktreeModules, "dir");
 
-		// A dangling link occupies the name without existing; the launch must not
-		// crash trying to create a symlink over it (EEXIST) and must not follow it.
+		// A proven-dangling link is removed: the launch must neither crash with
+		// EEXIST nor continue through a boundary that resolves nothing. For this
+		// non-workspace repo no boundary directory is created, so nothing may
+		// remain at the path at all.
 		const reused = prepareLaunchWorktree(repo, ["--worktree", "dangling-modules"]);
-		expect((await fs.lstat(path.join(reused.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
+		const replaced = path.join(reused.cwd, "node_modules");
+		expect(await Bun.file(replaced).exists()).toBe(false);
 	});
 
 	it("never shares an origin node_modules symlinked outside the repo (parent workspace hoist)", async () => {
@@ -660,7 +663,7 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		}
 	});
 
-	it("keeps an unprovable stale link present instead of deleting it (identity EACCES)", async () => {
+	it("refuses the launch for a stale link whose identity cannot be proven (EACCES)", async () => {
 		const repo = await createRepo("gjc-launch-worktree-hoist-eacces-");
 		await fs.mkdir(path.join(repo, "node_modules"));
 		const launched = prepareLaunchWorktree(repo, ["--worktree", "hoist-eacces"]);
@@ -669,8 +672,8 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 
 		// Target the identity-resolution branch specifically: the outer
 		// sourceRoot realpath must still succeed, and only the worktree link's
-		// resolution fails. Identity is then unprovable — the launcher must not
-		// delete a possibly user-owned link on an unproven identity.
+		// resolution fails. Identity is then unprovable — the launcher must
+		// refuse the launch rather than delete the link or continue through it.
 		const realRealpath = fsSync.realpathSync.bind(fsSync);
 		let reachedLinkResolution = false;
 		const realpathSpy = spyOn(fsSync, "realpathSync").mockImplementation(((pathArg: fsSync.PathLike) => {
@@ -681,10 +684,12 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 			return realRealpath(pathArg);
 		}) as unknown as typeof fsSync.realpathSync);
 		try {
-			const reused = prepareLaunchWorktree(repo, ["--worktree", "hoist-eacces"]);
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "hoist-eacces"])).toThrow(
+				/worktree_node_modules_unverified/,
+			);
 			expect(reachedLinkResolution).toBe(true);
-			// Unproven identity: the link survives; the launch reports present.
-			expect((await fs.lstat(path.join(reused.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
+			// The unproven link is preserved for the user to inspect.
+			expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
 		} finally {
 			realpathSpy.mockRestore();
 		}
@@ -779,7 +784,7 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		expect(probe.stdout.toString().trim()).toBe("worktree-own-source");
 	});
 
-	it("does not delete an unresolvable user-owned external node_modules link", async () => {
+	it("refuses the launch for a user-owned external node_modules link that cannot be resolved", async () => {
 		const repo = await createRepo("gjc-launch-worktree-unresolvable-link-");
 		const external = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-external-store-"));
 		cleanupPaths.push(external);
@@ -791,23 +796,109 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		await fs.symlink(path.join(external, "store"), worktreeModules, "dir");
 
 		// Identity resolution fails only for permission reasons: the link target is
-		// a user-owned external store, not the source checkout. The launch must
-		// keep the link (classify present) instead of deleting user data.
-		const denied: typeof fsSync.realpathSync = (() => {
-			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
-		}) as unknown as typeof fsSync.realpathSync;
-		const realpathSpy = spyOn(fsSync, "realpathSync");
-		realpathSpy.mockImplementationOnce(((pathArg: fsSync.PathLike) => {
-			if (String(pathArg) === worktreeModules) return denied(pathArg);
-			return fsSync.realpathSync(pathArg);
+		// a user-owned external store, not the source checkout. The launcher must
+		// refuse the launch rather than delete user data or continue through the
+		// unproven boundary. A persistent target-aware spy delegates to the real
+		// implementation for unrelated paths (the first reuse call resolves
+		// sourceRoot) and asserts the target path was reached.
+		const realRealpath = fsSync.realpathSync.bind(fsSync);
+		let reachedTarget = false;
+		const realpathSpy = spyOn(fsSync, "realpathSync").mockImplementation(((pathArg: fsSync.PathLike) => {
+			if (path.resolve(String(pathArg)) === path.resolve(worktreeModules)) {
+				reachedTarget = true;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realRealpath(pathArg);
 		}) as unknown as typeof fsSync.realpathSync);
 		try {
-			const reused = prepareLaunchWorktree(repo, ["--worktree", "unresolvable-link"]);
-			expect((await fs.lstat(path.join(reused.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
-			expect(await fs.readlink(path.join(reused.cwd, "node_modules"))).toBe(path.join(external, "store"));
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "unresolvable-link"])).toThrow(
+				/worktree_node_modules_unverified/,
+			);
+			expect(reachedTarget).toBe(true);
+			// The user-owned external link is preserved untouched.
+			expect(await fs.readlink(worktreeModules)).toBe(path.join(external, "store"));
 		} finally {
 			realpathSpy.mockRestore();
 		}
+	});
+
+	it("reconciles the boundary when workspace members change across worktree reuse", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-reconcile-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "reconcile"]);
+		const modules = path.join(first.cwd, "node_modules");
+		expect((await fs.lstat(path.join(modules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+
+		// Remove the member from the worktree tree (as a new commit would).
+		await fs.rm(path.join(first.cwd, "packages", "app"), { recursive: true, force: true });
+		// Add a different member.
+		await fs.mkdir(path.join(first.cwd, "packages", "newapp"), { recursive: true });
+		await Bun.write(path.join(first.cwd, "packages", "newapp", "package.json"), '{"name":"@scope/newapp"}\n');
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "reconcile"]);
+		const reconciled = path.join(reused.cwd, "node_modules");
+		// The stale member link is gone; it cannot resolve through an ancestor.
+		expect(await Bun.file(path.join(reconciled, "@scope", "app")).exists()).toBe(false);
+		// The new member is linked.
+		expect((await fs.lstat(path.join(reconciled, "@scope", "newapp"))).isSymbolicLink()).toBe(true);
+	});
+
+	it("builds the boundary from pnpm-workspace.yaml when package.json declares none", async () => {
+		const repo = await createRepo("gjc-launch-worktree-pnpm-decl-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(path.join(repo, "package.json"), JSON.stringify({ name: "root", private: true }));
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		await Bun.write(path.join(repo, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "pnpm workspace"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "pnpm-decl"]);
+		const link = path.join(launched.cwd, "node_modules", "@scope", "app");
+		expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(link)).toBe(path.join(launched.cwd, "packages", "app"));
+	});
+
+	it("refuses traversal workspace patterns instead of writing outside the worktree", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-traversal-");
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["../escape/*"] }),
+		);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "traversal pattern"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_pattern_unsafe/);
+	});
+
+	it("refuses member package names outside the npm grammar", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-bad-name-");
+		await fs.mkdir(path.join(repo, "packages", "evil"), { recursive: true });
+		await Bun.write(path.join(repo, "packages", "evil", "package.json"), '{"name":"../escape"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "bad name"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_member_name_invalid/);
+	});
+
+	it("refuses malformed member manifests instead of skipping them", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-bad-member-");
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), "{ not json");
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "bad member"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_member_invalid/);
+	});
+
+	it("leaves a user-owned node_modules directory without the marker untouched", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-user-dir-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "user-dir"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// Replace the launcher boundary with a user-owned install-like directory.
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.mkdir(path.join(worktreeModules, "ms"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "ms", "marker.txt"), "user-owned\n");
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "user-dir"]);
+		expect(await Bun.file(path.join(reused.cwd, "node_modules", "ms", "marker.txt")).text()).toBe("user-owned\n");
 	});
 });
 

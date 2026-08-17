@@ -538,6 +538,17 @@ function resolvesInside(entry: fs.Stats | fs.Dirent, entryPath: string, sourceRe
 }
 
 /**
+ * Marker file inside a launcher-owned worktree `node_modules` boundary recording
+ * that this launcher created the directory (#4620). Only directories carrying
+ * this marker are reconciled or removed by remediation; everything else is
+ * user-owned and never touched.
+ */
+const NODE_MODULES_OWNERSHIP_MARKER = ".gjc-node-modules-boundary";
+
+/** Package-name grammar accepted for boundary links (npm scope rules). */
+const PACKAGE_NAME_PATTERN = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i;
+
+/**
  * Isolates launch-worktree dependency resolution (#4620).
  *
  * Reusing the origin checkout's `node_modules` is only safe when the tree links
@@ -545,18 +556,22 @@ function resolvesInside(entry: fs.Stats | fs.Dirent, entryPath: string, sourceRe
  * that: their `@scope/pkg -> packages/pkg` links make worktree imports resolve
  * the origin checkout's live sources and let worktree-side installs rewrite the
  * origin's links. When self-links are detected the worktree is left without a
- * `node_modules` — never a cross-checkout symlink — so the worktree either gets
- * its own install or runs without one, always against its own commit.
+ * shared symlink — never a cross-checkout link — and instead carries a
+ * launcher-owned boundary that links the worktree's own workspace members.
  *
- * Already-contaminated worktrees have the stale `node_modules` symlink removed
- * on reuse. Remediation recognizes the link by identity — a worktree link that
- * resolves to the source checkout's `node_modules` itself is one this launcher
- * (or its predecessors) created, whether that tree sits inside the repo or
- * behind a parent-workspace hoist — plus any other link resolving inside the
- * source checkout. A real `node_modules` directory is always user-owned and
- * left untouched. An origin `node_modules` that is itself a symlink (vendored
- * inside the repo, or a nested-repo parent-workspace hoist) is never shared
- * either: its entries belong to another checkout's install graph.
+ * The boundary is reconciled on every launch so a reused worktree checked out
+ * at a different commit never resolves stale or missing members through an
+ * ancestor `node_modules`. An origin `node_modules` that is itself a symlink
+ * (vendored inside the repo, or a nested-repo parent-workspace hoist) is never
+ * shared either: its entries belong to another checkout's install graph.
+ *
+ * Ownership rules: a `node_modules` directory is launcher-owned only when it
+ * carries {@link NODE_MODULES_OWNERSHIP_MARKER}. Remediation removes only
+ * launcher-owned directories and positively-identified launcher-created
+ * symlinks (target equal to the source checkout's own `node_modules`). Any
+ * other link — including one whose target cannot be resolved — is user-owned:
+ * the launch fails closed with an actionable error rather than deleting it or
+ * continuing through an unproven dependency boundary.
  */
 export function ensureReusableNodeModules(sourceRoot: string, worktreePath: string): NodeModulesReuse {
 	const target = path.join(worktreePath, "node_modules");
@@ -564,32 +579,57 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 	if (targetStat) {
 		if (targetStat.isSymbolicLink()) {
 			// existsSync follows the link; a dangling link reports false but still
-			// occupies the name, so it must be handled here rather than below.
-			//
-			// Removal requires positive proof of contamination: an unresolvable
-			// link (EACCES/EPERM/EIO, transient network failure) is left in place
-			// for the user to inspect rather than deleted on suspicion, because
-			// its target could be a user-owned external store.
-			let sourceReal: string | null;
-			try {
-				sourceReal = fs.realpathSync(sourceRoot);
-			} catch {
-				sourceReal = null;
-			}
-			if (
-				(sourceReal !== null && positivelyResolvesInside(target, sourceReal)) ||
-				positivelyResolvesToSourceModules(target, sourceRoot)
-			) {
+			// occupies the name, so it is handled here rather than below.
+			const provenDangling = isProvenDangling(target);
+			if (!provenDangling && positivelyResolvesToSourceModules(target, sourceRoot)) {
 				fs.rmSync(target, { force: true });
-				ensureWorkspaceSelfLinkBoundary(worktreePath);
+				createWorkspaceSelfLinkBoundary(worktreePath);
 				return "isolated";
 			}
+			if (provenDangling) {
+				// A dangling link resolves nowhere: it can no longer pull origin
+				// sources, but it also provides no boundary. Replace it with the
+				// launcher-owned boundary so ancestor walk-up stays sealed.
+				fs.rmSync(target, { force: true });
+				createWorkspaceSelfLinkBoundary(worktreePath);
+				return "isolated";
+			}
+			// A link whose resolution provably lands outside both the source
+			// checkout's node_modules and every broken-link outcome is a
+			// user-owned external store: provably not source-coupled, so it is
+			// kept and reported present.
+			const resolved = tryRealpath(target);
+			if (resolved !== null) {
+				const sourceModules = tryRealpath(path.join(sourceRoot, "node_modules"));
+				if (sourceModules !== null && !sameFileSystemPath(resolved, sourceModules)) {
+					return "present";
+				}
+			}
+			// Unresolvable (EACCES/EPERM/EIO/...) or otherwise unproven: refuse
+			// to launch through an unverified dependency boundary.
+			throw new Error(
+				`worktree_node_modules_unverified:${JSON.stringify(shortenPath(target))} — GJC cannot prove this ` +
+					"node_modules link is safe to reuse or remove. Remove it manually or point it at the source " +
+					"checkout's own node_modules, then relaunch.",
+			);
 		}
+		if (targetStat.isDirectory()) {
+			const marker = path.join(target, NODE_MODULES_OWNERSHIP_MARKER);
+			if (fs.existsSync(marker)) {
+				// Launcher-owned: reconcile against the current commit's members.
+				createWorkspaceSelfLinkBoundary(worktreePath);
+				return "isolated";
+			}
+			// A real directory without the marker is user-owned (a real install,
+			// a store, or anything else): leave it completely untouched.
+			return "present";
+		}
+		// Neither directory nor symlink (file, socket, ...): user-owned.
 		return "present";
 	}
 	const source = path.join(sourceRoot, "node_modules");
 	if (!fs.existsSync(source) || nodeModulesLinksInto(source, sourceRoot)) {
-		ensureWorkspaceSelfLinkBoundary(worktreePath);
+		createWorkspaceSelfLinkBoundary(worktreePath);
 		return "missing";
 	}
 	// A node_modules root symlinked outside the repo belongs to another
@@ -597,15 +637,26 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 	// resolve that parent's live sources, so it is never shared either.
 	const sourceStat = fs.lstatSync(source);
 	if (sourceStat.isSymbolicLink()) {
-		ensureWorkspaceSelfLinkBoundary(worktreePath);
+		createWorkspaceSelfLinkBoundary(worktreePath);
 		return "missing";
 	}
 	fs.symlinkSync(source, target, "junction");
 	return "symlink";
 }
 
+/** True when `target` is a symlink whose resolution provably fails because it is broken. */
+function isProvenDangling(target: string): boolean {
+	try {
+		fs.realpathSync(target);
+		return false;
+	} catch (error) {
+		return BROKEN_LINK_CODES.has((error as NodeJS.ErrnoException).code ?? "");
+	}
+}
+
 /**
- * Creates a worktree-local resolution boundary for workspace packages.
+ * Creates or reconciles the worktree-local resolution boundary for workspace
+ * packages (#4620).
  *
  * `ensureReusableNodeModules` refuses to share the source tree for workspace
  * repos, but refusal alone does not isolate resolution: launch worktrees are
@@ -615,85 +666,184 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
  * live workspace sources anyway. An empty `node_modules` directory does not stop
  * that walk-up; only entries in the worktree's own `node_modules` do.
  *
- * This links each workspace member declared by the worktree's own root
- * `package.json` into `worktree/node_modules/<name> -> <worktree member>`,
- * mirroring what a worktree-local install would create for the workspace
- * packages themselves: offline, deterministic, and pointing only at the
- * worktree's own commit. External dependencies are not fabricated — the user's
- * own `bun install` (or npm/pnpm) in the worktree remains the way to obtain
- * them, and it is free to replace these links.
+ * Every workspace member declared by the worktree's own root manifest —
+ * `package.json` `workspaces` (array or `{packages}` object) or
+ * `pnpm-workspace.yaml` — is linked into `worktree/node_modules/<name> ->
+ * <worktree member>`, mirroring what a worktree-local install creates for the
+ * workspace packages themselves: offline, deterministic, own-commit only.
+ * Stale member links from a previous commit are pruned so reuse cannot resolve
+ * deleted members through an ancestor tree. External dependencies are not
+ * fabricated — the user's own install in the worktree is free to replace these
+ * links and, once run, owns the directory (the marker file coexists harmlessly;
+ * package managers ignore unknown dot-files).
+ *
+ * Fails closed: unreadable or malformed root/member manifests, workspace
+ * patterns that traverse outside the worktree, member names outside the npm
+ * grammar, and member or link paths escaping the worktree are isolation
+ * failures, not silent skips.
  */
-function ensureWorkspaceSelfLinkBoundary(worktreePath: string): boolean {
+function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
+	const declaration = readWorkspaceDeclaration(worktreePath);
+	// A repo with no workspace declaration has no members to link and no
+	// boundary to build; isolation from the source tree is already complete.
+	if (!declaration) return;
+	const { patterns, manifestFile } = declaration;
+
+	const members: Array<{ name: string; dir: string }> = [];
+	for (const pattern of patterns) {
+		if (!isConfinedWorkspacePattern(pattern)) {
+			throw new Error(
+				`worktree_workspace_pattern_unsafe:${JSON.stringify(pattern)} in ${JSON.stringify(manifestFile)} — ` +
+					"absolute paths and traversal segments cannot be used for the isolation boundary.",
+			);
+		}
+		for (const match of new Bun.Glob(path.posix.join(pattern, "package.json")).scanSync({
+			cwd: worktreePath,
+			dot: false,
+			onlyFiles: true,
+		})) {
+			const manifestPath = path.join(worktreePath, match);
+			if (!isInsideDirectory(worktreePath, manifestPath)) {
+				throw new Error(
+					`worktree_workspace_member_outside:${JSON.stringify(shortenPath(manifestPath))} — the isolation ` +
+						"boundary can only link members inside the worktree.",
+				);
+			}
+			const member = readMemberManifest(manifestPath, manifestFile);
+			if (!member.name) continue;
+			if (!PACKAGE_NAME_PATTERN.test(member.name) || member.name.includes("\\")) {
+				throw new Error(
+					`worktree_workspace_member_name_invalid:${JSON.stringify(member.name)} in ${JSON.stringify(
+						manifestFile,
+					)} — package names must be scoped npm names without separators or traversal.`,
+				);
+			}
+			members.push({ name: member.name, dir: path.dirname(manifestPath) });
+		}
+	}
+
+	const modules = path.join(worktreePath, "node_modules");
+	fs.mkdirSync(modules, { recursive: true });
+	const markerPath = path.join(modules, NODE_MODULES_OWNERSHIP_MARKER);
+	const expectedLinks = new Set(members.map(member => member.name));
+	for (const member of members) {
+		const linkPath = path.join(modules, ...member.name.split("/"));
+		if (!isInsideDirectory(modules, linkPath)) {
+			throw new Error(
+				`worktree_workspace_link_outside:${JSON.stringify(shortenPath(linkPath))} — boundary links must stay ` +
+					"inside the worktree node_modules.",
+			);
+		}
+		fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+		const existing = tryLstat(linkPath);
+		if (existing?.isSymbolicLink()) {
+			// Replace stale links (previous commit's members) with current ones.
+			fs.rmSync(linkPath, { force: true });
+		}
+		if (!tryLstat(linkPath)) fs.symlinkSync(member.dir, linkPath, "junction");
+	}
+	pruneStaleBoundaryLinks(modules, expectedLinks);
+	if (!fs.existsSync(markerPath)) fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
+}
+
+/**
+ * Removes launcher-created member links that are no longer declared at this
+ * commit, so a reused worktree cannot resolve deleted members through an
+ * ancestor `node_modules`. Only symlinks (this launcher never creates real
+ * entries) are considered; real files/directories are user-owned and kept.
+ */
+function pruneStaleBoundaryLinks(modules: string, expectedLinks: Set<string>): void {
+	for (const scope of fs.readdirSync(modules, { withFileTypes: true })) {
+		if (!scope.isDirectory() || scope.name === ".bin" || scope.name.startsWith(".")) continue;
+		const scopePath = path.join(modules, scope.name);
+		if (scope.name.startsWith("@")) {
+			for (const entry of fs.readdirSync(scopePath, { withFileTypes: true })) {
+				const fullName = `${scope.name}/${entry.name}`;
+				if (entry.isSymbolicLink() && !expectedLinks.has(fullName)) {
+					fs.rmSync(path.join(scopePath, entry.name), { force: true });
+				}
+			}
+		} else if (tryLstat(scopePath)?.isSymbolicLink() && !expectedLinks.has(scope.name)) {
+			fs.rmSync(scopePath, { force: true });
+		}
+	}
+}
+
+/** Reads the authoritative workspace declaration for the worktree root. */
+function readWorkspaceDeclaration(worktreePath: string): { patterns: string[]; manifestFile: string } | null {
+	const packageJsonPath = path.join(worktreePath, "package.json");
 	interface WorkspaceManifest {
 		workspaces?: string[] | { packages?: string[] };
 	}
-	let manifest: WorkspaceManifest;
 	try {
-		manifest = JSON.parse(fs.readFileSync(path.join(worktreePath, "package.json"), "utf8")) as WorkspaceManifest;
-	} catch {
-		return false;
-	}
-	const rawPatterns = Array.isArray(manifest.workspaces) ? manifest.workspaces : manifest.workspaces?.packages;
-	if (!rawPatterns || rawPatterns.length === 0) return false;
-	// Workspace patterns address package directories; append the manifest name so
-	// one glob both finds members and keeps the pattern shape package managers use.
-	const patterns = rawPatterns.map(pattern => path.posix.join(pattern, "package.json"));
-	const members: Array<{ name: string; dir: string }> = [];
-	for (const pattern of patterns) {
-		for (const match of new Bun.Glob(pattern).scanSync({ cwd: worktreePath, dot: false, onlyFiles: true })) {
-			const manifestPath = path.join(worktreePath, match);
-			try {
-				const member = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { name?: string };
-				if (typeof member.name === "string" && member.name.length > 0) {
-					members.push({ name: member.name, dir: path.dirname(manifestPath) });
-				}
-			} catch {
-				// A member manifest that cannot be read is skipped; its link is the
-				// user's install to create.
-			}
+		const manifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as WorkspaceManifest;
+		const rawPatterns = Array.isArray(manifest.workspaces) ? manifest.workspaces : manifest.workspaces?.packages;
+		if (Array.isArray(rawPatterns) && rawPatterns.length > 0) {
+			return { patterns: rawPatterns.map(String), manifestFile: "package.json" };
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			throw new Error(
+				`worktree_workspace_manifest_unreadable:${JSON.stringify(shortenPath(packageJsonPath))} — the ` +
+					"isolation boundary cannot be built from an unreadable manifest.",
+			);
 		}
 	}
-	if (members.length === 0) return false;
-	const modules = path.join(worktreePath, "node_modules");
-	fs.mkdirSync(modules, { recursive: true });
-	for (const member of members) {
-		const linkPath = path.join(modules, ...member.name.split("/"));
-		fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+	const pnpmPath = path.join(worktreePath, "pnpm-workspace.yaml");
+	if (fs.existsSync(pnpmPath)) {
 		try {
-			fs.symlinkSync(member.dir, linkPath, "junction");
-		} catch (error) {
-			const code = (error as NodeJS.ErrnoException).code ?? "";
-			if (code !== "EEXIST") throw error;
+			const parsed = Bun.YAML.parse(fs.readFileSync(pnpmPath, "utf8")) as { packages?: unknown } | null;
+			const rawPatterns = parsed?.packages;
+			if (Array.isArray(rawPatterns) && rawPatterns.length > 0) {
+				return { patterns: rawPatterns.map(String), manifestFile: "pnpm-workspace.yaml" };
+			}
+		} catch {
+			throw new Error(
+				`worktree_workspace_manifest_unreadable:${JSON.stringify(shortenPath(pnpmPath))} — the isolation ` +
+					"boundary cannot be built from a malformed manifest.",
+			);
 		}
 	}
-	return true;
+	return null;
 }
 
-/**
- * Positive-proof variant of {@link resolvesInside} for the destructive
- * remediation path: true only when the link's target provably resolves inside
- * the source checkout. Unprovable resolutions return false so the link is kept.
- */
-function positivelyResolvesInside(target: string, sourceReal: string): boolean {
+/** Reads a member manifest, failing closed when it exists but cannot be parsed. */
+function readMemberManifest(manifestPath: string, declaringFile: string): { name?: string } {
+	let raw: string;
 	try {
-		const resolved = fs.realpathSync(target);
-		return (
-			sameFileSystemPath(resolved, sourceReal) ||
-			(caseInsensitiveFs() && resolved.toLowerCase().startsWith(`${sourceReal.toLowerCase()}${path.sep}`)) ||
-			resolved.startsWith(`${sourceReal}${path.sep}`)
+		raw = fs.readFileSync(manifestPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+		throw new Error(
+			`worktree_workspace_member_unreadable:${JSON.stringify(shortenPath(manifestPath))} declared by ` +
+				`${JSON.stringify(declaringFile)} — the isolation boundary cannot skip an unreadable member.`,
 		);
+	}
+	try {
+		return JSON.parse(raw) as { name?: string };
 	} catch {
-		return false;
+		throw new Error(
+			`worktree_workspace_member_invalid:${JSON.stringify(shortenPath(manifestPath))} declared by ` +
+				`${JSON.stringify(declaringFile)} — the isolation boundary cannot skip a malformed member manifest.`,
+		);
 	}
 }
 
+/** True when a workspace glob pattern stays inside the worktree (no absolute or traversal segments). */
+function isConfinedWorkspacePattern(pattern: string): boolean {
+	if (pattern === "" || path.isAbsolute(pattern)) return false;
+	return !pattern.split(/[/\\]+/).includes("..");
+}
+
+/** True when `candidate` resolves strictly inside `dir`. */
+function isInsideDirectory(dir: string, candidate: string): boolean {
+	const relative = path.relative(path.resolve(dir), path.resolve(candidate));
+	return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
 /**
- * Positively verifies that `target` resolves to the source checkout's own
- * `node_modules`. Unlike the fail-closed scan helpers, this returns true only on
- * a proven identity match, because its caller removes the link: an unknown
- * resolution (EACCES, EPERM, EIO, transient network failure) must never
- * authorize deleting a possibly user-owned link. Unproven links are left in
- * place for the user to inspect.
+ * Positive-proof check for launcher-created links: true only when the link's
+ * target is the source checkout's own `node_modules`.
  */
 function positivelyResolvesToSourceModules(target: string, sourceRoot: string): boolean {
 	let resolvedTarget: string;
@@ -725,10 +875,18 @@ function caseInsensitiveFs(): boolean {
 	return process.platform === "win32" || process.platform === "darwin";
 }
 /** `lstat` that returns null instead of throwing for a missing path. */
-
 function tryLstat(target: string): fs.Stats | null {
 	try {
 		return fs.lstatSync(target);
+	} catch {
+		return null;
+	}
+}
+
+/** `realpath` that returns null instead of throwing when resolution fails. */
+function tryRealpath(target: string): string | null {
+	try {
+		return fs.realpathSync(target);
 	} catch {
 		return null;
 	}
