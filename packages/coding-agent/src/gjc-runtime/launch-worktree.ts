@@ -901,23 +901,28 @@ function readWorkspaceDeclaration(worktreePath: string): { patterns: string[]; m
 /** Strictly extracts a string list of workspace patterns; anything else is an isolation failure. */
 function extractPatternList(value: unknown): string[] | null {
 	if (value === undefined || value === null) return null;
-	if (!Array.isArray(value)) {
+	const patterns = Array.isArray(value)
+		? value
+		: typeof value === "object" && value !== null
+			? (value as { packages?: unknown }).packages
+			: null;
+	if (!Array.isArray(patterns)) {
 		throw new Error(
 			`worktree_workspace_manifest_invalid:${JSON.stringify(value)} — workspace declarations must be an ` +
 				"array of patterns or a { packages: [...] } object.",
 		);
 	}
-	const patterns: string[] = [];
-	for (const entry of value) {
+	const parsed: string[] = [];
+	for (const entry of patterns) {
 		if (typeof entry !== "string" || entry.length === 0) {
 			throw new Error(
 				`worktree_workspace_pattern_invalid:${JSON.stringify(entry)} — workspace patterns must be ` +
 					"non-empty strings.",
 			);
 		}
-		patterns.push(entry);
+		parsed.push(entry);
 	}
-	return patterns;
+	return parsed;
 }
 
 /** Reads a member manifest, failing closed when it exists but cannot be parsed. */

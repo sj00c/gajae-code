@@ -870,6 +870,23 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		expect(await fs.realpath(link)).toBe(path.join(launched.cwd, "packages", "app"));
 	});
 
+	it("builds the boundary from package.json workspace packages declarations", async () => {
+		const repo = await createRepo("gjc-launch-worktree-package-decl-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: { packages: ["packages/*"] } }),
+		);
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "package workspace"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "package-decl"]);
+		const link = path.join(launched.cwd, "node_modules", "@scope", "app");
+		expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(link)).toBe(path.join(launched.cwd, "packages", "app"));
+	});
+
 	it("refuses traversal workspace patterns instead of writing outside the worktree", async () => {
 		const repo = await createWorkspaceRepo("gjc-launch-worktree-traversal-");
 		await Bun.write(
