@@ -498,7 +498,11 @@ export function nodeModulesLinksInto(nodeModulesPath: string, sourceRoot: string
 		let entries: fs.Dirent[];
 		try {
 			entries = fs.readdirSync(dir, { withFileTypes: true });
-		} catch {
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code ?? "";
+			// A directory that vanished mid-scan holds nothing; one that cannot be
+			// read might hold the workspace self-link this scan exists to find.
+			if (code !== "ENOENT") return true;
 			continue;
 		}
 		for (const entry of entries) {
@@ -540,12 +544,15 @@ function resolvesInside(entry: fs.Stats | fs.Dirent, entryPath: string, sourceRe
  * `node_modules` — never a cross-checkout symlink — so the worktree either gets
  * its own install or runs without one, always against its own commit.
  *
- * Already-contaminated worktrees (a `node_modules` symlink pointing into the
- * source checkout) are remediated on reuse: the link is removed so the worktree
- * stops resolving origin sources. A real `node_modules` directory is always
- * user-owned and left untouched. An origin `node_modules` that is itself a
- * symlink resolving outside the repo (nested-repo-in-parent-workspace layouts)
- * is never shared either: its entries belong to another checkout's install.
+ * Already-contaminated worktrees have the stale `node_modules` symlink removed
+ * on reuse. Remediation recognizes the link by identity — a worktree link that
+ * resolves to the source checkout's `node_modules` itself is one this launcher
+ * (or its predecessors) created, whether that tree sits inside the repo or
+ * behind a parent-workspace hoist — plus any other link resolving inside the
+ * source checkout. A real `node_modules` directory is always user-owned and
+ * left untouched. An origin `node_modules` that is itself a symlink (vendored
+ * inside the repo, or a nested-repo parent-workspace hoist) is never shared
+ * either: its entries belong to another checkout's install graph.
  */
 export function ensureReusableNodeModules(sourceRoot: string, worktreePath: string): NodeModulesReuse {
 	const target = path.join(worktreePath, "node_modules");
@@ -554,7 +561,8 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 		if (targetStat.isSymbolicLink()) {
 			// existsSync follows the link; a dangling link reports false but still
 			// occupies the name, so it must be handled here rather than below.
-			if (resolvesInside(targetStat, target, fs.realpathSync(sourceRoot))) {
+			const sourceReal = fs.realpathSync(sourceRoot);
+			if (resolvesInside(targetStat, target, sourceReal) || resolvesToSourceModules(target, sourceRoot)) {
 				fs.rmSync(target, { force: true });
 				return "isolated";
 			}
@@ -570,6 +578,24 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 	if (sourceStat.isSymbolicLink()) return "missing";
 	fs.symlinkSync(source, target, "junction");
 	return "symlink";
+}
+
+/**
+ * Returns true when `target` resolves to the source checkout's own
+ * `node_modules`. This catches stale cross-checkout links whose destination is
+ * a parent-workspace hoist — outside the repo entirely — that the
+ * resolves-inside-source check cannot see.
+ */
+function resolvesToSourceModules(target: string, sourceRoot: string): boolean {
+	let resolvedTarget: string;
+	let resolvedSourceModules: string;
+	try {
+		resolvedTarget = fs.realpathSync(target);
+		resolvedSourceModules = fs.realpathSync(path.join(sourceRoot, "node_modules"));
+	} catch {
+		return false;
+	}
+	return resolvedTarget === resolvedSourceModules;
 }
 
 /** `lstat` that returns null instead of throwing for a missing path. */

@@ -619,6 +619,50 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		const worktreeModules = path.join(launched.cwd, "node_modules");
 		expect(await Bun.file(worktreeModules).exists()).toBe(false);
 	});
+
+	it("fails closed when a scan directory is unreadable", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-unreadable-scan-");
+		const originModules = path.join(repo, "node_modules");
+		// A self-link hidden behind a directory the scanner cannot read.
+		const hidden = path.join(originModules, "@scope");
+		await fs.mkdir(hidden, { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(hidden, "app"));
+		await fs.chmod(hidden, 0o000);
+		try {
+			const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+			expect(await Bun.file(path.join(launched.cwd, "node_modules")).exists()).toBe(false);
+		} finally {
+			await fs.chmod(hidden, 0o755);
+		}
+	});
+
+	it("remediates a stale worktree link to a parent-workspace hoist (identity match)", async () => {
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-stale-hoist-"));
+		cleanupPaths.push(parent);
+		const repo = path.join(parent, "repo");
+		await fs.mkdir(repo);
+		run("git", ["init"], repo);
+		run("git", ["config", "user.email", "test@example.com"], repo);
+		run("git", ["config", "user.name", "Test User"], repo);
+		await Bun.write(path.join(repo, "README.md"), "hello\n");
+		run("git", ["add", "README.md"], repo);
+		run("git", ["commit", "-m", "init"], repo);
+		// Parent workspace hoist borrowed by the nested repo.
+		await fs.mkdir(path.join(parent, "node_modules"), { recursive: true });
+		await fs.symlink(path.join(parent, "node_modules"), path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "stale-hoist"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect(await Bun.file(worktreeModules).exists()).toBe(false);
+		// Simulate the pre-fix contaminated state: the worktree's node_modules is a
+		// symlink to the repo's (hoisted, outside-sourceRoot) node_modules.
+		await fs.symlink(path.join(repo, "node_modules"), worktreeModules);
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "stale-hoist"]);
+		expect(await Bun.file(path.join(reused.cwd, "node_modules")).exists()).toBe(false);
+		// The parent's own tree survives remediation.
+		expect((await fs.stat(path.join(parent, "node_modules"))).isDirectory()).toBe(true);
+	});
 });
 
 describe("GJC_WORKTREE_DIR path red-team", () => {
