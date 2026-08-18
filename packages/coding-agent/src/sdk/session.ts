@@ -2000,17 +2000,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			taskDepth: options.taskDepth ?? 0,
 			currentAgentType: options.currentAgentType,
 			// Agent-invokable session rescope (#4629). Provided only where
-			// relocation is safe: top-level sessions (taskDepth 0) without a
-			// restricted bash surface. Runs the same sequence as the text/ACP
-			// `/move` handler so tool path resolution, bash default cwd, plugin
-			// caches, and the workspace tree all follow the move. Unlike the
-			// user-driven `/move`, the model-invoked accessor is bound to at
-			// most one successful move per session, rejects re-entrant calls,
-			// and only narrows: the canonical target must be a strict
-			// descendant of the canonical current cwd, so an injected or
-			// speculative call cannot widen the session's tool/write scope to a
-			// parent, a sibling project, or an arbitrary absolute path.
-			...(taskDepth === 0 && !options.bashRestrictionProfile && (options.bashAllowedPrefixes ?? []).length === 0
+			// relocation is safe: canonical top-level sessions (the same
+			// isCanonicalSubSession predicate that gates SDK hosting — taskDepth 0,
+			// no parentTaskPrefix, no currentAgentType) without a restricted bash
+			// surface. Runs the same sequence as the text/ACP `/move` handler so
+			// tool path resolution, the bash default cwd, and plugin caches follow
+			// the move. Unlike the user-driven `/move`, the model-invoked accessor
+			// is bound to at most one successful move per session, rejects
+			// re-entrant calls, refuses to move while a workflow skill is active
+			// (its cwd-local state and guards stay pinned to the launch root), and
+			// only narrows: the canonical target must be a strict descendant of
+			// the canonical current cwd, so an injected or speculative call cannot
+			// widen the session's tool/write scope to a parent, a sibling project,
+			// or an arbitrary absolute path.
+			...(!isCanonicalSubSession &&
+			!options.bashRestrictionProfile &&
+			(options.bashAllowedPrefixes ?? []).length === 0
 				? {
 						rescopeSessionCwd: (() => {
 							let moveInFlight = false;
@@ -2023,6 +2028,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								}
 								if (moveInFlight) {
 									throw new Error("A session move is already in progress; wait for it to finish.");
+								}
+								// Workflow skills keep cwd-local state and mutation guards under
+								// the launch root's .gjc/_session-<id>; moving out from under a
+								// live workflow would strand that state and let later guarded
+								// mutations run from an unguarded cwd. Refuse until the skill
+								// reaches its terminal phase.
+								if (session?.getActiveSkillState()) {
+									throw new Error(
+										"A workflow skill is active in this session; finish or exit it before rescoping.",
+									);
 								}
 								moveInFlight = true;
 								try {

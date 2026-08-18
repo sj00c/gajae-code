@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 
@@ -147,6 +148,78 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		});
 		try {
 			expect(session.getToolByName("move_session")).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("does not expose move_session in canonical sub-sessions identified by parentTaskPrefix or currentAgentType alone", async () => {
+		for (const overrides of [{ parentTaskPrefix: "0-Worker" }, { currentAgentType: "executor" }] as Array<
+			Record<string, unknown>
+		>) {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+			tempDirs.push(tempDir);
+			const cwdA = path.join(tempDir, "root");
+			fs.mkdirSync(cwdA, { recursive: true });
+
+			const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+			const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"], ...overrides });
+			try {
+				expect(
+					session.getToolByName("move_session"),
+					`sub-session with ${Object.keys(overrides)[0]} must not expose move_session`,
+				).toBeUndefined();
+			} finally {
+				await session.dispose();
+			}
+		}
+	});
+
+	it("refuses to move while a workflow skill is active", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const activated = Promise.withResolvers<void>();
+			const unsubscribe = session.subscribe(event => {
+				if (
+					event.type === "message_start" &&
+					event.message.role === "custom" &&
+					event.message.customType === SKILL_PROMPT_MESSAGE_TYPE
+				)
+					activated.resolve();
+			});
+			session.agent.emitExternalEvent({
+				type: "message_start",
+				message: {
+					role: "custom",
+					customType: SKILL_PROMPT_MESSAGE_TYPE,
+					content: "# Deep Interview",
+					display: true,
+					details: { name: "deep-interview" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+			});
+			await activated.promise;
+			unsubscribe();
+			expect(session.getActiveSkillState()).toMatchObject({ skill: "deep-interview" });
+
+			const moveTool = session.getToolByName("move_session")!;
+			let error: unknown;
+			try {
+				await moveTool.execute("move-during-workflow", { path: "repo-b" });
+			} catch (err) {
+				error = err;
+			}
+			expect(error).toBeDefined();
+			expect(String((error as Error)?.message ?? error)).toContain("workflow skill is active");
+			expect(sessionManager.getCwd()).toBe(cwdA);
 		} finally {
 			await session.dispose();
 		}

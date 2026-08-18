@@ -2905,6 +2905,7 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 		"strict": true,
 		"deferrable": false,
 		"loadMode": "essential",
+		"nonAbortable": true,
 		"concurrency": "exclusive",
 		"intent": "omit"
 	},

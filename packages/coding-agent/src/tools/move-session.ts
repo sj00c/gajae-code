@@ -32,6 +32,9 @@ export class MoveSessionTool implements AgentTool<typeof moveSessionSchema, Move
 	// The move chdirs the process and resets global caches; it must not
 	// interleave with other tool executions across flush→moveTo→chdir.
 	readonly concurrency = "exclusive" as const;
+	// The move commits session-file relocation; aborting mid-sequence would
+	// leave a half-moved session with no rollback path.
+	readonly nonAbortable = true;
 	readonly #session: ToolSession;
 
 	constructor(session: ToolSession) {
