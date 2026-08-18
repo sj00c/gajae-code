@@ -1091,35 +1091,37 @@ type V010OwnershipLockMetadata = {
 	ino?: number;
 	ctimeMs?: number;
 };
-type OwnershipLockRead =
+export type OwnershipLockRead =
 	| { kind: "missing" }
 	| { kind: "malformed"; raw: string; mtimeMs?: number }
 	| { kind: "v010"; metadata: V010OwnershipLockMetadata }
 	| { kind: "legacy"; metadata: LegacyOwnershipLockMetadata }
 	| { kind: "valid"; metadata: OwnershipLockMetadata };
 
-/** Read lock provenance without treating a corrupt legacy artifact as a filesystem failure. */
-export async function readOwnershipLock(fsImpl: TelegramDaemonFs, file: string): Promise<OwnershipLockRead> {
-	let raw: string;
-	try {
-		raw = await fsImpl.readFile(file, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
-		throw error;
-	}
+/**
+ * Parse already-read lock bytes into their provenance shape. Shared by the
+ * acquisition path's file reader and by recovery, which must classify the same
+ * bytes the same way before deciding a lock belongs to a validated stopped
+ * owner. Stat-derived provenance (v0.10 empty-file identity, malformed mtimes)
+ * is filled by the caller, which owns the filesystem view.
+ */
+export function parseOwnershipLock(
+	raw: string,
+	stat?: { mtimeMs?: number; dev?: number; ino?: number; ctimeMs?: number; size?: number },
+): OwnershipLockRead {
 	if (raw.length === 0) {
-		const stat = await fsImpl.stat?.(file).catch(() => undefined);
-		if (stat?.size !== 0) return { kind: "malformed", raw, mtimeMs: stat?.mtimeMs };
-		return {
-			kind: "v010",
-			metadata: {
-				size: 0,
-				...(stat?.mtimeMs === undefined ? {} : { mtimeMs: stat.mtimeMs }),
-				...(stat?.dev === undefined ? {} : { dev: stat.dev }),
-				...(stat?.ino === undefined ? {} : { ino: stat.ino }),
-				...(stat?.ctimeMs === undefined ? {} : { ctimeMs: stat.ctimeMs }),
-			},
-		};
+		if (stat !== undefined)
+			return {
+				kind: "v010",
+				metadata: {
+					size: 0,
+					...(stat.mtimeMs === undefined ? {} : { mtimeMs: stat.mtimeMs }),
+					...(stat.dev === undefined ? {} : { dev: stat.dev }),
+					...(stat.ino === undefined ? {} : { ino: stat.ino }),
+					...(stat.ctimeMs === undefined ? {} : { ctimeMs: stat.ctimeMs }),
+				},
+			};
+		return { kind: "malformed", raw };
 	}
 	try {
 		const value = JSON.parse(raw) as Partial<OwnershipLockMetadata>;
@@ -1142,11 +1144,32 @@ export async function readOwnershipLock(fsImpl: TelegramDaemonFs, file: string):
 			return { kind: "legacy", metadata: { pid, startedAt } };
 		}
 	} catch {}
-	const mtimeMs = await fsImpl
-		.stat?.(file)
-		.then(stat => stat.mtimeMs)
-		.catch(() => undefined);
-	return { kind: "malformed", raw, ...(mtimeMs === undefined ? {} : { mtimeMs }) };
+	return { kind: "malformed", raw };
+}
+
+/** Read lock provenance without treating a corrupt legacy artifact as a filesystem failure. */
+export async function readOwnershipLock(fsImpl: TelegramDaemonFs, file: string): Promise<OwnershipLockRead> {
+	let raw: string;
+	try {
+		raw = await fsImpl.readFile(file, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+		throw error;
+	}
+	if (raw.length === 0) {
+		const stat = await fsImpl.stat?.(file).catch(() => undefined);
+		if (stat?.size !== 0) return { kind: "malformed", raw, mtimeMs: stat?.mtimeMs };
+		return parseOwnershipLock(raw, stat);
+	}
+	const parsed = parseOwnershipLock(raw);
+	if (parsed.kind === "malformed") {
+		const mtimeMs = await fsImpl
+			.stat?.(file)
+			.then(stat => stat.mtimeMs)
+			.catch(() => undefined);
+		return { kind: "malformed", raw, ...(mtimeMs === undefined ? {} : { mtimeMs }) };
+	}
+	return parsed;
 }
 
 /**
@@ -1191,7 +1214,8 @@ function ownershipLockMatches(left: OwnershipLockRead, right: OwnershipLockRead)
 	return JSON.stringify(left.metadata) === JSON.stringify(right.metadata);
 }
 
-function ownershipLockMatchesState(lock: OwnershipLockRead, state: DaemonState | undefined): boolean {
+/** Whether a valid lock's metadata carries exactly this owner's identity. */
+export function ownershipLockMatchesState(lock: OwnershipLockRead, state: DaemonState | undefined): boolean {
 	return Boolean(
 		lock.kind === "valid" &&
 			state &&
@@ -1448,7 +1472,15 @@ export async function renewOwnerHeartbeatSidecar(input: {
 	}
 }
 
-function ownershipLockMatchesStoppedState(
+/**
+ * Whether an ownership lock's content binds to the stopped state that
+ * authorizes its removal: a canonical modern tombstone requires the lock to
+ * carry the exact owner identity (ownerId, acquisitionId, pid, incarnation);
+ * a legacy pre-acquisition tombstone accepts its historical lock shapes.
+ * Recovery must answer the same question before unlinking, so it deletes the
+ * lock the tombstone owns — never whatever currently occupies the pathname.
+ */
+export function ownershipLockMatchesStoppedState(
 	lock: OwnershipLockRead,
 	state: unknown,
 	pidAlive: (pid: number) => boolean,

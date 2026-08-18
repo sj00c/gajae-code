@@ -177,6 +177,16 @@ function daemonStateJson(over: Record<string, unknown>): string {
 		...over,
 	});
 }
+function ownershipLockJson(over: Record<string, unknown>): string {
+	return `${JSON.stringify({
+		pid: 4242,
+		incarnation: "linux:100",
+		ownerId: "owner-a",
+		acquisitionId: "owner-a",
+		startedAt: 0,
+		...over,
+	})}\n`;
+}
 
 describe("notification-service status", () => {
 	test("status report is secret-safe and shows a fingerprint", () => {
@@ -966,7 +976,7 @@ describe("notification-service recovery", () => {
 	test("clears the lock of a retired owner whose process never exited", async () => {
 		const { fs, unlinked } = mockFs({
 			[paths.state]: daemonStateJson({ pid: 1000, stoppedAt: 2_000 }),
-			[paths.lock]: "lock",
+			[paths.lock]: ownershipLockJson({ pid: 1000 }),
 		});
 		const report = await recoverNotifications({
 			settings,
@@ -1026,10 +1036,59 @@ describe("notification-service recovery", () => {
 		expect(unlinked).not.toContain(paths.lock);
 	});
 
+	// The lock is removed by identity, not by pathname. A retired owner's
+	// tombstone authorizes removal of ITS OWN lock only: a successor's or
+	// initializer's lock already sitting on the pathname must survive, or
+	// recovery would break the single-poller guarantee it exists to enforce.
+	test("retains a lock that does not belong to the retired owner", async () => {
+		const { fs, unlinked, store } = mockFs({
+			[paths.state]: daemonStateJson({ pid: 1000, stoppedAt: 2_000 }),
+			[paths.lock]: ownershipLockJson({ pid: 4321, ownerId: "owner-successor", acquisitionId: "owner-successor" }),
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.action).toBe("owner-superseded");
+		expect(unlinked).not.toContain(paths.lock);
+		expect(store.has(paths.lock)).toBe(true);
+	});
+
+	test("retains a malformed lock that no stopped owner can claim", async () => {
+		const { fs, unlinked, store } = mockFs({
+			[paths.state]: daemonStateJson({ pid: 1000, stoppedAt: 2_000 }),
+			[paths.lock]: "lock",
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.action).toBe("owner-superseded");
+		expect(unlinked).not.toContain(paths.lock);
+		expect(store.has(paths.lock)).toBe(true);
+	});
+
+	test("retains a dead owner's lock when its content names a different owner", async () => {
+		const { fs, unlinked, store } = mockFs({
+			[paths.state]: daemonStateJson({ pid: 555 }),
+			[paths.lock]: ownershipLockJson({ pid: 555, ownerId: "owner-other", acquisitionId: "owner-other" }),
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: () => false },
+		});
+		expect(report.daemon.action).toBe("owner-superseded");
+		expect(unlinked).not.toContain(paths.lock);
+		expect(store.has(paths.lock)).toBe(true);
+	});
+
 	test("clears the lock of a confirmed-dead owner", async () => {
 		const { fs, unlinked } = mockFs({
 			[paths.state]: daemonStateJson({ pid: 555 }),
-			[paths.lock]: "lock",
+			[paths.lock]: ownershipLockJson({ pid: 555 }),
 		});
 		const report = await recoverNotifications({
 			settings,
@@ -1560,7 +1619,7 @@ describe("notification-service forced stale-marker recovery", () => {
 		const { fs, unlinked } = mockFs(
 			{
 				[paths.state]: daemonStateJson({ pid: 555, ownerId: "owner-a" }),
-				[paths.lock]: "lock",
+				[paths.lock]: ownershipLockJson({ pid: 555 }),
 				[paths.steal]: "not json at all",
 			},
 			{ mtimes: { [paths.steal]: NOW - 120_000 } },

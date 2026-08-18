@@ -48,8 +48,12 @@ import type { DiscordDiagnosticProvider } from "./discord-provider";
 import { SlackLiveProvider } from "./slack-live-provider";
 import type { SlackDiagnosticProvider } from "./slack-provider";
 import {
+	type DaemonState,
 	isStoppedDaemonState,
 	type OwnerFreshnessSnapshot,
+	ownershipLockMatchesState,
+	ownershipLockMatchesStoppedState,
+	parseOwnershipLock,
 	readOwnerFreshnessSnapshot,
 	type TelegramDaemonFs,
 } from "./telegram-daemon";
@@ -1728,12 +1732,33 @@ async function removeDeadOwnerLock(
 		// record as owner consent that acquisition would call ambiguous.
 		if (pidAlive(current.state.pid) && !isCanonicalStopConsent(current.raw)) return "now-alive";
 		if (!(await daemonTransitionLockIsHeld({ fs, path: paths.steal, lock: transition }))) return "contended";
+		// Delete the lock the validated record owns, never whatever currently
+		// occupies the pathname: a successor's or initializer's lock may already
+		// be present even under the steal mutex, and unlinking it by name would
+		// break the single-poller guarantee. The lock's parsed metadata must
+		// still bind to this exact owner (the same predicates the acquisition
+		// path's reclaim uses), and the unlink itself is identity-bound so the
+		// file cannot be swapped between the check and the removal.
+		const lockRaw = await fs.readFile(paths.lock, "utf8").catch(() => undefined);
+		if (lockRaw === undefined) return "cleared";
+		let lockOwner: unknown;
 		try {
-			await fs.unlink(paths.lock);
-			return "cleared";
+			lockOwner = JSON.parse(current.raw);
 		} catch {
-			return "unlink-failed";
+			return "superseded";
 		}
+		const lockStat = await fs.stat?.(paths.lock).catch(() => undefined);
+		const lockRead = parseOwnershipLock(lockRaw, lockStat);
+		// A self-retired owner must own its lock by content; a dead owner whose
+		// record is not a stopped tombstone still needs the lock to carry its
+		// exact identity before recovery may remove it.
+		if (!isCanonicalStopConsent(current.raw)) {
+			if (!ownershipLockMatchesState(lockRead, lockOwner as DaemonState)) return "superseded";
+		} else if (!ownershipLockMatchesStoppedState(lockRead, lockOwner, pidAlive)) return "superseded";
+		const lockEndpoint = await fs.readEndpointFile(paths.lock).catch(() => undefined);
+		if (!lockEndpoint) return "unlink-failed";
+		const removed = await fs.exactUnlink(paths.lock, lockEndpoint.identity);
+		return removed.ok ? "cleared" : "unlink-failed";
 	} finally {
 		await releaseDaemonTransitionLock({ fs, path: paths.steal, lock: transition });
 	}
