@@ -95,6 +95,28 @@ jobs:
                     echo "tag_name="
                  } >> "$GITHUB_OUTPUT"
               fi
+         - name: Validate stable tag protected-main provenance
+           if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+           env:
+              SOURCE_SHA: ${{ github.sha }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              # A stable tag workflow is evaluated from the tagged revision and
+              # later grants repository write plus the OIDC identity token, so
+              # the tagged commit must provably come from the protected main
+              # line: fetch
+              # the live default branch from origin and require ancestry.
+              # This check alone cannot stop an actor allowed to create tags
+              # from pointing one at a side-branch commit with modified
+              # workflow YAML; closing that half requires the owner-controlled
+              # repository settings documented on the publish job below.
+              git fetch --quiet --tags --prune --unshallow origin +refs/heads/main:refs/remotes/origin/main \
+                 || git fetch --quiet --tags --prune origin +refs/heads/main:refs/remotes/origin/main
+              if ! git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main; then
+                 echo "Stable release tag $GITHUB_REF_NAME resolves to $SOURCE_SHA, which is not an ancestor of origin/main; refusing release" >&2
+                 exit 1
+              fi
    # ---------------------------------------------------------------------------
    # PR + main branch: lint/typecheck (native-free) and the test suite.
    # These never run on tags — a tag is cut from an already-green main.
@@ -603,11 +625,24 @@ jobs:
          # GitHub OIDC token for a short-lived registry credential, so no
          # long-lived NPM_TOKEN is involved and nothing expires under us.
          id-token: write
+      # Owner-controlled trust boundary (workflow half): this job only runs
+      # under the npm-release environment, whose protection rules live in the
+      # repository settings and are NOT evaluated from the tagged revision.
+      # To close the tag-creation bypass the owner must configure:
+      #   1. a ruleset protecting `main` (require pull request + checks),
+      #   2. a tag ruleset for `refs/tags/v*` restricting creation to
+      #      maintainers,
+      #   3. environment `npm-release` with required reviewers and deployment
+      #      refs restricted to protected branches plus the v* tag pattern.
+      # Until those exist this environment reference is only a gate hook.
+      environment: npm-release
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
-              node-version: "24"
+              # Exact patch pin: this job holds the OIDC identity token, so the
+              # bootstrap runtime must not float across Node releases.
+              node-version: "24.19.0"
          - name: Pin npm for OIDC trusted publishing
            # Trusted publishing requires npm >= 11.5.1; do not rely on whatever
            # npm the Node distribution happens to bundle. The pin is exact and

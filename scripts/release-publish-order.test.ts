@@ -342,7 +342,8 @@ describe("immutable stable release contracts", () => {
 		const tag = "v1.2.3";
 
 		expect(releaseScript).toContain('await git(["tag", "--no-sign", `v${version}`]);');
-		expect(releaseScript).toContain('["ls-remote", "origin", "refs/heads/main", `refs/tags/${tag}`, `refs/tags/${tag}^{}`]');
+		expect(releaseScript).toContain('const remoteRefs = ["refs/heads/main", `refs/tags/${tag}`, `refs/tags/${tag}^{}`] as const;');
+		expect(releaseScript).toContain('["ls-remote", "origin", ...remoteRefs]');
 		expect(releaseScript).not.toContain('["ls-remote", "--refs", "origin", "refs/heads/main", `refs/tags/${tag}`]');
 		expect(() => assertAtomicPushRemoteState([
 			`${sourceCommit}\trefs/heads/main`,

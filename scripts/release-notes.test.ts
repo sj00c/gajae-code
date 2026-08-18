@@ -154,8 +154,20 @@ describe("notes body", () => {
 	test("keeps the historical section order and compare link", () => {
 		const body = notes({ commits: [commit("fff", "fix(x): direct push")] });
 		expect(body.startsWith("## What's Changed\n")).toBe(true);
-		expect(body).toContain(`* fix(x): direct push by @Yeachan-Heo in https://github.com/${repo}/commit/fff`);
+		// No resolved login: the Git display name renders without an `@` mention.
+		expect(body).toContain(`* fix(x): direct push by Yeachan-Heo in https://github.com/${repo}/commit/fff`);
+		expect(body).not.toContain("@Yeachan-Heo");
 		expect(body.trimEnd().endsWith(`**Full Changelog**: https://github.com/${repo}/compare/v0.14.0...v0.14.1`)).toBe(true);
+	});
+
+	test("credits the resolved GitHub login for fallback commits, never a display-name mention", () => {
+		const withLogin: ReleaseCommit = { sha: "abc", subject: "fix(y): direct push", author: "Yeachan Heo", githubLogin: "Yeachan-Heo" };
+		const withoutLogin: ReleaseCommit = { sha: "def", subject: "fix(z): direct push", author: "Some Display Name" };
+		const body = notes({ commits: [withLogin, withoutLogin] });
+
+		expect(body).toContain(`* fix(y): direct push by @Yeachan-Heo in https://github.com/${repo}/commit/abc`);
+		expect(body).toContain(`* fix(z): direct push by Some Display Name in https://github.com/${repo}/commit/def`);
+		expect(body).not.toContain("@Some Display Name");
 	});
 
 	test("credits a pull request once even when several of its commits ship", () => {

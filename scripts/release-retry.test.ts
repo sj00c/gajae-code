@@ -3,7 +3,12 @@ import { $ } from "bun";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { planAtomicPushRollback, pushReleaseRefsAtomically } from "./release";
+import {
+	localRollbackCommands,
+	planAtomicPushRollback,
+	pushReleaseRefsAtomically,
+	reconcileAtomicPushFailure,
+} from "./release";
 
 const originalCwd = process.cwd();
 const tempRoots: string[] = [];
@@ -99,5 +104,108 @@ describe("rejected atomic push recovery", () => {
 		expect(remoteMain).toBe(releaseCommit);
 		const remoteTag = (await git(work, ["ls-remote", "origin", "refs/tags/v9.9.9"])).split("\t")[0]?.trim();
 		expect(remoteTag).toBe(releaseCommit);
+	});
+});
+
+describe("ambiguous atomic push failure reconciliation", () => {
+	const sourceCommit = "d".repeat(40);
+	const preMain = "e".repeat(40);
+
+	test("a committed transaction with a failed push result reconciles as success", () => {
+		const disposition = reconcileAtomicPushFailure("v9.9.9", {
+			sourceCommit,
+			prePushMain: preMain,
+			prePushTag: "",
+			remoteReachable: true,
+			postPushMain: sourceCommit,
+			postPushTag: sourceCommit,
+		});
+		expect(disposition.kind).toBe("committed");
+		expect(disposition.note).toContain("no local state was rolled back");
+	});
+
+	test("rollback is allowed only after proving neither remote ref moved", () => {
+		const disposition = reconcileAtomicPushFailure("v9.9.9", {
+			sourceCommit,
+			prePushMain: preMain,
+			prePushTag: "",
+			remoteReachable: true,
+			postPushMain: preMain,
+			postPushTag: "",
+		});
+		expect(disposition.kind).toBe("rollback");
+	});
+
+	test("a partially moved remote preserves all local state", () => {
+		const disposition = reconcileAtomicPushFailure("v9.9.9", {
+			sourceCommit,
+			prePushMain: preMain,
+			prePushTag: "",
+			remoteReachable: true,
+			postPushMain: sourceCommit,
+			postPushTag: "",
+		});
+		expect(disposition.kind).toBe("preserve");
+		expect(disposition.note).toContain("PARTIALLY");
+		expect(disposition.note).toContain("preserved untouched");
+		expect(disposition.note).toContain("Do not retry blindly");
+	});
+
+	test("an unreachable remote preserves all local state", () => {
+		const disposition = reconcileAtomicPushFailure("v9.9.9", {
+			sourceCommit,
+			prePushMain: preMain,
+			prePushTag: "",
+			remoteReachable: false,
+		});
+		expect(disposition.kind).toBe("preserve");
+		expect(disposition.note).toContain("could not be re-queried");
+		expect(disposition.note).toContain("do NOT roll back");
+	});
+});
+
+describe("idempotent per-outcome rollback guidance", () => {
+	const releaseCommit = "f".repeat(40);
+	const preReleaseCommit = "0".repeat(40);
+
+	test("emits only the commands for the artifacts that still exist", () => {
+		expect(localRollbackCommands("v9.9.9", releaseCommit, preReleaseCommit, { tagPresent: false, onReleaseCommit: true }))
+			.toEqual([`test "$(git rev-parse HEAD)" = "${releaseCommit}" && git reset --hard ${preReleaseCommit}`]);
+		expect(localRollbackCommands("v9.9.9", releaseCommit, preReleaseCommit, { tagPresent: true, onReleaseCommit: false }))
+			.toEqual(["git show-ref --verify --quiet refs/tags/v9.9.9 && git tag --delete v9.9.9"]);
+		expect(localRollbackCommands("v9.9.9", releaseCommit, preReleaseCommit, { tagPresent: false, onReleaseCommit: false }))
+			.toEqual([]);
+	});
+});
+
+describe("accepted remote transaction with a client-side failed push", () => {
+	test("reconciles as success and keeps the local release state", async () => {
+		const { work, preReleaseCommit } = await releaseFixture();
+
+		// A git shim that performs the real atomic push but reports failure,
+		// simulating a transport error after the remote committed.
+		const shimDir = `${work}/.shim`;
+		await fs.mkdir(shimDir);
+		const realGit = (await $`which git`.quiet().text()).trim();
+		await Bun.write(`${shimDir}/git`, `#!/bin/sh\nif [ "$1" = "-c" ]; then :; fi\nfor arg in "$@"; do if [ "$arg" = "--atomic" ]; then "${realGit}" "$@"; code=$?; if [ $code -eq 0 ]; then exit 5; else exit $code; fi; fi; done\nexec "${realGit}" "$@"\n`);
+		await fs.chmod(`${shimDir}/git`, 0o755);
+
+		const originalPath = process.env.PATH;
+		process.env.PATH = `${shimDir}:${originalPath}`;
+		try {
+			process.chdir(work);
+			await pushReleaseRefsAtomically("9.9.9");
+		} finally {
+			process.env.PATH = originalPath;
+		}
+
+		// Success: no rollback happened — HEAD is still the release commit and
+		// the tag still exists, and the remote carries both refs.
+		const head = (await git(work, ["rev-parse", "HEAD"])).trim();
+		expect(head).not.toBe(preReleaseCommit);
+		const tagCheck = await $`git show-ref --verify --quiet refs/tags/v9.9.9`.cwd(work).quiet().nothrow();
+		expect(tagCheck.exitCode).toBe(0);
+		const remoteTag = (await git(work, ["ls-remote", "origin", "refs/tags/v9.9.9"])).split("\t")[0]?.trim();
+		expect(remoteTag).toBe(head);
 	});
 });

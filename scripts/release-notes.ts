@@ -38,8 +38,13 @@ const BUMP_SUBJECT = /^chore: bump version to /u;
 export interface ReleaseCommit {
 	sha: string;
 	subject: string;
-	/** GitHub login to credit when no pull request is attributed. */
+	/**
+	 * Git author display name from `%an`. It is NOT a GitHub login and must
+	 * never be rendered as an `@` mention without a resolved `githubLogin`.
+	 */
 	author: string;
+	/** Resolved GitHub login for the author, when the API provides one. */
+	githubLogin?: string;
 }
 
 export interface CandidatePullRequest {
@@ -128,8 +133,11 @@ export function buildReleaseNotes(input: ReleaseNotesInput): string {
 			lines.push(`* ${title} by @${author} in ${repoUrl}/pull/${number}`);
 			continue;
 		}
-		const { sha, subject, author } = attribution.commit;
-		lines.push(`* ${subject} by @${author} in ${repoUrl}/commit/${sha.slice(0, 10)}`);
+		const { sha, subject, author, githubLogin } = attribution.commit;
+		// A Git display name is not a GitHub login: rendering it as `@name`
+		// would publish an invalid or misleading mention.
+		const credit = githubLogin !== undefined ? `@${githubLogin}` : author;
+		lines.push(`* ${subject} by ${credit} in ${repoUrl}/commit/${sha.slice(0, 10)}`);
 	}
 
 	// A contributor is new when the release contains the earliest pull request
@@ -243,6 +251,18 @@ async function firstMergedPullRequest(repo: string, author: string): Promise<num
 	return (JSON.parse(raw) as { number: number }[])[0]?.number;
 }
 
+/**
+ * Resolves the GitHub login authoring a commit. The API reports `null` when
+ * the commit email is not linked to any account; that is an explicit answer,
+ * not a failure, and yields `undefined` (the caller renders the Git display
+ * name without `@`). Transport/API failures throw via the strict gh path.
+ */
+async function resolveCommitLogin(repo: string, sha: string): Promise<string | undefined> {
+	const raw = await gh(["api", `repos/${repo}/commits/${sha}`, "--jq", ".author.login // \"\""]);
+	const login = raw.trim();
+	return login === "" || login === "null" ? undefined : login;
+}
+
 export async function deriveReleaseNotes(repo: string, baseTag: string, head: string, headTag: string): Promise<string> {
 	const commits = await collectCommits(baseTag, head);
 	const pullRequestsByNumber = new Map<number, CandidatePullRequest>();
@@ -271,7 +291,12 @@ export async function deriveReleaseNotes(repo: string, baseTag: string, head: st
 	const firstMergedPullRequestByAuthor = new Map<string, number>();
 	for (const commit of commits) {
 		const attribution = attributeCommit(commit, { candidatesBySha, pullRequestsByNumber }, shippedSubjects);
-		if (attribution.kind !== "pull-request") continue;
+		if (attribution.kind !== "pull-request") {
+			// Fallback commits credit by login only when one is resolved;
+			// otherwise the Git display name is rendered without `@`.
+			commit.githubLogin = await resolveCommitLogin(repo, await cherryPickOrigin(commit.sha));
+			continue;
+		}
 		const { author } = attribution.pullRequest;
 		if (firstMergedPullRequestByAuthor.has(author)) continue;
 		const first = await firstMergedPullRequest(repo, author);

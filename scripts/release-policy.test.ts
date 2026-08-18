@@ -151,6 +151,39 @@ describe("stable release policy", () => {
 		expect(notes).toContain(': > "$notes"');
 	});
 
+	test("gates stable tag releases on protected-main provenance and the approval environment", async () => {
+		const ci = await workflow();
+		const metadata = jobSection(ci, "release_metadata");
+		const publish = jobSection(ci, "publish");
+
+		// The tagged SHA must provably sit on the fetched origin/main line before
+		// anything in the release graph can run (publish needs release_metadata).
+		expect(metadata).toContain("Validate stable tag protected-main provenance");
+		expect(metadata).toContain("+refs/heads/main:refs/remotes/origin/main");
+		expect(metadata).toContain('git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main');
+		expect(publish).toContain("needs: [release_prepare, release_metadata]");
+
+		// The publish job is wired to the owner-protected approval environment;
+		// its protection rules are repository settings, not tag-resolved YAML.
+		expect(publish).toContain("environment: npm-release");
+	});
+
+	test("pins the OIDC-capable Node bootstrap to an exact patch", async () => {
+		const ci = await workflow();
+		const publish = jobSection(ci, "publish");
+
+		expect(publish).toContain('node-version: "24.19.0"');
+		expect(publish).not.toContain('node-version: "24"');
+		expect(publish).not.toMatch(/node-version: "24\.[x*]/u);
+	});
+
+	test("keeps the release regression suites on the normal release CI path", async () => {
+		const manifest = JSON.parse(await Bun.file(path.join(repoRoot, "package.json")).text()) as { scripts: Record<string, string> };
+		const release = manifest.scripts["test:release"];
+		expect(release).toContain("scripts/release-notes.test.ts");
+		expect(release).toContain("scripts/release-retry.test.ts");
+	});
+
 	test("the publish job carries the stable finalization job name", async () => {
 		const ci = await workflow();
 		// release.ts watches this exact job to confirm the release finalized.
