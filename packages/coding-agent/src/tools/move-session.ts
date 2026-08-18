@@ -7,7 +7,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import moveSessionDescription from "../prompts/tools/move-session.md" with { type: "text" };
 import type { ToolSession } from "./index";
-import { shortenPath } from "./render-utils";
+import { Ellipsis, replaceTabs, shortenPath, truncateToWidth } from "./render-utils";
 import { ToolError } from "./tool-errors";
 
 const moveSessionSchema = z.object({
@@ -63,8 +63,17 @@ interface MoveSessionRenderArgs {
 	to: string;
 }
 
+const MOVE_SESSION_PREVIEW_WIDTH = 120;
+
 export const moveSessionToolRenderer = {
-	renderCall: (args: unknown): Component => new Text(`move_session ${String(args ?? "")}`, 1, 1),
+	renderCall: (args: unknown): Component => {
+		const target =
+			typeof args === "object" && args !== null && typeof (args as { path?: unknown }).path === "string"
+				? (args as { path: string }).path
+				: "";
+		const text = truncateToWidth(replaceTabs(`move_session ${target}`), MOVE_SESSION_PREVIEW_WIDTH, Ellipsis.Omit);
+		return new Text(text, 1, 1);
+	},
 	renderResult: (
 		result: { details?: unknown; isError?: boolean },
 		_options: RenderResultOptions & { renderContext?: Record<string, unknown> },
@@ -74,6 +83,13 @@ export const moveSessionToolRenderer = {
 		const from = typeof details.from === "string" ? details.from : "";
 		const to = typeof details.to === "string" ? details.to : "";
 		const body = result.isError ? "move_session failed" : `Session moved: ${shortenPath(from)} → ${shortenPath(to)}`;
-		return new Text(theme.fg(result.isError ? "error" : "accent", body), 1, 1);
+		return new Text(
+			theme.fg(
+				result.isError ? "error" : "accent",
+				truncateToWidth(replaceTabs(body), MOVE_SESSION_PREVIEW_WIDTH, Ellipsis.Omit),
+			),
+			1,
+			1,
+		);
 	},
 };

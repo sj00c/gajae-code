@@ -2003,30 +2003,75 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// relocation is safe: top-level sessions (taskDepth 0) without a
 			// restricted bash surface. Runs the same sequence as the text/ACP
 			// `/move` handler so tool path resolution, bash default cwd, plugin
-			// caches, and the workspace tree all follow the move.
+			// caches, and the workspace tree all follow the move. Unlike the
+			// user-driven `/move`, the model-invoked accessor is bound to at
+			// most one successful move per session, rejects re-entrant calls,
+			// and only narrows: the canonical target must be a strict
+			// descendant of the canonical current cwd, so an injected or
+			// speculative call cannot widen the session's tool/write scope to a
+			// parent, a sibling project, or an arbitrary absolute path.
 			...(taskDepth === 0 && !options.bashRestrictionProfile && (options.bashAllowedPrefixes ?? []).length === 0
 				? {
-						rescopeSessionCwd: async (target: string): Promise<{ from: string; to: string }> => {
-							const from = sessionManager.getCwd();
-							const resolvedPath = path.resolve(from, target);
-							let isDirectory = false;
-							try {
-								isDirectory = (await fs.stat(resolvedPath)).isDirectory();
-							} catch {
-								// fall through to the error below
-							}
-							if (!isDirectory) {
-								throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
-							}
-							await sessionManager.flush();
-							await sessionManager.moveTo(resolvedPath);
-							setProjectDir(resolvedPath);
-							resetCapabilities();
-							const projectRegistry = await resolveActiveProjectRegistryPath(sessionManager.getCwd());
-							clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
-							await session?.refreshSshTool({ activateIfAvailable: true });
-							return { from, to: sessionManager.getCwd() };
-						},
+						rescopeSessionCwd: (() => {
+							let moveInFlight = false;
+							let moveConsumed = false;
+							return async (target: string): Promise<{ from: string; to: string }> => {
+								if (moveConsumed) {
+									throw new Error(
+										"This session has already been rescoped; only one agent-invoked move is allowed per session.",
+									);
+								}
+								if (moveInFlight) {
+									throw new Error("A session move is already in progress; wait for it to finish.");
+								}
+								moveInFlight = true;
+								try {
+									const from = sessionManager.getCwd();
+									const resolvedPath = path.resolve(from, target);
+									let canonicalFrom: string;
+									let canonicalTarget: string;
+									try {
+										canonicalFrom = await fs.realpath(from);
+										canonicalTarget = await fs.realpath(resolvedPath);
+									} catch {
+										throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
+									}
+									if (!(await fs.stat(canonicalTarget)).isDirectory()) {
+										throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
+									}
+									const relative = path.relative(canonicalFrom, canonicalTarget);
+									if (relative === "") {
+										throw new Error(
+											`Target ${canonicalTarget} is the current session directory; nothing to move.`,
+										);
+									}
+									if (relative.startsWith("..") || path.isAbsolute(relative)) {
+										throw new Error(
+											`Refusing to rescope outside the current session directory: ${canonicalTarget} is not within ${canonicalFrom}. move_session only narrows the session scope; ask the user to restart or /move for a broader relocation.`,
+										);
+									}
+									await sessionManager.flush();
+									await sessionManager.moveTo(canonicalTarget);
+									// The move committed; consume the one-move bound before the
+									// best-effort follow-up steps so a later refresh failure
+									// cannot be misread as "not moved" and retried.
+									moveConsumed = true;
+									setProjectDir(canonicalTarget);
+									resetCapabilities();
+									const projectRegistry = await resolveActiveProjectRegistryPath(sessionManager.getCwd());
+									clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
+									try {
+										await session?.refreshSshTool({ activateIfAvailable: true });
+									} catch {
+										// Non-fatal: the session has moved; the SSH tool refreshes
+										// on its next activation attempt.
+									}
+									return { from, to: sessionManager.getCwd() };
+								} finally {
+									moveInFlight = false;
+								}
+							};
+						})(),
 					}
 				: {}),
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,

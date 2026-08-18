@@ -314,8 +314,11 @@ export interface ToolSession {
 	 * an existing directory, running the same sequence as the `/move` handler
 	 * (flush → moveTo → setProjectDir → plugin/capability cache reset). Absent
 	 * in contexts where relocation must not happen: subagent sessions
-	 * (taskDepth > 0) and read-only/restricted bash profiles. Throws when the
-	 * target does not exist or is not a directory.
+	 * (taskDepth > 0) and read-only/restricted bash profiles. Bound to one
+	 * successful move per session, rejects re-entrant calls, and only narrows:
+	 * the canonical (realpath) target must be a strict descendant of the
+	 * canonical current cwd. Throws when the target does not exist, is not a
+	 * directory, or escapes the current scope.
 	 */
 	rescopeSessionCwd?: (path: string) => Promise<{ from: string; to: string }>;
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */

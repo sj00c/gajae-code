@@ -169,4 +169,114 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await session.dispose();
 		}
 	});
+
+	it("refuses to rescope outside the current session directory", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const outside = path.join(tempDir, "sibling");
+		fs.mkdirSync(cwdA, { recursive: true });
+		fs.mkdirSync(outside, { recursive: true });
+
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			for (const target of [outside, "..", path.dirname(cwdA), "/"]) {
+				let error: unknown;
+				try {
+					await moveTool.execute(`move-outside-${target}`, { path: target });
+				} catch (err) {
+					error = err;
+				}
+				expect(error, `target ${target} must be refused`).toBeDefined();
+				expect(String((error as Error)?.message ?? error)).toContain("only narrows");
+				expect(sessionManager.getCwd()).toBe(cwdA);
+			}
+			// A refused move does not consume the one-move bound.
+			const repoB = path.join(cwdA, "repo-b");
+			fs.mkdirSync(repoB, { recursive: true });
+			const result = await moveTool.execute("move-after-refusals", { path: "repo-b" });
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+			expect(textContent(result)).toContain("repo-b");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("rejects moving to the current directory itself", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		fs.mkdirSync(cwdA, { recursive: true });
+
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			let error: unknown;
+			try {
+				await moveTool.execute("move-self", { path: "." });
+			} catch (err) {
+				error = err;
+			}
+			expect(error).toBeDefined();
+			expect(String((error as Error)?.message ?? error)).toContain("nothing to move");
+			expect(sessionManager.getCwd()).toBe(cwdA);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("allows only one successful move per session", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		const deeper = path.join(cwdA, "repo-b", "pkg");
+		fs.mkdirSync(deeper, { recursive: true });
+
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			await moveTool.execute("move-first", { path: "repo-b" });
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+
+			let error: unknown;
+			try {
+				await moveTool.execute("move-second", { path: "pkg" });
+			} catch (err) {
+				error = err;
+			}
+			expect(error).toBeDefined();
+			expect(String((error as Error)?.message ?? error)).toContain("only one agent-invoked move");
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("canonicalizes a symlinked target to its realpath", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const realRepo = path.join(cwdA, "real-repo");
+		const link = path.join(cwdA, "link-repo");
+		fs.mkdirSync(realRepo, { recursive: true });
+		fs.symlinkSync(realRepo, link);
+
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			const result = await moveTool.execute("move-symlink", { path: "link-repo" });
+			const canonical = fs.realpathSync(realRepo);
+			expect(sessionManager.getCwd()).toBe(canonical);
+			const details = (result as { details?: { to?: string } }).details ?? {};
+			expect(details.to).toBe(canonical);
+		} finally {
+			await session.dispose();
+		}
+	});
 });

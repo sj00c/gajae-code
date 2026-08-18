@@ -6,7 +6,10 @@ or repository: after this call, every later turn resolves relative paths, the ba
 and the workspace tree from the new directory instead of rescanning the whole root.
 
 - `path` must be an existing directory; relative paths resolve against the current session cwd.
-- Use it once the target repo is identified — not speculatively — because the session file and
-  caches move with the session.
+  The canonical target must be strictly inside the current session directory — moves to a
+  parent, a sibling project, or an unrelated absolute path are refused.
+- A session can be moved this way at most once, and never while another move is running; a
+  rejected call does not consume the move. Use it once the target repo is identified — not
+  speculatively — because the session file and caches move with the session.
 - This tool is unavailable in subagent sessions and restricted profiles; ask the top-level
   session to rescope instead.
