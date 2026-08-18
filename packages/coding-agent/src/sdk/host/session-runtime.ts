@@ -2647,6 +2647,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// continuation agent_start with an empty queue leaves the current owner
 			// untouched (review thread P1).
 			const drained = current.pending.splice(0);
+
 			if (drained.length > 0) {
 				current.openLifecycleBatches.push({ invocations: drained });
 				adoptLifecycleBatch(drained);

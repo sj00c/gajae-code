@@ -2881,6 +2881,96 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("every promoted follow-up in a drained batch receives a zero-progress lease", async () => {
+		// Red-team finding (#4668): agent_start leased only the head of the
+		// drained batch, so follow-ups promoted together beyond the head had no
+		// deadline and could remain accepted with zero execution forever.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-lease-batch-"));
+		try {
+			const promoted: Array<(() => void) | undefined> = [];
+			const harness = await invocationHarness("lease-batch", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
+						promoted.push((options as { onQueuedPromoted?: () => void } | undefined)?.onQueuedPromoted);
+						return;
+					}
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			const followUpB = await harness.control("turn.follow_up", { text: "b" });
+			const followUpC = await harness.control("turn.follow_up", { text: "c" });
+			expect(followUpB.ok).toBe(true);
+			expect(followUpC.ok).toBe(true);
+			expect(promoted).toHaveLength(2);
+			// The unwind promotes both queued follow-ups into ONE run: a single
+			// agent_start drains the batch.
+			promoted[0]?.();
+			promoted[1]?.();
+			await harness.emit("agent_start");
+			const idsB = { commandId: followUpB.result?.commandId, turnId: followUpB.result?.turnId };
+			const idsC = { commandId: followUpC.result?.commandId, turnId: followUpC.result?.turnId };
+			for (const ids of [idsB, idsC]) {
+				expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+					status: "failed",
+					error: { code: "prompt_deadline_exceeded" },
+				});
+			}
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a non-empty agent_start re-entry preserves the replaced turn's lease and leases the replacement", async () => {
+		// Red-team finding (#4668): a second agent_start without a prior agent_end
+		// replaces the tracked invocation. The replaced turn's acceptance lease
+		// must be retained (clearing it would leave its record accepted with no
+		// zero-progress bound) and the replacement must be leased too.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-lease-reentry-"));
+		try {
+			let promoted: (() => void) | undefined;
+			const harness = await invocationHarness("lease-reentry", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
+						promoted = (options as { onQueuedPromoted?: () => void } | undefined)?.onQueuedPromoted;
+						return;
+					}
+					// The first turn accepts and then never makes progress.
+					await new Promise<void>(() => {});
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			const followUp = await harness.control("turn.follow_up", { text: "replacement" });
+			expect(followUp.ok).toBe(true);
+			promoted?.();
+			// Re-entry with a non-empty drain while the first turn never ended.
+			await harness.emit("agent_start");
+			const idsFirst = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			const idsFollowUp = { commandId: followUp.result?.commandId, turnId: followUp.result?.turnId };
+			expect(await settledStatus(harness, "turn.prompt_status", idsFirst)).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", idsFollowUp)).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("goal.list/get on a session without a goal returns a diagnostic state, not resource_gone", async () => {
 		// During the zero-activity incident goal.list/get degraded to a bare
 		// resource_gone ("snapshot payload is unavailable"), which was

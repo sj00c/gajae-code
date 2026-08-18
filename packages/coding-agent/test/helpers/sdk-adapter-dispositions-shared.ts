@@ -111,7 +111,9 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"queue.message.move": "invalid_position",
 	"queue.message.update": "invalid_message",
 	"transcript.body": "resource_gone",
-	"goal.list/get": "resource_gone",
+	// goal.list/get is intentionally absent: on a goal-less session it now
+	// succeeds with an explicit no_active_goal diagnostic payload instead of
+	// resource_gone (#4668), so adapters must observe ok: true.
 	"session.last_assistant": "resource_gone",
 	"resource.body": "resource_gone",
 	"artifact.read": "resource_gone",
