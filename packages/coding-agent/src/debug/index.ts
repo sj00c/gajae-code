@@ -345,6 +345,10 @@ export class DebugSelectorComponent extends Container {
 				logSource,
 			});
 
+			// The composer is reusable across overlays; detach it before clearing
+			// so clear() disposes only the transient viewer, not the editor's
+			// tab-width listener (disposal is terminal).
+			this.ctx.editorContainer.detachChild(this.ctx.editor);
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(viewer);
 			this.ctx.ui.setFocus(viewer);
@@ -364,6 +368,10 @@ export class DebugSelectorComponent extends Container {
 			onUpdate: () => this.ctx.ui.requestRender(),
 		});
 
+		// The composer is reusable across overlays; detach it before clearing
+		// so clear() disposes only the transient viewer, not the editor's
+		// tab-width listener (disposal is terminal).
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(viewer);
 		this.ctx.ui.setFocus(viewer);
