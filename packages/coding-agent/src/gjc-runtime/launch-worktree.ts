@@ -776,14 +776,35 @@ function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
 				ownership.delete(name);
 				continue;
 			}
-			fs.rmSync(linkPath, { force: true });
 		} else if (tryLstat(linkPath)) continue;
-		fs.symlinkSync(member.dir, linkPath, "junction");
+		// Atomically install the new link: create at a process-unique temporary
+		// name in the same directory, then rename(2) over the destination.
+		// Rename replaces atomically, so a failure or interruption mid-flight
+		// can never leave a missing member entry that the next launch would
+		// silently accept as a complete marker-owned boundary (#4626 review:
+		// marker-owned partial boundary). Same-directory placement keeps the
+		// rename a same-filesystem operation.
+		const tempPath = `${linkPath}.gjc-new-${process.pid}-${Date.now()}`;
+		fs.symlinkSync(member.dir, tempPath, "junction");
+		fs.renameSync(tempPath, linkPath);
 		ownership.set(name, member.dir);
 	}
 	reconcileBoundaryLinks(modules, members, markerPath);
 	writeBoundaryOwnership(modules, ownership);
 	if (!fs.existsSync(markerPath)) fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
+	// Post-condition: the boundary we just reconciled must actually resolve
+	// every declared member. A crash, ENOSPC, or interruption in any earlier
+	// step could have left a marker-owned partial boundary; this launch would
+	// otherwise report success while missing members resolve through an
+	// ancestor checkout. Fail loudly instead of accepting the partial state.
+	const completedDeclaration = readWorkspaceDeclaration(worktreePath);
+	if (completedDeclaration && !isCompleteResolutionBoundary(worktreePath, modules, completedDeclaration)) {
+		throw new Error(
+			`worktree_boundary_incomplete_after_reconcile:${JSON.stringify(shortenPath(modules))} — the isolation ` +
+				"boundary does not resolve every declared workspace member after reconciliation. The boundary state " +
+				"may be damaged; remove the node_modules directory and relaunch.",
+		);
+	}
 }
 /**
  * Scans the worktree's workspace declarations and returns the absolute paths of

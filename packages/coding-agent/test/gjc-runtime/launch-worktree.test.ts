@@ -788,7 +788,7 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		// node_modules is an ancestor module root. Module resolution inside the
 		// worktree must still bind to the worktree's own commit, not the parent's
 		// live sources.
-		const probe = Bun.spawnSync(["bun", "-e", 'import { marker } from "@scope/app"; console.log(marker)'], {
+		const probe = Bun.spawnSync(["bun", "-e", 'import { marker } from "@scope/app"; process.stdout.write(marker)'], {
 			cwd: launched.cwd,
 			stdout: "pipe",
 			stderr: "pipe",
@@ -987,9 +987,13 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		const worktreeModules = path.join(launched.cwd, "node_modules");
 		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
 
-		// Simulate a package-manager install replacing the boundary links with
-		// real entries while the marker happens to survive.
-		await fs.rm(path.join(worktreeModules, "@scope"), { recursive: true, force: true });
+		// Simulate a package-manager install replacing the launcher's link with
+		// a real installed entry while the marker happens to survive. A real
+		// install materializes every workspace member; the unrelated `ms`
+		// entry proves the launcher did not prune it.
+		await fs.rm(path.join(worktreeModules, "@scope", "app"));
+		await fs.mkdir(path.join(worktreeModules, "@scope", "app"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "@scope", "app", "index.js"), "// installed\n");
 		await fs.mkdir(path.join(worktreeModules, "ms"), { recursive: true });
 		await Bun.write(path.join(worktreeModules, "ms", "index.js"), "// installed\n");
 
@@ -1238,6 +1242,20 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		);
 		// Refused, not deleted.
 		expect(await Bun.file(worktreeModules).text()).toBe("not a directory\n");
+	});
+	it("refuses a marker-owned boundary left incomplete by a damaged replacement", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-partial-reconcile-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "partial-reconcile"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+
+		// Simulate the crash window of a non-atomic replacement: the member
+		// link is gone while the marker and ownership manifest survive.
+		await fs.rm(path.join(worktreeModules, "@scope", "app"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "partial-reconcile"])).toThrow(
+			/worktree_boundary_incomplete_after_reconcile/,
+		);
 	});
 
 	it("rejects symlinked parents that resolve outside the boundary", async () => {
