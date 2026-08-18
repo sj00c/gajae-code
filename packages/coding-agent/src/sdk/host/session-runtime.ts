@@ -1399,6 +1399,7 @@ function createControlSurface(
 		// Skills always start their own invocation; a plain prompt starts one
 		// only when idle at dispatch time.
 		const startsOwnTurn = kind === "skill" || (kind === "prompt" && !alwaysQueued && !queuedAtDispatch);
+		let promotionStartsOwnRun: boolean | undefined;
 		try {
 			const submission = Promise.resolve(
 				run({
@@ -1408,8 +1409,10 @@ function createControlSurface(
 					// is later PROMOTED to its own run needs its pending ownership entry
 					// created at promotion so the submitting connection can
 					// terminal-abort that turn (review threads P1/P2).
-					onQueuedPromoted: (promotion: { startsOwnRun: boolean }) =>
-						onPromotedTurn?.(kind, correlation, requesterConnectionId, promotion),
+					onQueuedPromoted: (promotion: { startsOwnRun: boolean }) => {
+						promotionStartsOwnRun = promotion.startsOwnRun;
+						onPromotedTurn?.(kind, correlation, requesterConnectionId, promotion);
+					},
 					queuedAtDispatch,
 				}),
 			);
@@ -1421,7 +1424,11 @@ function createControlSurface(
 						// terminalizing here is safe — unless the submission resolved at queue time
 						// (followUp, or a prompt diverted to steer while streaming), in which case
 						// the turn's own lifecycle events drive terminalization.
-						if (!queuedAtDispatch) {
+						// Dispatch-race P1: queuedAtDispatch is the pre-dispatch snapshot;
+						// a delayed preflight diverted to steering fires onQueuedPromoted
+						// with startsOwnRun:false and is now attached to the in-flight run.
+						// Do not terminalize from the stale snapshot — the run will.
+						if (!queuedAtDispatch && promotionStartsOwnRun !== false) {
 							// The accepted work settled without its own run still pending:
 							// retire the pending ownership entry (and with it the
 							// acceptance-anchored deadline lease, #4668 review) BEFORE
@@ -2607,6 +2614,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					}>;
 				}>;
 				disposeGate?: () => void;
+				lifecycleActive: boolean;
 		  }
 		| undefined;
 	// Shared with the control surface's terminal abort: the correlated
@@ -2624,7 +2632,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// turn it did not submit, and never set for agent-initiated turns (review
 	// thread P1).
 	const activePromptOwnerHolder: { connectionIds?: Set<string> } = {};
-	const emitLifecycle = async (type: "agent_start" | "agent_end", ctx: ExtensionContext): Promise<void> => {
+	const emitLifecycle = async (
+		type: "agent_start" | "agent_end" | "agent_failed",
+		ctx: ExtensionContext,
+	): Promise<void> => {
 		const current = active;
 		if (!current) return;
 		const adoptLifecycleBatch = (
@@ -2650,6 +2661,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		let transitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		if (type === "agent_start") {
+			// Mark lifecycle active even when the drain is empty: a monitor/cron
+			// run started by the session has no SDK pending entry but is still a
+			// real active run that later in-run promotions must attach to instead
+			// of falling back to pending (review P1). Empty drains leave the
+			// previous SDK owner untouched.
+			current.lifecycleActive = true;
 			// Drain EVERY entry admitted for this run: a continuation may promote
 			// several follow-ups (each with its own requester correlation) into one
 			// run, and each submitting connection must be able to terminal-abort it.
@@ -2711,6 +2728,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", async (_event, ctx) => await emitLifecycle("agent_start", ctx));
 	api.on("agent_end", async (_event, ctx) => await emitLifecycle("agent_end", ctx));
+	(
+		api as unknown as {
+			on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void>) => void;
+		}
+	).on("agent_failed", async (_event, ctx) => await emitLifecycle("agent_failed", ctx));
 	api.on("turn_start", async (_event, ctx) => {
 		const current = active;
 		if (!current) return;
@@ -2774,6 +2796,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			getMaxMs: () => {
 				const v = options.settings?.get("sdk.promptMaxRuntimeMs" as never) as number | undefined;
 				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
+			},
+			onExpired: correlation => {
+				const idx = pending.findIndex(
+					entry =>
+						entry.correlation.commandId === correlation.commandId &&
+						entry.correlation.turnId === correlation.turnId,
+				);
+				if (idx >= 0) pending.splice(idx, 1);
 			},
 		});
 		const pending: Array<{
@@ -2858,7 +2888,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// immediately: it shares that run's ownership and terminalizes
 				// with it.
 				const current = active;
-				if (current && (current.activeInvocation || (current.drainedInvocations?.length ?? 0) > 0)) {
+				if (current?.lifecycleActive) {
+					// If this correlation was already admitted as own-run via the
+					// idle snapshot (onAccepted -> pending) but later diverted to
+					// steering and consumed in-run, move it from pending to the
+					// active run so a later unrelated agent_start cannot re-drain it
+					// (dispatch-race P1).
+					const pendingIdx = pending.findIndex(
+						entry =>
+							entry.correlation.commandId === correlation.commandId &&
+							entry.correlation.turnId === correlation.turnId,
+					);
+					if (pendingIdx >= 0) pending.splice(pendingIdx, 1);
 					if (connectionId !== undefined) {
 						const owners = new Set(activePromptOwnerHolder.connectionIds ?? []);
 						owners.add(connectionId);
@@ -3113,6 +3154,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			waitForGateResolutionQuiescence,
 			disposeGate,
+			lifecycleActive: false,
 		};
 		try {
 			await runtime.start();
@@ -3142,6 +3184,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					},
 					waitForGateResolutionQuiescence,
 					disposeGate,
+					lifecycleActive: false,
 				};
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}

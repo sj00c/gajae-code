@@ -6088,10 +6088,12 @@ export class AgentSession {
 											// continuations retain predecessor accounting, and resetAttemptBudget keeps
 											// the sticky fallback cursor unchanged.
 											onRunAccepted: (handle: AttemptRunHandle, acceptance) => {
-												// A continuation consuming queued messages starts a NEW run
-												// (its own agent_start), so promotions fire as own-run (#4668).
+												// Maintenance continuations continue the logical run without a new
+												// agent_start (review P1); their queued messages are in-run
+												// consumptions, not own-run promotions.
+												const startsOwn = options?.maintenanceContinuation !== true;
 												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
-													startsOwnRun: true,
+													startsOwnRun: startsOwn,
 												});
 												for (const message of acceptance.consumedQueuedMessages) {
 													const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);

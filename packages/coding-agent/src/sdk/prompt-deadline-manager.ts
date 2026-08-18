@@ -28,17 +28,20 @@ export class PromptDeadlineManager {
 	readonly #getLeaseMs: () => number;
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
+	readonly #onExpired?: (correlation: InvocationCorrelation) => void;
 
 	constructor(options: {
 		reconciliation: DeadlineReconciliation;
 		getLeaseMs: () => number;
 		getMaxMs: () => number;
 		now?: () => number;
+		onExpired?: (correlation: InvocationCorrelation) => void;
 	}) {
 		this.#reconciliation = options.reconciliation;
 		this.#getLeaseMs = options.getLeaseMs;
 		this.#getMaxMs = options.getMaxMs;
 		this.#now = options.now ?? Date.now;
+		this.#onExpired = options.onExpired;
 	}
 
 	#clearTimer(key: string): void {
@@ -93,6 +96,9 @@ export class PromptDeadlineManager {
 		} catch {
 			// finalize may race with normal terminalization; ignore.
 		} finally {
+			try {
+				this.#onExpired?.(correlation);
+			} catch {}
 			this.clear(correlation);
 		}
 	}
