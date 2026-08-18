@@ -1156,14 +1156,17 @@ describe("SessionSdkSessionRuntime", () => {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
-			sendUserMessage: (
+			sendUserMessage: async (
 				_content: string,
 				options: { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void } | undefined,
-			) =>
-				Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
-					options?.onPreflightAccepted?.();
-					return {};
-				}),
+			) => {
+				await options?.onPreflightAcceptCommit?.();
+				options?.onPreflightAccepted?.();
+				// Production-faithful: an accepted run stays in-flight for the whole
+				// test; sendUserMessage resolution (turn completion) never precedes
+				// agent_start (#4668 success-retirement).
+				await new Promise<void>(() => {});
+			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
 		const reconciliationStore = createReconciliationStore({
@@ -2971,6 +2974,124 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("an accepted prompt that settles before agent_start cannot mis-own a later turn", async () => {
+		// Red-team finding (#4668): a successful own-turn submission resolving
+		// after acceptance but before agent_start left its pending ownership
+		// entry behind, so a later agent_start drained the stale entry and made
+		// the old requester an owner of a turn it did not start.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-settle-early-owner-"));
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+			sendUserMessage: async (
+				content: string,
+				options: { onPreflightAcceptCommit?: () => Promise<void> } | undefined,
+			) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (content === "hangs") await new Promise<void>(() => {});
+			},
+		} as unknown as ExtensionAPI;
+		const transport = memoryTransport();
+		const reconciliationStore = createReconciliationStore({
+			sessionFile: path.join(cwd, "session.json"),
+			sessionId: transport.sessionId,
+		});
+		const seamCalls: Array<{ handle: string; scope: string }> = [];
+		createSdkSessionRuntimeExtension(api, {
+			agentDir: cwd,
+			createTransport: async () => transport,
+			terminalAbortSeams: {
+				getReconciliationStore: () => reconciliationStore,
+				getTerminalTurnEpoch: () => 7,
+				getActivePromptHandle: () => "settle-early-handle",
+				getActivePromptOwnerConnectionId: () => undefined,
+				cancelPendingPreflightForTerminalAbort: () => {},
+				abortPromptAndWaitWithTerminal: async (handle, options) => {
+					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
+					return { status: "settled", terminalScope: {} };
+				},
+			},
+		});
+		const ctx = { ...extensionContext(transport.sessionId, cwd), isIdle: () => true } as ExtensionContext;
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			const waitFrame = async (id: string) => {
+				const deadline = Date.now() + 15_000;
+				while (!transport.sent.some(frame => frame.id === id)) {
+					if (Date.now() > deadline) throw new Error(`Timed out waiting for ${id}`);
+					await Bun.sleep(20);
+				}
+				return transport.sent.find(frame => frame.id === id);
+			};
+			// conn-a's prompt is accepted and settles successfully BEFORE any
+			// agent_start: its pending ownership entry must be retired.
+			transport.feed("conn-a", {
+				type: "control_request",
+				id: "settle-early-a",
+				operation: "turn.prompt",
+				input: { text: "settles" },
+			} as SdkFrame);
+			const acceptedA = (await waitFrame("settle-early-a")) as { result?: { commandId?: string; turnId?: string } };
+			const idsA = { commandId: acceptedA.result?.commandId, turnId: acceptedA.result?.turnId };
+			const statusDeadline = Date.now() + 15_000;
+			for (;;) {
+				transport.feed("conn-a", {
+					type: "query_request",
+					id: "settle-early-status",
+					query: "turn.prompt_status",
+					input: idsA,
+				} as SdkFrame);
+				const statusFrame = (await waitFrame("settle-early-status")) as {
+					result?: { status?: string };
+				};
+				transport.sent.splice(transport.sent.indexOf(statusFrame), 1);
+				if (statusFrame.result?.status === "terminal_ok") break;
+				if (Date.now() > statusDeadline) throw new Error("settled prompt never reported terminal_ok");
+				await Bun.sleep(20);
+			}
+			// conn-b's prompt is accepted and hangs; its run then starts.
+			transport.feed("conn-b", {
+				type: "control_request",
+				id: "settle-early-b",
+				operation: "turn.prompt",
+				input: { text: "hangs" },
+			} as SdkFrame);
+			await waitFrame("settle-early-b");
+			await handlers.get("agent_start")?.({}, ctx);
+			// conn-a must NOT be an owner of conn-b's turn.
+			transport.feed("conn-a", {
+				type: "control_request",
+				id: "settle-early-abort-a",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "settle-early-abort-a-key",
+			} as SdkFrame);
+			expect(await waitFrame("settle-early-abort-a")).toMatchObject({
+				ok: true,
+				result: expect.objectContaining({ turn: "no_active_turn" }),
+			});
+			expect(seamCalls).toHaveLength(0);
+			// conn-b owns its turn and can terminal-abort it.
+			transport.feed("conn-b", {
+				type: "control_request",
+				id: "settle-early-abort-b",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "settle-early-abort-b-key",
+			} as SdkFrame);
+			expect(await waitFrame("settle-early-abort-b")).toMatchObject({
+				ok: true,
+				result: expect.objectContaining({ turn: "stopped" }),
+			});
+			expect(seamCalls).toEqual([{ handle: "settle-early-handle", scope: "turn" }]);
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("goal.list/get on a session without a goal returns a diagnostic state, not resource_gone", async () => {
 		// During the zero-activity incident goal.list/get degraded to a bare
 		// resource_gone ("snapshot payload is unavailable"), which was
@@ -3264,6 +3385,10 @@ test("SDK-only host keeps the idle-submitted prompt's owner when isIdle flips du
 			// The session's in-flight bookkeeping begins during the accept
 			// window: a re-read of isIdle() now reports streaming.
 			idle = false;
+			// Production-faithful: the accepted run stays in-flight; sendUserMessage
+			// resolution (turn completion) never precedes agent_start (#4668
+			// success-retirement).
+			await new Promise<void>(() => {});
 		},
 	} as unknown as ExtensionAPI;
 	const transport = memoryTransport();

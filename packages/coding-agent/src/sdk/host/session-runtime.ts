@@ -1419,13 +1419,22 @@ function createControlSurface(
 						// terminalizing here is safe — unless the submission resolved at queue time
 						// (followUp, or a prompt diverted to steer while streaming), in which case
 						// the turn's own lifecycle events drive terminalization.
-						if (!queuedAtDispatch)
+						if (!queuedAtDispatch) {
+							// The accepted work settled without its own run still pending:
+							// retire the pending ownership entry (and with it the
+							// acceptance-anchored deadline lease, #4668 review) BEFORE
+							// terminalizing. A stale entry would otherwise be drained by
+							// a later agent_start and hand this connection ownership of
+							// a turn it did not start. No-op when agent_start already
+							// drained the entry.
+							retirePendingOwner?.(correlation);
 							void reconciliation.noteTransition(kind, correlation, {
 								type: "agent_end",
 								...(typeof result === "string"
 									? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
 									: {}),
 							});
+						}
 						return;
 					}
 					if (allowCompletionFallback) {
