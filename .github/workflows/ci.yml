@@ -437,26 +437,24 @@ jobs:
               name: gjc-binary-${{ matrix.target_id }}
               path: ${{ matrix.binary_path }}
 
-   publish:
+   release_prepare:
       if: ${{ always() && needs.native.result == 'success' && needs.binaries.result == 'success' && ((needs.release_metadata.outputs.channel == 'stable' && startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch') || (needs.release_metadata.outputs.channel == 'nightly' && needs.nightly_gate.result == 'success')) }}
       needs: [native, binaries, release_metadata, nightly_gate]
       timeout-minutes: 45
       runs-on: ubuntu-22.04
       permissions:
-         contents: write
-         # npm trusted publishing (OIDC): npm >= 11.5.1 exchanges this job's
-         # GitHub OIDC token for a short-lived registry credential, so no
-         # long-lived NPM_TOKEN is involved and nothing expires under us.
-         id-token: write
+         contents: read
+         # Release-note attribution enumerates the pull requests behind each
+         # shipped commit. This job holds no write scope and no OIDC identity
+         # token: everything untrusted (dependency installs, repository
+         # scripts, GitHub API reads) happens here, before any credential that
+         # can publish exists.
+         pull-requests: read
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
-              node-version: "24"
-         - name: Pin npm for OIDC trusted publishing
-           # Trusted publishing requires npm >= 11.5.1; do not rely on whatever
-           # npm the Node distribution happens to bundle.
-           run: npm install -g npm@^11.5.1
+              # Release notes need the full history and the tag list.
+              fetch-depth: 0
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3.14"
@@ -523,6 +521,136 @@ jobs:
                  200) echo "Release $TAG_NAME already exists; refusing upsert" >&2; exit 1 ;;
                  *) echo "Cannot verify release absence: GitHub API returned HTTP $status" >&2; exit 1 ;;
               esac
+         - name: Derive and validate release notes
+           # A curated release is assembled by cherry-picking onto main, so
+           # generate_release_notes has no merged pull requests to describe and
+           # emits a body containing only a compare link (v0.14.1 shipped that).
+           # The body is resolved and validated HERE, in the credential-free
+           # preparation job, before the publish job performs the irreversible
+           # npm publication: a fetch, API, parse, or generation failure aborts
+           # the run while nothing immutable has shipped yet.
+           env:
+              GH_TOKEN: ${{ github.token }}
+              TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
+              SOURCE_SHA: ${{ github.sha }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              git fetch --quiet --tags --prune
+              notes_dir="$RUNNER_TEMP/release-notes"
+              mkdir -p "$notes_dir"
+              notes="$notes_dir/release-notes.md"
+              # Only exact stable vX.Y.Z tags that are ancestors of this release
+              # head may anchor the range; nightly/RC or unrelated-branch tags
+              # would derive notes from the wrong base. The loop is pipe-free so
+              # a no-candidate outcome reaches the documented empty-notes
+              # fallback instead of aborting under pipefail.
+              previous=""
+              while IFS= read -r tag; do
+                 [ "$tag" = "$TAG_NAME" ] && continue
+                 [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+                 if git merge-base --is-ancestor "$tag" "$SOURCE_SHA"; then
+                    previous="$tag"
+                    break
+                 fi
+              done < <(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname)
+              if [ -z "$previous" ]; then
+                 echo "No previous stable tag to compare against; leaving notes empty" >&2
+                 : > "$notes"
+              else
+                 bun scripts/release-notes.ts \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --base "$previous" \
+                    --head "$SOURCE_SHA" \
+                    --head-tag "$TAG_NAME" \
+                    --out "$notes"
+                 # The release cannot be redone once packages are immutable, so
+                 # the persisted body must be deterministic: a second derivation
+                 # has to reproduce it byte-for-byte.
+                 repeat="$notes_dir/release-notes-repeat.md"
+                 bun scripts/release-notes.ts \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --base "$previous" \
+                    --head "$SOURCE_SHA" \
+                    --head-tag "$TAG_NAME" \
+                    --out "$repeat"
+                 cmp --silent "$notes" "$repeat" || { echo "Release notes derivation is not deterministic" >&2; exit 1; }
+                 rm -f "$repeat"
+              fi
+              (cd "$notes_dir" && sha256sum release-notes.md > release-notes.sha256)
+         - name: Persist validated release notes
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: release-notes-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-notes
+              if-no-files-found: error
+              retention-days: 30
+              overwrite: true
+
+   publish:
+      # Minimal credential boundary: the only job holding contents: write and
+      # the OIDC identity token. All preparation (dependency installs behind
+      # native builds, repository scripts, GitHub API reads, notes derivation)
+      # happened in release_prepare; this job consumes its integrity-checked
+      # artifacts and performs only the irreversible steps.
+      if: ${{ needs.release_prepare.result == 'success' }}
+      needs: [release_prepare, release_metadata]
+      timeout-minutes: 45
+      runs-on: ubuntu-22.04
+      permissions:
+         contents: write
+         # npm trusted publishing (OIDC): npm >= 11.5.1 exchanges this job's
+         # GitHub OIDC token for a short-lived registry credential, so no
+         # long-lived NPM_TOKEN is involved and nothing expires under us.
+         id-token: write
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - name: Pin npm for OIDC trusted publishing
+           # Trusted publishing requires npm >= 11.5.1; do not rely on whatever
+           # npm the Node distribution happens to bundle. The pin is exact and
+           # integrity-verifiable: a mutable range inside this credential-
+           # bearing job would let a drifting or compromised CLI publish.
+           env:
+              NPM_PIN_VERSION: "11.5.1"
+              # sha512 of https://registry.npmjs.org/npm/-/npm-11.5.1.tgz
+              # (matches the registry dist.integrity for npm@11.5.1).
+              NPM_TARBALL_SHA512: "232e6f5d9e799bcb486920b3e9ba907fdf96e576cf7e8c9446c8162e33a416096a1d37a9e910d9a918f6b1f606791c99bc6bb61ee2569b496ec74af13d0dbd95"
+           shell: bash
+           run: |
+              set -euo pipefail
+              tmp="$(mktemp -d "$RUNNER_TEMP/npm-pin.XXXXXX")"
+              npm pack "npm@${NPM_PIN_VERSION}" --pack-destination "$tmp"
+              echo "$NPM_TARBALL_SHA512  $tmp/npm-${NPM_PIN_VERSION}.tgz" | sha512sum --check --strict -
+              npm install -g "$tmp/npm-${NPM_PIN_VERSION}.tgz"
+              test "$(npm --version)" = "$NPM_PIN_VERSION"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3.14"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Download pre-publication package evidence
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: release-evidence-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-evidence
+         - name: Download validated release notes
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: release-notes-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-notes
+         - name: Verify release notes integrity
+           shell: bash
+           run: |
+              set -euo pipefail
+              cd "$RUNNER_TEMP/release-notes"
+              sha256sum --check --strict release-notes.sha256
          - name: Publish packages to npm
            env:
               RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}
@@ -548,36 +676,6 @@ jobs:
               pattern: gjc-binary-*
               path: release-binaries
               merge-multiple: true
-         - name: Derive release notes
-           # A curated release is assembled by cherry-picking onto main, so
-           # generate_release_notes has no merged pull requests to describe and
-           # emits a body containing only a compare link (v0.14.1 shipped that).
-           # Deriving from the range credits the pull requests that actually
-           # shipped, and refuses to credit ones this release excluded.
-           env:
-              GH_TOKEN: ${{ github.token }}
-              TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
-           shell: bash
-           run: |
-              set -euo pipefail
-              # The publish checkout is shallow and tagless, so neither the tag
-              # list nor the commit range exists until history is fetched.
-              git fetch --quiet --tags --prune --unshallow || git fetch --quiet --tags --prune
-              notes="$RUNNER_TEMP/release-notes.md"
-              previous="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
-                 | grep -vFx "$TAG_NAME" | head -1)"
-              if [ -z "$previous" ]; then
-                 echo "No previous stable tag to compare against; leaving notes empty" >&2
-                 : > "$notes"
-              else
-                 bun scripts/release-notes.ts \
-                    --repo "$GITHUB_REPOSITORY" \
-                    --base "$previous" \
-                    --head "$GITHUB_SHA" \
-                    --head-tag "$TAG_NAME" \
-                    --out "$notes"
-              fi
-              echo "RELEASE_NOTES_PATH=$notes" >> "$GITHUB_ENV"
          - name: Create GitHub Release
            uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
            with:
@@ -587,7 +685,7 @@ jobs:
               draft: false
               prerelease: ${{ needs.release_metadata.outputs.channel == 'nightly' }}
               make_latest: ${{ needs.release_metadata.outputs.channel != 'nightly' }}
-              body_path: ${{ env.RELEASE_NOTES_PATH }}
+              body_path: ${{ runner.temp }}/release-notes/release-notes.md
               generate_release_notes: false
               fail_on_unmatched_files: true
               files: |

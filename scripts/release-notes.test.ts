@@ -5,6 +5,7 @@ import {
 	SHIPPED_COVERAGE_THRESHOLD,
 	attributeCommit,
 	buildReleaseNotes,
+	isExplicitEmptyGhResult,
 	normalizeSubject,
 	parseReleaseNotesCli,
 	parseSubjectPullRequestRef,
@@ -224,5 +225,25 @@ describe("cli", () => {
 
 	test("rejects a dangling flag instead of silently dropping it", () => {
 		expect(() => parseReleaseNotesCli(["--repo", "o/n", "--base"])).toThrow("Usage");
+	});
+});
+
+describe("fail-closed gh result classification", () => {
+	test("treats success and explicit not-found as empty, everything else as failure", () => {
+		// Explicit success and explicit no-result responses are the only empty outcomes.
+		expect(isExplicitEmptyGhResult(0, "")).toBe(true);
+		expect(isExplicitEmptyGhResult(1, "GraphQL: Could not resolve to a PullRequest with the number of 999999.")).toBe(true);
+		expect(isExplicitEmptyGhResult(1, "no pull requests found")).toBe(true);
+	});
+
+	test("fails closed on auth, transport, and API errors", () => {
+		expect(isExplicitEmptyGhResult(1, "gh: To authenticate, please run `gh auth login`.")).toBe(false);
+		expect(isExplicitEmptyGhResult(1, "HTTP 403: Resource not accessible by integration")).toBe(false);
+		expect(isExplicitEmptyGhResult(1, "HTTP 500: Internal Server Error")).toBe(false);
+		expect(isExplicitEmptyGhResult(1, "dial tcp: lookup api.github.com: no such host")).toBe(false);
+		expect(isExplicitEmptyGhResult(1, "API rate limit exceeded")).toBe(false);
+		// A bare/unknown failure must never be mistaken for an explicit empty.
+		expect(isExplicitEmptyGhResult(1, "")).toBe(false);
+		expect(isExplicitEmptyGhResult(128, "fatal: something else")).toBe(false);
 	});
 });

@@ -420,23 +420,46 @@ export function assertAtomicPushRemoteState(output: string, sourceCommit: string
 	}
 }
 
-async function pushReleaseRefsAtomically(version: string): Promise<void> {
+/**
+ * Local state a rejected atomic push must undo so the same version can be
+ * retried as the original transaction: the release tag and the release
+ * commit (whose parent is the pre-release HEAD captured before tagging).
+ */
+export interface AtomicPushRollbackPlan {
+	tag: string;
+	preReleaseCommit: string;
+}
+
+export function planAtomicPushRollback(version: string, preReleaseCommit: string): AtomicPushRollbackPlan {
+	if (!isStableReleaseVersion(version)) throw new Error(`Release version must be exact stable X.Y.Z, received ${version}`);
+	if (!/^[0-9a-f]{40}$/u.test(preReleaseCommit)) throw new Error("Cannot resolve pre-release commit for atomic push rollback");
+	return { tag: `v${version}`, preReleaseCommit };
+}
+
+export async function pushReleaseRefsAtomically(version: string): Promise<void> {
 	const sourceCommit = (await git(["rev-parse", "HEAD"]).text()).trim();
 	if (!/^[0-9a-f]{40}$/u.test(sourceCommit)) throw new Error("Cannot resolve release commit for atomic push");
+	const preReleaseCommit = (await git(["rev-parse", "HEAD^"]).text()).trim();
+	const rollbackPlan = planAtomicPushRollback(version, preReleaseCommit);
 	const push = await git(releaseAtomicPushArgs(version)).quiet().nothrow();
 	if (push.exitCode !== 0) {
-		// Nothing reached origin, so the local tag created moments ago is the only
-		// artifact of this attempt. Leaving it behind makes the immutable-tag
-		// preflight reject the *same* version on the next run, forcing a version
-		// burn for a failure that published nothing. Drop it and let the operator
-		// retry this version once the push cause is resolved.
-		const rollback = await git(["tag", "--delete", `v${version}`]).quiet().nothrow();
+		// Nothing reached origin, so the only artifacts of this attempt are the
+		// local release commit and tag created moments ago. Leaving either behind
+		// breaks the retry: the immutable-tag preflight rejects the reused tag,
+		// and the half-prepared tree makes the next run see an empty Unreleased
+		// section, duplicate release headings, or nothing-to-commit. Roll back the
+		// complete local release state so retrying the same version re-runs the
+		// original transaction from a clean tree (the release flow asserts a clean
+		// tree before preparing, so resetting to the pre-release commit loses
+		// nothing outside this attempt).
+		const tagRollback = await git(["tag", "--delete", rollbackPlan.tag]).quiet().nothrow();
+		const commitRollback = await git(["reset", "--hard", rollbackPlan.preReleaseCommit]).quiet().nothrow();
 		const rollbackNote =
-			rollback.exitCode === 0
-				? `Local tag v${version} was removed, so this version can be retried.`
-				: `Local tag v${version} could not be removed; delete it before retrying (git tag -d v${version}).`;
+			tagRollback.exitCode === 0 && commitRollback.exitCode === 0
+				? `Local tag ${rollbackPlan.tag} and the release commit were rolled back to ${rollbackPlan.preReleaseCommit}; this version can be retried once the push cause is resolved.`
+				: `Local rollback incomplete (tag delete exit ${tagRollback.exitCode ?? "unknown"}, reset exit ${commitRollback.exitCode ?? "unknown"}); before retrying run: git tag -d ${rollbackPlan.tag} && git reset --hard ${rollbackPlan.preReleaseCommit}`;
 		throw new Error(
-			`Atomic push of main and v${version} was rejected; neither ref may be retried independently: ${outputOf(push) || `exit ${push.exitCode ?? "unknown"}`}. ${rollbackNote}`,
+			`Atomic push of main and ${rollbackPlan.tag} was rejected; neither ref may be retried independently: ${outputOf(push) || `exit ${push.exitCode ?? "unknown"}`}. ${rollbackNote}`,
 		);
 	}
 	const tag = `v${version}`;

@@ -155,10 +155,41 @@ async function git(args: readonly string[]): Promise<string> {
 	return result.stdout.toString();
 }
 
+/** stderr patterns that mean "definitely nothing exists", not "lookup failed". */
+const EXPLICIT_EMPTY_PATTERNS: readonly RegExp[] = [
+	/could not resolve to a PullRequest/iu,
+	/no pull requests? found/iu,
+];
+
+/**
+ * True only for an explicit no-result response: a successful exit, or a
+ * failure whose stderr positively identifies "does not exist". Anything else
+ * (auth, transport, rate limit, server error) must fail closed, because
+ * deriving notes from a partially reachable GitHub silently drops attribution
+ * and new-contributor detection, and the release cannot be redone once the
+ * published packages are immutable.
+ */
+export function isExplicitEmptyGhResult(exitCode: number, stderr: string): boolean {
+	if (exitCode === 0) return true;
+	return EXPLICIT_EMPTY_PATTERNS.some(pattern => pattern.test(stderr));
+}
+
 async function gh(args: readonly string[]): Promise<string> {
 	const result = await $`gh ${args}`.quiet().nothrow();
-	// A commit with no associated pull request is normal, not a failure.
-	return result.exitCode === 0 ? result.stdout.toString() : "";
+	if (result.exitCode !== 0) {
+		throw new Error(`gh ${args.join(" ")} failed (exit ${result.exitCode}): ${result.stderr.toString().trim()}`);
+	}
+	return result.stdout.toString();
+}
+
+async function ghAllowExplicitEmpty(args: readonly string[]): Promise<string | undefined> {
+	const result = await $`gh ${args}`.quiet().nothrow();
+	if (result.exitCode !== 0) {
+		const stderr = result.stderr.toString().trim();
+		if (isExplicitEmptyGhResult(result.exitCode, stderr)) return undefined;
+		throw new Error(`gh ${args.join(" ")} failed (exit ${result.exitCode}): ${stderr}`);
+	}
+	return result.stdout.toString();
 }
 
 async function collectCommits(baseTag: string, head: string): Promise<ReleaseCommit[]> {
@@ -181,8 +212,8 @@ async function cherryPickOrigin(sha: string): Promise<string> {
 }
 
 async function loadPullRequest(repo: string, number: number): Promise<CandidatePullRequest | undefined> {
-	const raw = await gh(["pr", "view", String(number), "--repo", repo, "--json", "number,title,author,commits"]);
-	if (raw.trim() === "") return undefined;
+	const raw = await ghAllowExplicitEmpty(["pr", "view", String(number), "--repo", repo, "--json", "number,title,author,commits"]);
+	if (raw === undefined || raw.trim() === "") return undefined;
 	const parsed = JSON.parse(raw) as {
 		number: number;
 		title: string;

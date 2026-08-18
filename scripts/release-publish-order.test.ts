@@ -462,6 +462,7 @@ describe("native release binary coverage", () => {
 		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
 		const native = workflowJob(workflow, "native");
 		const binaries = workflowJob(workflow, "binaries");
+		const prepare = workflowJob(workflow, "release_prepare");
 		const publish = workflowJob(workflow, "publish");
 
 		for (const job of [native, binaries]) {
@@ -469,20 +470,21 @@ describe("native release binary coverage", () => {
 			expect(job).toContain("inputs.rehearsal == 'tag-build-verify'");
 			expect(job).toContain("inputs.rehearsal == 'nightly-release'");
 		}
-		expect(publish).toContain("needs.release_metadata.outputs.channel == 'stable'");
-		expect(publish).toContain("needs.release_metadata.outputs.channel == 'nightly'");
+		expect(prepare).toContain("needs.release_metadata.outputs.channel == 'stable'");
+		expect(prepare).toContain("needs.release_metadata.outputs.channel == 'nightly'");
 		expect(workflow).not.toContain("release_source_verify");
 		expect(workflow).not.toContain("verify exact source SHA passed a successful main CI run");
 
 		expect(native).toContain("needs: [release_metadata]");
 		expect(binaries).toContain("needs: [native, release_metadata]");
-		expect(publish).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
+		expect(prepare).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
+		expect(publish).toContain("needs: [release_prepare, release_metadata]");
 
-		expect(publish).toContain("--prepare-evidence --evidence-dir");
+		expect(prepare).toContain("--prepare-evidence --evidence-dir");
+		expect(prepare).toContain("Persist pre-publication package evidence");
 		expect(publish).toContain("--publish-from-evidence");
 		expect(publish).toContain("gajae-production-release");
 		expect(publish).toContain("gajae-nightly-release");
-		expect(publish).toContain("Persist pre-publication package evidence");
 		expect(publish).toContain("id-token: write");
 
 		expect(publish).toContain("softprops/action-gh-release");
