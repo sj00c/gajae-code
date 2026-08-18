@@ -321,6 +321,7 @@ function createControllerContext(
 			clear: () => {
 				children.length = 0;
 			},
+			detachChild: () => {},
 			addChild: (child: unknown) => {
 				children.push(child);
 			},

@@ -76,6 +76,22 @@ function makeComposerHarness() {
 }
 
 /**
+ * The /debug viewers re-open the selector through `ctx.showDebugSelector()`
+ * (debug/index.ts onExit); wire that hook to the real SelectorController
+ * method so the production cycle runs end to end.
+ */
+function makeDebugHarness() {
+	const harness = makeComposerHarness();
+	const controller = new SelectorController(harness.ctx);
+	const debugCtx = {
+		...harness.ctx,
+		showDebugSelector: () => controller.showDebugSelector(),
+	} as unknown as InteractiveModeContext;
+	const debugController = new SelectorController(debugCtx);
+	return { harness, controller: debugController };
+}
+
+/**
  * Toggle the default tab width once and assert the composer's listener fired.
  * Returns the invalidation count after the toggle.
  */
@@ -165,7 +181,7 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 
 	test("debug log and raw-SSE viewer opens do not dispose the reusable composer", async () => {
 		setThemeInstance(testTheme);
-		const harness = makeComposerHarness();
+		const { harness, controller } = makeDebugHarness();
 		const invalidations = countInvalidations(harness.editor);
 		const defaultWidth = 3;
 		setDefaultTabWidth(defaultWidth);
@@ -179,54 +195,52 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 		const today = new Date().toISOString().slice(0, 10);
 		await fs.writeFile(path.join(tempRoot, `gjc.${today}.log`), "seeded log line\n", "utf8");
 
-		/**
-		 * Mount the debug selector exactly the way the production entry does
-		 * (showSelector's post-#4605 detach shape), so only the viewer open
-		 * paths under test here can dispose the composer.
-		 */
+		// The production /debug entry: showDebugSelector goes through the real
+		// SelectorController.showSelector generic open boundary, so the open
+		// detach at that boundary is exercised too. Viewer exits re-open the
+		// selector through the ctx hook exactly like production (wired in
+		// makeDebugHarness).
 		const openDebugSelector = () => {
-			harness.editorContainer.detachChild(harness.editor);
-			harness.editorContainer.clear();
-			const selector = new DebugSelectorComponent(debugCtx, () => {
-				harness.editorContainer.clear();
-				harness.editorContainer.addChild(harness.editor);
-			});
-			harness.editorContainer.addChild(selector);
+			controller.showDebugSelector();
+			const selector = harness.editorContainer.children.find(child => child instanceof DebugSelectorComponent);
+			if (!selector) throw new Error("Expected the debug selector to mount");
 			return selector;
 		};
-		// Viewer exits re-open the debug selector through the ctx hook, exactly
-		// like production (debug/index.ts onExit -> ctx.showDebugSelector).
-		const debugCtx = { ...harness.ctx, showDebugSelector: () => openDebugSelector() } as InteractiveModeContext;
 		// DEBUG_MENU_ITEMS order: open-artifacts, performance, work, dump,
-		// memory, logs, ... — "logs" is index 5 (five downs).
-		const LOGS_INDEX = 5;
+		// memory, logs, system, raw-sse — "logs" is index 5, "raw-sse" is 7.
+		const menuIndexes = { logs: 5, rawSse: 7 } as const;
+
+		const runViewerCycle = async (menuIndex: number) => {
+			const selector = openDebugSelector();
+			for (let step = 0; step < menuIndex; step += 1) selector.handleInput(SELECT_DOWN_KEY);
+			selector.handleInput(SELECT_CONFIRM_KEY);
+			// DebugSelectorComponent calls done() (restore) then opens the real
+			// viewer through the exact production path under test.
+			const deadline = Date.now() + 2_000;
+			while (
+				(harness.editorContainer.children[0] === harness.editor ||
+					harness.editorContainer.children[0] instanceof DebugSelectorComponent) &&
+				Date.now() < deadline
+			) {
+				await Bun.sleep(1);
+			}
+			expect(harness.editorContainer.children.length).toBe(1);
+			const viewer = harness.editorContainer.children[0];
+			expect(viewer).not.toBe(harness.editor);
+			expect(viewer).not.toBeInstanceOf(DebugSelectorComponent);
+			// Production close: viewer exit re-opens the debug selector;
+			// canceling that restores the composer.
+			viewer?.handleInput?.(CANCEL_KEY);
+			expect(harness.editorContainer.children[0]).toBeInstanceOf(DebugSelectorComponent);
+			harness.editorContainer.children[0]?.handleInput?.(CANCEL_KEY);
+			expect(harness.editorContainer.children).toEqual([harness.editor]);
+		};
 
 		try {
 			let previous = 0;
 			for (let cycle = 0; cycle < 4; cycle += 1) {
-				const selector = openDebugSelector();
-				for (let step = 0; step < LOGS_INDEX; step += 1) selector.handleInput(SELECT_DOWN_KEY);
-				selector.handleInput(SELECT_CONFIRM_KEY);
-				// DebugSelectorComponent calls done() (restore) then opens the
-				// real log viewer through the exact production path under test.
-				const deadline = Date.now() + 2_000;
-				while (
-					(harness.editorContainer.children[0] === harness.editor ||
-						harness.editorContainer.children[0] instanceof DebugSelectorComponent) &&
-					Date.now() < deadline
-				) {
-					await Bun.sleep(1);
-				}
-				expect(harness.editorContainer.children.length).toBe(1);
-				const viewer = harness.editorContainer.children[0];
-				expect(viewer).not.toBe(harness.editor);
-				expect(viewer).not.toBeInstanceOf(DebugSelectorComponent);
-				// Production close: viewer exit re-opens the debug selector;
-				// canceling that restores the composer.
-				viewer?.handleInput?.(CANCEL_KEY);
-				expect(harness.editorContainer.children[0]).toBeInstanceOf(DebugSelectorComponent);
-				harness.editorContainer.children[0]?.handleInput?.(CANCEL_KEY);
-				expect(harness.editorContainer.children).toEqual([harness.editor]);
+				// Both changed viewer branches, alternating per cycle.
+				await runViewerCycle(cycle % 2 === 0 ? menuIndexes.logs : menuIndexes.rawSse);
 				previous = expectTabWidthToggleInvalidates(invalidations, previous, defaultWidth);
 			}
 			expect(previous).toBeGreaterThanOrEqual(4);
