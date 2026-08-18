@@ -593,12 +593,24 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 			}
 			// A link that resolves is either provably the source checkout's own
 			// node_modules (handled above, the exact link this launcher creates)
-			// or a user-owned external store: provably not source-coupled, kept
-			// and reported present.
+			// or another tree. Any other tree is user-owned, but ownership alone
+			// does not isolate resolution: for a workspace repo it must also be a
+			// complete boundary for this commit, or missing members would resolve
+			// through an ancestor checkout (#4620).
 			const resolved = tryRealpath(target);
 			if (resolved !== null) {
 				const sourceModules = tryRealpath(path.join(sourceRoot, "node_modules"));
-				if (sourceModules !== null && !sameFileSystemPath(resolved, sourceModules)) {
+				const isSourceModules = sourceModules !== null && sameFileSystemPath(resolved, sourceModules);
+				if (!isSourceModules) {
+					const declaration = readWorkspaceDeclaration(worktreePath);
+					if (declaration && !isCompleteResolutionBoundary(worktreePath, target, declaration)) {
+						throw new Error(
+							`worktree_node_modules_boundary_incomplete:${JSON.stringify(shortenPath(target))} — the worktree ` +
+								"declares workspace packages that this link does not resolve, so missing members would " +
+								"resolve through an ancestor checkout. Run the package manager inside the worktree to " +
+								"complete the install, or remove this link and relaunch to let GJC create its boundary.",
+						);
+					}
 					return "present";
 				}
 			}
@@ -613,6 +625,10 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 		}
 		if (targetStat.isDirectory()) {
 			const marker = path.join(target, NODE_MODULES_OWNERSHIP_MARKER);
+			// The marker is the launcher's ownership proof: anything but a
+			// regular file inside this directory (symlink, dir, dangling link)
+			// cannot prove launcher ownership and must not be followed.
+			assertBoundaryMetadataFile(target, marker, "worktree_boundary_marker_invalid");
 			if (fs.existsSync(marker)) {
 				// Launcher-owned: reconcile against the current commit's members.
 				createWorkspaceSelfLinkBoundary(worktreePath);
@@ -636,7 +652,19 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 			}
 			return "present";
 		}
-		// Neither directory nor symlink (file, socket, ...): user-owned.
+		// Neither directory nor symlink (file, socket, FIFO, ...): it cannot
+		// hold `node_modules/<workspace-member>` entries, so for a workspace
+		// repo resolution would walk up to an ancestor checkout. Refuse the
+		// launch (never delete the user-owned entry) with remediation.
+		const nonDirectoryDeclaration = readWorkspaceDeclaration(worktreePath);
+		if (nonDirectoryDeclaration) {
+			throw new Error(
+				`worktree_node_modules_not_a_boundary:${JSON.stringify(shortenPath(target))} — the worktree declares ` +
+					"workspace packages, but this entry is not a directory and cannot provide local resolution for " +
+					"them, so imports would resolve through an ancestor checkout. Remove the entry and relaunch, or " +
+					"replace it with a complete install.",
+			);
+		}
 		return "present";
 	}
 	// The isolation decision is driven by the worktree's own workspace
@@ -693,6 +721,9 @@ function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
 	const declaration = readWorkspaceDeclaration(worktreePath);
 	const modules = path.join(worktreePath, "node_modules");
 	const markerPath = path.join(modules, NODE_MODULES_OWNERSHIP_MARKER);
+	// Both boundary metadata names must be plain regular files inside the
+	// boundary before anything reads or writes through them.
+	assertBoundaryMetadataFile(modules, markerPath, "worktree_boundary_marker_invalid");
 	const markerOwned = fs.existsSync(markerPath);
 	if (!declaration) {
 		// No declaration at this commit: a marker-owned boundary from a previous
@@ -758,15 +789,14 @@ function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
  * Scans the worktree's workspace declarations and returns the absolute paths of
  * every member `package.json` they select.
  *
- * Pattern semantics follow pnpm/npm ordering: patterns are evaluated in
- * declaration order and later patterns override earlier ones — a trailing
- * `!pattern` removes every directory matched so far, exactly like pnpm's
- * documented negation behavior. Traversal or absolute patterns are isolation
- * failures, not silent skips.
+ * Pattern semantics follow pnpm/npm ordered semantics: patterns are evaluated
+ * in declaration order and later patterns override earlier ones — `!pattern`
+ * removes every directory matched so far, and a later positive pattern
+ * re-includes it. Traversal or absolute patterns are isolation failures, not
+ * silent skips.
  */
 function scanWorkspaceMemberManifests(worktreePath: string, patterns: string[], manifestFile: string): string[] {
-	const globPatterns: string[] = [];
-	const negations: string[] = [];
+	const selected = new Set<string>();
 	for (const pattern of patterns) {
 		if (!isConfinedWorkspacePattern(pattern)) {
 			throw new Error(
@@ -774,23 +804,16 @@ function scanWorkspaceMemberManifests(worktreePath: string, patterns: string[], 
 					"absolute paths and traversal segments cannot be used for the isolation boundary.",
 			);
 		}
-		if (pattern.startsWith("!")) negations.push(pattern.slice(1));
-		else globPatterns.push(pattern);
-	}
-	const selected = new Set<string>();
-	for (const pattern of globPatterns) {
-		for (const match of new Bun.Glob(path.posix.join(pattern, "package.json")).scanSync({
-			cwd: worktreePath,
-			dot: false,
-			onlyFiles: true,
-		})) {
-			selected.add(match);
+		const positive = pattern.startsWith("!") ? pattern.slice(1) : pattern;
+		const glob = new Bun.Glob(path.posix.join(positive, "package.json"));
+		if (pattern.startsWith("!")) {
+			for (const match of selected) {
+				if (glob.match(match)) selected.delete(match);
+			}
+			continue;
 		}
-	}
-	for (const negation of negations) {
-		const excluded = new Bun.Glob(path.posix.join(negation, "package.json"));
-		for (const match of selected) {
-			if (excluded.match(match)) selected.delete(match);
+		for (const match of glob.scanSync({ cwd: worktreePath, dot: false, onlyFiles: true })) {
+			selected.add(match);
 		}
 	}
 	return [...selected].map(match => path.join(worktreePath, match));
@@ -877,14 +900,17 @@ function reconcileBoundaryLinks(
 /**
  * Reads the per-link ownership manifest beside the boundary marker.
  *
- * Fails closed: a manifest that exists but cannot be read or parsed as a flat
- * string→string record of valid package names authorizes nothing — silently
- * treating it as empty would let remediation delete links the launcher cannot
- * prove it owns, or preserve stale links it should have pruned. An absent
- * manifest (first creation) is legitimately empty.
+ * Fails closed: a manifest that exists but is not a regular file inside the
+ * boundary (a symlink lets a checkout redirect reconciliation reads and writes
+ * to an arbitrary external path), cannot be read, or cannot be parsed as a
+ * flat string→string record of valid package names authorizes nothing —
+ * silently treating it as empty would let remediation delete links the
+ * launcher cannot prove it owns, or preserve stale links it should have
+ * pruned. An absent manifest (first creation) is legitimately empty.
  */
 function readBoundaryOwnership(modules: string): Map<string, string> {
 	const manifestPath = path.join(modules, NODE_MODULES_LINK_OWNERSHIP_MANIFEST);
+	assertBoundaryMetadataFile(modules, manifestPath, "worktree_boundary_manifest_invalid");
 	let raw: string;
 	try {
 		raw = fs.readFileSync(manifestPath, "utf8");
@@ -939,13 +965,50 @@ function isRecordedLinkAtIdentity(linkPath: string, recordedTarget: string): boo
 	if (recordedReal === null) return false;
 	return sameFileSystemPath(targetReal, recordedReal);
 }
-
 /** Writes the per-link ownership manifest beside the boundary marker. */
 function writeBoundaryOwnership(modules: string, ownership: Map<string, string>): void {
 	const manifestPath = path.join(modules, NODE_MODULES_LINK_OWNERSHIP_MANIFEST);
+	assertBoundaryMetadataFile(modules, manifestPath, "worktree_boundary_manifest_invalid");
 	const record: Record<string, string> = {};
 	for (const [name, dir] of ownership) record[name] = dir;
 	fs.writeFileSync(manifestPath, `${JSON.stringify(record, null, "\t")}\n`);
+}
+
+/**
+ * Boundary metadata (ownership marker and link manifest) must be a regular
+ * file lexically inside `modules` whose realpath also resolves inside
+ * `modules`. A symlink at either name lets a checkout redirect the launcher's
+ * metadata reads and writes to an arbitrary path outside the boundary —
+ * including creating or overwriting an external file — so anything but a
+ * plain regular file inside the boundary fails closed. An absent entry is
+ * fine: it is about to be created.
+ */
+function assertBoundaryMetadataFile(modules: string, metadataPath: string, errorCode: string): void {
+	// lstat (not existsSync) decides absence: a dangling symlink must be seen
+	// as an obstruction, not as "will be created", or the write below would
+	// create the external target.
+	const stat = tryLstat(metadataPath);
+	if (stat === null) return;
+	if (!stat.isFile()) {
+		throw new Error(
+			`${errorCode}:${JSON.stringify(shortenPath(metadataPath))} — boundary metadata must be a regular file ` +
+				"inside the launcher-owned node_modules, not a symlink or directory.",
+		);
+	}
+	const modulesReal = tryRealpath(modules);
+	const metadataReal = tryRealpath(metadataPath);
+	if (modulesReal === null || metadataReal === null) {
+		throw new Error(
+			`${errorCode}:${JSON.stringify(shortenPath(metadataPath))} — boundary metadata identity cannot be ` +
+				"resolved, so writes through it cannot be proven safe.",
+		);
+	}
+	if (metadataReal !== modulesReal && !isInsideDirectoryReal(modulesReal, metadataReal)) {
+		throw new Error(
+			`${errorCode}:${JSON.stringify(shortenPath(metadataPath))} — boundary metadata resolves outside the ` +
+				"launcher-owned node_modules and must not be read or written through.",
+		);
+	}
 }
 
 /**

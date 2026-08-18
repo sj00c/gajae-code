@@ -1077,6 +1077,57 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 			/worktree_boundary_manifest_invalid/,
 		);
 	});
+	it("never reads a link-ownership manifest that is a symlink to an external file", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-manifest-symlink-");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-manifest-escape-"));
+		cleanupPaths.push(outside);
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "manifest-symlink"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		const outsideTarget = path.join(outside, "secret.txt");
+		await Bun.write(outsideTarget, "do-not-touch\n");
+		await fs.rm(path.join(worktreeModules, ".gjc-node-modules-links.json"));
+		await fs.symlink(outsideTarget, path.join(worktreeModules, ".gjc-node-modules-links.json"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "manifest-symlink"])).toThrow(
+			/worktree_boundary_manifest_invalid/,
+		);
+		// The external target is never created or overwritten through the link.
+		expect(await Bun.file(outsideTarget).text()).toBe("do-not-touch\n");
+	});
+
+	it("fails closed on a dangling link-ownership manifest symlink", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-manifest-dangling-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "manifest-dangling"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(path.join(worktreeModules, ".gjc-node-modules-links.json"));
+		await fs.symlink(
+			path.join(os.tmpdir(), "gjc-no-such-manifest-target-xyz"),
+			path.join(worktreeModules, ".gjc-node-modules-links.json"),
+		);
+
+		// A dangling link must be treated as an obstruction, not "absent": the
+		// write below it would otherwise create the external target.
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "manifest-dangling"])).toThrow(
+			/worktree_boundary_manifest_invalid/,
+		);
+	});
+
+	it("never treats a symlinked boundary marker as launcher ownership", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-marker-symlink-");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-marker-escape-"));
+		cleanupPaths.push(outside);
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "marker-symlink"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		const outsideTarget = path.join(outside, "marker.txt");
+		await Bun.write(outsideTarget, "marker\n");
+		await fs.rm(path.join(worktreeModules, ".gjc-node-modules-boundary"));
+		await fs.symlink(outsideTarget, path.join(worktreeModules, ".gjc-node-modules-boundary"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "marker-symlink"])).toThrow(
+			/worktree_boundary_marker_invalid/,
+		);
+		expect(await Bun.file(outsideTarget).text()).toBe("marker\n");
+	});
 
 	it("excludes members matched by later negated pnpm workspace patterns", async () => {
 		const repo = await createRepo("gjc-launch-worktree-negation-");
@@ -1125,6 +1176,68 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		const reconciled = path.join(reused.cwd, "node_modules");
 		expect(await fs.lstat(path.join(reconciled, "@scope", "legacy")).catch(() => null)).toBe(null);
 		expect((await fs.lstat(path.join(reconciled, "@scope", "app"))).isSymbolicLink()).toBe(true);
+	});
+	it("re-includes a member negated earlier when a later positive pattern matches it", async () => {
+		const repo = await createRepo("gjc-launch-worktree-reinclude-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "legacy"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({
+				name: "root",
+				private: true,
+				workspaces: ["packages/*", "!packages/legacy", "packages/legacy"],
+			}),
+		);
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		await Bun.write(path.join(repo, "packages", "legacy", "package.json"), '{"name":"@scope/legacy"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "re-inclusion"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "reinclude"]);
+		const modules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(modules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+		// Ordered semantics: the trailing positive pattern re-includes the member
+		// the negation removed, so it gets a local link instead of resolving
+		// through an ancestor.
+		expect((await fs.lstat(path.join(modules, "@scope", "legacy"))).isSymbolicLink()).toBe(true);
+	});
+
+	it("refuses an external node_modules link that is not a complete boundary", async () => {
+		// Ancestor workspace whose install graph carries a source-linked member.
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-external-link-"));
+		cleanupPaths.push(parent);
+		const ancestorModules = path.join(parent, "node_modules");
+		await fs.mkdir(path.join(ancestorModules, "@scope"), { recursive: true });
+		await fs.symlink(path.join(parent, "live-app"), path.join(ancestorModules, "@scope", "app"));
+		await fs.mkdir(path.join(parent, "live-app"), { recursive: true });
+
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-external-link-repo-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "external-link"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.symlink(ancestorModules, worktreeModules);
+
+		// The ancestor tree does not resolve the worktree's own member (it
+		// points at the ancestor's live copy), so accepting it would bind the
+		// worktree to the ancestor's sources: refused.
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "external-link"])).toThrow(
+			/worktree_node_modules_boundary_incomplete/,
+		);
+	});
+
+	it("refuses a non-directory node_modules entry in a workspace worktree", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-file-obstruction-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "file-obstruction"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await Bun.write(worktreeModules, "not a directory\n");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "file-obstruction"])).toThrow(
+			/worktree_node_modules_not_a_boundary/,
+		);
+		// Refused, not deleted.
+		expect(await Bun.file(worktreeModules).text()).toBe("not a directory\n");
 	});
 
 	it("rejects symlinked parents that resolve outside the boundary", async () => {
