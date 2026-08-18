@@ -11,6 +11,8 @@
  * the current source: it creates missing links, prunes links whose target is
  * gone, and never replaces a non-symlink entry.
  */
+
+import * as nodeCrypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
@@ -104,6 +106,43 @@ export class SkillsBridgeError extends Error {
 		super(message);
 		this.name = "SkillsBridgeError";
 	}
+}
+/**
+ * Atomically quarantine a bridge symlink and unlink it only after its identity
+ * is verified POST-rename.
+ *
+ * A plain `lstat` → `unlink` sequence has a destructive window: another
+ * process can replace the checked symlink between the two calls, and the
+ * unlink then deletes the foreign replacement. Renaming the entry into a
+ * GJC-owned quarantine name first closes that window -- the rename is atomic,
+ * nothing is deleted until the quarantined object's link text is re-verified,
+ * and a mis-captured foreign object is restored by renaming it back before the
+ * error surfaces. (`exactUnlink` cannot express this for symlinks: the native
+ * deliberately refuses `S_IFLNK` targets.)
+ */
+async function quarantineUnlinkVerified(linkPath: string, expectedTarget: string): Promise<void> {
+	const quarantine = path.join(
+		path.dirname(linkPath),
+		`.gjc-paseo-quarantine-${process.pid}-${nodeCrypto.randomUUID()}`,
+	);
+	await fs.rename(linkPath, quarantine);
+	let text: string;
+	try {
+		text = await fs.readlink(quarantine);
+	} catch (error) {
+		// The quarantined name is not a symlink at all (a foreign file or
+		// directory was swapped onto the pathname): restore and refuse.
+		void error;
+		await fs.rename(quarantine, linkPath).catch(() => undefined);
+		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before removal: ${linkPath}`);
+	}
+	if (resolvedLinkTarget(text, quarantine) !== expectedTarget) {
+		// The pathname was swapped between preflight and the rename: what we
+		// captured is foreign. Restore it atomically and refuse.
+		await fs.rename(quarantine, linkPath);
+		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before removal: ${linkPath}`);
+	}
+	await fs.unlink(quarantine);
 }
 
 /**
@@ -339,7 +378,7 @@ async function pruneRecordedDangling(entry: BridgeEntryPlan): Promise<void> {
 	if (state.kind !== "dangling" || state.link !== entry.danglingTarget) {
 		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before pruning: ${entry.linkPath}`);
 	}
-	await fs.unlink(entry.linkPath);
+	await quarantineUnlinkVerified(entry.linkPath, entry.targetPath);
 }
 
 async function createNoReplace(entry: BridgeEntryPlan): Promise<void> {
@@ -355,24 +394,14 @@ async function createNoReplace(entry: BridgeEntryPlan): Promise<void> {
 }
 
 async function pruneStale(plan: BridgePrunePlan): Promise<void> {
-	const state = await foreignSymlinkState(plan.linkPath);
-	if (state.kind !== "symlink" || state.link !== plan.linkTarget) {
-		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before pruning: ${plan.linkPath}`);
-	}
-	await fs.unlink(plan.linkPath);
+	await quarantineUnlinkVerified(plan.linkPath, resolvedLinkTarget(plan.linkTarget, plan.linkPath));
 }
 
 async function adoptLegacyLink(plan: BridgeAdoptPlan, legacySourceDir: string): Promise<void> {
 	// The preflight recorded this exact symlink as GJC's own legacy link; the
-	// unlink is refused if anything changed in between, mirroring pruneStale.
-	const current = await foreignSymlinkState(plan.linkPath);
-	if (
-		current.kind !== "symlink" ||
-		resolvedLinkTarget(current.link, plan.linkPath) !== path.resolve(legacySourceDir, plan.name)
-	) {
-		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before migration: ${plan.linkPath}`);
-	}
-	await fs.unlink(plan.linkPath);
+	// captured object is verified post-rename inside the quarantine, so a
+	// pathname swap can never delete a foreign link.
+	await quarantineUnlinkVerified(plan.linkPath, path.resolve(legacySourceDir, plan.name));
 	await fs.symlink(plan.targetPath, plan.linkPath);
 }
 
@@ -421,14 +450,20 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 export async function inverseSkillsBridge(
 	deps: PaseoSetupDependencies,
 	result: SkillsBridgeInstallResult,
+	options: { readonly bridgeDir?: string } = {},
 ): Promise<void> {
 	if (result.sourceDir === undefined) {
 		throw new SkillsBridgeError("Refusing to undo Paseo skill bridge entries without a recorded source directory");
 	}
+	// Removal must operate on the SAME directory it validated. The ledger
+	// records the directory GJC actually created links in; a later profile or
+	// path migration must not make removal inspect the old directory while
+	// unlinking from the current one.
+	const bridgeDir = options.bridgeDir ?? deps.paths.bridgeDir;
 	const diverged: string[] = [];
 	const ownedNames = [...result.createdEntries, ...result.adoptedEntries];
 	for (const name of ownedNames) {
-		const destination = linkPath(deps, name);
+		const destination = path.join(bridgeDir, name);
 		const target = path.resolve(result.sourceDir, name);
 		const state = await entryState(destination, target);
 		// `dangling` still carries link text pointing exactly where we wrote it;
@@ -439,10 +474,12 @@ export async function inverseSkillsBridge(
 	if (diverged.length > 0) {
 		throw new SkillsBridgeError(`Refusing to remove diverged Paseo skill bridge entries: ${diverged.join(", ")}`);
 	}
-	for (const name of ownedNames) await fs.unlink(linkPath(deps, name));
+	for (const name of ownedNames) {
+		await quarantineUnlinkVerified(path.join(bridgeDir, name), path.resolve(result.sourceDir, name));
+	}
 	if (!result.bridgeDirCreated) return;
 	try {
-		await fs.rmdir(deps.paths.bridgeDir);
+		await fs.rmdir(bridgeDir);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOTEMPTY") return;
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;

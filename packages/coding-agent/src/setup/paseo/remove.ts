@@ -16,6 +16,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { planPublish, publishPlan, readTarget } from "./json-publisher";
 import { removeSeededRoles } from "./orchestration-preferences";
+import type { ProvenanceLedger } from "./paseo-ownership";
 import {
 	EMPTY_LEDGER,
 	isProvenancedOrchestrationKey,
@@ -49,6 +50,10 @@ async function lstatAllowingAbsent(destination: string): Promise<Stats | undefin
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
 	}
+}
+/** The directory the ledger says GJC created links in; the current path only when the ledger predates the record. */
+function bridgeDirOf(ledger: ProvenanceLedger, deps: PaseoSetupDependencies): string {
+	return ledger.bridgePath ?? deps.paths.bridgeDir;
 }
 
 /**
@@ -95,7 +100,7 @@ export async function removePaseoSetup(
 			// recorded when the link was created. A name Paseo no longer ships
 			// is still removed, because the record -- not today's source
 			// contents -- is what proves GJC created it.
-			const bridgeDir = ledger.bridgePath ?? deps.paths.bridgeDir;
+			const bridgeDir = bridgeDirOf(ledger, deps);
 			const createdEntries: string[] = [];
 			for (const name of ledger.bridgeEntries) {
 				if (path.basename(name) !== name || name.includes("/")) continue;
@@ -110,21 +115,27 @@ export async function removePaseoSetup(
 			// single location a pre-#4638 install could have linked from, so a
 			// machine wedged by #4638 can still be rolled back.
 			const sourceDir = ledger.bridgeSourceDir ?? legacyRecordedSourceDir(deps.home ?? "");
-			await inverseSkillsBridge(deps, {
-				createdEntries,
-				prunedEntries: [],
-				adoptedEntries: [],
-				bridgeDirCreated: ledger.bridgeDirCreated ?? false,
-				sourceDir,
-			});
+			await inverseSkillsBridge(
+				deps,
+				{
+					createdEntries,
+					prunedEntries: [],
+					adoptedEntries: [],
+					bridgeDirCreated: ledger.bridgeDirCreated ?? false,
+					sourceDir,
+				},
+				// Unlink, directory cleanup, and diagnostics all operate on the
+				// ledger-recorded directory the entries above were validated in.
+				{ bridgeDir },
+			);
 			removed.push(bridgeDir);
 			nextLedger = { ...nextLedger, bridgeEntries: [], bridgeDirCreated: false, bridgeSourceDir: undefined };
 		} catch (error) {
 			const detail = error instanceof SkillsBridgeError ? error.message : String(error);
-			remaining.push(deps.paths.bridgeDir);
+			remaining.push(bridgeDirOf(ledger, deps));
 			await writeProvenance(deps.paths.provenanceLedger, nextLedger);
 			return partial(removed, remaining, {
-				failedStep: deps.paths.bridgeDir,
+				failedStep: bridgeDirOf(ledger, deps),
 				detail,
 				retained: [deps.paths.provenanceLedger],
 			});

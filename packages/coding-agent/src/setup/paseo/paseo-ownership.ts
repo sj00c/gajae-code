@@ -44,6 +44,15 @@ export const EMPTY_LEDGER: ProvenanceLedger = {
 	seededOrchestrationKeys: {},
 };
 
+export class ProvenanceLedgerCorruptError extends Error {
+	constructor(provenancePath: string, detail: string) {
+		super(
+			`Paseo provenance ledger is corrupt (${provenancePath}): ${detail}. Restore it from a backup or delete it after confirming no Paseo bridge links are live; GJC will not guess ownership from a damaged record.`,
+		);
+		this.name = "ProvenanceLedgerCorruptError";
+	}
+}
+
 export async function readProvenance(provenancePath: string): Promise<ProvenanceLedger> {
 	let raw: string;
 	try {
@@ -65,10 +74,12 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 				: {}),
 			...(typeof parsed.bridgeDirCreated === "boolean" ? { bridgeDirCreated: parsed.bridgeDirCreated } : {}),
 		};
-	} catch {
-		// A corrupt GJC-side ledger must not brick removal: treat it as empty so
-		// nothing is deleted on unproven ownership, which is the safe direction.
-		return EMPTY_LEDGER;
+	} catch (error) {
+		// A corrupt GJC-side ledger is an explicit recovery error, not an empty
+		// ledger: treating it as empty would silently discard every ownership
+		// record while the links those records cover are still live, defeating
+		// the record-before-mutation guarantee.
+		throw new ProvenanceLedgerCorruptError(provenancePath, error instanceof Error ? error.message : String(error));
 	}
 }
 
@@ -78,8 +89,25 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 
 export async function writeProvenance(provenancePath: string, ledger: ProvenanceLedger): Promise<void> {
 	await fs.mkdir(path.dirname(provenancePath), { recursive: true, mode: 0o700 });
-	await Bun.write(provenancePath, serializeJson(ledger));
-	await fs.chmod(provenancePath, 0o600);
+	// Write-then-rename: an interrupted Bun.write can leave a truncated file,
+	// which would otherwise read back as a corrupt (now explicit-error) ledger
+	// and strand every published link without ownership metadata. The temporary
+	// is fsynced before the rename so the record is durable once visible.
+	const temporary = `${provenancePath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+	const payload = serializeJson(ledger);
+	try {
+		const handle = await fs.open(temporary, "w", 0o600);
+		try {
+			await handle.writeFile(payload, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await fs.rename(temporary, provenancePath);
+	} catch (error) {
+		await fs.rm(temporary, { force: true }).catch(() => undefined);
+		throw error;
+	}
 }
 
 /**

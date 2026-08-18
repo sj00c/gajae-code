@@ -185,30 +185,36 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		}
 
 		// Step 3: the symlink bridge. Install converges the bridge to the current
-		// source (create missing, prune stale, adopt pre-#4638 legacy links), so
-		// the ledger records the entry set that exists afterwards, not just what
-		// this run happened to create.
+		// source (create missing, prune stale, adopt pre-#4638 legacy links).
 		//
-		// Provenance is committed BEFORE any link is created or pruned: a crash
-		// between mutation and record would otherwise leave live links nothing
-		// owns (a retry classifies them as noops and never re-attempts the
-		// record, so `check` reads healthy while `--remove` has nothing to
-		// clean). Writing the record first means a crash before mutation leaves a
-		// superset record -- harmless, because entries that were never created
-		// are simply absent on disk and `--remove` skips absent entries -- and a
-		// crash after mutation is always covered by the record already on disk.
+		// Provenance is committed BEFORE any link is created or pruned, and the
+		// ownership set is exactly what GJC will own after this run: links it
+		// created in an earlier run (the pre-existing non-noop entries), links
+		// it adopts through the legacy migration, and -- until the prunes
+		// complete -- the stale links it is about to remove, so a crash between
+		// record and unlink still leaves every on-disk link covered. A `noop`
+		// entry GJC did not previously record is deliberately NOT added: an
+		// exact-target link the user created themselves must never become
+		// GJC-owned just because a re-run observed it.
 		const bridgeLedger = await readProvenance(deps.paths.provenanceLedger);
-		const preflightEntryNames = [
-			...Object.keys(bridgePreflight.entries),
+		const previouslyRecorded = new Set(bridgeLedger.bridgeEntries ?? []);
+		const ownedAfterRun = [
+			// Entries this run or an earlier run actually creates/recreates.
+			...Object.values(bridgePreflight.entries)
+				.filter(entry => entry.action !== "noop" || (previouslyRecorded.has(entry.name) && entry.action === "noop"))
+				.map(entry => entry.name),
+			// Legacy links GJC adopts become owned at their new target.
 			...bridgePreflight.adopts.map(adopt => adopt.name),
-		];
-		const hasBridgeWork =
-			preflightEntryNames.length > 0 || bridgePreflight.prunes.length > 0 || bridgePreflight.bridgeDirCreated;
+			// Prune candidates stay recorded until the unlink completes below;
+			// the post-install write then drops them.
+			...bridgePreflight.prunes.map(prune => prune.name),
+		].filter((name, index, all) => all.indexOf(name) === index);
+		const hasBridgeWork = ownedAfterRun.length > 0 || bridgePreflight.bridgeDirCreated;
 		if (hasBridgeWork || bridgePreflight.sourceDir !== undefined) {
 			await writeProvenance(deps.paths.provenanceLedger, {
 				...bridgeLedger,
 				bridgePath: deps.paths.bridgeDir,
-				bridgeEntries: preflightEntryNames,
+				bridgeEntries: ownedAfterRun,
 				// `bridgeDirCreated` records whether GJC created the directory
 				// ORIGINALLY, so `--remove` knows whether the empty directory is
 				// ours to delete. A convergence run over an existing directory
@@ -218,6 +224,15 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			});
 		}
 		const bridge = await installSkillsBridge(bridgePreflight);
+		// Prunes have completed: drop them from the ownership record so a later
+		// `--remove` does not treat the removed names as still owned.
+		if (bridgePreflight.prunes.length > 0) {
+			const afterPrunes = await readProvenance(deps.paths.provenanceLedger);
+			await writeProvenance(deps.paths.provenanceLedger, {
+				...afterPrunes,
+				bridgeEntries: (afterPrunes.bridgeEntries ?? []).filter(name => !bridge.prunedEntries.includes(name)),
+			});
+		}
 		if (
 			bridge.createdEntries.length > 0 ||
 			bridge.prunedEntries.length > 0 ||

@@ -46,22 +46,21 @@ export function paseoAppSkillsCandidates(home: string = os.homedir()): readonly 
 
 /**
  * `PASEO_SKILLS_DIR` as explicit user intent only.
- * `PASEO_SKILLS_DIR` as explicit user intent only.
  *
  * Bun loads `cwd/.env` into `process.env` before any module runs, so a cloned
  * repository can ship a `.env` that points this override at a directory the
  * repository also ships -- and global `gjc setup paseo` run from inside that
  * checkout would bridge the repository's own `paseo*` prompt content into the
- * user's GJC configuration. The same trust rule `native-skill-hook.ts` already
- * applies to `GJC_CODING_AGENT_DIR`: a value that matches what the project
- * `.env` sets is not honoured. An operator whose real environment happens to
- * carry the identical value loses the override, which is the conservative
- * trade the credential boundary already makes.
+ * user's GJC configuration. The trust rule is presence-based, not
+ * value-equality: the project dotenv defining the key AT ALL is enough to
+ * reject the override, because Bun expands interpolations (`$PWD`, `${VAR}`)
+ * before we can compare, so a literal comparison can be bypassed by expansion.
+ * The same conservative presence rule the credential boundary applies.
  */
 function trustedPaseoSkillsDirOverride(): string | undefined {
 	const value = process.env.PASEO_SKILLS_DIR;
 	if (!value) return undefined;
-	if (parseEnvFile(path.join(process.cwd(), ".env")).PASEO_SKILLS_DIR === value) return undefined;
+	if (parseEnvFile(path.join(process.cwd(), ".env")).PASEO_SKILLS_DIR !== undefined) return undefined;
 	return value;
 }
 

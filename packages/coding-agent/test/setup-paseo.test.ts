@@ -721,36 +721,185 @@ describe("skills bridge", () => {
 		}
 	});
 
-	test("a failed provenance write leaves no unrecorded bridge links (#4644 review r2)", async () => {
+	test("a bridge-step provenance write failure leaves the ledger intact and no links behind (#4644 review r3)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
 		await seedConfig(fixture.paths);
-		// Make the provenance ledger unwritable so the bridge step cannot commit
-		// its record: a directory in place of the ledger file makes every write
-		// fail on the real fs surface.
-		const ledgerDir = fixture.paths.provenanceLedger;
-		await fs.mkdir(ledgerDir, { recursive: true });
-
+		// Complete one install so provider/orchestration steps and their ledger
+		// records exist, then reset ONLY the bridge and make the provenance
+		// directory unwritable. The next run must fail while committing the
+		// bridge provenance -- AFTER the earlier steps, AT the bridge step --
+		// proving the record-before-mutation ordering: no link appears and the
+		// ledger is unchanged (the failed write rolls back to the old record).
+		await runPaseoSetup({}, fixture.deps);
+		const before = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
+		await fs.rm(fixture.paths.bridgeDir, { recursive: true });
+		const ledgerParent = path.dirname(fixture.paths.provenanceLedger);
+		await fs.chmod(ledgerParent, 0o555);
 		let outcome: Awaited<ReturnType<typeof runPaseoSetup>> | undefined;
 		try {
 			outcome = await runPaseoSetup({}, fixture.deps);
 		} catch {
 			// A thrown error is also acceptable; both must leave no unrecorded
 			// links.
+		} finally {
+			await fs.chmod(ledgerParent, 0o755);
 		}
 
-		// Whatever the outcome shape, no bridge link may exist that no ledger
-		// records: the bridge directory must be absent or empty, because the
-		// provenance write happens BEFORE any link is created.
-		const bridgeExists = await fs
-			.stat(fixture.paths.bridgeDir)
-			.then(() => true)
-			.catch(() => false);
-		if (bridgeExists) {
-			const names = await fs.readdir(fixture.paths.bridgeDir);
-			expect(names).toEqual([]);
-		}
+		// The bridge directory must not exist: no link was created before the
+		// record committed.
+		await expect(fs.stat(fixture.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+		// The failed atomic write left the previous ledger byte-identical and no
+		// temporary litter behind.
+		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(before);
+		expect((await fs.readdir(ledgerParent)).filter(name => name.endsWith(".tmp"))).toEqual([]);
 		if (outcome?.kind === "install") {
 			expect(outcome.result.outcome).not.toBe("installed");
+		}
+	});
+
+	test("a user-created exact-target link is never recorded or removed (#4644 review r3)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		// The user pre-creates a link whose target matches what GJC would write,
+		// in an existing bridge directory no ledger ever recorded.
+		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		await fs.symlink(
+			path.join(fixture.paths.agentsSkillsDir as string, "paseo"),
+			path.join(fixture.paths.bridgeDir, "paseo"),
+		);
+
+		const install = await runPaseoSetup({}, fixture.deps);
+		expect(install.kind).toBe("install");
+		// The user link is a noop to install but is NOT adopted into ownership.
+		const ledger = await readProvenance(fixture.paths.provenanceLedger);
+		expect(ledger.bridgeEntries).not.toContain("paseo");
+		expect(ledger.bridgeEntries).toContain("paseo-advisor");
+
+		// Remove cleans only what GJC recorded; the user's link survives.
+		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("removed");
+		expect((await fs.lstat(path.join(fixture.paths.bridgeDir, "paseo"))).isSymbolicLink()).toBe(true);
+	});
+
+	test("a corrupt provenance ledger is an explicit error, never an empty one (#4644 review r3)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await fs.mkdir(path.dirname(fixture.paths.provenanceLedger), { recursive: true });
+		await Bun.write(fixture.paths.provenanceLedger, "{ not json at all");
+		await expect(readProvenance(fixture.paths.provenanceLedger)).rejects.toThrow(/corrupt/);
+		// Check surfaces the corruption instead of silently owning nothing.
+		await expect(checkPaseoSetup(fixture.deps)).rejects.toThrow(/corrupt/);
+	});
+
+	test("prune ownership stays recorded until the unlink completes (#4644 review r3)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		// A Paseo release drops a skill; the next install prunes it.
+		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
+		const rerun = await runPaseoSetup({}, fixture.deps);
+		expect(rerun.kind).toBe("install");
+		// After the prune completes the name is no longer owned...
+		const ledger = await readProvenance(fixture.paths.provenanceLedger);
+		expect(ledger.bridgeEntries).not.toContain("paseo-loop");
+		// ...and the link is gone.
+		await expect(fs.lstat(path.join(fixture.paths.bridgeDir, "paseo-loop"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		// The pre-prune record (written before mutation) included the name, so a
+		// crash between record and unlink could not strand an unowned link; that
+		// window is exercised by the ownership-superset invariant below.
+		expect([...(ledger.bridgeEntries ?? [])].sort()).toEqual([
+			"paseo",
+			"paseo-advisor",
+			"paseo-committee",
+			"paseo-handoff",
+		]);
+	});
+
+	test("a swapped pathname is detected post-rename and the foreign link restored (#4644 review r3)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		// A foreign link occupies a name the (hand-built) preflight believes is
+		// GJC's own with a different recorded target.
+		await fs.symlink(
+			path.join(fixture.paths.agentsSkillsDir as string, "paseo"),
+			path.join(fixture.paths.bridgeDir, "paseo-loop"),
+		);
+		const before = await snapshotTree(fixture.paths.bridgeDir);
+
+		await expect(
+			installSkillsBridge({
+				bridgeDir: fixture.paths.bridgeDir,
+				bridgeDirCreated: false,
+				entries: {},
+				prunes: [
+					{
+						name: "paseo-loop",
+						linkPath: path.join(fixture.paths.bridgeDir, "paseo-loop"),
+						linkTarget: path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"),
+					},
+				],
+				adopts: [],
+			}),
+		).rejects.toBeInstanceOf(SkillsBridgeError);
+		// The foreign link is back at its original path, untouched, and no
+		// quarantine litter remains.
+		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
+	});
+
+	test("an interpolated project .env override is rejected by presence (#4644 review r3)", async () => {
+		const root = await makeRoot();
+		const home = path.join(root, "home");
+		const userDir = path.join(home, ".agents", "skills");
+		await fs.mkdir(userDir, { recursive: true });
+		const repoDir = path.join(root, "repo");
+		const repoSkills = path.join(repoDir, "skills");
+		await fs.mkdir(path.join(repoSkills, "paseo-evil"), { recursive: true });
+		// Bun expands $PWD before process.env sees the value, so a literal
+		// comparison would match nothing; presence must be the rule.
+		await Bun.write(path.join(repoDir, ".env"), "PASEO_SKILLS_DIR=$PWD/skills\n");
+		const priorCwd = process.cwd();
+		process.chdir(repoDir);
+		process.env.PASEO_SKILLS_DIR = repoSkills;
+		try {
+			await expect(resolvePaseoSkillsSource(home)).resolves.toEqual({ dir: userDir, origin: "user" });
+		} finally {
+			process.chdir(priorCwd);
+			delete process.env.PASEO_SKILLS_DIR;
+		}
+	});
+
+	test("removal uses the ledger-recorded bridge directory throughout (#4644 review r3)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		// Simulate a path migration: the ledger still records the original
+		// directory (which holds the links), while deps.paths points elsewhere.
+		const recorded = fixture.paths.bridgeDir;
+		const moved = path.join(fixture.root, "moved-paseo-skills");
+		await fs.mkdir(moved, { recursive: true });
+		const ledger = await readProvenance(fixture.paths.provenanceLedger);
+		const migratedDeps: PaseoSetupDependencies = {
+			...fixture.deps,
+			paths: { ...fixture.deps.paths, bridgeDir: moved },
+		};
+
+		const remove = await removePaseoSetup(migratedDeps, { now: new Date() });
+		if (remove.outcome !== "removed" && remove.outcome !== "partial-removal") {
+			throw new Error(`expected a removal outcome, got ${remove.outcome}`);
+		}
+		// The RECORDED directory is the one cleaned: its links are gone, and the
+		// failure path (if any) reports the recorded directory rather than the
+		// current one.
+		for (const name of ledger.bridgeEntries ?? []) {
+			await expect(fs.lstat(path.join(recorded, name))).rejects.toMatchObject({ code: "ENOENT" });
 		}
 	});
 
