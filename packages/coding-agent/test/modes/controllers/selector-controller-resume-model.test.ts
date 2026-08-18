@@ -11,6 +11,7 @@ type TestContext = InteractiveModeContext & {
 	editorContainer: {
 		children: unknown[];
 		clear: () => void;
+		detachChild: (child: unknown) => void;
 		addChild: (child: unknown) => void;
 	};
 };
@@ -24,6 +25,9 @@ function createContext(options: {
 		children: [] as unknown[],
 		clear() {
 			this.children = [];
+		},
+		detachChild(child: unknown) {
+			this.children = this.children.filter(entry => entry !== child);
 		},
 		addChild(child: unknown) {
 			this.children.push(child);

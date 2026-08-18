@@ -7,6 +7,8 @@ import { getAgentDir, getLogsDir, setAgentDir, setDefaultTabWidth } from "@gajae
 import { defaultEditorTheme } from "../../tui/test/test-themes";
 import { AsyncJobManager } from "../src/async";
 import { DebugSelectorComponent } from "../src/debug";
+import { DebugLogViewerComponent } from "../src/debug/log-viewer";
+import { RawSseViewerComponent } from "../src/debug/raw-sse";
 import { CustomEditor } from "../src/modes/components/custom-editor";
 import { JobsOverlayComponent } from "../src/modes/components/jobs-overlay";
 import { TasksPaneComponent } from "../src/modes/components/tasks-pane";
@@ -190,59 +192,73 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 		// #handleViewLogs path mounts the real viewer without touching the
 		// operator's real ~/.gjc/logs. PI_CONFIG_DIR is a trusted single dir NAME
 		// (see dirs.ts getConfigDirName); a fresh resolver picks it up on
-		// setAgentDir, and cleanup removes the whole tree.
+		// setAgentDir, and cleanup removes the whole tree. Snapshot every piece
+		// of process-global directory state BEFORE mutating it and restore all
+		// of it in the finally below — setAgentDir also writes
+		// GJC_CODING_AGENT_DIR, so that env var is restored too.
 		const originalAgentDir = getAgentDir();
 		const originalConfigDir = process.env.PI_CONFIG_DIR;
+		const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
 		const configName = `gjc-test-composer-detach-${Date.now().toString(36)}`;
-		process.env.PI_CONFIG_DIR = configName;
-		setAgentDir(path.join(os.tmpdir(), configName));
-		const logsDir = getLogsDir();
-		await fs.mkdir(logsDir, { recursive: true });
 		const today = new Date().toISOString().slice(0, 10);
-		await fs.writeFile(path.join(logsDir, `gjc.${today}.log`), "seeded log line\n", "utf8");
-
-		// The production /debug entry: showDebugSelector goes through the real
-		// SelectorController.showSelector generic open boundary, so the open
-		// detach at that boundary is exercised too. Viewer exits re-open the
-		// selector through the ctx hook exactly like production (wired in
-		// makeDebugHarness).
-		const openDebugSelector = () => {
-			controller.showDebugSelector();
-			const selector = harness.editorContainer.children.find(child => child instanceof DebugSelectorComponent);
-			if (!selector) throw new Error("Expected the debug selector to mount");
-			return selector;
-		};
-		// DEBUG_MENU_ITEMS order: open-artifacts, performance, work, dump,
-		// memory, logs, system, raw-sse — "logs" is index 5, "raw-sse" is 7.
-		const menuIndexes = { logs: 5, rawSse: 7 } as const;
-
-		const runViewerCycle = async (menuIndex: number) => {
-			const selector = openDebugSelector();
-			for (let step = 0; step < menuIndex; step += 1) selector.handleInput(SELECT_DOWN_KEY);
-			selector.handleInput(SELECT_CONFIRM_KEY);
-			// DebugSelectorComponent calls done() (restore) then opens the real
-			// viewer through the exact production path under test.
-			const deadline = Date.now() + 2_000;
-			while (
-				(harness.editorContainer.children[0] === harness.editor ||
-					harness.editorContainer.children[0] instanceof DebugSelectorComponent) &&
-				Date.now() < deadline
-			) {
-				await Bun.sleep(1);
-			}
-			expect(harness.editorContainer.children.length).toBe(1);
-			const viewer = harness.editorContainer.children[0];
-			expect(viewer).not.toBe(harness.editor);
-			expect(viewer).not.toBeInstanceOf(DebugSelectorComponent);
-			// Production close: viewer exit re-opens the debug selector;
-			// canceling that restores the composer.
-			viewer?.handleInput?.(CANCEL_KEY);
-			expect(harness.editorContainer.children[0]).toBeInstanceOf(DebugSelectorComponent);
-			harness.editorContainer.children[0]?.handleInput?.(CANCEL_KEY);
-			expect(harness.editorContainer.children).toEqual([harness.editor]);
-		};
 
 		try {
+			process.env.PI_CONFIG_DIR = configName;
+			setAgentDir(path.join(os.tmpdir(), configName));
+			const logsDir = getLogsDir();
+			await fs.mkdir(logsDir, { recursive: true });
+			await fs.writeFile(path.join(logsDir, `gjc.${today}.log`), "seeded log line\n", "utf8");
+
+			// The production /debug entry: showDebugSelector goes through the real
+			// SelectorController.showSelector generic open boundary, so the open
+			// detach at that boundary is exercised too. Viewer exits re-open the
+			// selector through the ctx hook exactly like production (wired in
+			// makeDebugHarness).
+			const openDebugSelector = () => {
+				controller.showDebugSelector();
+				const selector = harness.editorContainer.children.find(child => child instanceof DebugSelectorComponent);
+				if (!selector) throw new Error("Expected the debug selector to mount");
+				return selector;
+			};
+			// DEBUG_MENU_ITEMS order: open-artifacts, performance, work, dump,
+			// memory, logs, system, raw-sse — "logs" is index 5, "raw-sse" is 7.
+			const menuIndexes = { logs: 5, rawSse: 7 } as const;
+
+			const runViewerCycle = async (menuIndex: number) => {
+				const selector = openDebugSelector();
+				for (let step = 0; step < menuIndex; step += 1) selector.handleInput(SELECT_DOWN_KEY);
+				selector.handleInput(SELECT_CONFIRM_KEY);
+				// DebugSelectorComponent calls done() (restore) then opens the real
+				// viewer through the exact production path under test.
+				const deadline = Date.now() + 2_000;
+				while (
+					(harness.editorContainer.children[0] === harness.editor ||
+						harness.editorContainer.children[0] instanceof DebugSelectorComponent) &&
+					Date.now() < deadline
+				) {
+					await Bun.sleep(1);
+				}
+				expect(harness.editorContainer.children.length).toBe(1);
+				const viewer = harness.editorContainer.children[0];
+				expect(viewer).not.toBe(harness.editor);
+				expect(viewer).not.toBeInstanceOf(DebugSelectorComponent);
+				// Concrete per-branch proof BEFORE the shared lifecycle probe: the
+				// logs index must mount a DebugLogViewerComponent and the raw-SSE
+				// index a RawSseViewerComponent, so a menu reorder or dispatch
+				// mismatch fails here instead of staying green on the wrong path.
+				if (menuIndex === menuIndexes.logs) {
+					expect(viewer).toBeInstanceOf(DebugLogViewerComponent);
+				} else {
+					expect(viewer).toBeInstanceOf(RawSseViewerComponent);
+				}
+				// Production close: viewer exit re-opens the debug selector;
+				// canceling that restores the composer.
+				viewer?.handleInput?.(CANCEL_KEY);
+				expect(harness.editorContainer.children[0]).toBeInstanceOf(DebugSelectorComponent);
+				harness.editorContainer.children[0]?.handleInput?.(CANCEL_KEY);
+				expect(harness.editorContainer.children).toEqual([harness.editor]);
+			};
+
 			let previous = 0;
 			for (let cycle = 0; cycle < 4; cycle += 1) {
 				// Both changed viewer branches, alternating per cycle.
@@ -254,6 +270,8 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 		} finally {
 			if (originalConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
 			else process.env.PI_CONFIG_DIR = originalConfigDir;
+			if (originalCodingAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalCodingAgentDir;
 			setAgentDir(originalAgentDir);
 			setDefaultTabWidth(4);
 			await fs.rm(path.join(os.homedir(), configName), { recursive: true, force: true });

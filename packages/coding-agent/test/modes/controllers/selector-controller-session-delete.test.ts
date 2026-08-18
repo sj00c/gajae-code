@@ -52,6 +52,11 @@ function createContext(currentSessionFile: string): {
 			this.children = [];
 			calls.push("editorContainer.clear");
 		},
+		detachChild(child: unknown) {
+			const index = this.children.indexOf(child);
+			if (index !== -1) this.children.splice(index, 1);
+			calls.push("editorContainer.detachChild");
+		},
 		addChild(child: unknown) {
 			this.children.push(child);
 			calls.push("editorContainer.addChild");
@@ -412,6 +417,7 @@ describe("SelectorController session deletion", () => {
 
 		expect(dropSession).toHaveBeenCalledWith(activeSession.path);
 		expect(calls).toEqual([
+			"editorContainer.detachChild",
 			"editorContainer.clear",
 			"editorContainer.addChild",
 			"ui.requestRender",
@@ -508,6 +514,7 @@ describe("SelectorController session deletion", () => {
 			"ui.requestRender",
 			`delete:${activeSessionPath}`,
 			"showStatus:Current session transcript and artifacts deleted",
+			"editorContainer.detachChild",
 			"editorContainer.clear",
 			"editorContainer.addChild",
 			"ui.requestRender",
