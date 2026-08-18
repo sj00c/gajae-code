@@ -116,6 +116,7 @@ function makeSession(cwd: string): any {
 		hasEditTool: true,
 		taskDepth: 0,
 		currentAgentType: "executor",
+		rescopeSessionCwd: async () => ({ from: cwd, to: cwd }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
 		getSessionId: () => "catalog",

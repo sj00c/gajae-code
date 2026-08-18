@@ -56,6 +56,7 @@ function makeSession(overrides: Record<string, unknown> = {}): any {
 		requireYieldTool: false,
 		enableLsp: true,
 		taskDepth: 0,
+		rescopeSessionCwd: async () => ({ from: process.cwd(), to: process.cwd() }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
 	};
@@ -125,6 +126,7 @@ describe("tool descriptor compatibility gate", () => {
 			"write",
 			"skill",
 			"goal",
+			"move_session",
 		];
 		expect(Object.keys(BUILTIN_TOOLS)).toEqual(expectedBuiltin);
 		expect(Object.keys(BUILTIN_TOOL_DESCRIPTORS)).toEqual(expectedBuiltin);

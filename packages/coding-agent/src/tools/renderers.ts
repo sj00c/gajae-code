@@ -23,6 +23,7 @@ import { evalToolRenderer } from "./eval";
 import { findToolRenderer } from "./find";
 import { githubToolRenderer } from "./gh-renderer";
 import { jobToolRenderer } from "./job";
+import { moveSessionToolRenderer } from "./move-session";
 import { readToolRenderer } from "./read";
 import { recipeToolRenderer } from "./recipe/render";
 import { resolveToolRenderer } from "./resolve";
@@ -72,6 +73,7 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	todo_write: todoWriteToolRenderer as ToolRenderer,
 	github: githubToolRenderer as ToolRenderer,
 	goal: goalToolRenderer as ToolRenderer,
+	move_session: moveSessionToolRenderer as ToolRenderer,
 	web_search: webSearchToolRenderer as ToolRenderer,
 	write: writeToolRenderer as ToolRenderer,
 };

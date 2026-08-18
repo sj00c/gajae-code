@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	Agent,
@@ -33,6 +34,7 @@ import {
 	postmortem,
 	prompt,
 	Snowflake,
+	setProjectDir,
 } from "@gajae-code/utils";
 import {
 	createAppendOnlyContextManager,
@@ -46,7 +48,7 @@ import {
 	isBackgroundJobSupportEnabled,
 	jobElapsedMs,
 } from "../async";
-import { loadCapability } from "../capability";
+import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { resolveModelProfileName } from "../config/model-profile-contract";
@@ -70,6 +72,7 @@ import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
 import { initializeWithSettings } from "../discovery";
+import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers";
 import { TtsrManager } from "../export/ttsr";
 import type { CustomCommandsLoadResult, LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../extensibility/custom-tools/types";
@@ -1996,6 +1999,36 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			requireYieldTool: options.requireYieldTool,
 			taskDepth: options.taskDepth ?? 0,
 			currentAgentType: options.currentAgentType,
+			// Agent-invokable session rescope (#4629). Provided only where
+			// relocation is safe: top-level sessions (taskDepth 0) without a
+			// restricted bash surface. Runs the same sequence as the text/ACP
+			// `/move` handler so tool path resolution, bash default cwd, plugin
+			// caches, and the workspace tree all follow the move.
+			...(taskDepth === 0 && !options.bashRestrictionProfile && (options.bashAllowedPrefixes ?? []).length === 0
+				? {
+						rescopeSessionCwd: async (target: string): Promise<{ from: string; to: string }> => {
+							const from = sessionManager.getCwd();
+							const resolvedPath = path.resolve(from, target);
+							let isDirectory = false;
+							try {
+								isDirectory = (await fs.stat(resolvedPath)).isDirectory();
+							} catch {
+								// fall through to the error below
+							}
+							if (!isDirectory) {
+								throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
+							}
+							await sessionManager.flush();
+							await sessionManager.moveTo(resolvedPath);
+							setProjectDir(resolvedPath);
+							resetCapabilities();
+							const projectRegistry = await resolveActiveProjectRegistryPath(sessionManager.getCwd());
+							clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
+							await session?.refreshSshTool({ activateIfAvailable: true });
+							return { from, to: sessionManager.getCwd() };
+						},
+					}
+				: {}),
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),

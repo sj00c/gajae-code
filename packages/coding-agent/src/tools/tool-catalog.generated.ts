@@ -2885,6 +2885,28 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 		"loadMode": "essential",
 		"intent": "omit"
 	},
+	"move_session": {
+		"name": "move_session",
+		"label": "Move Session",
+		"description": "Rescope the session to a narrower working directory.\n\nUse this only when the session's working directory is a broad launcher root (for example a\nmulti-repo workspace like `~/Projects`) and the task has clearly converged on one subdirectory\nor repository: after this call, every later turn resolves relative paths, the bash default cwd,\nand the workspace tree from the new directory instead of rescanning the whole root.\n\n- `path` must be an existing directory; relative paths resolve against the current session cwd.\n- Use it once the target repo is identified — not speculatively — because the session file and\n  caches move with the session.\n- This tool is unavailable in subagent sessions and restricted profiles; ask the top-level\n  session to rescope instead.",
+		"parameters": {
+			"type": "object",
+			"properties": {
+				"path": {
+					"type": "string",
+					"description": "target directory: absolute, or relative to the current session cwd"
+				}
+			},
+			"required": [
+				"path"
+			],
+			"additionalProperties": false
+		},
+		"strict": true,
+		"deferrable": false,
+		"loadMode": "essential",
+		"intent": "omit"
+	},
 	"yield": {
 		"name": "yield",
 		"label": "Submit Result",
