@@ -918,17 +918,67 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_member_invalid/);
 	});
 
-	it("leaves a user-owned node_modules directory without the marker untouched", async () => {
+	it("leaves a complete user-owned node_modules directory without the marker untouched", async () => {
 		const repo = await createWorkspaceRepo("gjc-launch-worktree-user-dir-");
 		const launched = prepareLaunchWorktree(repo, ["--worktree", "user-dir"]);
 		const worktreeModules = path.join(launched.cwd, "node_modules");
-		// Replace the launcher boundary with a user-owned install-like directory.
+		// Replace the launcher boundary with a user-owned install-like directory
+		// that still resolves every declared member (a copy of the member).
 		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.mkdir(path.join(worktreeModules, "@scope", "app"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "@scope", "app", "index.js"), "// installed\n");
 		await fs.mkdir(path.join(worktreeModules, "ms"), { recursive: true });
 		await Bun.write(path.join(worktreeModules, "ms", "marker.txt"), "user-owned\n");
 
 		const reused = prepareLaunchWorktree(repo, ["--worktree", "user-dir"]);
 		expect(await Bun.file(path.join(reused.cwd, "node_modules", "ms", "marker.txt")).text()).toBe("user-owned\n");
+		expect(await Bun.file(path.join(reused.cwd, "node_modules", "@scope", "app", "index.js")).text()).toBe(
+			"// installed\n",
+		);
+	});
+
+	it("refuses an incomplete user-owned node_modules directory in a workspace worktree", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-incomplete-dir-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "incomplete-dir"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// A partial tree: unrelated entries only, the declared member is absent,
+		// so it would resolve through an ancestor checkout.
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.mkdir(path.join(worktreeModules, "ms"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "ms", "marker.txt"), "user-owned\n");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "incomplete-dir"])).toThrow(
+			/worktree_node_modules_boundary_incomplete/,
+		);
+		// Refused, not deleted: the user-owned content survives.
+		expect(await Bun.file(path.join(launched.cwd, "node_modules", "ms", "marker.txt")).text()).toBe("user-owned\n");
+	});
+
+	it("refuses a user-owned node_modules directory whose member entry resolves outside the worktree", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-outside-dir-");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-outside-member-"));
+		cleanupPaths.push(outside);
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "outside-dir"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.mkdir(path.join(worktreeModules, "@scope"), { recursive: true });
+		await fs.symlink(outside, path.join(worktreeModules, "@scope", "app"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "outside-dir"])).toThrow(
+			/worktree_node_modules_boundary_incomplete/,
+		);
+	});
+	it("refuses a member entry that loops back to the boundary directory itself", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-selfloop-dir-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "selfloop-dir"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		await fs.rm(worktreeModules, { recursive: true, force: true });
+		await fs.mkdir(path.join(worktreeModules, "@scope"), { recursive: true });
+		await fs.symlink(worktreeModules, path.join(worktreeModules, "@scope", "app"));
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "selfloop-dir"])).toThrow(
+			/worktree_node_modules_boundary_incomplete/,
+		);
 	});
 
 	it("preserves package-manager-installed links inside a marker-owned boundary", async () => {
@@ -963,6 +1013,118 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		// Stale member link is pruned and the launcher no longer claims the dir.
 		expect(await fs.lstat(path.join(reusedModules, "@scope", "app")).catch(() => null)).toBe(null);
 		expect(await fs.lstat(path.join(reusedModules, ".gjc-node-modules-boundary")).catch(() => null)).toBe(null);
+	});
+	it("never deletes a package-manager entry that replaced a recorded boundary link", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-replaced-recorded-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "replaced-recorded"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(worktreeModules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+
+		// Replace only the recorded member link with a different identity while
+		// the marker and the ownership manifest (which still records the old
+		// target) survive — the launcher must not delete the replacement.
+		await fs.rm(path.join(worktreeModules, "@scope", "app"));
+		const replaced = path.join(launched.cwd, "vendor", "app-copy");
+		await fs.mkdir(replaced, { recursive: true });
+		await Bun.write(path.join(replaced, "index.js"), "// vendored\n");
+		await fs.symlink(replaced, path.join(worktreeModules, "@scope", "app"));
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "replaced-recorded"]);
+		const reusedModules = path.join(reused.cwd, "node_modules");
+		const link = path.join(reusedModules, "@scope", "app");
+		// The replacement is preserved untouched; the launcher dropped its
+		// stale claim instead of deleting the entry on the manifest's say-so.
+		expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+		expect(await fs.readlink(link)).toBe(replaced);
+	});
+
+	it("fails closed on a malformed link-ownership manifest", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-bad-manifest-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "bad-manifest"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+
+		await Bun.write(path.join(worktreeModules, ".gjc-node-modules-links.json"), "{ not json");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "bad-manifest"])).toThrow(
+			/worktree_boundary_manifest_invalid/,
+		);
+	});
+
+	it("fails closed on a link-ownership manifest with traversal entry names", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-traversal-manifest-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "traversal-manifest"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+
+		// A crafted manifest key that would escape node_modules if joined.
+		await Bun.write(
+			path.join(worktreeModules, ".gjc-node-modules-links.json"),
+			JSON.stringify({ "../../outside": "/tmp/somewhere" }),
+		);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "traversal-manifest"])).toThrow(
+			/worktree_boundary_manifest_invalid/,
+		);
+	});
+
+	it("fails closed on a non-object link-ownership manifest", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-array-manifest-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "array-manifest"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+
+		await Bun.write(path.join(worktreeModules, ".gjc-node-modules-links.json"), '["@scope/app"]');
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "array-manifest"])).toThrow(
+			/worktree_boundary_manifest_invalid/,
+		);
+	});
+
+	it("excludes members matched by later negated pnpm workspace patterns", async () => {
+		const repo = await createRepo("gjc-launch-worktree-negation-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "legacy"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*", "!packages/legacy"] }),
+		);
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		await Bun.write(path.join(repo, "packages", "legacy", "package.json"), '{"name":"@scope/legacy"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "negated workspace"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "negation"]);
+		const modules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(modules, "@scope", "app")).catch(() => null))?.isSymbolicLink()).toBe(true);
+		// The negated member is excluded: never linked, so it cannot shadow or
+		// be resolved as a workspace member.
+		expect(await fs.lstat(path.join(modules, "@scope", "legacy")).catch(() => null)).toBe(null);
+	});
+
+	it("reconciles a boundary when a member becomes excluded by a negated pattern", async () => {
+		const repo = await createRepo("gjc-launch-worktree-negation-reconcile-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "legacy"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }),
+		);
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		await Bun.write(path.join(repo, "packages", "legacy", "package.json"), '{"name":"@scope/legacy"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "workspace"], repo);
+
+		const first = prepareLaunchWorktree(repo, ["--worktree", "negation-reconcile"]);
+		const modules = path.join(first.cwd, "node_modules");
+		expect((await fs.lstat(path.join(modules, "@scope", "legacy"))).isSymbolicLink()).toBe(true);
+
+		// Exclude the member at a later commit.
+		await Bun.write(
+			path.join(first.cwd, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*", "!packages/legacy"] }),
+		);
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "negation-reconcile"]);
+		const reconciled = path.join(reused.cwd, "node_modules");
+		expect(await fs.lstat(path.join(reconciled, "@scope", "legacy")).catch(() => null)).toBe(null);
+		expect((await fs.lstat(path.join(reconciled, "@scope", "app"))).isSymbolicLink()).toBe(true);
 	});
 
 	it("rejects symlinked parents that resolve outside the boundary", async () => {

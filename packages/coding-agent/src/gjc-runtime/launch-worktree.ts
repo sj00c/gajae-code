@@ -618,8 +618,22 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 				createWorkspaceSelfLinkBoundary(worktreePath);
 				return "isolated";
 			}
-			// A real directory without the marker is user-owned (a real install,
-			// a store, or anything else): leave it completely untouched.
+			// A real directory without the marker is user-owned. For a workspace
+			// repo it is accepted only when it is already a complete boundary for
+			// the current commit: every declared member must resolve from this
+			// directory to a location inside this worktree. A partial tree lets
+			// missing members resolve through an ancestor workspace — exactly the
+			// contamination #4620 exists to stop — so an incomplete directory is
+			// refused (never deleted) and the user is told to complete or remove it.
+			const declaration = readWorkspaceDeclaration(worktreePath);
+			if (declaration && !isCompleteResolutionBoundary(worktreePath, target, declaration)) {
+				throw new Error(
+					`worktree_node_modules_boundary_incomplete:${JSON.stringify(shortenPath(target))} — the worktree ` +
+						"declares workspace packages that this directory does not resolve, so missing members would " +
+						"resolve through an ancestor checkout. Run the package manager inside the worktree to complete " +
+						"the install, or remove this directory and relaunch to let GJC create its boundary.",
+				);
+			}
 			return "present";
 		}
 		// Neither directory nor symlink (file, socket, ...): user-owned.
@@ -688,36 +702,25 @@ function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
 		return;
 	}
 	const { patterns, manifestFile } = declaration;
-
-	const members = new Map<string, string>();
-	for (const pattern of patterns) {
-		if (!isConfinedWorkspacePattern(pattern)) {
+	const members = new Map<string, { manifestPath: string; dir: string }>();
+	for (const manifestPath of scanWorkspaceMemberManifests(worktreePath, patterns, manifestFile)) {
+		const member = readMemberManifest(manifestPath, manifestFile);
+		if (!member.name) continue;
+		if (!PACKAGE_NAME_PATTERN.test(member.name) || member.name.includes("\\")) {
 			throw new Error(
-				`worktree_workspace_pattern_unsafe:${JSON.stringify(pattern)} in ${JSON.stringify(manifestFile)} — ` +
-					"absolute paths and traversal segments cannot be used for the isolation boundary.",
+				`worktree_workspace_member_name_invalid:${JSON.stringify(member.name)} in ${JSON.stringify(
+					manifestFile,
+				)} — package names must be scoped npm names without separators or traversal.`,
 			);
 		}
-		for (const match of new Bun.Glob(path.posix.join(pattern, "package.json")).scanSync({
-			cwd: worktreePath,
-			dot: false,
-			onlyFiles: true,
-		})) {
-			const manifestPath = path.join(worktreePath, match);
-			assertCanonicalInside(worktreePath, manifestPath, "worktree_workspace_member_outside");
-			const member = readMemberManifest(manifestPath, manifestFile);
-			if (!member.name) continue;
-			if (!PACKAGE_NAME_PATTERN.test(member.name) || member.name.includes("\\")) {
-				throw new Error(
-					`worktree_workspace_member_name_invalid:${JSON.stringify(member.name)} in ${JSON.stringify(
-						manifestFile,
-					)} — package names must be scoped npm names without separators or traversal.`,
-				);
-			}
-			// The member directory itself must resolve inside the worktree: a
-			// symlinked member pointing at another checkout must never become a
-			// boundary target.
-			assertCanonicalInside(worktreePath, path.dirname(manifestPath), "worktree_workspace_member_outside");
-			members.set(member.name, path.dirname(manifestPath));
+		const manifestDir = path.dirname(manifestPath);
+		// The member directory itself must resolve inside the worktree: a
+		// symlinked member pointing at another checkout must never become a
+		// boundary target.
+		assertCanonicalInside(worktreePath, manifestDir, "worktree_workspace_member_outside");
+		const declared = members.get(member.name);
+		if (declared === undefined || manifestPath.localeCompare(declared.manifestPath) < 0) {
+			members.set(member.name, { manifestPath, dir: manifestDir });
 		}
 	}
 
@@ -726,38 +729,141 @@ function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
 	if (!markerOwned && fs.existsSync(modules)) return;
 	fs.mkdirSync(modules, { recursive: true });
 	const ownership = readBoundaryOwnership(modules);
-	for (const [name, dir] of members) {
+	for (const [name, member] of members) {
 		const linkPath = path.join(modules, ...name.split("/"));
 		// Containment for a link destination is about the PATH inside node_modules
 		// (the link's target legitimately lives elsewhere in the worktree).
 		assertPathInside(modules, linkPath, "worktree_workspace_link_outside");
 		fs.mkdirSync(path.dirname(linkPath), { recursive: true });
-		// Replace only links this launcher recorded; anything else at the path is
-		// user-owned (a package-manager install replaced the tree) — keep it and
-		// skip managing that entry.
+		// Replace only links this launcher recorded AND that still carry the
+		// recorded identity; anything else at the path is user-owned (a
+		// package-manager install replaced the tree) — keep it and skip managing
+		// that entry.
 		const recorded = ownership.get(name);
-		if (recorded !== undefined) fs.rmSync(linkPath, { force: true });
-		else if (tryLstat(linkPath)) continue;
-		fs.symlinkSync(dir, linkPath, "junction");
-		ownership.set(name, dir);
+		if (recorded !== undefined) {
+			if (!isRecordedLinkAtIdentity(linkPath, recorded)) {
+				ownership.delete(name);
+				continue;
+			}
+			fs.rmSync(linkPath, { force: true });
+		} else if (tryLstat(linkPath)) continue;
+		fs.symlinkSync(member.dir, linkPath, "junction");
+		ownership.set(name, member.dir);
 	}
 	reconcileBoundaryLinks(modules, members, markerPath);
 	writeBoundaryOwnership(modules, ownership);
 	if (!fs.existsSync(markerPath)) fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`);
 }
+/**
+ * Scans the worktree's workspace declarations and returns the absolute paths of
+ * every member `package.json` they select.
+ *
+ * Pattern semantics follow pnpm/npm ordering: patterns are evaluated in
+ * declaration order and later patterns override earlier ones — a trailing
+ * `!pattern` removes every directory matched so far, exactly like pnpm's
+ * documented negation behavior. Traversal or absolute patterns are isolation
+ * failures, not silent skips.
+ */
+function scanWorkspaceMemberManifests(worktreePath: string, patterns: string[], manifestFile: string): string[] {
+	const globPatterns: string[] = [];
+	const negations: string[] = [];
+	for (const pattern of patterns) {
+		if (!isConfinedWorkspacePattern(pattern)) {
+			throw new Error(
+				`worktree_workspace_pattern_unsafe:${JSON.stringify(pattern)} in ${JSON.stringify(manifestFile)} — ` +
+					"absolute paths and traversal segments cannot be used for the isolation boundary.",
+			);
+		}
+		if (pattern.startsWith("!")) negations.push(pattern.slice(1));
+		else globPatterns.push(pattern);
+	}
+	const selected = new Set<string>();
+	for (const pattern of globPatterns) {
+		for (const match of new Bun.Glob(path.posix.join(pattern, "package.json")).scanSync({
+			cwd: worktreePath,
+			dot: false,
+			onlyFiles: true,
+		})) {
+			selected.add(match);
+		}
+	}
+	for (const negation of negations) {
+		const excluded = new Bun.Glob(path.posix.join(negation, "package.json"));
+		for (const match of selected) {
+			if (excluded.match(match)) selected.delete(match);
+		}
+	}
+	return [...selected].map(match => path.join(worktreePath, match));
+}
+
+/**
+ * True when `modules` already resolves every workspace member the worktree
+ * declares at this commit, each to a location inside this worktree — i.e. the
+ * directory is a complete resolution boundary and no member can fall through
+ * to an ancestor checkout. The check proves where each entry RESOLVES, not how
+ * it got there: a package-manager symlink to the worktree member, a hard copy
+ * of the member, or a real install that happens to shadow the member all stop
+ * the ancestor walk-up the same way. What can never count is a missing entry
+ * or one resolving outside this worktree — those are exactly the fall-through
+ * paths #4620 exists to close.
+ */
+function isCompleteResolutionBoundary(
+	worktreePath: string,
+	modules: string,
+	declaration: { patterns: string[]; manifestFile: string },
+): boolean {
+	const members = new Map<string, string>();
+	const manifestPaths = scanWorkspaceMemberManifests(worktreePath, declaration.patterns, declaration.manifestFile);
+	for (const manifestPath of manifestPaths) {
+		const member = readMemberManifest(manifestPath, declaration.manifestFile);
+		if (!member.name) continue;
+		const declared = members.get(member.name);
+		if (declared === undefined || manifestPath.localeCompare(declared) < 0) {
+			members.set(member.name, manifestPath);
+		}
+	}
+	const worktreeReal = tryRealpath(worktreePath);
+	if (worktreeReal === null) return false;
+	const modulesReal = tryRealpath(modules);
+	if (modulesReal === null) return false;
+	for (const name of members.keys()) {
+		const entryPath = path.join(modules, ...name.split("/"));
+		const resolved = tryRealpath(entryPath);
+		if (resolved === null) return false;
+		// Resolving to the worktree root itself, or into the boundary directory
+		// being validated (a self-looping link), is not a member entry; a real
+		// entry anywhere else inside the worktree shadows the ancestor walk-up.
+		if (sameFileSystemPath(resolved, worktreeReal)) return false;
+		if (sameFileSystemPath(resolved, modulesReal)) return false;
+		if (!caseInsensitiveFs() && !resolved.startsWith(`${worktreeReal}${path.sep}`)) {
+			return false;
+		}
+		if (caseInsensitiveFs() && !resolved.toLowerCase().startsWith(`${worktreeReal.toLowerCase()}${path.sep}`)) {
+			return false;
+		}
+	}
+	return true;
+}
 
 /**
  * Removes launcher-recorded member links that are no longer declared at this
- * commit. Only links whose names appear in the recorded ownership manifest are
- * candidates; a package-manager install that replaced the tree leaves no
- * recorded ownership, so its entries are never touched.
+ * commit. Only links that are still symlinks carrying their recorded identity
+ * are removed; a package-manager install that replaced a recorded entry leaves
+ * a different identity at the path, which is user-owned and never touched.
  */
-function reconcileBoundaryLinks(modules: string, members: Map<string, string>, markerPath: string): void {
+function reconcileBoundaryLinks(
+	modules: string,
+	members: Map<string, { manifestPath: string; dir: string }>,
+	markerPath: string,
+): void {
 	const ownership = readBoundaryOwnership(modules);
 	for (const name of ownership.keys()) {
 		if (members.has(name)) continue;
 		const linkPath = path.join(modules, ...name.split("/"));
-		if (tryLstat(linkPath)?.isSymbolicLink()) fs.rmSync(linkPath, { force: true });
+		const recorded = ownership.get(name);
+		if (recorded !== undefined && isRecordedLinkAtIdentity(linkPath, recorded)) {
+			fs.rmSync(linkPath, { force: true });
+		}
 		ownership.delete(name);
 	}
 	writeBoundaryOwnership(modules, ownership);
@@ -768,19 +874,70 @@ function reconcileBoundaryLinks(modules: string, members: Map<string, string>, m
 	}
 }
 
-/** Reads the per-link ownership manifest beside the boundary marker. */
+/**
+ * Reads the per-link ownership manifest beside the boundary marker.
+ *
+ * Fails closed: a manifest that exists but cannot be read or parsed as a flat
+ * string→string record of valid package names authorizes nothing — silently
+ * treating it as empty would let remediation delete links the launcher cannot
+ * prove it owns, or preserve stale links it should have pruned. An absent
+ * manifest (first creation) is legitimately empty.
+ */
 function readBoundaryOwnership(modules: string): Map<string, string> {
 	const manifestPath = path.join(modules, NODE_MODULES_LINK_OWNERSHIP_MANIFEST);
+	let raw: string;
 	try {
-		const parsed = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
-		const map = new Map<string, string>();
-		for (const [name, dir] of Object.entries(parsed)) {
-			if (typeof dir === "string") map.set(name, dir);
-		}
-		return map;
-	} catch {
-		return new Map();
+		raw = fs.readFileSync(manifestPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+		throw new Error(
+			`worktree_boundary_manifest_unreadable:${JSON.stringify(shortenPath(manifestPath))} — link ownership ` +
+				"cannot be proven, so the isolation boundary cannot be reconciled safely.",
+		);
 	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new Error(
+			`worktree_boundary_manifest_invalid:${JSON.stringify(shortenPath(manifestPath))} — link ownership ` +
+				"cannot be proven, so the isolation boundary cannot be reconciled safely.",
+		);
+	}
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(
+			`worktree_boundary_manifest_invalid:${JSON.stringify(shortenPath(manifestPath))} — link ownership ` +
+				"cannot be proven, so the isolation boundary cannot be reconciled safely.",
+		);
+	}
+	const map = new Map<string, string>();
+	for (const [name, dir] of Object.entries(parsed as Record<string, unknown>)) {
+		if (typeof dir !== "string" || !PACKAGE_NAME_PATTERN.test(name) || name.includes("\\")) {
+			throw new Error(
+				`worktree_boundary_manifest_invalid:${JSON.stringify(shortenPath(manifestPath))} — entry ` +
+					`${JSON.stringify(name)} is not a recorded package link, so its ownership cannot be proven.`,
+			);
+		}
+		map.set(name, dir);
+	}
+	return map;
+}
+
+/**
+ * Positive identity proof for a recorded boundary link: the entry must be a
+ * symlink whose recorded target directory still exists, and whose realpath
+ * must still resolve to that recorded target's realpath. Anything else — a
+ * replaced entry, a dangling link, an unreadable path — is not the launcher's
+ * link and must never be replaced or removed on the manifest's say-so.
+ */
+function isRecordedLinkAtIdentity(linkPath: string, recordedTarget: string): boolean {
+	const stat = tryLstat(linkPath);
+	if (stat === null || !stat.isSymbolicLink()) return false;
+	const targetReal = tryRealpath(linkPath);
+	if (targetReal === null) return false;
+	const recordedReal = tryRealpath(recordedTarget);
+	if (recordedReal === null) return false;
+	return sameFileSystemPath(targetReal, recordedReal);
 }
 
 /** Writes the per-link ownership manifest beside the boundary marker. */
