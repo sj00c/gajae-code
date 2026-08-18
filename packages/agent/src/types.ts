@@ -349,7 +349,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * attach per-turn state (e.g. a fresh owned-completion lineage) at actual
 	 * resume admission rather than when the message was merely queued.
 	 */
-	onFollowUpConsumed?: (messages: AgentMessage[]) => void;
+	onFollowUpConsumed?: (messages: AgentMessage[], promotion: { startsOwnRun: boolean }) => void;
+	/**
+	 * Invoked with the steering messages the loop dequeues mid-run for the
+	 * CURRENT turn (right after getSteeringMessages). `promotion.startsOwnRun`
+	 * is false for in-run consumption and true when the batch starts a new run.
+	 */
+	onSteeringConsumed?: (messages: AgentMessage[], promotion: { startsOwnRun: boolean }) => void;
 	/**
 	 * Supplies one bounded synthetic recovery instruction before the loop would
 	 * otherwise yield. Unlike a follow-up, it is sent only to the provider and

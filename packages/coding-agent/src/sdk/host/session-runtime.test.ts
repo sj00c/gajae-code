@@ -3017,6 +3017,54 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("tool progress renews the deadlines of every correlation attached to the active run", async () => {
+		// Review finding (#4668): progress renewal covered only the head
+		// invocation, so an in-run consumed correlation sharing a long run would
+		// false-fire prompt_deadline_exceeded before the shared agent_end.
+		// Production dispatch of the in-run consumption itself is covered by
+		// agent-session-promotion-identity.test.ts; this exercises the runtime
+		// renewal wiring at the SDK boundary.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-renew-attached-"));
+		try {
+			let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
+			const harness = await invocationHarness("renew-attached", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					if (content === "consumed") {
+						promoted = (
+							options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined
+						)?.onQueuedPromoted;
+						return;
+					}
+					await new Promise<void>(() => {});
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			const consumed = await harness.control("turn.follow_up", { text: "consumed" });
+			expect(consumed.ok).toBe(true);
+			promoted?.({ startsOwnRun: false });
+			const ids = { commandId: consumed.result?.commandId, turnId: consumed.result?.turnId };
+			// Past the 25ms lease, repeated tool activity keeps the attached
+			// correlation alive: without renewal it would already be
+			// prompt_deadline_exceeded by the first sleep boundary.
+			for (let i = 0; i < 3; i += 1) {
+				await harness.emit("tool_execution_start");
+				await Bun.sleep(15);
+			}
+			const midRun = await harness.query("turn.prompt_status", ids);
+			expect(midRun.result?.status).not.toBe("failed");
+			await harness.emit("agent_end");
+			const final = await harness.query("turn.prompt_status", ids);
+			expect(final.result?.status).toBe("terminal_ok");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 	test("an in-run consumed follow-up is not parked for an unrelated later agent_start", async () => {
 		// Review finding (#4668 P1): a follow-up consumed inside the running turn
 		// used to be appended to pending; a later unrelated agent_start would

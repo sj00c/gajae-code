@@ -303,6 +303,8 @@ export interface AgentOptions {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 	/** Invoked with the follow-up messages dequeued for the next turn (reassignable). */
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
+	/** Invoked with the steering messages dequeued mid-run for the current turn (reassignable). */
+	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
 
 	/**
 	 * Opt-in OpenTelemetry instrumentation. Passing `{}` enables the loop's
@@ -472,6 +474,8 @@ export class Agent {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 	/** Invoked with the follow-up messages dequeued for the next turn. Reassign at any time. */
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
+	/** Invoked with the steering messages dequeued mid-run for the current turn. Reassign at any time. */
+	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
 
 	constructor(opts: AgentOptions = {}) {
 		this.#state = { ...this.#state, ...opts.initialState };
@@ -516,6 +520,7 @@ export class Agent {
 		this.#shouldPause = opts.shouldPause;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.onFollowUpConsumed = opts.onFollowUpConsumed;
+		this.onSteeringConsumed = opts.onSteeringConsumed;
 		this.afterToolCall = opts.afterToolCall;
 		this.#telemetry = opts.telemetry;
 		this.#appendOnlyContext = opts.appendOnlyContext;
@@ -1495,7 +1500,7 @@ export class Agent {
 				// envelopes are filtered before they reach the loop, and delivered
 				// envelopes settle their registrations — the direct path otherwise
 				// bypasses onFollowUpConsumed entirely (review threads P1/P2).
-				await this.onFollowUpConsumed?.(queuedFollowUp);
+				await this.onFollowUpConsumed?.(queuedFollowUp, { startsOwnRun: true });
 				// The hook can filter the WHOLE batch (every entry denied by a
 				// scope:"owned" abort): starting an empty provider run would
 				// violate the zero-final-call guarantee, so return without
@@ -1542,7 +1547,7 @@ export class Agent {
 			// bypassing the hook would leak every such job's ownership tuple and
 			// eventually exhaust the bounded ownership registries (review thread
 			// P2).
-			await this.onFollowUpConsumed?.(queuedFollowUp);
+			await this.onFollowUpConsumed?.(queuedFollowUp, { startsOwnRun: true });
 			// The hook can filter the WHOLE batch (every entry denied by a
 			// scope:"owned" abort): starting an empty provider run would violate
 			// the zero-final-call guarantee, so return without running the loop
@@ -1816,6 +1821,9 @@ export class Agent {
 					this.#steeringQueue = [...queued, ...this.#steeringQueue];
 					return [];
 				}
+				// Mid-run consumption into the CURRENT turn: the batch never starts
+				// its own run (#4668).
+				if (queued.length > 0) await this.onSteeringConsumed?.(queued, { startsOwnRun: false });
 				return queued;
 			},
 			requeueSteeringMessages: (messages: AgentMessage[]) => {
@@ -1832,7 +1840,7 @@ export class Agent {
 					return [];
 				}
 				if (queued.length > 0) {
-					await this.onFollowUpConsumed?.(queued);
+					await this.onFollowUpConsumed?.(queued, { startsOwnRun: false });
 				}
 				return queued;
 			},

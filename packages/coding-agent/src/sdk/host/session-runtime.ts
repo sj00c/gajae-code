@@ -2720,16 +2720,24 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	api.on("turn_end", (_event, ctx) =>
 		active?.runtime.emitEvent({ type: "turn_end", sessionId: ctx.sessionManager.getSessionId() }),
 	);
-	api.on("tool_execution_start", async (_event, ctx) => {
+	// Tool activity renews the deadline of EVERY prompt correlation attached to
+	// the active run — the root invocation plus any in-run consumed follow-ups
+	// sharing it — not only the head, or an attached correlation would
+	// false-fire prompt_deadline_exceeded during a long shared run (#4668).
+	const renewAttributableProgress = (eventType: string): void => {
 		const current = active;
-		if (current?.activeInvocation?.kind !== "prompt") return;
-		current.deadlineManager.onAttributableEvent(current.activeInvocation.correlation, "tool_execution_start");
+		if (!current) return;
+		const batch = current.drainedInvocations ?? (current.activeInvocation ? [current.activeInvocation] : []);
+		for (const invocation of batch)
+			if (invocation.kind === "prompt")
+				current.deadlineManager.onAttributableEvent(invocation.correlation, eventType);
+	};
+	api.on("tool_execution_start", async (_event, ctx) => {
+		renewAttributableProgress("tool_execution_start");
 		void ctx;
 	});
 	api.on("tool_execution_end", async (_event, ctx) => {
-		const current = active;
-		if (current?.activeInvocation?.kind !== "prompt") return;
-		current.deadlineManager.onAttributableEvent(current.activeInvocation.correlation, "tool_execution_end");
+		renewAttributableProgress("tool_execution_end");
 		void ctx;
 	});
 	const errorCode = (error: unknown): string | undefined =>

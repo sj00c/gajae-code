@@ -3731,7 +3731,7 @@ export class AgentSession {
 		// actual resume admission — when the loop dequeues the follow-up for the
 		// next turn, the previously streaming turn has ended, so mutating the
 		// session-wide epoch/lineage is safe and its tools bind the fresh lineage.
-		this.agent.onFollowUpConsumed = messages => {
+		this.agent.onFollowUpConsumed = (messages, promotion) => {
 			// A follow-up whose owned-completion origin is DENIED — an owned
 			// scope landed after the result was queued, or the tuple is
 			// forged/vanished-disabled — must NOT resume the agent: remove it
@@ -3765,7 +3765,14 @@ export class AgentSession {
 			// when the batch is drained by a continuation the message did not
 			// schedule (a skipped continuation must never discard the correlation
 			// of work that is still consumed; review thread P2).
-			this.#fireQueuedPromotionHooks(messages);
+			this.#fireQueuedPromotionHooks(messages, promotion);
+		};
+		// Steering consumed mid-run never starts its own run: fire the stored
+		// promotion hook at the REAL dequeue boundary so the SDK attaches the
+		// submitter to the in-flight run instead of parking the correlation for
+		// an unrelated later agent_start (#4668).
+		this.agent.onSteeringConsumed = (messages, promotion) => {
+			this.#fireQueuedPromotionHooks(messages, promotion);
 		};
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
@@ -6081,7 +6088,11 @@ export class AgentSession {
 											// continuations retain predecessor accounting, and resetAttemptBudget keeps
 											// the sticky fallback cursor unchanged.
 											onRunAccepted: (handle: AttemptRunHandle, acceptance) => {
-												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages);
+												// A continuation consuming queued messages starts a NEW run
+												// (its own agent_start), so promotions fire as own-run (#4668).
+												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
+													startsOwnRun: true,
+												});
 												for (const message of acceptance.consumedQueuedMessages) {
 													const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
 													if (sdkRunToken) {
