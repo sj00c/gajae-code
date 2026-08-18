@@ -10,6 +10,8 @@
  * that cannot be undone safely halts the rest, so the result is an
  * interpretable prefix rather than a scattered mix.
  */
+
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { planPublish, publishPlan, readTarget } from "./json-publisher";
@@ -25,12 +27,28 @@ import {
 import { type PaseoProviderEntry, providerEntryHash } from "./provider-config";
 import type { PartialRemovalEvidence, PaseoRemoveResult } from "./result-types";
 import type { PaseoSetupDependencies } from "./setup-deps";
-import { inverseSkillsBridge, SkillsBridgeError } from "./skills-bridge";
+import { inverseSkillsBridge, legacyRecordedSourceDir, SkillsBridgeError } from "./skills-bridge";
 
 export interface RemoveOptions {
 	readonly now: Date;
 	/** Undo the config.yml `skills.customDirectories` append. Supplied by the orchestrator. */
 	readonly unregisterBridgeDirectory?: () => Promise<void>;
+}
+/**
+ * `lstat` distinguishing a genuinely absent path from a filesystem failure.
+ *
+ * A permission or I/O error on the bridge directory must NOT be collapsed into
+ * "absent": treating it as absence clears all bridge provenance and reports a
+ * successful removal while an owned link is still on disk. Only `ENOENT` counts
+ * as absent; every other error propagates and fails the removal closed.
+ */
+async function lstatAllowingAbsent(destination: string): Promise<Stats | undefined> {
+	try {
+		return await fs.lstat(destination);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
 }
 
 /**
@@ -82,21 +100,20 @@ export async function removePaseoSetup(
 			for (const name of ledger.bridgeEntries) {
 				if (path.basename(name) !== name || name.includes("/")) continue;
 				const destination = path.join(bridgeDir, name);
-				const stat = await fs.lstat(destination).catch(() => undefined);
+				const stat = await lstatAllowingAbsent(destination);
 				if (stat?.isSymbolicLink() === true) createdEntries.push(name);
 			}
 			// A recorded source directory is trusted even after it disappears
 			// (Paseo uninstalled): link-text verification does not need it on
-			// disk, and the links are inside GJC's own bridge directory.
-			const sourceDir = ledger.bridgeSourceDir ?? (await deps.skillsSource?.())?.dir;
-			if (sourceDir === undefined) {
-				throw new SkillsBridgeError(
-					`Cannot prove ownership of Paseo skill bridge entries: no source directory recorded and none resolvable (${bridgeDir})`,
-				);
-			}
+			// disk, and the links are inside GJC's own bridge directory. A
+			// legacy ledger that predates `bridgeSourceDir` falls back to the
+			// single location a pre-#4638 install could have linked from, so a
+			// machine wedged by #4638 can still be rolled back.
+			const sourceDir = ledger.bridgeSourceDir ?? legacyRecordedSourceDir(deps.home ?? "");
 			await inverseSkillsBridge(deps, {
 				createdEntries,
 				prunedEntries: [],
+				adoptedEntries: [],
 				bridgeDirCreated: ledger.bridgeDirCreated ?? false,
 				sourceDir,
 			});

@@ -136,6 +136,8 @@ export interface PaseoSetupDependencies {
 	 * a Paseo.app bundle).
 	 */
 	readonly skillsSource?: () => Promise<PaseoSkillSource | undefined>;
+	/** Home directory used to derive the legacy pre-#4638 bridge source. */
+	readonly home?: string;
 }
 
 export function createDefaultPaseoPaths(agentDir: string = getAgentDir(), home: string = os.homedir()): PaseoPaths {
@@ -233,5 +235,6 @@ export function createDefaultPaseoSetupDependencies(): PaseoSetupDependencies {
 		runProviderLs,
 		now: () => new Date(),
 		skillsSource: () => resolvePaseoSkillsSource(),
+		home: os.homedir(),
 	};
 }

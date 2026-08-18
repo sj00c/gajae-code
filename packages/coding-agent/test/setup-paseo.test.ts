@@ -35,7 +35,12 @@ import {
 	resolveGjcCommand,
 } from "../src/setup/paseo/provider-config";
 import { removePaseoSetup } from "../src/setup/paseo/remove";
-import { checkExitCode, type SetupCheckResult, type SetupCheckStatus } from "../src/setup/paseo/result-types";
+import {
+	checkExitCode,
+	type PaseoRemoveResult,
+	type SetupCheckResult,
+	type SetupCheckStatus,
+} from "../src/setup/paseo/result-types";
 import {
 	type PaseoLsOutcome,
 	type PaseoPaths,
@@ -117,6 +122,7 @@ async function makeFixture(outcome: PaseoLsOutcome = { kind: "timeout", timeoutM
 		},
 		now: () => new Date("2026-01-01T00:00:00.000Z"),
 		skillsSource: async () => ({ dir: agentsSkills, origin: "user" }),
+		home,
 	};
 	return { root, paths, deps, probes, spawned };
 }
@@ -574,10 +580,25 @@ describe("skills bridge", () => {
 		expect(await fs.readdir(fixture.paths.bridgeDir)).not.toContain("paseo-file");
 	});
 
+	/** Install without the full saga but with a realistic ledger, so preflight's provenance gate can run. */
+	async function installWithLedger(deps: PaseoSetupDependencies): Promise<void> {
+		const preflight = await preflightSkillsBridge(deps);
+		await installSkillsBridge(preflight);
+		await writeProvenance(deps.paths.provenanceLedger, {
+			version: 1,
+			providerKeys: {},
+			seededOrchestrationKeys: {},
+			bridgePath: deps.paths.bridgeDir,
+			bridgeEntries: [...Object.keys(preflight.entries), ...preflight.adopts.map(adopt => adopt.name)],
+			bridgeDirCreated: false,
+			...(preflight.sourceDir ? { bridgeSourceDir: preflight.sourceDir } : {}),
+		});
+	}
+
 	test("install converges the bridge after a Paseo release adds and drops skills (#4638)", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);
-		await installSkillsBridge(await preflightSkillsBridge(fixture.deps));
+		await installWithLedger(fixture.deps);
 
 		// Paseo 0.4.0: paseo-loop is gone, paseo-help is new.
 		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
@@ -602,7 +623,7 @@ describe("skills bridge", () => {
 	test("a re-run after a source skill is deleted prunes the dead link instead of leaving it (#4638)", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);
-		await installSkillsBridge(await preflightSkillsBridge(fixture.deps));
+		await installWithLedger(fixture.deps);
 		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-committee"), { recursive: true });
 
 		const result = await installSkillsBridge(await preflightSkillsBridge(fixture.deps));
@@ -610,6 +631,150 @@ describe("skills bridge", () => {
 		await expect(fs.lstat(path.join(fixture.paths.bridgeDir, "paseo-committee"))).rejects.toMatchObject({
 			code: "ENOENT",
 		});
+	});
+	test("a foreign paseo-prefixed symlink is never pruned, with or without provenance (#4644 review)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await installWithLedger(fixture.deps);
+
+		// A live user symlink at a name the source does not carry and no ledger
+		// ever recorded: directory creation cannot prove ownership, so install
+		// must refuse instead of silently deleting it.
+		await fs.symlink(
+			path.join(fixture.paths.agentsSkillsDir as string, "paseo"),
+			path.join(fixture.paths.bridgeDir, "paseo-mine"),
+		);
+		const before = await snapshotTree(fixture.paths.bridgeDir);
+
+		await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
+	});
+
+	test("a pre-#4638 bridge pointing at the legacy source is adopted, not refused (#4644 review)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		// The legacy machine: allowlist links into ~/.agents/skills, ledger
+		// without bridgeSourceDir. The source still resolves to the same
+		// directory, so adoption is a no-op re-point of the same target.
+		await installWithLedger(fixture.deps);
+		const ledger = await readProvenance(fixture.paths.provenanceLedger);
+		await writeProvenance(fixture.paths.provenanceLedger, {
+			...ledger,
+			bridgeSourceDir: undefined,
+		});
+
+		const preflight = await preflightSkillsBridge(fixture.deps);
+		// Same-directory legacy links are already correct: nothing to adopt.
+		expect(preflight.adopts).toEqual([]);
+	});
+
+	test("a legacy ledger with links into a retired ~/.agents/skills converges onto the app bundle (#4644 review)", async () => {
+		// The exact wedged state from #4638: five allowlist links into a
+		// ~/.agents/skills that never existed, a desktop app now present, and a
+		// legacy ledger without bridgeSourceDir.
+		const fixture = await makeFixture(lsOk("gjc"));
+		await fs.rm(fixture.paths.agentsSkillsDir as string, { recursive: true });
+		const legacySource = fixture.paths.agentsSkillsDir as string;
+		const bundle = path.join(fixture.root, "Applications", "Paseo.app", "Contents", "Resources", "skills");
+		for (const name of ["paseo", "paseo-help"]) {
+			await fs.mkdir(path.join(bundle, name), { recursive: true });
+			await fs.writeFile(path.join(bundle, name, "SKILL.md"), `# ${name}\n`);
+		}
+		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		for (const name of SKILL_NAMES) {
+			await fs.symlink(path.join(legacySource, name), path.join(fixture.paths.bridgeDir, name));
+		}
+		await writeProvenance(fixture.paths.provenanceLedger, {
+			version: 1,
+			providerKeys: {},
+			seededOrchestrationKeys: {},
+			bridgePath: fixture.paths.bridgeDir,
+			bridgeEntries: [...SKILL_NAMES],
+			bridgeDirCreated: false,
+		});
+		const deps: PaseoSetupDependencies = {
+			...fixture.deps,
+			skillsSource: async () => ({ dir: bundle, origin: "app-bundle" }),
+		};
+
+		// Check reports the wedge (dangling legacy links) instead of passing.
+		const drifted = await checkPaseoSetup(deps);
+		expect(drifted.status).toBe("drift");
+
+		// Re-running setup converges: adopt paseo, prune the retired names,
+		// create paseo-help, and record the discovered source directory.
+		const install = await runPaseoSetup({}, deps);
+		expect(install.kind).toBe("install");
+		const ledger = await readProvenance(fixture.paths.provenanceLedger);
+		expect([...(ledger.bridgeEntries ?? [])].sort()).toEqual(["paseo", "paseo-help"]);
+		expect(ledger.bridgeSourceDir).toBe(bundle);
+		const linked = (await fs.readdir(fixture.paths.bridgeDir)).sort();
+		expect(linked).toEqual(["paseo", "paseo-help"]);
+		for (const name of linked) {
+			expect(await fs.readlink(path.join(fixture.paths.bridgeDir, name))).toBe(path.join(bundle, name));
+		}
+
+		const result = await checkPaseoSetup(deps);
+		expect(result.status).toBe("pass");
+		expect(checkExitCode(result)).toBe(0);
+	});
+
+	test("remove rolls back a legacy ledger with no recorded source directory (#4644 review)", async () => {
+		// The same wedged machine, exercising --remove directly: the ledger
+		// predates bridgeSourceDir, so ownership is proven against the legacy
+		// ~/.agents/skills location rather than a re-discovered source.
+		const fixture = await makeFixture(lsOk("gjc"));
+		const legacySource = fixture.paths.agentsSkillsDir as string;
+		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		for (const name of SKILL_NAMES) {
+			await fs.symlink(path.join(legacySource, name), path.join(fixture.paths.bridgeDir, name));
+		}
+		await writeProvenance(fixture.paths.provenanceLedger, {
+			version: 1,
+			providerKeys: {},
+			seededOrchestrationKeys: {},
+			bridgePath: fixture.paths.bridgeDir,
+			bridgeEntries: [...SKILL_NAMES],
+			bridgeDirCreated: true,
+		});
+		// No source can be discovered anymore (the app is gone), and the legacy
+		// ledger has no bridgeSourceDir: removal must still prove ownership.
+		const deps: PaseoSetupDependencies = {
+			...fixture.deps,
+			skillsSource: async () => undefined,
+		};
+
+		const result = await removePaseoSetup(deps, { now: new Date() });
+		expect(result.outcome).toBe("removed");
+		// Every legacy link is gone and the bridge directory was removed.
+		await expect(fs.stat(deps.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("a non-ENOENT filesystem failure fails removal closed instead of reporting success (#4644 review)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await installWithLedger(fixture.deps);
+
+		// Simulate a permission failure on the bridge directory: the recorded
+		// entry is still on disk, but lstat cannot traverse to it. Removal must
+		// report partial-removal and retain the ledger, never claim success.
+		// chmod 000 blocks traversal with EACCES on the real syscall surface,
+		// which is exactly the errno class the review asked to keep distinct.
+		await fs.chmod(fixture.paths.bridgeDir, 0o000);
+		let result: PaseoRemoveResult;
+		try {
+			result = await removePaseoSetup(fixture.deps, { now: new Date() });
+		} finally {
+			await fs.chmod(fixture.paths.bridgeDir, 0o755);
+		}
+		expect(result.outcome).toBe("partial-removal");
+		if (result.outcome !== "partial-removal") throw new Error("unreachable");
+		expect(result.evidence.detail).toContain("EACCES");
+
+		// The owned link still exists and the ledger still records it.
+		expect((await fs.lstat(path.join(fixture.paths.bridgeDir, "paseo"))).isSymbolicLink()).toBe(true);
+		const ledger = await readProvenance(fixture.paths.provenanceLedger);
+		expect(ledger.bridgeEntries).toContain("paseo");
 	});
 
 	test("both protected skill trees are byte-identical across install and check (AC-8, AC-19)", async () => {
