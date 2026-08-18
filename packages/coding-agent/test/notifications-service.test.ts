@@ -1006,6 +1006,26 @@ describe("notification-service recovery", () => {
 		expect(unlinked).not.toContain(paths.lock);
 	});
 
+	// A record with a live pid, an integer `stoppedAt`, and a malformed body
+	// (missing the incarnation field `hasSafeDaemonStateShape` requires) is not
+	// owner consent: acquisition classifies it as ambiguous and refuses to touch
+	// it, so recovery must not unlink its lock either. This is the
+	// acquisition/recovery equivalence the reviewer required: recovery never
+	// validates less than acquisition, in either direction.
+	test("still protects a live owner whose stopped record fails the acquisition shape predicate", async () => {
+		const { fs, unlinked } = mockFs({
+			[paths.state]: daemonStateJson({ pid: 1000, stoppedAt: 2_000, incarnation: undefined }),
+			[paths.lock]: "lock",
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.action).toBe("left-active");
+		expect(unlinked).not.toContain(paths.lock);
+	});
+
 	test("clears the lock of a confirmed-dead owner", async () => {
 		const { fs, unlinked } = mockFs({
 			[paths.state]: daemonStateJson({ pid: 555 }),

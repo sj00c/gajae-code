@@ -47,7 +47,12 @@ import { DiscordLiveProvider } from "./discord-live-provider";
 import type { DiscordDiagnosticProvider } from "./discord-provider";
 import { SlackLiveProvider } from "./slack-live-provider";
 import type { SlackDiagnosticProvider } from "./slack-provider";
-import { type OwnerFreshnessSnapshot, readOwnerFreshnessSnapshot, type TelegramDaemonFs } from "./telegram-daemon";
+import {
+	isStoppedDaemonState,
+	type OwnerFreshnessSnapshot,
+	readOwnerFreshnessSnapshot,
+	type TelegramDaemonFs,
+} from "./telegram-daemon";
 import { DAEMON_GENERATION } from "./telegram-daemon-contract";
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
@@ -562,11 +567,31 @@ function parseDaemonState(raw: string): NormalizedDaemonState | undefined {
 async function readDaemonStateFile(
 	fs: NotificationServiceFs,
 	file: string,
-): Promise<NormalizedDaemonState | undefined> {
+): Promise<{ state: NormalizedDaemonState; raw: string } | undefined> {
 	try {
-		return parseDaemonState(await fs.readFile(file, "utf8"));
+		const raw = await fs.readFile(file, "utf8");
+		const state = parseDaemonState(raw);
+		return state ? { state, raw } : undefined;
 	} catch {
 		return undefined;
+	}
+}
+/**
+ * Whether a normalized daemon record carries owner-consent to reclaim its lock:
+ * the persisted record must satisfy the acquisition path's stopped-owner
+ * predicate (`isStoppedDaemonState`) — a fully canonical modern tombstone with
+ * an acquisition id, or an exact legacy pre-acquisition tombstone. Recovery must
+ * not accept a `stoppedAt` field on an otherwise-malformed record as consent:
+ * acquisition would classify that same record as ambiguous and refuse to touch
+ * it, and recovery answering the ownership question more loosely than
+ * acquisition is exactly the divergence this path must never reintroduce.
+ */
+function isCanonicalStopConsent(raw: string | undefined): boolean {
+	if (raw === undefined) return false;
+	try {
+		return isStoppedDaemonState(JSON.parse(raw));
+	} catch {
+		return false;
 	}
 }
 
@@ -1655,7 +1680,8 @@ async function forceDetachBlockedTransitionMarker(input: {
  * primitive re-checks ownership while holding the same steal-mutex the daemon's
  * own takeover path uses ({@link DaemonPaths.steal}), so the two are mutually
  * exclusive, and unlinks only when the recorded owner is still the same
- * confirmed-dead — or self-retired by a canonical `stoppedAt` marker — process.
+ * confirmed-dead — or self-retired by a stop marker the acquisition path itself
+ * would honor — process.
  */
 async function removeDeadOwnerLock(
 	fs: NotificationServiceFs,
@@ -1693,13 +1719,14 @@ async function removeDeadOwnerLock(
 	if (!transition) return "contended";
 	try {
 		const current = await readDaemonStateFile(fs, paths.state);
-		if (!current || current.ownerId !== expected.ownerId || current.pid !== expected.pid) return "superseded";
+		if (!current || current.state.ownerId !== expected.ownerId || current.state.pid !== expected.pid)
+			return "superseded";
 		// A live pid that already published its own stop marker has relinquished
-		// serving; only a live owner without one is still protected here.
-		// `stoppedAt` is normalized with the same safe-integer rule the daemon's
-		// own shape predicate uses, so only a marker a canonical owner could have
-		// written counts as consent.
-		if (pidAlive(current.pid) && current.stoppedAt === undefined) return "now-alive";
+		// serving; only a live owner without one is still protected here. The
+		// marker counts only when the whole record satisfies the acquisition
+		// path's stopped-owner predicate, so recovery never treats a malformed
+		// record as owner consent that acquisition would call ambiguous.
+		if (pidAlive(current.state.pid) && !isCanonicalStopConsent(current.raw)) return "now-alive";
 		if (!(await daemonTransitionLockIsHeld({ fs, path: paths.steal, lock: transition }))) return "contended";
 		try {
 			await fs.unlink(paths.lock);
@@ -1716,8 +1743,9 @@ async function removeDeadOwnerLock(
  * Ownership-protected cleanup. Removes only DEAD-owner artifacts:
  * per-session endpoint files with positive proof of death (a stale tombstone or
  * a dead recorded pid), and a daemon lock whose recorded owner is confirmed
- * dead or has published its own `stoppedAt` marker (normalized with the
- * daemon's safe-integer rule, so only a canonical marker counts as consent).
+ * dead or has published its own `stoppedAt` marker. The marker counts as
+ * consent only when the whole record satisfies the acquisition path's
+ * stopped-owner predicate, so recovery never validates less than acquisition.
  * A PID-less endpoint is treated as unknown (not dead) and kept. The
  * daemon lock is removed through {@link removeDeadOwnerLock}, an owner-bound
  * primitive that re-checks ownership under the daemon steal-mutex so it can
@@ -1805,8 +1833,10 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	// `stoppedAt` and then failed to exit is alive but no longer serving: the
 	// acquisition path already refuses to treat that tombstone as a live owner,
 	// so recovery must not report it as one and leave the lock behind forever.
-	// The marker is normalized with the daemon's own safe-integer rule, so only
-	// consent a canonical owner could have written unlocks a live pid.
+	// Consent is the acquisition path's own stopped-owner predicate over the raw
+	// record, so a `stoppedAt` field on an otherwise-malformed record — which
+	// acquisition would classify as ambiguous and refuse to touch — is never
+	// enough for recovery to unlink a live pid's lock.
 	const paths = daemonPaths(opts.settings.getAgentDir());
 	let daemonFiles: string[] = [];
 	try {
@@ -1816,6 +1846,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	}
 	const hasLock = daemonFiles.includes(path.basename(paths.lock));
 	const state = await readDaemonStateFile(fs, paths.state);
+	const stopConsent = isCanonicalStopConsent(state?.raw);
 	let daemon: NotificationRecoveryReport["daemon"];
 	if (!state) {
 		daemon = hasLock
@@ -1826,19 +1857,19 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 					pid: undefined,
 				}
 			: { action: "none", detail: "no daemon ownership record", ownerId: undefined, pid: undefined };
-	} else if (pidAlive(state.pid) && state.stoppedAt === undefined) {
+	} else if (pidAlive(state.state.pid) && !stopConsent) {
 		daemon = {
 			action: "left-active",
-			detail: `live daemon owned by pid ${state.pid} left untouched`,
-			ownerId: state.ownerId,
-			pid: state.pid,
+			detail: `live daemon owned by pid ${state.state.pid} left untouched`,
+			ownerId: state.state.ownerId,
+			pid: state.state.pid,
 		};
 	} else if (hasLock) {
 		const outcome = await removeDeadOwnerLock(
 			fs,
 			paths,
 			pidAlive,
-			state,
+			state.state,
 			now,
 			deps.pidIncarnation ?? defaultTransitionPidIncarnation,
 			opts.forceDaemonLock === true,
@@ -1855,14 +1886,14 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 							: "orphan-lock-left";
 		const detail =
 			outcome === "cleared"
-				? `cleared lock of ${state.stoppedAt === undefined ? "dead" : "retired"} owner pid ${state.pid}`
+				? `cleared lock of ${stopConsent ? "retired" : "dead"} owner pid ${state.state.pid}`
 				: outcome === "now-alive"
-					? `owner pid ${state.pid} became live during recovery; lock left untouched`
+					? `owner pid ${state.state.pid} became live during recovery; lock left untouched`
 					: outcome === "superseded"
 						? "a new daemon owner took over during recovery; lock left untouched"
 						: outcome === "contended"
 							? `recovery blocked by transition marker; lock left untouched${opts.forceDaemonLock ? " even after forced stale-marker retry" : ""}`
-							: `could not remove lock of dead owner pid ${state.pid}`;
+							: `could not remove lock of dead owner pid ${state.state.pid}`;
 		const blockingReason = outcome === "contended" ? "transition-marker-unavailable-or-contended" : undefined;
 		const markerAgeMs =
 			blockingReason && fs.stat
@@ -1876,7 +1907,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 				phase: "recovery",
 				outcome: action,
 				reason: blockingReason,
-				pid: state.pid,
+				pid: state.state.pid,
 				ageMs: markerAgeMs,
 				detail,
 			});
@@ -1884,8 +1915,8 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 		daemon = {
 			action,
 			detail,
-			ownerId: state.ownerId,
-			pid: state.pid,
+			ownerId: state.state.ownerId,
+			pid: state.state.pid,
 			...(blockingReason
 				? { blockingReason, markerAgeMs, forceCommand: "gjc notify recovery --force-daemon-lock" }
 				: {}),
@@ -1893,9 +1924,9 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	} else {
 		daemon = {
 			action: "none",
-			detail: `dead owner pid ${state.pid} recorded but no lock present`,
-			ownerId: state.ownerId,
-			pid: state.pid,
+			detail: `dead owner pid ${state.state.pid} recorded but no lock present`,
+			ownerId: state.state.ownerId,
+			pid: state.state.pid,
 		};
 	}
 

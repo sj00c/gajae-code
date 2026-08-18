@@ -1635,7 +1635,14 @@ function isLegacyStoppedDaemonState(state: unknown): boolean {
 	);
 }
 
-function isStoppedDaemonState(state: unknown): boolean {
+/**
+ * Whether a persisted daemon record proves its owner stopped serving: either a
+ * fully canonical modern record with a `stoppedAt` marker and an acquisition id,
+ * or an exact legacy pre-acquisition tombstone. This is the acquisition path's
+ * stopped-owner predicate; recovery must answer the same question with the same
+ * rule so the two paths never disagree about what counts as owner consent.
+ */
+export function isStoppedDaemonState(state: unknown): boolean {
 	return isExplicitlyStoppedDaemonState(state) || isLegacyStoppedDaemonState(state);
 }
 
