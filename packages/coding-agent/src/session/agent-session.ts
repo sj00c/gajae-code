@@ -2177,7 +2177,7 @@ export class AgentSession {
 	// not when an independently scheduled continuation is accepted — a skipped
 	// continuation must never discard the correlation of work that is still
 	// consumed (review thread P2).
-	readonly #followUpPromotionHooks = new Map<AgentMessage, () => void>();
+	readonly #followUpPromotionHooks = new Map<AgentMessage, (promotion: { startsOwnRun: boolean }) => void>();
 	/** SDK-owned follow-ups held outside Agent's live queue until the active run ends. */
 	#deferredSdkFollowUps: AgentMessage[] = [];
 	// Client/SDK steering (turn.prompt diverted to steer while streaming, or an
@@ -2192,7 +2192,7 @@ export class AgentSession {
 	/** Per-message SDK requester-ownership correlation for queued client steers:
 	 *  fired exactly once when the steer's run accepts it — via the idle
 	 *  auto-continue or the terminal-abort rearm (review thread P1). */
-	readonly #steerPromotionHooks = new WeakMap<AgentMessage, () => void>();
+	readonly #steerPromotionHooks = new WeakMap<AgentMessage, (promotion: { startsOwnRun: boolean }) => void>();
 	/** Monotonic steering admission sequence; the terminal abort snapshots it. */
 	#steeringAdmissionSeq = 0;
 	readonly #externalSteerAdmissionSeq = new WeakMap<AgentMessage, number>();
@@ -2210,17 +2210,20 @@ export class AgentSession {
 	readonly #terminalAbortSteeringSnapshotKeys = new Map<number, string>();
 	#terminalAbortAdmissionSeq = 0;
 	#queuedDisplaySequence = 0;
-	#fireQueuedPromotionHooks(messages: readonly AgentMessage[]): void {
+	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
 		for (const message of messages) {
 			const steerHook = this.#steerPromotionHooks.get(message);
 			if (steerHook) {
 				this.#steerPromotionHooks.delete(message);
-				steerHook();
+				// A steer is consumed INSIDE the currently running turn: no new
+				// agent_start follows for it (#4668 review).
+				steerHook({ startsOwnRun: promotion?.startsOwnRun ?? false });
 			}
 			const followUpHook = this.#followUpPromotionHooks.get(message);
 			if (followUpHook) {
 				this.#followUpPromotionHooks.delete(message);
-				followUpHook();
+				// A follow-up is promoted to its own run, whose agent_start follows.
+				followUpHook({ startsOwnRun: promotion?.startsOwnRun ?? true });
 			}
 		}
 	}
@@ -10955,7 +10958,11 @@ export class AgentSession {
 	async #queueSteer(
 		text: string,
 		images?: ImageContent[],
-		options?: { claimsGenuineUserIntent?: boolean; onPromoted?: () => void; external?: boolean },
+		options?: {
+			claimsGenuineUserIntent?: boolean;
+			onPromoted?: (promotion: { startsOwnRun: boolean }) => void;
+			external?: boolean;
+		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
@@ -11001,7 +11008,7 @@ export class AgentSession {
 		options?: {
 			forceOneAtATime?: boolean;
 			claimsGenuineUserIntent?: boolean;
-			onPromoted?: () => void;
+			onPromoted?: (promotion: { startsOwnRun: boolean }) => void;
 			sdkRunToken?: string;
 		},
 	): Promise<QueuedFollowUpOwner> {
@@ -11546,7 +11553,7 @@ export class AgentSession {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
-			onQueuedPromoted?: () => void;
+			onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			sdkRunToken?: string;
 		},
@@ -11718,7 +11725,7 @@ export class AgentSession {
 			const fireQueuedPromotion = () => {
 				if ((!freshAtReservation && !promoteAfterAbortUnwind) || queuedPromotionFired) return;
 				queuedPromotionFired = true;
-				options?.onQueuedPromoted?.();
+				options?.onQueuedPromoted?.({ startsOwnRun: true });
 			};
 			await this.prompt(text, {
 				expandPromptTemplates: false,
@@ -12790,7 +12797,7 @@ export class AgentSession {
 							resetRetryReplaySafety: true,
 							onRunAccepted: () => {
 								runAccepted = true;
-								if (selected) this.#fireQueuedPromotionHooks([message]);
+								if (selected) this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });
 								if (selected) {
 									this.#steeringMessages = this.#steeringMessages.filter(entry => entry !== selected.display);
 									this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== selected.display);

@@ -1232,6 +1232,7 @@ function createControlSurface(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
 		connectionId: string | undefined,
+		promotion: { startsOwnRun: boolean },
 	) => void,
 	policy?: SdkSurfacePolicy,
 	settings?: Settings,
@@ -1331,7 +1332,7 @@ function createControlSurface(
 			onPreflightAccepted: () => void;
 			onPreflightAcceptCommit: () => Promise<void>;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
-			onQueuedPromoted: () => void;
+			onQueuedPromoted: (promotion: { startsOwnRun: boolean }) => void;
 			queuedAtDispatch: boolean;
 		}) => Promise<unknown>,
 		acceptedFields?: () => Record<string, unknown>,
@@ -1407,7 +1408,8 @@ function createControlSurface(
 					// is later PROMOTED to its own run needs its pending ownership entry
 					// created at promotion so the submitting connection can
 					// terminal-abort that turn (review threads P1/P2).
-					onQueuedPromoted: () => onPromotedTurn?.(kind, correlation, requesterConnectionId),
+					onQueuedPromoted: (promotion: { startsOwnRun: boolean }) =>
+						onPromotedTurn?.(kind, correlation, requesterConnectionId, promotion),
 					queuedAtDispatch,
 				}),
 			);
@@ -2827,11 +2829,40 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (kind === "prompt" && startsOwnTurn) deadlineManager.onAccepted(correlation);
 			},
 			steerReconciliation,
-			(kind, correlation, connectionId) => {
-				// A steering-queued submission PROMOTED to its own run (finished
-				// prompt unwinding) starts with an empty pending queue at its
-				// agent_start; create the entry at promotion so the submitting
-				// connection owns that turn (review thread P2).
+			(kind, correlation, connectionId, promotion) => {
+				// Lease at the ACTUAL promotion boundary (#4668 review): a promoted
+				// submission that wedges before its run's agent_start must still
+				// terminalize boundedly instead of remaining accepted forever.
+				if (kind === "prompt") deadlineManager.onAccepted(correlation);
+				if (promotion?.startsOwnRun !== false) {
+					// A submission PROMOTED to its own run (finished prompt unwinding)
+					// starts with an empty pending queue at its agent_start; create the
+					// entry at promotion so the submitting connection owns that turn
+					// (review thread P2).
+					pending.push({ kind, correlation, connectionId });
+					return;
+				}
+				// Consumed INSIDE the currently running turn: no new agent_start
+				// follows for it, so a pending entry would be drained by an
+				// UNRELATED later agent_start and hand the connection ownership of
+				// a turn it did not start, plus a false prompt_deadline_exceeded
+				// (#4668 review). Attach the submitter to the in-flight run
+				// immediately: it shares that run's ownership and terminalizes
+				// with it.
+				const current = active;
+				if (current && (current.activeInvocation || (current.drainedInvocations?.length ?? 0) > 0)) {
+					if (connectionId !== undefined) {
+						const owners = new Set(activePromptOwnerHolder.connectionIds ?? []);
+						owners.add(connectionId);
+						activePromptOwnerHolder.connectionIds = owners;
+					}
+					if (current.drainedInvocations === undefined)
+						current.drainedInvocations = current.activeInvocation ? [current.activeInvocation] : [];
+					current.drainedInvocations.push({ kind, correlation });
+					return;
+				}
+				// No in-flight run is visible (lifecycle race): fall back to the
+				// pending queue; the promotion lease above still bounds it.
 				pending.push({ kind, correlation, connectionId });
 			},
 			surfaceFactory.policy,

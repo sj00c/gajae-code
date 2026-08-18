@@ -1190,7 +1190,7 @@ export interface ExtensionAPI {
 			queuedAtDispatch?: boolean;
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
-			onQueuedPromoted?: () => void;
+			onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			/** Internal SDK correlation owner for an exact queued follow-up. */
 			sdkRunToken?: string;
@@ -1415,7 +1415,7 @@ export type SendUserMessageHandler = (
 		onPreflightAccepted?: () => void;
 		onPreflightAcceptCommit?: () => void | Promise<void>;
 		/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
-		onQueuedPromoted?: () => void;
+		onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
 		preflightSignal?: AbortSignal;
 		/** Internal SDK correlation owner for an exact queued follow-up. */
 		sdkRunToken?: string;

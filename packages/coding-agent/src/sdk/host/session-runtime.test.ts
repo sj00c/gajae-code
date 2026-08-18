@@ -434,7 +434,7 @@ describe("SessionSdkSessionRuntime", () => {
 		// submitting connection can terminal-abort that turn.
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-unwind-promoted-"));
 		let idle = true;
-		let promoted: (() => void) | undefined;
+		let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
 		const queuedDispositions: boolean[] = [];
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 		const api = {
@@ -447,7 +447,7 @@ describe("SessionSdkSessionRuntime", () => {
 					| {
 							onPreflightAccepted?: () => void;
 							onPreflightAcceptCommit?: () => void;
-							onQueuedPromoted?: () => void;
+							onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
 							queuedAtDispatch?: boolean;
 					  }
 					| undefined,
@@ -517,7 +517,7 @@ describe("SessionSdkSessionRuntime", () => {
 			expect(promoted).toBeDefined();
 			// The unwind continuation promotes the queued steer to its own run: the
 			// correlation hook fires before agent_start...
-			promoted!();
+			promoted!({ startsOwnRun: true });
 			// ...and B's run starts: ownership transfers to conn-b.
 			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
 			// B's own terminal abort now stops its turn (previously no_active_turn).
@@ -2890,13 +2890,16 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		// deadline and could remain accepted with zero execution forever.
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-lease-batch-"));
 		try {
-			const promoted: Array<(() => void) | undefined> = [];
+			const promoted: Array<((promotion: { startsOwnRun: boolean }) => void) | undefined> = [];
 			const harness = await invocationHarness("lease-batch", cwd, {
 				settings: zeroProgressSettings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
 					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
-						promoted.push((options as { onQueuedPromoted?: () => void } | undefined)?.onQueuedPromoted);
+						promoted.push(
+							(options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined)
+								?.onQueuedPromoted,
+						);
 						return;
 					}
 				},
@@ -2911,8 +2914,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(promoted).toHaveLength(2);
 			// The unwind promotes both queued follow-ups into ONE run: a single
 			// agent_start drains the batch.
-			promoted[0]?.();
-			promoted[1]?.();
+			promoted[0]?.({ startsOwnRun: true });
+			promoted[1]?.({ startsOwnRun: true });
 			await harness.emit("agent_start");
 			const idsB = { commandId: followUpB.result?.commandId, turnId: followUpB.result?.turnId };
 			const idsC = { commandId: followUpC.result?.commandId, turnId: followUpC.result?.turnId };
@@ -2936,13 +2939,15 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		// zero-progress bound) and the replacement must be leased too.
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-lease-reentry-"));
 		try {
-			let promoted: (() => void) | undefined;
+			let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
 			const harness = await invocationHarness("lease-reentry", cwd, {
 				settings: zeroProgressSettings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
 					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
-						promoted = (options as { onQueuedPromoted?: () => void } | undefined)?.onQueuedPromoted;
+						promoted = (
+							options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined
+						)?.onQueuedPromoted;
 						return;
 					}
 					// The first turn accepts and then never makes progress.
@@ -2954,7 +2959,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness.emit("agent_start");
 			const followUp = await harness.control("turn.follow_up", { text: "replacement" });
 			expect(followUp.ok).toBe(true);
-			promoted?.();
+			promoted?.({ startsOwnRun: true });
 			// Re-entry with a non-empty drain while the first turn never ended.
 			await harness.emit("agent_start");
 			const idsFirst = { commandId: first.result?.commandId, turnId: first.result?.turnId };
@@ -2970,6 +2975,170 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a promoted follow-up that never reaches agent_start terminalizes with prompt_deadline_exceeded", async () => {
+		// Review finding (#4668 P1): before the promotion-boundary lease, a queued
+		// follow-up that was durably accepted and promoted but whose agent_start
+		// never arrived had no lease and stayed accepted indefinitely.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-promote-no-start-"));
+		try {
+			let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
+			const harness = await invocationHarness("promote-no-start", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
+						promoted = (
+							options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined
+						)?.onQueuedPromoted;
+						return;
+					}
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			const followUp = await harness.control("turn.follow_up", { text: "promoted" });
+			expect(followUp.ok).toBe(true);
+			// Promotion to its own run fires, but the run's agent_start never arrives.
+			promoted?.({ startsOwnRun: true });
+			const ids = { commandId: followUp.result?.commandId, turnId: followUp.result?.turnId };
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("an in-run consumed follow-up is not parked for an unrelated later agent_start", async () => {
+		// Review finding (#4668 P1): a follow-up consumed inside the running turn
+		// used to be appended to pending; a later unrelated agent_start would
+		// drain the stale correlation, mis-assign abort ownership, and could
+		// fabricate a prompt_deadline_exceeded. The consumed submission must
+		// attach to the in-flight run and terminalize with it instead.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-inrun-consume-"));
+		let idle = true;
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+			sendUserMessage: async (
+				content: string,
+				options:
+					| {
+							onPreflightAcceptCommit?: () => Promise<void>;
+							onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
+					  }
+					| undefined,
+			) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (content === "consumed") {
+					promoted = options?.onQueuedPromoted;
+					return;
+				}
+				await new Promise<void>(() => {});
+			},
+		} as unknown as ExtensionAPI;
+		const transport = memoryTransport();
+		const reconciliationStore = createReconciliationStore({
+			sessionFile: path.join(cwd, "session.json"),
+			sessionId: transport.sessionId,
+		});
+		const seamCalls: Array<{ handle: string; scope: string }> = [];
+		createSdkSessionRuntimeExtension(api, {
+			agentDir: cwd,
+			createTransport: async () => transport,
+			terminalAbortSeams: {
+				getReconciliationStore: () => reconciliationStore,
+				getTerminalTurnEpoch: () => 7,
+				getActivePromptHandle: () => "inrun-handle",
+				getActivePromptOwnerConnectionId: () => undefined,
+				cancelPendingPreflightForTerminalAbort: () => {},
+				abortPromptAndWaitWithTerminal: async (handle, options) => {
+					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
+					return { status: "settled", terminalScope: {} };
+				},
+			},
+		});
+		const ctx = { ...extensionContext(transport.sessionId, cwd), isIdle: () => idle } as ExtensionContext;
+		const waitFrame = async (id: string) => {
+			const deadline = Date.now() + 15_000;
+			while (!transport.sent.some(frame => frame.id === id)) {
+				if (Date.now() > deadline) throw new Error(`Timed out waiting for ${id}`);
+				await Bun.sleep(20);
+			}
+			return transport.sent.find(frame => frame.id === id);
+		};
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			// conn-a's prompt starts its run and streams.
+			transport.feed("conn-a", {
+				type: "control_request",
+				id: "inrun-a",
+				operation: "turn.prompt",
+				input: { text: "running" },
+			} as SdkFrame);
+			await waitFrame("inrun-a");
+			idle = false;
+			await handlers.get("agent_start")?.({}, ctx);
+			// conn-b's prompt is queued while streaming, then CONSUMED inside the
+			// running turn (no new agent_start for it).
+			transport.feed("conn-b", {
+				type: "control_request",
+				id: "inrun-b",
+				operation: "turn.prompt",
+				input: { text: "consumed" },
+			} as SdkFrame);
+			const acceptedB = (await waitFrame("inrun-b")) as { result?: { commandId?: string; turnId?: string } };
+			promoted?.({ startsOwnRun: false });
+			// The consuming run ends. The consumed submission must terminalize
+			// WITH it (terminal_ok, never a fabricated prompt_deadline_exceeded):
+			// with the bug it would still be parked in pending as merely accepted.
+			await handlers.get("agent_end")?.({}, ctx);
+			const statusOf = async (ids: { commandId?: string; turnId?: string }, frameId: string) => {
+				transport.feed("conn-a", {
+					type: "query_request",
+					id: frameId,
+					query: "turn.prompt_status",
+					input: ids,
+				} as SdkFrame);
+				return (await waitFrame(frameId)) as { result?: { status?: string; error?: { code?: string } } };
+			};
+			const idsB = { commandId: acceptedB.result?.commandId, turnId: acceptedB.result?.turnId };
+			expect((await statusOf(idsB, "inrun-status-b")).result?.status).toBe("terminal_ok");
+			// A separate later turn starts: the consumed correlation must NOT be
+			// drained into it, so conn-b owns nothing and its abort is refused.
+			transport.feed("conn-c", {
+				type: "control_request",
+				id: "inrun-c",
+				operation: "turn.prompt",
+				input: { text: "later" },
+			} as SdkFrame);
+			await waitFrame("inrun-c");
+			await handlers.get("agent_start")?.({}, ctx);
+			transport.feed("conn-b", {
+				type: "control_request",
+				id: "inrun-abort-b",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "inrun-abort-b-key",
+			} as SdkFrame);
+			expect(await waitFrame("inrun-abort-b")).toMatchObject({
+				ok: true,
+				result: expect.objectContaining({ turn: "no_active_turn" }),
+			});
+			expect(seamCalls).toHaveLength(0);
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
@@ -3593,7 +3762,7 @@ test("SDK-only host does not assign a follow-up requester ownership until the fo
 	// correlates only when the queued follow-up is actually promoted.
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-followup-stale-"));
 	const idle = true;
-	let promoted: (() => void) | undefined;
+	let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
@@ -3605,7 +3774,7 @@ test("SDK-only host does not assign a follow-up requester ownership until the fo
 				| {
 						onPreflightAccepted?: () => void;
 						onPreflightAcceptCommit?: () => void;
-						onQueuedPromoted?: () => void;
+						onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
 				  }
 				| undefined,
 		) =>
@@ -3678,7 +3847,7 @@ test("SDK-only host does not assign a follow-up requester ownership until the fo
 		});
 		expect(seamCalls).toHaveLength(0);
 		// When the follow-up IS promoted, B owns its run and can abort it.
-		promoted!();
+		promoted!({ startsOwnRun: true });
 		await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
 		transport.feed("conn-b", {
 			type: "control_request",
@@ -3706,7 +3875,7 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 	// connections owners of that run, so each can terminal-abort work it
 	// submitted, while a foreign connection still cannot.
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-multi-followup-"));
-	const promoted: Array<() => void> = [];
+	const promoted: Array<(promotion: { startsOwnRun: boolean }) => void> = [];
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
@@ -3718,7 +3887,7 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 				| {
 						onPreflightAccepted?: () => void;
 						onPreflightAcceptCommit?: () => void;
-						onQueuedPromoted?: () => void;
+						onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
 				  }
 				| undefined,
 		) =>
@@ -3773,7 +3942,7 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 		expect(promoted).toHaveLength(2);
 		// ONE continuation drains both follow-ups into one run: both per-message
 		// hooks fire at dequeue, then the run starts.
-		for (const hook of promoted) hook();
+		for (const hook of promoted) hook({ startsOwnRun: true });
 		await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
 		// Both submitting connections can terminal-abort the shared run.
 		for (const [connectionId, id] of [

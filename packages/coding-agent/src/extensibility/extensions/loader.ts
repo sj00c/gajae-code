@@ -342,7 +342,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 			queuedAtDispatch?: boolean;
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
-			onQueuedPromoted?: () => void;
+			onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			sdkRunToken?: string;
 		},
