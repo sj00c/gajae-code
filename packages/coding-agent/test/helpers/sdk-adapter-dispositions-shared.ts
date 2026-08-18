@@ -138,7 +138,18 @@ export const expectedGlobalErrors: Readonly<Record<string, string>> = {
 export function expectSemanticResult(operation: Operation, result: unknown): void {
 	const code = expectedDomainErrors[operation.sdkId];
 	if (code) expect(result).toMatchObject({ ok: false, error: { code } });
-	else expect(result).toMatchObject({ ok: true });
+	else if (operation.sdkId === "goal.list/get") {
+		expect(result).toMatchObject({ ok: true });
+		const page =
+			(result as { page?: { items?: unknown[] } } | null)?.page ??
+			(result as { result?: { page?: { items?: unknown[] } } } | null)?.result?.page ??
+			(result as { data?: { page?: { items?: unknown[] } } } | null)?.data?.page;
+		if (page?.items && page.items.length > 0) {
+			expect(page.items[0]).toMatchObject({ enabled: false, goal: null, reason: "no_active_goal" });
+			const msg = (page.items[0] as { message?: unknown }).message;
+			if (msg !== undefined) expect(typeof msg === "string" && msg.length > 0).toBe(true);
+		}
+	} else expect(result).toMatchObject({ ok: true });
 }
 
 export function expectGlobalSemanticResult(operation: Operation, result: unknown): void {
