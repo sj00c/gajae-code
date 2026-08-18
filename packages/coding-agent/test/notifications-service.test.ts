@@ -1098,6 +1098,156 @@ describe("notification-service recovery", () => {
 		expect(report.daemon.action).toBe("cleared-dead-owner-lock");
 		expect(unlinked).toContain(paths.lock);
 	});
+
+	// `stoppedAt: 0` is a canonical marker the daemon's own shape predicate
+	// accepts: an owner that retired at epoch zero is still retired, and its
+	// lock is reclaimable even though its pid lingers.
+	test("treats stoppedAt 0 as owner consent for a lingering pid", async () => {
+		const { fs, unlinked } = mockFs({
+			[paths.state]: daemonStateJson({ pid: 1000, stoppedAt: 0 }),
+			[paths.lock]: ownershipLockJson({ pid: 1000 }),
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.action).toBe("cleared-dead-owner-lock");
+		expect(unlinked).toContain(paths.lock);
+	});
+
+	// A negative marker is not consent in either direction: recovery
+	// normalization rejects it, and the stopped-state predicates must too —
+	// a live owner with stoppedAt -1 stays protected.
+	test("still protects a live owner whose stop marker is negative", async () => {
+		const { fs, unlinked } = mockFs({
+			[paths.state]: daemonStateJson({ pid: 1000, stoppedAt: -1 }),
+			[paths.lock]: ownershipLockJson({ pid: 1000 }),
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.action).toBe("left-active");
+		expect(unlinked).not.toContain(paths.lock);
+	});
+
+	// Generation-3 legacy owners died with historical locks acquisition still
+	// understands: a legacy {pid, startedAt} lock and the v0.10 empty-file lock
+	// must stay reclaimable after their owner dies, or the lock strands forever.
+	test("clears a matching legacy lock of a dead pre-acquisition owner", async () => {
+		const { fs, unlinked } = mockFs({
+			[paths.state]: daemonStateJson({
+				pid: 555,
+				incarnation: undefined,
+				acquisitionId: undefined,
+				ownershipPhase: undefined,
+				generation: 3,
+				stoppedAt: 2_000,
+			}),
+			[paths.lock]: `${JSON.stringify({ pid: 555, startedAt: 0 })}\n`,
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: () => false },
+		});
+		expect(report.daemon.action).toBe("cleared-dead-owner-lock");
+		expect(unlinked).toContain(paths.lock);
+	});
+
+	test("retains a legacy lock whose pid names a different owner", async () => {
+		const { fs, unlinked, store } = mockFs({
+			[paths.state]: daemonStateJson({
+				pid: 555,
+				incarnation: undefined,
+				acquisitionId: undefined,
+				ownershipPhase: undefined,
+				generation: 3,
+				stoppedAt: 2_000,
+			}),
+			[paths.lock]: `${JSON.stringify({ pid: 4321, startedAt: 0 })}\n`,
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: () => false },
+		});
+		expect(report.daemon.action).toBe("owner-superseded");
+		expect(unlinked).not.toContain(paths.lock);
+		expect(store.has(paths.lock)).toBe(true);
+	});
+
+	test("clears a v0.10 empty lock of a dead generation-3 owner", async () => {
+		const { fs, unlinked, store } = mockFs({
+			[paths.state]: daemonStateJson({
+				pid: 555,
+				incarnation: undefined,
+				acquisitionId: undefined,
+				ownershipPhase: undefined,
+				generation: 3,
+				stoppedAt: 2_000,
+			}),
+			[paths.lock]: "",
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: () => false },
+		});
+		expect(report.daemon.action).toBe("cleared-dead-owner-lock");
+		expect(unlinked).toContain(paths.lock);
+		expect(store.has(paths.lock)).toBe(false);
+	});
+
+	// A lock replaced between validation and identity capture must fail
+	// closed: the exact-unlink identity no longer matches the inspected file,
+	// so the successor's lock survives and recovery reports the failure.
+	test("retains the lock when the file is replaced before the exact unlink", async () => {
+		const { fs, unlinked, store } = mockFs(
+			{
+				[paths.state]: daemonStateJson({ pid: 555 }),
+				[paths.lock]: ownershipLockJson({ pid: 555 }),
+			},
+			{
+				onExactUnlink: (_file, mutated) => {
+					mutated.set(
+						paths.lock,
+						ownershipLockJson({ pid: 4321, ownerId: "owner-successor", acquisitionId: "owner-successor" }),
+					);
+				},
+			},
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: () => false },
+		});
+		expect(report.daemon.action).toBe("orphan-lock-left");
+		expect(unlinked).not.toContain(paths.lock);
+		expect(store.has(paths.lock)).toBe(true);
+	});
+
+	// Lock-read failures other than proven absence retain the lock and surface
+	// a failure diagnostic; only ENOENT is idempotently "already cleared".
+	test("retains the lock and reports failure when the lock read fails with EACCES", async () => {
+		const { fs, unlinked, store } = mockFs(
+			{
+				[paths.state]: daemonStateJson({ pid: 555 }),
+				[paths.lock]: ownershipLockJson({ pid: 555 }),
+			},
+			{ rejectEndpointFiles: new Set([paths.lock]) },
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-empty",
+			deps: { fs, pidAlive: () => false },
+		});
+		expect(report.daemon.action).toBe("orphan-lock-left");
+		expect(unlinked).not.toContain(paths.lock);
+		expect(store.has(paths.lock)).toBe(true);
+	});
 	test("does not count or remove a rejected link or replacement endpoint", async () => {
 		const endpoint = path.join(epDir, "link.json");
 		const { fs, store, unlinked } = mockFs(

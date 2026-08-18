@@ -48,10 +48,9 @@ import type { DiscordDiagnosticProvider } from "./discord-provider";
 import { SlackLiveProvider } from "./slack-live-provider";
 import type { SlackDiagnosticProvider } from "./slack-provider";
 import {
-	type DaemonState,
 	isStoppedDaemonState,
 	type OwnerFreshnessSnapshot,
-	ownershipLockMatchesState,
+	ownershipLockMatchesDeadState,
 	ownershipLockMatchesStoppedState,
 	parseOwnershipLock,
 	readOwnerFreshnessSnapshot,
@@ -1733,32 +1732,64 @@ async function removeDeadOwnerLock(
 		if (pidAlive(current.state.pid) && !isCanonicalStopConsent(current.raw)) return "now-alive";
 		if (!(await daemonTransitionLockIsHeld({ fs, path: paths.steal, lock: transition }))) return "contended";
 		// Delete the lock the validated record owns, never whatever currently
-		// occupies the pathname: a successor's or initializer's lock may already
-		// be present even under the steal mutex, and unlinking it by name would
-		// break the single-poller guarantee. The lock's parsed metadata must
-		// still bind to this exact owner (the same predicates the acquisition
-		// path's reclaim uses), and the unlink itself is identity-bound so the
-		// file cannot be swapped between the check and the removal.
-		const lockRaw = await fs.readFile(paths.lock, "utf8").catch(() => undefined);
-		if (lockRaw === undefined) return "cleared";
+		// occupies the pathname. Validation and deletion are bound to ONE
+		// no-follow regular-file snapshot: the same read that yields the bytes
+		// the ownership predicate runs over also yields the identity the
+		// exact-unlink removes, so a replacement between check and unlink fails
+		// closed instead of deleting a successor's lock. A non-regular lock
+		// path (FIFO/device) never blocks recovery: the no-follow snapshot read
+		// rejects it before any open() can hang.
+		let lockEndpoint: NotificationEndpointFile | undefined;
+		try {
+			lockEndpoint = await fs.readEndpointFile(paths.lock);
+		} catch (error) {
+			// Only proven absence is idempotently "cleared"; every other read
+			// failure (permissions, transient I/O) must retain the lock and
+			// surface a diagnostic rather than report success.
+			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "cleared";
+			return "unlink-failed";
+		}
+		if (!lockEndpoint) return "unlink-failed";
 		let lockOwner: unknown;
 		try {
 			lockOwner = JSON.parse(current.raw);
 		} catch {
 			return "superseded";
 		}
-		const lockStat = await fs.stat?.(paths.lock).catch(() => undefined);
-		const lockRead = parseOwnershipLock(lockRaw, lockStat);
-		// A self-retired owner must own its lock by content; a dead owner whose
-		// record is not a stopped tombstone still needs the lock to carry its
-		// exact identity before recovery may remove it.
-		if (!isCanonicalStopConsent(current.raw)) {
-			if (!ownershipLockMatchesState(lockRead, lockOwner as DaemonState)) return "superseded";
-		} else if (!ownershipLockMatchesStoppedState(lockRead, lockOwner, pidAlive)) return "superseded";
-		const lockEndpoint = await fs.readEndpointFile(paths.lock).catch(() => undefined);
-		if (!lockEndpoint) return "unlink-failed";
-		const removed = await fs.exactUnlink(paths.lock, lockEndpoint.identity);
-		return removed.ok ? "cleared" : "unlink-failed";
+		// The snapshot identity is the only filesystem view this path trusts:
+		// size/mtime from the same no-follow read prove the v0.10 empty-file
+		// lock shape without a separate stat race.
+		const lockIdentity = lockEndpoint.identity;
+		const lockStat = { size: Number(lockIdentity.size), mtimeMs: Number(lockIdentity.mtimeNs) / 1_000_000 };
+		const lockRead = parseOwnershipLock(lockEndpoint.bytes.toString("utf8"), lockStat);
+		// A self-retired owner must own its lock by content (canonical modern
+		// tombstone or exact legacy tombstone, matching acquisition); a plain
+		// dead owner needs the lock to bind to its record through the
+		// legacy-aware dead-owner predicate, so generation-3 and v0.10 locks
+		// stay reclaimable after their owner dies.
+		if (isCanonicalStopConsent(current.raw)) {
+			if (!ownershipLockMatchesStoppedState(lockRead, lockOwner, pidAlive)) return "superseded";
+		} else if (!ownershipLockMatchesDeadState(lockRead, lockOwner)) return "superseded";
+		let removed: NotificationExactUnlinkResult;
+		try {
+			removed = await fs.exactUnlink(paths.lock, lockEndpoint.identity);
+		} catch {
+			return "unlink-failed";
+		}
+		// A typed retained cleanup whose canonical path is gone counts as
+		// removed: the quarantine relocation is the durable evidence.
+		if (removed.ok) return "cleared";
+		if (
+			removed.code === "cleanup_pending" &&
+			typeof removed.detachedPath === "string" &&
+			removed.detachedPath.length > 0 &&
+			(await fs
+				.readFile(paths.lock, "utf8")
+				.then(() => false)
+				.catch(() => true))
+		)
+			return "cleared";
+		return "unlink-failed";
 	} finally {
 		await releaseDaemonTransitionLock({ fs, path: paths.steal, lock: transition });
 	}

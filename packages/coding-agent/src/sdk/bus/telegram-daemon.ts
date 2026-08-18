@@ -1110,7 +1110,7 @@ export function parseOwnershipLock(
 	stat?: { mtimeMs?: number; dev?: number; ino?: number; ctimeMs?: number; size?: number },
 ): OwnershipLockRead {
 	if (raw.length === 0) {
-		if (stat !== undefined)
+		if (stat !== undefined && (stat.size === undefined || stat.size === 0))
 			return {
 				kind: "v010",
 				metadata: {
@@ -1503,6 +1503,34 @@ export function ownershipLockMatchesStoppedState(
 	);
 }
 
+/**
+ * Whether an ownership lock's content binds to the record of an owner whose
+ * process is confirmed dead: a modern lock must carry the owner's exact
+ * identity (ownerId, acquisitionId, pid, incarnation), while the historical
+ * shapes acquisition still understands stay reclaimable — a legacy
+ * `{pid, startedAt}` lock owned by that dead pid, or a generation-3 v0.10
+ * empty-file lock. Without this, a legacy or v0.10 owner's death would leave
+ * its lock retained forever.
+ */
+export function ownershipLockMatchesDeadState(lock: OwnershipLockRead, state: unknown): boolean {
+	if (lock.kind === "valid")
+		return ownershipLockMatchesState(lock, hasSafeDaemonStateShape(state) ? state : undefined);
+	if (hasSafeDaemonStateShape(state)) return false;
+	const legacyState = state as Partial<DaemonState> | undefined;
+	const legacyStartedAt = legacyState?.startedAt;
+	if (
+		!legacyState ||
+		!Number.isSafeInteger(legacyState.pid) ||
+		(legacyState.pid ?? 0) <= 0 ||
+		!Number.isSafeInteger(legacyStartedAt)
+	)
+		return false;
+	if (lock.kind === "legacy")
+		return lock.metadata.pid === legacyState.pid && lock.metadata.startedAt <= (legacyStartedAt as number);
+	if (lock.kind === "v010") return legacyState.generation === 3;
+	return false;
+}
+
 async function transitionLockIsHeldByCaller(input: {
 	fs: TelegramDaemonFs;
 	path: string;
@@ -1635,6 +1663,7 @@ function isExplicitlyStoppedDaemonState(state: unknown): state is DaemonState {
 	return Boolean(
 		hasSafeDaemonStateShape(state) &&
 			state.stoppedAt !== undefined &&
+			state.stoppedAt >= 0 &&
 			typeof state.acquisitionId === "string" &&
 			state.acquisitionId.length > 0,
 	);
@@ -1657,6 +1686,7 @@ function isLegacyStoppedDaemonState(state: unknown): boolean {
 			Number.isSafeInteger(candidate.startedAt) &&
 			Number.isSafeInteger(candidate.heartbeatAt) &&
 			Number.isSafeInteger(candidate.stoppedAt) &&
+			(candidate.stoppedAt ?? 0) >= 0 &&
 			(candidate.launcherPid === undefined ||
 				(Number.isSafeInteger(candidate.launcherPid) && (candidate.launcherPid ?? 0) > 0)) &&
 			candidate.version === DAEMON_VERSION &&
