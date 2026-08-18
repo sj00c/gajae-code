@@ -18,12 +18,7 @@ import type { RawSettings, Settings } from "../../config/settings";
 import type { SettingPath } from "../../config/settings-schema";
 import { readProvenance } from "./paseo-ownership";
 import type { DriftReason } from "./result-types";
-import {
-	PASEO_SKILL_PREFIX,
-	type PaseoSetupDependencies,
-	type PaseoSkillSource,
-	UNBRIDGED_SKILL_NAMES,
-} from "./setup-deps";
+import { PASEO_SKILL_PREFIX, type PaseoSetupDependencies, type PaseoSkillSource } from "./setup-deps";
 
 /**
  * Resolve the skills source through the injectable seam, so tests never touch a
@@ -113,8 +108,10 @@ export class SkillsBridgeError extends Error {
 
 /**
  * Entry names the bridge mirrors, derived from the source directory's own
- * contents: every `paseo`-prefixed directory except the denylist. Non-directory
- * entries (files, symlinks) yield nothing -- the bridge links directories only.
+ * contents: every `paseo`-prefixed directory. Non-directory entries (files,
+ * symlinks) yield nothing -- the bridge links directories only. There is no
+ * name denylist: the prefix (`paseo`, not `paseo-`) is the filter, so a
+ * denylisted name like `context-search` fails the prefix test on its own.
  */
 export async function sourceBridgeEntries(sourceDir: string): Promise<readonly string[]> {
 	const entries = await fs.readdir(sourceDir, { withFileTypes: true }).catch(error => {
@@ -124,7 +121,6 @@ export async function sourceBridgeEntries(sourceDir: string): Promise<readonly s
 	const names: string[] = [];
 	for (const entry of entries) {
 		if (!entry.name.startsWith(PASEO_SKILL_PREFIX)) continue;
-		if ((UNBRIDGED_SKILL_NAMES as readonly string[]).includes(entry.name)) continue;
 		if (!entry.isDirectory()) continue;
 		names.push(entry.name);
 	}
@@ -229,7 +225,14 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 	const source = await resolveSource(deps);
 	const ledger = await readProvenance(deps.paths.provenanceLedger);
 	const recordedEntries = new Set(ledger.bridgeEntries ?? []);
+	// The recorded source decides ownership everywhere in this preflight: a name
+	// in the ledger is ours only while its link still points where the ledger
+	// says we put it. A ledger that predates `bridgeSourceDir` is legacy, and the
+	// single location a pre-#4638 install could have linked from stands in.
+	const ledgerSourceDir = ledger.bridgeSourceDir;
 	const legacySourceDir = legacyRecordedSourceDir(deps.home ?? "");
+	const isLegacyLedger = ledgerSourceDir === undefined;
+	const ownershipSourceDir = ledgerSourceDir ?? legacySourceDir;
 	if (source === undefined) {
 		// No source directory anywhere: the bridge is skipped entirely. Creating
 		// links into a directory that does not exist is worse than not bridging.
@@ -244,20 +247,24 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 		const target = path.resolve(sourceDir, name);
 		const state = directory === "absent" ? { kind: "absent" as const } : await entryState(destination, target);
 		if (state.kind === "conflict") {
-			// A recorded link whose text still resolves into the legacy source is
-			// GJC's own rot from a pre-#4638 install, not a user hand edit: re-point
-			// it at the discovered source instead of refusing the whole plan.
+			// A recorded link whose text still resolves into the ownership source
+			// (the ledger's own record, or the legacy location for a legacy
+			// ledger) is GJC's own link, not a user hand edit: re-point it at the
+			// discovered source. Adoption exists only for legacy ledgers -- a
+			// ledger that already records a source must not have its links
+			// silently rewritten to a different directory.
 			const recorded = recordedEntries.has(name);
-			const legacyTarget = path.resolve(legacySourceDir, name);
-			const migrated =
+			const ownershipTarget = path.resolve(ownershipSourceDir, name);
+			const migratable =
 				recorded &&
+				isLegacyLedger &&
 				directory !== "absent" &&
-				(await entryState(destination, legacyTarget).then(s => s.kind !== "conflict"));
-			if (!migrated) {
+				(await entryState(destination, ownershipTarget).then(s => s.kind !== "conflict"));
+			if (!migratable) {
 				conflicts.push(destination);
 				continue;
 			}
-			adopts.push({ name, linkPath: destination, targetPath: target, legacySourceDir });
+			adopts.push({ name, linkPath: destination, targetPath: target, legacySourceDir: ownershipSourceDir });
 			continue;
 		}
 		entries[name] = {
@@ -289,9 +296,14 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 				conflicts.push(destination);
 				continue;
 			}
-			// A recorded symlink whose name the source no longer carries: its
-			// target is gone by definition (or points at the retired legacy
-			// source), so pruning converges the bridge on re-run.
+			// The same exact-target predicate `--remove` applies: a recorded
+			// name is only ours while the link still points under the source the
+			// ledger recorded. A user who retargeted the link at their own tree
+			// keeps it -- it is reported as a conflict instead of pruned.
+			if (resolvedLinkTarget(state.link, destination) !== path.resolve(ownershipSourceDir, entry.name)) {
+				conflicts.push(destination);
+				continue;
+			}
 			prunes.push({ name: entry.name, linkPath: destination, linkTarget: state.link });
 		}
 	}

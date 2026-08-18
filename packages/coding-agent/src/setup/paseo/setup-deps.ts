@@ -8,7 +8,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir } from "@gajae-code/utils";
+import { getAgentDir, parseEnvFile } from "@gajae-code/utils";
 
 /** Prefix used to enumerate Paseo-owned skills when scanning for drift. */
 export const PASEO_SKILL_PREFIX = "paseo";
@@ -45,16 +45,38 @@ export function paseoAppSkillsCandidates(home: string = os.homedir()): readonly 
 }
 
 /**
+ * `PASEO_SKILLS_DIR` as explicit user intent only.
+ * `PASEO_SKILLS_DIR` as explicit user intent only.
+ *
+ * Bun loads `cwd/.env` into `process.env` before any module runs, so a cloned
+ * repository can ship a `.env` that points this override at a directory the
+ * repository also ships -- and global `gjc setup paseo` run from inside that
+ * checkout would bridge the repository's own `paseo*` prompt content into the
+ * user's GJC configuration. The same trust rule `native-skill-hook.ts` already
+ * applies to `GJC_CODING_AGENT_DIR`: a value that matches what the project
+ * `.env` sets is not honoured. An operator whose real environment happens to
+ * carry the identical value loses the override, which is the conservative
+ * trade the credential boundary already makes.
+ */
+function trustedPaseoSkillsDirOverride(): string | undefined {
+	const value = process.env.PASEO_SKILLS_DIR;
+	if (!value) return undefined;
+	if (parseEnvFile(path.join(process.cwd(), ".env")).PASEO_SKILLS_DIR === value) return undefined;
+	return value;
+}
+
+/**
  * Resolve the directory Paseo's skills live in.
  *
  * `PASEO_SKILLS_DIR` overrides discovery for relocated bundles and tests; it is
- * honored only when absolute and present, so a stale variable can never produce
- * dangling bridge links. `~/.agents/skills` wins over an app bundle because it
- * is the user-visible location GJC documented. Returns `undefined` when no
- * source directory exists at all -- the bridge is skipped, never guessed at.
+ * honored only when it is explicit user intent (not the project `.env`), absolute,
+ * and present, so a stale or untrusted variable can never produce bridge links.
+ * `~/.agents/skills` wins over an app bundle because it is the user-visible
+ * location GJC documented. Returns `undefined` when no source directory exists
+ * at all -- the bridge is skipped, never guessed at.
  */
 export async function resolvePaseoSkillsSource(home: string = os.homedir()): Promise<PaseoSkillSource | undefined> {
-	const override = process.env.PASEO_SKILLS_DIR;
+	const override = trustedPaseoSkillsDirOverride();
 	if (override !== undefined && path.isAbsolute(override) && (await isDirectory(override))) {
 		return { dir: path.resolve(override), origin: "app-bundle" };
 	}

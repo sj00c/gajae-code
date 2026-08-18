@@ -649,6 +649,134 @@ describe("skills bridge", () => {
 		await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
 		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
 	});
+	test("a retargeted recorded link is a conflict, never pruned (#4644 review r2)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await installWithLedger(fixture.deps);
+
+		// The user retargets a ledger-recorded name at their own tree, then a
+		// Paseo release drops that name from the source. Setup must apply the
+		// same exact-target predicate remove does: the recorded NAME is not
+		// ownership once the link no longer points where the ledger recorded.
+		await fs.rm(path.join(fixture.paths.bridgeDir, "paseo-loop"));
+		await fs.symlink(path.join(fixture.root, "user-own-tree"), path.join(fixture.paths.bridgeDir, "paseo-loop"));
+		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
+		const before = await snapshotTree(fixture.paths.bridgeDir);
+
+		await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
+	});
+
+	test("adoption is refused when the ledger already records a source (#4644 review r2)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		// The ledger records ~/.agents/skills as its source, but the discovered
+		// source is the app bundle and a recorded link points somewhere else
+		// entirely: adoption exists only for legacy ledgers, so this conflicts.
+		const bundle = path.join(fixture.root, "Applications", "Paseo.app", "Contents", "Resources", "skills");
+		for (const name of ["paseo"]) {
+			await fs.mkdir(path.join(bundle, name), { recursive: true });
+			await fs.writeFile(path.join(bundle, name, "SKILL.md"), `# ${name}\n`);
+		}
+		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		await fs.symlink(path.join(fixture.root, "elsewhere"), path.join(fixture.paths.bridgeDir, "paseo"));
+		await writeProvenance(fixture.paths.provenanceLedger, {
+			version: 1,
+			providerKeys: {},
+			seededOrchestrationKeys: {},
+			bridgePath: fixture.paths.bridgeDir,
+			bridgeEntries: ["paseo"],
+			bridgeDirCreated: false,
+			bridgeSourceDir: fixture.paths.agentsSkillsDir,
+		});
+		const deps: PaseoSetupDependencies = {
+			...fixture.deps,
+			skillsSource: async () => ({ dir: bundle, origin: "app-bundle" }),
+		};
+
+		await expect(preflightSkillsBridge(deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+	});
+
+	test("PASEO_SKILLS_DIR from a project .env is not honored (#4644 review r2)", async () => {
+		const root = await makeRoot();
+		const home = path.join(root, "home");
+		const userDir = path.join(home, ".agents", "skills");
+		await fs.mkdir(userDir, { recursive: true });
+		// A cloned repository ships this .env and the directory it points at.
+		const repoDir = path.join(root, "repo");
+		const repoSkills = path.join(repoDir, "skills");
+		await fs.mkdir(repoSkills, { recursive: true });
+		await fs.mkdir(path.join(repoSkills, "paseo-evil"), { recursive: true });
+		await Bun.write(path.join(repoDir, ".env"), `PASEO_SKILLS_DIR=${repoSkills}\n`);
+		const priorCwd = process.cwd();
+		process.chdir(repoDir);
+		const prior = process.env.PASEO_SKILLS_DIR;
+		process.env.PASEO_SKILLS_DIR = repoSkills;
+		try {
+			await expect(resolvePaseoSkillsSource(home)).resolves.toEqual({ dir: userDir, origin: "user" });
+		} finally {
+			process.chdir(priorCwd);
+			if (prior === undefined) delete process.env.PASEO_SKILLS_DIR;
+			else process.env.PASEO_SKILLS_DIR = prior;
+		}
+	});
+
+	test("a failed provenance write leaves no unrecorded bridge links (#4644 review r2)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedConfig(fixture.paths);
+		// Make the provenance ledger unwritable so the bridge step cannot commit
+		// its record: a directory in place of the ledger file makes every write
+		// fail on the real fs surface.
+		const ledgerDir = fixture.paths.provenanceLedger;
+		await fs.mkdir(ledgerDir, { recursive: true });
+
+		let outcome: Awaited<ReturnType<typeof runPaseoSetup>> | undefined;
+		try {
+			outcome = await runPaseoSetup({}, fixture.deps);
+		} catch {
+			// A thrown error is also acceptable; both must leave no unrecorded
+			// links.
+		}
+
+		// Whatever the outcome shape, no bridge link may exist that no ledger
+		// records: the bridge directory must be absent or empty, because the
+		// provenance write happens BEFORE any link is created.
+		const bridgeExists = await fs
+			.stat(fixture.paths.bridgeDir)
+			.then(() => true)
+			.catch(() => false);
+		if (bridgeExists) {
+			const names = await fs.readdir(fixture.paths.bridgeDir);
+			expect(names).toEqual([]);
+		}
+		if (outcome?.kind === "install") {
+			expect(outcome.result.outcome).not.toBe("installed");
+		}
+	});
+
+	test("bridgeDirCreated survives a convergence rerun and remove cleans the directory (#4644 review r2)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedConfig(fixture.paths);
+
+		await runPaseoSetup({}, fixture.deps);
+		// A second run over the now-existing directory must not rewrite the
+		// original bridgeDirCreated=true.
+		await runPaseoSetup({}, fixture.deps);
+		const ledger = await readProvenance(fixture.paths.provenanceLedger);
+		expect(ledger.bridgeDirCreated).toBe(true);
+
+		// Paseo then disappears entirely; remove must still delete the (now
+		// dangling) bridge directory GJC created.
+		await fs.rm(fixture.paths.agentsSkillsDir as string, { recursive: true });
+		const deps: PaseoSetupDependencies = {
+			...fixture.deps,
+			skillsSource: async () => undefined,
+		};
+		const remove = await runPaseoSetup({ remove: true }, deps);
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("removed");
+		await expect(fs.stat(deps.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+	});
 
 	test("a pre-#4638 bridge pointing at the legacy source is adopted, not refused (#4644 review)", async () => {
 		const fixture = await makeFixture();

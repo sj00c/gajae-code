@@ -188,6 +188,35 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// source (create missing, prune stale, adopt pre-#4638 legacy links), so
 		// the ledger records the entry set that exists afterwards, not just what
 		// this run happened to create.
+		//
+		// Provenance is committed BEFORE any link is created or pruned: a crash
+		// between mutation and record would otherwise leave live links nothing
+		// owns (a retry classifies them as noops and never re-attempts the
+		// record, so `check` reads healthy while `--remove` has nothing to
+		// clean). Writing the record first means a crash before mutation leaves a
+		// superset record -- harmless, because entries that were never created
+		// are simply absent on disk and `--remove` skips absent entries -- and a
+		// crash after mutation is always covered by the record already on disk.
+		const bridgeLedger = await readProvenance(deps.paths.provenanceLedger);
+		const preflightEntryNames = [
+			...Object.keys(bridgePreflight.entries),
+			...bridgePreflight.adopts.map(adopt => adopt.name),
+		];
+		const hasBridgeWork =
+			preflightEntryNames.length > 0 || bridgePreflight.prunes.length > 0 || bridgePreflight.bridgeDirCreated;
+		if (hasBridgeWork || bridgePreflight.sourceDir !== undefined) {
+			await writeProvenance(deps.paths.provenanceLedger, {
+				...bridgeLedger,
+				bridgePath: deps.paths.bridgeDir,
+				bridgeEntries: preflightEntryNames,
+				// `bridgeDirCreated` records whether GJC created the directory
+				// ORIGINALLY, so `--remove` knows whether the empty directory is
+				// ours to delete. A convergence run over an existing directory
+				// must not rewrite a previous `true` to `false`.
+				bridgeDirCreated: bridgeLedger.bridgeDirCreated === true || bridgePreflight.bridgeDirCreated,
+				...(bridgePreflight.sourceDir !== undefined ? { bridgeSourceDir: bridgePreflight.sourceDir } : {}),
+			});
+		}
 		const bridge = await installSkillsBridge(bridgePreflight);
 		if (
 			bridge.createdEntries.length > 0 ||
@@ -196,17 +225,6 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			bridge.bridgeDirCreated
 		) {
 			changed.push(deps.paths.bridgeDir);
-			const ledger = await readProvenance(deps.paths.provenanceLedger);
-			await writeProvenance(deps.paths.provenanceLedger, {
-				...ledger,
-				bridgePath: deps.paths.bridgeDir,
-				bridgeEntries: [
-					...Object.keys(bridgePreflight.entries),
-					...bridgePreflight.adopts.map(adopt => adopt.name),
-				],
-				bridgeDirCreated: bridge.bridgeDirCreated,
-				...(bridge.sourceDir !== undefined ? { bridgeSourceDir: bridge.sourceDir } : {}),
-			});
 			completed.push({
 				label: deps.paths.bridgeDir,
 				undo: async () => {
