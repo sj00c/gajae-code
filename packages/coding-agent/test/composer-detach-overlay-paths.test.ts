@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Container, Input } from "@gajae-code/tui";
-import { getAgentDir, Snowflake, setAgentDir, setDefaultTabWidth } from "@gajae-code/utils";
+import { getAgentDir, getLogsDir, setAgentDir, setDefaultTabWidth } from "@gajae-code/utils";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
 import { AsyncJobManager } from "../src/async";
 import { DebugSelectorComponent } from "../src/debug";
@@ -186,14 +186,20 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 		const defaultWidth = 3;
 		setDefaultTabWidth(defaultWidth);
 
-		// Point the dated-log source at a temp agent dir with seeded log files
-		// so the real #handleViewLogs path mounts the real viewer.
+		// Seed today's dated log under a per-run config dir so the real
+		// #handleViewLogs path mounts the real viewer without touching the
+		// operator's real ~/.gjc/logs. PI_CONFIG_DIR is a trusted single dir NAME
+		// (see dirs.ts getConfigDirName); a fresh resolver picks it up on
+		// setAgentDir, and cleanup removes the whole tree.
 		const originalAgentDir = getAgentDir();
-		const tempRoot = path.join(os.tmpdir(), "pi-composer-detach-debug", Snowflake.next());
-		await fs.mkdir(tempRoot, { recursive: true });
-		setAgentDir(tempRoot);
+		const originalConfigDir = process.env.PI_CONFIG_DIR;
+		const configName = `gjc-test-composer-detach-${Date.now().toString(36)}`;
+		process.env.PI_CONFIG_DIR = configName;
+		setAgentDir(path.join(os.tmpdir(), configName));
+		const logsDir = getLogsDir();
+		await fs.mkdir(logsDir, { recursive: true });
 		const today = new Date().toISOString().slice(0, 10);
-		await fs.writeFile(path.join(tempRoot, `gjc.${today}.log`), "seeded log line\n", "utf8");
+		await fs.writeFile(path.join(logsDir, `gjc.${today}.log`), "seeded log line\n", "utf8");
 
 		// The production /debug entry: showDebugSelector goes through the real
 		// SelectorController.showSelector generic open boundary, so the open
@@ -246,9 +252,11 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 			expect(previous).toBeGreaterThanOrEqual(4);
 			expectDisposedEditorStopsInvalidating(harness.editor, harness.editorContainer, invalidations, defaultWidth);
 		} finally {
+			if (originalConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
+			else process.env.PI_CONFIG_DIR = originalConfigDir;
 			setAgentDir(originalAgentDir);
 			setDefaultTabWidth(4);
-			await fs.rm(tempRoot, { recursive: true, force: true });
+			await fs.rm(path.join(os.homedir(), configName), { recursive: true, force: true });
 		}
 	});
 
