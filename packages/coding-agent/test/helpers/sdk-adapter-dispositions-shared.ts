@@ -144,11 +144,19 @@ export function expectSemanticResult(operation: Operation, result: unknown): voi
 			(result as { page?: { items?: unknown[] } } | null)?.page ??
 			(result as { result?: { page?: { items?: unknown[] } } } | null)?.result?.page ??
 			(result as { data?: { page?: { items?: unknown[] } } } | null)?.data?.page;
-		if (page?.items && page.items.length > 0) {
-			expect(page.items[0]).toMatchObject({ enabled: false, goal: null, reason: "no_active_goal" });
-			const msg = (page.items[0] as { message?: unknown }).message;
-			if (msg !== undefined) expect(typeof msg === "string" && msg.length > 0).toBe(true);
-		}
+		expect(page != null, "goal.list/get missing page").toBe(true);
+		const ensuredPage = page as { items: unknown[] };
+		expect(
+			Array.isArray(ensuredPage.items) && ensuredPage.items.length > 0,
+			"goal.list/get diagnostic must contain at least one item",
+		).toBe(true);
+		const first = ensuredPage.items[0] as Record<string, unknown> & { message?: unknown };
+		expect(first).toMatchObject({ enabled: false, goal: null, reason: "no_active_goal" });
+		const msg = first.message;
+		expect(
+			typeof msg === "string" && (msg as string).length > 0,
+			"goal.list/get diagnostic message must be non-empty",
+		).toBe(true);
 	} else expect(result).toMatchObject({ ok: true });
 }
 

@@ -1232,7 +1232,7 @@ function createControlSurface(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
 		connectionId: string | undefined,
-		promotion: { startsOwnRun: boolean },
+		promotion?: { startsOwnRun?: boolean },
 	) => void,
 	policy?: SdkSurfacePolicy,
 	settings?: Settings,
@@ -1332,7 +1332,7 @@ function createControlSurface(
 			onPreflightAccepted: () => void;
 			onPreflightAcceptCommit: () => Promise<void>;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
-			onQueuedPromoted: (promotion: { startsOwnRun: boolean }) => void;
+			onQueuedPromoted: (promotion?: { startsOwnRun?: boolean }) => void;
 			queuedAtDispatch: boolean;
 		}) => Promise<unknown>,
 		acceptedFields?: () => Record<string, unknown>,
@@ -1409,8 +1409,8 @@ function createControlSurface(
 					// is later PROMOTED to its own run needs its pending ownership entry
 					// created at promotion so the submitting connection can
 					// terminal-abort that turn (review threads P1/P2).
-					onQueuedPromoted: (promotion: { startsOwnRun: boolean }) => {
-						promotionStartsOwnRun = promotion.startsOwnRun;
+					onQueuedPromoted: (promotion?: { startsOwnRun?: boolean }) => {
+						promotionStartsOwnRun = promotion?.startsOwnRun;
 						onPromotedTurn?.(kind, correlation, requesterConnectionId, promotion);
 					},
 					queuedAtDispatch,
@@ -2749,7 +2749,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const renewAttributableProgress = (eventType: string): void => {
 		const current = active;
 		if (!current) return;
-		const batch = current.drainedInvocations ?? (current.activeInvocation ? [current.activeInvocation] : []);
+		const head = current.activeInvocation ? [current.activeInvocation] : [];
+		const drained = current.drainedInvocations ?? [];
+		const batch =
+			drained.length > 0
+				? head.length > 0 &&
+					!drained.some(
+						v =>
+							v.correlation.commandId === head[0]!.correlation.commandId &&
+							v.correlation.turnId === head[0]!.correlation.turnId,
+					)
+					? [...drained, ...head]
+					: drained
+				: head;
 		for (const invocation of batch)
 			if (invocation.kind === "prompt")
 				current.deadlineManager.onAttributableEvent(invocation.correlation, eventType);
@@ -2900,19 +2912,21 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							entry.correlation.turnId === correlation.turnId,
 					);
 					if (pendingIdx >= 0) pending.splice(pendingIdx, 1);
-					if (connectionId !== undefined) {
-						const owners = new Set(activePromptOwnerHolder.connectionIds ?? []);
-						owners.add(connectionId);
-						activePromptOwnerHolder.connectionIds = owners;
-					}
+					// In-run consumed steering tracks deadline but must NOT gain
+					// root turn.abort authority (review P1).
 					if (current.drainedInvocations === undefined)
 						current.drainedInvocations = current.activeInvocation ? [current.activeInvocation] : [];
 					current.drainedInvocations.push({ kind, correlation });
 					return;
 				}
-				// No in-flight run is visible (lifecycle race): fall back to the
-				// pending queue; the promotion lease above still bounds it.
-				pending.push({ kind, correlation, connectionId });
+				// No in-flight run visible and this is an in-run consumption
+				// racing agent_end (review P1): do not park in pending for the
+				// next unrelated run. Drop and terminalize boundedly.
+				deadlineManager.clear(correlation);
+				void (active?.reconciliation ?? reconciliation).noteTransition(kind, correlation, {
+					type: "agent_failed",
+					error: Object.assign(new Error("in-run promotion raced turn end"), { code: "busy" }),
+				} as never);
 			},
 			surfaceFactory.policy,
 			options.settings,
