@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AsyncJobManager } from "../../async";
+import type { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionContext } from "../../extensibility/extensions";
 import {
 	registerOwnedRegistration,
@@ -2402,6 +2403,7 @@ async function invocationHarness(
 		invokeSkill?: (name: string, args?: string, options?: PreflightHooks) => Promise<unknown>;
 		abort?: () => void;
 		isIdle?: () => boolean;
+		settings?: Settings;
 	},
 ): Promise<InvocationHarness> {
 	const waiters = new Map<string, (frame: ResponseFrame) => void>();
@@ -2416,6 +2418,7 @@ async function invocationHarness(
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
+		...(hooks.settings ? { settings: hooks.settings } : {}),
 		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
 			sessionId: id,
 			stateRoot,
@@ -2791,6 +2794,110 @@ describe("post-acceptance invocation terminalization", () => {
 			expect(settledTerminal).toEqual(claimedTerminal);
 			// The recorded reason is the sanitized late failure: never fabricated, never raw.
 			expect(settled.result?.error).toEqual({ code: "upstream_error", message: "Prompt submission failed." });
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("accepted-control zero-execution bound (#4668)", () => {
+	// Short deterministic deadline for the zero-progress lease.
+	const zeroProgressSettings = {
+		get: (key: string) =>
+			key === "sdk.promptDeadlineMs" ? 25 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+	} as unknown as Settings;
+
+	test("an accepted prompt that never reaches agent_start terminalizes with prompt_deadline_exceeded", async () => {
+		// Defect repro: the SDK accepts turn.prompt (durable command/turn IDs are
+		// returned), but the run wedges between acceptance and agent_start, so
+		// session stats stay at zero with no failure surface. Before the fix the
+		// deadline lease was only created at agent_start, leaving the record
+		// accepted forever; the lease is now anchored at durable acceptance.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-zero-progress-prompt-"));
+		try {
+			const harness = await invocationHarness("zero-progress-prompt", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					// Accepted, then permanently no execution progress and no agent_start.
+					await new Promise<void>(() => {});
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			expect(accepted.ok).toBe(true);
+			const { commandId, turnId } = accepted.result ?? {};
+			expect(commandId).toEqual(expect.any(String));
+			expect(turnId).toEqual(expect.any(String));
+			// The acceptance receipt alone is not execution: still only "accepted".
+			const initial = await harness.query("turn.prompt_status", { commandId, turnId });
+			expect(initial.result?.status).toBe("accepted");
+			// Bounded zero-progress: the prompt terminalizes with an actionable error.
+			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded", message: "Prompt deadline exceeded." },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("an abort_and_prompt replacement of a zero-execution turn is also bounded", async () => {
+		// The issue observed both the original turn.prompt AND the replacement
+		// turn.abort_and_prompt accepted with permanently zero activity. Both the
+		// superseded original and the replacement must terminalize with an
+		// actionable error instead of remaining accepted forever.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-zero-progress-replacement-"));
+		try {
+			const harness = await invocationHarness("zero-progress-replacement", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await new Promise<void>(() => {});
+				},
+			});
+			const original = await harness.control("turn.prompt", { text: "original" });
+			expect(original.ok).toBe(true);
+			const replacement = await harness.control("turn.abort_and_prompt", { text: "replacement" });
+			expect(replacement.ok).toBe(true);
+			const originalIds = { commandId: original.result?.commandId, turnId: original.result?.turnId };
+			const replacementIds = { commandId: replacement.result?.commandId, turnId: replacement.result?.turnId };
+			expect(replacementIds.commandId).toEqual(expect.any(String));
+			expect(await settledStatus(harness, "turn.prompt_status", originalIds)).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", replacementIds)).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("goal.list/get on a session without a goal returns a diagnostic state, not resource_gone", async () => {
+		// During the zero-activity incident goal.list/get degraded to a bare
+		// resource_gone ("snapshot payload is unavailable"), which was
+		// indistinguishable from snapshot-store corruption. The query must remain
+		// available with a diagnostically useful payload.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-goal-diagnostic-"));
+		try {
+			const harness = await invocationHarness("goal-diagnostic", cwd, {});
+			const frame = await harness.query("goal.list/get", {});
+			expect(frame.ok).toBe(true);
+			const page = (frame as unknown as { page?: { items?: unknown[]; complete?: boolean } }).page;
+			expect(page?.complete).toBe(true);
+			expect(page?.items?.[0]).toMatchObject({
+				enabled: false,
+				goal: null,
+				reason: "no_active_goal",
+			});
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);

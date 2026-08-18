@@ -877,8 +877,23 @@ function createQuerySurface(
 			systemPrompt: ctx.getSystemPrompt(),
 			...getLiveState(),
 		}),
-		getGoalState: () =>
-			typeof (ctx as Partial<ExtensionContext>).getGoalState === "function" ? ctx.getGoalState() : undefined,
+		getGoalState: () => {
+			const state =
+				typeof (ctx as Partial<ExtensionContext>).getGoalState === "function" ? ctx.getGoalState() : undefined;
+			if (state !== undefined) return state;
+			// #4668: goal.list/get must stay diagnostically useful on a session
+			// without a goal. Returning undefined degrades the query to a bare
+			// resource_gone ("snapshot payload is unavailable"), which was
+			// indistinguishable from snapshot-store corruption while triaging
+			// accepted-but-zero-activity turns.
+			return {
+				enabled: false,
+				goal: null,
+				reason: "no_active_goal",
+				message:
+					"No goal is active in this session: goal mode has not created or resumed a goal, so no goal snapshot exists yet.",
+			};
+		},
 		getTodoState: () =>
 			typeof (ctx as Partial<ExtensionContext>).getTodoState === "function" ? ctx.getTodoState() : [],
 		getDiff,
@@ -2790,6 +2805,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// queued would assign its stale connection as owner of a later
 				// agent-initiated turn (review thread P1).
 				if (startsOwnTurn) pending.push({ kind, correlation, connectionId });
+				// Anchor the zero-progress deadline at durable acceptance, not at
+				// agent_start (#4668): an accepted own-turn prompt that wedges
+				// between acceptance and run start (provider/credential/compaction
+				// preflight) never emits agent_start, so a lease created only at
+				// agent_start would leave it accepted with zero activity forever.
+				// Queued submissions (startsOwnTurn === false) are leased at
+				// promotion/agent_start instead, so a prompt waiting behind a
+				// legitimately long turn never false-fires. The agent_start
+				// re-entry in emitLifecycle is a no-op for an existing lease.
+				if (kind === "prompt" && startsOwnTurn) deadlineManager.onAccepted(correlation);
 			},
 			steerReconciliation,
 			(kind, correlation, connectionId) => {
@@ -2814,6 +2839,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// thread P1).
 				const index = pending.findIndex(entry => entry.correlation === correlation);
 				if (index >= 0) pending.splice(index, 1);
+				// The submission is already terminalized via noteTransition; its
+				// acceptance-anchored lease (#4668) must not linger and later fire
+				// a phantom prompt_deadline_exceeded over the real failure.
+				deadlineManager.clear(correlation);
 			},
 			() => acceptingGateResolutions,
 			trackGateResolution,
