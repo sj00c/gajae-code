@@ -2045,7 +2045,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											`Target ${canonicalTarget} is the current session directory; nothing to move.`,
 										);
 									}
-									if (relative.startsWith("..") || path.isAbsolute(relative)) {
+									if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
 										throw new Error(
 											`Refusing to rescope outside the current session directory: ${canonicalTarget} is not within ${canonicalFrom}. move_session only narrows the session scope; ask the user to restart or /move for a broader relocation.`,
 										);

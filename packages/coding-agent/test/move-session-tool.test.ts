@@ -279,4 +279,23 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await session.dispose();
 		}
 	});
+
+	it("accepts a child literally named with leading dots (not a parent escape)", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const dotted = path.join(cwdA, "..dots");
+		fs.mkdirSync(dotted, { recursive: true });
+
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			const result = await moveTool.execute("move-dotted-child", { path: "..dots" });
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(dotted));
+			expect(textContent(result)).toContain("..dots");
+		} finally {
+			await session.dispose();
+		}
+	});
 });

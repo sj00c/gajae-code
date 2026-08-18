@@ -29,6 +29,9 @@ export class MoveSessionTool implements AgentTool<typeof moveSessionSchema, Move
 	readonly parameters = moveSessionSchema;
 	readonly strict = true;
 	readonly intent = "omit" as const;
+	// The move chdirs the process and resets global caches; it must not
+	// interleave with other tool executions across flush→moveTo→chdir.
+	readonly concurrency = "exclusive" as const;
 	readonly #session: ToolSession;
 
 	constructor(session: ToolSession) {
