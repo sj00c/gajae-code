@@ -4,12 +4,13 @@
  * Dispatches to diagnosis, install, or removal, and owns the flag combinations
  * that must be rejected before any target is touched.
  */
+import * as path from "node:path";
 import { Settings } from "../../config/settings";
 import { checkPaseoSetup } from "./check";
 import { type CompletedStep, compensate, receiptStep, recoverIntent, runJsonStep, SagaStepError } from "./install-saga";
 import { PaseoPublishError, readTarget } from "./json-publisher";
 import { createOrchestrationSeed, removeSeededRoles } from "./orchestration-preferences";
-import { readProvenance, writeProvenance } from "./paseo-ownership";
+import { type ProvenanceLedger, readProvenance, writeProvenance } from "./paseo-ownership";
 import {
 	buildProviderEntry,
 	createProviderMutation,
@@ -24,6 +25,7 @@ import type { PaseoSetupDependencies } from "./setup-deps";
 import {
 	installSkillsBridge,
 	inverseSkillsBridge,
+	legacyRecordedSourceDir,
 	preflightSkillsBridge,
 	registerSkillsBridgeDirectory,
 } from "./skills-bridge";
@@ -74,10 +76,18 @@ export async function runPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepe
 
 	if (flags.remove) {
 		const settings = await Settings.init();
+		const ledger = await readProvenance(deps.paths.provenanceLedger);
+		// Unregister the LEDGER-RECORDED directory (the one GJC actually
+		// registered at install time); after a path migration this can differ
+		// from the current default bridge path.
+		const recordedBridgeDir = ledger.bridgePath ?? deps.paths.bridgeDir;
 		const result = await removePaseoSetup(deps, {
 			now: deps.now(),
 			unregisterBridgeDirectory: async () => {
-				await unregisterBridgeDirectory(settings, deps.paths.bridgeDir);
+				await unregisterBridgeDirectory(settings, recordedBridgeDir);
+				if (recordedBridgeDir !== deps.paths.bridgeDir) {
+					await unregisterBridgeDirectory(settings, deps.paths.bridgeDir).catch(() => undefined);
+				}
 			},
 		});
 		return { kind: "remove", result };
@@ -197,7 +207,37 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// exact-target link the user created themselves must never become
 		// GJC-owned just because a re-run observed it.
 		const bridgeLedger = await readProvenance(deps.paths.provenanceLedger);
-		const previouslyRecorded = new Set(bridgeLedger.bridgeEntries ?? []);
+		// Migration binding: recorded ownership belongs to the recorded bridge
+		// PATH, not to the skill names alone. When the agent/profile path moved,
+		// the names are not carried over silently -- a user-owned exact-target
+		// link at the new path must never inherit ownership from the old one,
+		// and the old path's links are cleaned up explicitly instead of being
+		// abandoned by the overwrite below.
+		const recordedBridgePath = bridgeLedger.bridgePath;
+		const isMigration =
+			recordedBridgePath !== undefined && path.resolve(recordedBridgePath) !== path.resolve(deps.paths.bridgeDir);
+		let migratedOldEntries: readonly string[] = [];
+		if (isMigration && (bridgeLedger.bridgeEntries?.length ?? 0) > 0) {
+			const oldSourceDir = bridgeLedger.bridgeSourceDir ?? legacyRecordedSourceDir(deps.home ?? "");
+			migratedOldEntries = bridgeLedger.bridgeEntries ?? [];
+			await inverseSkillsBridge(
+				deps,
+				{
+					createdEntries: [...migratedOldEntries],
+					prunedEntries: [],
+					adoptedEntries: [],
+					bridgeDirCreated: bridgeLedger.bridgeDirCreated ?? false,
+					sourceDir: oldSourceDir,
+				},
+				{ bridgeDir: path.resolve(recordedBridgePath) },
+			).catch(error => {
+				throw new SagaStepError(
+					"install",
+					`bridge path migrated from ${recordedBridgePath} but the old bridge could not be cleaned: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			});
+		}
+		const previouslyRecorded = isMigration ? new Set<string>() : new Set(bridgeLedger.bridgeEntries ?? []);
 		const ownedAfterRun = [
 			// Entries this run or an earlier run actually creates/recreates.
 			...Object.values(bridgePreflight.entries)
@@ -257,7 +297,16 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			});
 		}
 
-		// Step 4: register the bridge with GJC skill discovery.
+		// Step 4: register the bridge with GJC skill discovery -- only when the
+		// bridge was validated against a real source this run. Registering an
+		// existing directory that no source validates and no ledger owns would
+		// globally load whatever a stale or foreign bridge contains.
+		if (bridgePreflight.sourceDir === undefined && !ledgerOwnsBridge(bridgeLedger)) {
+			throw new SagaStepError(
+				"install",
+				`Refusing to register Paseo skills bridge without a validated source or ownership record (${deps.paths.bridgeDir}); re-run after Paseo is installed or point PASEO_SKILLS_DIR at the real skills directory`,
+			);
+		}
 		const settings = await Settings.init();
 		const receipt = await registerSkillsBridgeDirectory(settings, deps.paths.bridgeDir);
 		completed.push(receiptStep("config.yml skills.customDirectories", receipt));
@@ -275,6 +324,11 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 	}
 
 	return { outcome: "installed", changed };
+}
+
+/** True when the ledger proves GJC owns the current bridge directory and its entries. */
+function ledgerOwnsBridge(ledger: ProvenanceLedger): boolean {
+	return (ledger.bridgeEntries?.length ?? 0) > 0 && ledger.bridgePath !== undefined;
 }
 
 function removeProviderKey(draft: Record<string, unknown>, providerKey: string): void {

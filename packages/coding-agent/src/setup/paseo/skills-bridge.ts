@@ -147,10 +147,12 @@ async function quarantineUnlinkVerified(linkPath: string, expectedTarget: string
 
 /**
  * Entry names the bridge mirrors, derived from the source directory's own
- * contents: every `paseo`-prefixed directory. Non-directory entries (files,
- * symlinks) yield nothing -- the bridge links directories only. There is no
- * name denylist: the prefix (`paseo`, not `paseo-`) is the filter, so a
- * denylisted name like `context-search` fails the prefix test on its own.
+ * contents: every `paseo`-prefixed directory. Plain files yield nothing, and a
+ * directory symlink/junction is resolved and validated before it is bridged --
+ * GJC's own skill discovery follows such links, so a symlinked skills directory
+ * is a legitimate source shape. There is no name denylist: the prefix
+ * (`paseo`, not `paseo-`) is the filter, so a denylisted name like
+ * `context-search` fails the prefix test on its own.
  */
 export async function sourceBridgeEntries(sourceDir: string): Promise<readonly string[]> {
 	const entries = await fs.readdir(sourceDir, { withFileTypes: true }).catch(error => {
@@ -160,8 +162,16 @@ export async function sourceBridgeEntries(sourceDir: string): Promise<readonly s
 	const names: string[] = [];
 	for (const entry of entries) {
 		if (!entry.name.startsWith(PASEO_SKILL_PREFIX)) continue;
-		if (!entry.isDirectory()) continue;
-		names.push(entry.name);
+		if (entry.isDirectory()) {
+			names.push(entry.name);
+			continue;
+		}
+		// A directory symlink (or Windows junction) is a valid source shape:
+		// resolve it and keep it only when it really is a directory.
+		if (entry.isSymbolicLink()) {
+			const resolved = await fs.stat(path.join(sourceDir, entry.name)).catch(() => undefined);
+			if (resolved?.isDirectory()) names.push(entry.name);
+		}
 	}
 	names.sort();
 	return names;

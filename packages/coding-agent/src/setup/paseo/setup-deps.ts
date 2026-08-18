@@ -45,22 +45,41 @@ export function paseoAppSkillsCandidates(home: string = os.homedir()): readonly 
 }
 
 /**
+ * Every project dotenv variant Bun can load for the current working directory.
+ *
+ * Bun's default order loads `.env`, then the `NODE_ENV`-specific file, then
+ * `.env.local`, all from `process.cwd()` before any module runs. A repository
+ * can define `PASEO_SKILLS_DIR` in any of them, so the trust check must
+ * consider the full set, not just `.env`.
+ */
+function projectDotenvVariants(): readonly string[] {
+	const files = [".env", ".env.local"];
+	const env = process.env.NODE_ENV;
+	if (env === "development" || env === "production" || env === "test") files.push(`.env.${env}`);
+	files.push(`.env.${env ?? "development"}.local`, `.env.${env ?? "production"}.local`);
+	return [...new Set(files)];
+}
+
+/**
  * `PASEO_SKILLS_DIR` as explicit user intent only.
  *
- * Bun loads `cwd/.env` into `process.env` before any module runs, so a cloned
- * repository can ship a `.env` that points this override at a directory the
- * repository also ships -- and global `gjc setup paseo` run from inside that
- * checkout would bridge the repository's own `paseo*` prompt content into the
- * user's GJC configuration. The trust rule is presence-based, not
- * value-equality: the project dotenv defining the key AT ALL is enough to
- * reject the override, because Bun expands interpolations (`$PWD`, `${VAR}`)
- * before we can compare, so a literal comparison can be bypassed by expansion.
- * The same conservative presence rule the credential boundary applies.
+ * Bun loads the project dotenv variants above into `process.env` before any
+ * module runs, so a cloned repository can point this override at a directory
+ * the repository also ships -- and global `gjc setup paseo` run from inside
+ * that checkout would bridge the repository's own `paseo*` prompt content into
+ * the user's GJC configuration. The trust rule is presence-based across every
+ * variant: the project defining the key in ANY dotenv file rejects the
+ * override, because Bun expands interpolations (`$PWD`, `${VAR}`) before a
+ * value comparison could match. An operator whose real environment carries the
+ * same value loses the override while inside such a checkout -- the same
+ * conservative trade the credential boundary already makes.
  */
 function trustedPaseoSkillsDirOverride(): string | undefined {
 	const value = process.env.PASEO_SKILLS_DIR;
 	if (!value) return undefined;
-	if (parseEnvFile(path.join(process.cwd(), ".env")).PASEO_SKILLS_DIR !== undefined) return undefined;
+	for (const file of projectDotenvVariants()) {
+		if (parseEnvFile(path.join(process.cwd(), file)).PASEO_SKILLS_DIR !== undefined) return undefined;
+	}
 	return value;
 }
 

@@ -51,9 +51,52 @@ async function lstatAllowingAbsent(destination: string): Promise<Stats | undefin
 		throw error;
 	}
 }
-/** The directory the ledger says GJC created links in; the current path only when the ledger predates the record. */
-function bridgeDirOf(ledger: ProvenanceLedger, deps: PaseoSetupDependencies): string {
-	return ledger.bridgePath ?? deps.paths.bridgeDir;
+
+/**
+ * The ledger-recorded bridge directory, validated before any destructive use.
+ *
+ * A malformed, tampered, or path-replaced provenance record must never
+ * redirect `--remove` at an unrelated directory: the recorded path has to be
+ * absolute, stay inside the trusted agent root (the parent of the current
+ * bridge directory), and resolve -- without following a final symlink -- to
+ * the expected bridge directory shape. Anything else fails the removal closed.
+ */
+async function validatedBridgeDir(ledger: ProvenanceLedger, deps: PaseoSetupDependencies): Promise<string> {
+	const recorded = ledger.bridgePath ?? deps.paths.bridgeDir;
+	const trustedRoot = path.resolve(deps.paths.bridgeDir, "..");
+	const resolved = path.resolve(recorded);
+	if (!path.isAbsolute(recorded) || resolved !== recorded) {
+		throw new SkillsBridgeError(
+			`Refusing to remove Paseo skills bridge: ledger-recorded path is not absolute (${recorded})`,
+		);
+	}
+	if (resolved !== path.resolve(trustedRoot) && !resolved.startsWith(`${path.resolve(trustedRoot)}${path.sep}`)) {
+		throw new SkillsBridgeError(
+			`Refusing to remove Paseo skills bridge: ledger-recorded path escapes the agent directory (${recorded})`,
+		);
+	}
+	try {
+		const stat = await fs.lstat(recorded);
+		if (stat.isSymbolicLink()) {
+			throw new SkillsBridgeError(
+				`Refusing to remove Paseo skills bridge: ledger-recorded path is a symlink (${recorded})`,
+			);
+		}
+		if (!stat.isDirectory()) {
+			throw new SkillsBridgeError(
+				`Refusing to remove Paseo skills bridge: ledger-recorded path is not a directory (${recorded})`,
+			);
+		}
+	} catch (error) {
+		if (error instanceof SkillsBridgeError) throw error;
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			// The recorded directory is gone: nothing to remove on disk, and the
+			// ledger cleanup below still runs.
+			return recorded;
+		}
+		throw error;
+	}
+	return recorded;
 }
 
 /**
@@ -91,8 +134,11 @@ export async function removePaseoSetup(
 		}
 	}
 
-	// Step 3 inverse: the symlink bridge.
-	if (ledger.bridgeEntries && ledger.bridgeEntries.length > 0) {
+	// Step 3 inverse: the symlink bridge. Runs when entries are recorded OR
+	// when GJC created the directory itself -- a convergence run that pruned
+	// the final entry leaves `bridgeEntries: []` with `bridgeDirCreated: true`,
+	// and the empty directory GJC created is still ours to remove.
+	if ((ledger.bridgeEntries?.length ?? 0) > 0 || ledger.bridgeDirCreated === true) {
 		try {
 			// The ledger once filtered entries through a compiled-in name
 			// allowlist; ownership is now proven by the entry itself being a
@@ -100,13 +146,17 @@ export async function removePaseoSetup(
 			// recorded when the link was created. A name Paseo no longer ships
 			// is still removed, because the record -- not today's source
 			// contents -- is what proves GJC created it.
-			const bridgeDir = bridgeDirOf(ledger, deps);
-			const createdEntries: string[] = [];
-			for (const name of ledger.bridgeEntries) {
+			const bridgeDir = await validatedBridgeDir(ledger, deps);
+			// Every present recorded pathname is preserved for inverse
+			// validation: an entry replaced by a regular file or directory is
+			// handed to the inverse, which reports it as a divergence instead of
+			// being silently skipped and reported as success.
+			const presentEntries: string[] = [];
+			for (const name of ledger.bridgeEntries ?? []) {
 				if (path.basename(name) !== name || name.includes("/")) continue;
 				const destination = path.join(bridgeDir, name);
 				const stat = await lstatAllowingAbsent(destination);
-				if (stat?.isSymbolicLink() === true) createdEntries.push(name);
+				if (stat !== undefined) presentEntries.push(name);
 			}
 			// A recorded source directory is trusted even after it disappears
 			// (Paseo uninstalled): link-text verification does not need it on
@@ -118,7 +168,7 @@ export async function removePaseoSetup(
 			await inverseSkillsBridge(
 				deps,
 				{
-					createdEntries,
+					createdEntries: presentEntries,
 					prunedEntries: [],
 					adoptedEntries: [],
 					bridgeDirCreated: ledger.bridgeDirCreated ?? false,
@@ -132,10 +182,10 @@ export async function removePaseoSetup(
 			nextLedger = { ...nextLedger, bridgeEntries: [], bridgeDirCreated: false, bridgeSourceDir: undefined };
 		} catch (error) {
 			const detail = error instanceof SkillsBridgeError ? error.message : String(error);
-			remaining.push(bridgeDirOf(ledger, deps));
+			remaining.push(ledger.bridgePath ?? deps.paths.bridgeDir);
 			await writeProvenance(deps.paths.provenanceLedger, nextLedger);
 			return partial(removed, remaining, {
-				failedStep: bridgeDirOf(ledger, deps),
+				failedStep: ledger.bridgePath ?? deps.paths.bridgeDir,
 				detail,
 				retained: [deps.paths.provenanceLedger],
 			});
