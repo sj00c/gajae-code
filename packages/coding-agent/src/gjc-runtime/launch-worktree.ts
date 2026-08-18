@@ -489,10 +489,22 @@ const BROKEN_LINK_CODES = new Set(["ENOENT", "ENOTDIR", "ELOOP", "EDEADLK"]);
  */
 export function nodeModulesLinksInto(nodeModulesPath: string, sourceRoot: string): boolean {
 	const sourceReal = fs.realpathSync(sourceRoot);
-	// The node_modules root itself may be a symlink (some setups point it at a
-	// vendored directory inside the repo); its own resolution is checked first.
-	if (resolvesInside(fs.lstatSync(nodeModulesPath), nodeModulesPath, sourceReal)) return true;
+	// The node_modules root itself may be a symlink: a root that resolves
+	// OUTSIDE the source repo belongs to another checkout's install graph
+	// (nested repo in a parent workspace, external store) and must never be
+	// recursively traversed as if it were this repo's own tree — its entries
+	// resolve foreign live sources by construction, so the share decision is
+	// already made. A root resolving inside the source repo is checked by
+	// prefix below.
+	const rootStat = fs.lstatSync(nodeModulesPath);
+	if (rootStat.isSymbolicLink()) {
+		const rootReal = tryRealpath(nodeModulesPath);
+		if (rootReal === null) return true;
+		if (!isInsideOrEqualReal(sourceReal, rootReal)) return true;
+	}
+	if (resolvesInside(rootStat, nodeModulesPath, sourceReal)) return true;
 	const stack: Array<{ dir: string; depth: number }> = [{ dir: nodeModulesPath, depth: 0 }];
+	let depthCapped = false;
 	while (stack.length > 0) {
 		const { dir, depth } = stack.pop() as { dir: string; depth: number };
 		let entries: fs.Dirent[];
@@ -510,10 +522,21 @@ export function nodeModulesLinksInto(nodeModulesPath: string, sourceRoot: string
 			if (resolvesInside(entry, entryPath, sourceReal)) return true;
 			if (entry.isDirectory() && depth + 1 < NODE_MODULES_SCAN_DEPTH) {
 				stack.push({ dir: entryPath, depth: depth + 1 });
+			} else if (entry.isDirectory()) {
+				// A directory at the depth cap was not examined: the scan cannot
+				// prove it holds no self-link, so the tree is treated as linked.
+				depthCapped = true;
 			}
 		}
 	}
-	return false;
+	return depthCapped;
+}
+
+/** True when `candidateReal` equals `dirReal` or resolves strictly inside it (realpath identity). */
+function isInsideOrEqualReal(dirReal: string, candidateReal: string): boolean {
+	if (candidateReal === dirReal) return true;
+	const relative = path.relative(dirReal, candidateReal);
+	return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
 /**
@@ -531,8 +554,9 @@ function resolvesInside(entry: fs.Stats | fs.Dirent, entryPath: string, sourceRe
 		return !BROKEN_LINK_CODES.has((error as NodeJS.ErrnoException).code ?? "");
 	}
 	return (
-		sameFileSystemPath(target, sourceReal) ||
-		(caseInsensitiveFs() && target.toLowerCase().startsWith(`${sourceReal.toLowerCase()}${path.sep}`)) ||
+		sameFileSystemPath(target, sourceReal, sourceReal) ||
+		(volumeMatchesCaseInsensitively(sourceReal) &&
+			target.toLowerCase().startsWith(`${sourceReal.toLowerCase()}${path.sep}`)) ||
 		target.startsWith(`${sourceReal}${path.sep}`)
 	);
 }
@@ -588,6 +612,24 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 			// occupies the name, so it is handled here rather than below.
 			if (positivelyResolvesToSourceModules(target, sourceRoot)) {
 				fs.rmSync(target, { force: true });
+				// A plain (non-workspace) repository whose source tree is proven
+				// safe to share keeps its dependency tree: re-establish the same
+				// share this launcher created instead of leaving the worktree
+				// with no dependencies at all. Only a workspace repo, a missing
+				// source tree, a symlinked source root, or a source tree that
+				// now links back into the repo isolates.
+				const declaration = readWorkspaceDeclaration(worktreePath);
+				const source = path.join(sourceRoot, "node_modules");
+				const sourceStat = tryLstat(source);
+				if (
+					!declaration &&
+					sourceStat !== null &&
+					sourceStat.isDirectory() &&
+					!nodeModulesLinksInto(source, sourceRoot)
+				) {
+					fs.symlinkSync(source, target, "junction");
+					return "symlink";
+				}
 				createWorkspaceSelfLinkBoundary(worktreePath);
 				return "isolated";
 			}
@@ -600,7 +642,7 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 			const resolved = tryRealpath(target);
 			if (resolved !== null) {
 				const sourceModules = tryRealpath(path.join(sourceRoot, "node_modules"));
-				const isSourceModules = sourceModules !== null && sameFileSystemPath(resolved, sourceModules);
+				const isSourceModules = sourceModules !== null && sameFileSystemPath(resolved, sourceModules, sourceRoot);
 				if (!isSourceModules) {
 					const declaration = readWorkspaceDeclaration(worktreePath);
 					if (declaration && !isCompleteResolutionBoundary(worktreePath, target, declaration)) {
@@ -732,11 +774,17 @@ function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
 		if (markerOwned) reconcileBoundaryLinks(modules, new Map(), markerPath);
 		return;
 	}
-	const { patterns, manifestFile } = declaration;
+	const { manifestFile } = declaration;
 	const members = new Map<string, { manifestPath: string; dir: string }>();
-	for (const manifestPath of scanWorkspaceMemberManifests(worktreePath, patterns, manifestFile)) {
+	for (const manifestPath of scanWorkspaceMemberManifests(worktreePath, declaration)) {
 		const member = readMemberManifest(manifestPath, manifestFile);
-		if (!member.name) continue;
+		if (!member.name) {
+			throw new Error(
+				`worktree_workspace_member_name_invalid:${JSON.stringify(shortenPath(manifestPath))} declared by ` +
+					`${JSON.stringify(manifestFile)} — a selected member without a package name cannot be linked, ` +
+					"so the isolation boundary cannot be proven complete.",
+			);
+		}
 		if (!PACKAGE_NAME_PATTERN.test(member.name) || member.name.includes("\\")) {
 			throw new Error(
 				`worktree_workspace_member_name_invalid:${JSON.stringify(member.name)} in ${JSON.stringify(
@@ -810,32 +858,33 @@ function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
  * Scans the worktree's workspace declarations and returns the absolute paths of
  * every member `package.json` they select.
  *
- * Pattern semantics follow pnpm/npm ordered semantics: patterns are evaluated
- * in declaration order and later patterns override earlier ones — `!pattern`
- * removes every directory matched so far, and a later positive pattern
- * re-includes it. Traversal or absolute patterns are isolation failures, not
- * silent skips.
+ * Each declaration source is evaluated independently with pnpm/npm ordered
+ * semantics — patterns apply in declaration order, `!pattern` removes matches
+ * selected so far in THAT declaration, and a later positive pattern
+ * re-includes them — and the member set is the UNION of what every
+ * declaration selects. A negation in one root manifest therefore cannot
+ * exclude a member another root manifest positively selects.
+ *
+ * Traversal or absolute patterns are isolation failures, not silent skips.
  */
-function scanWorkspaceMemberManifests(worktreePath: string, patterns: string[], manifestFile: string): string[] {
+function scanWorkspaceMemberManifests(worktreePath: string, declaration: WorkspaceDeclaration): string[] {
 	const selected = new Set<string>();
-	for (const pattern of patterns) {
-		if (!isConfinedWorkspacePattern(pattern)) {
-			throw new Error(
-				`worktree_workspace_pattern_unsafe:${JSON.stringify(pattern)} in ${JSON.stringify(manifestFile)} — ` +
-					"absolute paths and traversal segments cannot be used for the isolation boundary.",
-			);
-		}
-		const positive = pattern.startsWith("!") ? pattern.slice(1) : pattern;
-		const glob = new Bun.Glob(path.posix.join(positive, "package.json"));
-		if (pattern.startsWith("!")) {
-			for (const match of selected) {
-				if (glob.match(match)) selected.delete(match);
+	for (const source of declaration.sources) {
+		const sourceSelected = new Set<string>();
+		for (const pattern of source.patterns) {
+			const positive = pattern.startsWith("!") ? pattern.slice(1) : pattern;
+			const glob = new Bun.Glob(path.posix.join(positive, "package.json"));
+			if (pattern.startsWith("!")) {
+				for (const match of sourceSelected) {
+					if (glob.match(match)) sourceSelected.delete(match);
+				}
+				continue;
 			}
-			continue;
+			for (const match of glob.scanSync({ cwd: worktreePath, dot: false, onlyFiles: true })) {
+				sourceSelected.add(match);
+			}
 		}
-		for (const match of glob.scanSync({ cwd: worktreePath, dot: false, onlyFiles: true })) {
-			selected.add(match);
-		}
+		for (const match of sourceSelected) selected.add(match);
 	}
 	return [...selected].map(match => path.join(worktreePath, match));
 }
@@ -854,13 +903,12 @@ function scanWorkspaceMemberManifests(worktreePath: string, patterns: string[], 
 function isCompleteResolutionBoundary(
 	worktreePath: string,
 	modules: string,
-	declaration: { patterns: string[]; manifestFile: string },
+	declaration: WorkspaceDeclaration,
 ): boolean {
 	const members = new Map<string, string>();
-	const manifestPaths = scanWorkspaceMemberManifests(worktreePath, declaration.patterns, declaration.manifestFile);
-	for (const manifestPath of manifestPaths) {
+	for (const manifestPath of scanWorkspaceMemberManifests(worktreePath, declaration)) {
 		const member = readMemberManifest(manifestPath, declaration.manifestFile);
-		if (!member.name) continue;
+		if (!member.name) return false;
 		const declared = members.get(member.name);
 		if (declared === undefined || manifestPath.localeCompare(declared) < 0) {
 			members.set(member.name, manifestPath);
@@ -877,12 +925,15 @@ function isCompleteResolutionBoundary(
 		// Resolving to the worktree root itself, or into the boundary directory
 		// being validated (a self-looping link), is not a member entry; a real
 		// entry anywhere else inside the worktree shadows the ancestor walk-up.
-		if (sameFileSystemPath(resolved, worktreeReal)) return false;
-		if (sameFileSystemPath(resolved, modulesReal)) return false;
-		if (!caseInsensitiveFs() && !resolved.startsWith(`${worktreeReal}${path.sep}`)) {
+		if (sameFileSystemPath(resolved, worktreeReal, worktreePath)) return false;
+		if (sameFileSystemPath(resolved, modulesReal, worktreePath)) return false;
+		if (!volumeMatchesCaseInsensitively(worktreePath) && !resolved.startsWith(`${worktreeReal}${path.sep}`)) {
 			return false;
 		}
-		if (caseInsensitiveFs() && !resolved.toLowerCase().startsWith(`${worktreeReal.toLowerCase()}${path.sep}`)) {
+		if (
+			volumeMatchesCaseInsensitively(worktreePath) &&
+			!resolved.toLowerCase().startsWith(`${worktreeReal.toLowerCase()}${path.sep}`)
+		) {
 			return false;
 		}
 	}
@@ -984,7 +1035,7 @@ function isRecordedLinkAtIdentity(linkPath: string, recordedTarget: string): boo
 	if (targetReal === null) return false;
 	const recordedReal = tryRealpath(recordedTarget);
 	if (recordedReal === null) return false;
-	return sameFileSystemPath(targetReal, recordedReal);
+	return sameFileSystemPath(targetReal, recordedReal, path.dirname(linkPath));
 }
 /** Writes the per-link ownership manifest beside the boundary marker. */
 function writeBoundaryOwnership(modules: string, ownership: Map<string, string>): void {
@@ -1098,49 +1149,97 @@ function isInsideDirectoryReal(dirReal: string, candidateReal: string): boolean 
 	const relative = path.relative(dirReal, candidateReal);
 	return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
-/** Reads the authoritative workspace declaration for the worktree root. */
-function readWorkspaceDeclaration(worktreePath: string): { patterns: string[]; manifestFile: string } | null {
+/** A single workspace declaration source (root manifest file). */
+interface WorkspaceDeclarationSource {
+	patterns: string[];
+	manifestFile: string;
+}
+
+/** The worktree root's authoritative workspace declarations. */
+interface WorkspaceDeclaration {
+	sources: WorkspaceDeclarationSource[];
+	manifestFile: string;
+}
+
+/**
+ * The worktree root's authoritative workspace declarations (#4620).
+ *
+ * `package.json` `workspaces` and `pnpm-workspace.yaml` are kept as separate
+ * declarations on purpose: ordered negation semantics are per-declaration, so
+ * merging their pattern lists into one sequence would let a `!pattern` in one
+ * file exclude a member the other file positively selects. Members are the
+ * UNION of what each declaration independently selects.
+ *
+ * Manifest presence is decided by `lstat`: a dangling symlink or other
+ * non-regular entry at a manifest name is an obstruction, not an absent
+ * declaration, because the boundary cannot be proven from a manifest that
+ * cannot be read as a plain file.
+ */
+function readWorkspaceDeclaration(worktreePath: string): WorkspaceDeclaration | null {
 	const packageJsonPath = path.join(worktreePath, "package.json");
 	let packageJsonPatterns: string[] | null = null;
-	try {
-		const manifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as { workspaces?: unknown };
-		packageJsonPatterns = extractPatternList(manifest.workspaces);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+	const packageJsonStat = tryLstat(packageJsonPath);
+	if (packageJsonStat !== null) {
+		if (!packageJsonStat.isFile()) {
 			throw new Error(
 				`worktree_workspace_manifest_unreadable:${JSON.stringify(shortenPath(packageJsonPath))} — the ` +
-					"isolation boundary cannot be built from an unreadable manifest.",
+					"isolation boundary cannot be built from a manifest that is not a regular file.",
 			);
+		}
+		try {
+			const manifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as { workspaces?: unknown };
+			packageJsonPatterns = extractPatternList(manifest.workspaces, "package.json");
+		} catch (error) {
+			// Isolation-contract errors (invalid declarations) propagate; only a
+			// vanished file (ENOENT from the race between lstat and read) is
+			// tolerated as an absent declaration.
+			if (!(error instanceof Error) || !/worktree_workspace_(manifest|pattern)_/.test(error.message)) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+					throw new Error(
+						`worktree_workspace_manifest_unreadable:${JSON.stringify(shortenPath(packageJsonPath))} — the ` +
+							"isolation boundary cannot be built from an unreadable manifest.",
+					);
+				}
+			} else {
+				throw error;
+			}
 		}
 	}
 	const pnpmPath = path.join(worktreePath, "pnpm-workspace.yaml");
 	let pnpmPatterns: string[] | null = null;
-	if (fs.existsSync(pnpmPath)) {
-		try {
-			const parsed = Bun.YAML.parse(fs.readFileSync(pnpmPath, "utf8")) as { packages?: unknown } | null;
-			pnpmPatterns = extractPatternList(parsed?.packages);
-		} catch {
+	const pnpmStat = tryLstat(pnpmPath);
+	if (pnpmStat !== null) {
+		if (!pnpmStat.isFile()) {
 			throw new Error(
 				`worktree_workspace_manifest_unreadable:${JSON.stringify(shortenPath(pnpmPath))} — the isolation ` +
-					"boundary cannot be built from a malformed manifest.",
+					"boundary cannot be built from a manifest that is not a regular file.",
 			);
 		}
+		try {
+			const parsed = Bun.YAML.parse(fs.readFileSync(pnpmPath, "utf8")) as { packages?: unknown } | null;
+			pnpmPatterns = extractPatternList(parsed?.packages, "pnpm-workspace.yaml");
+		} catch (error) {
+			// Isolation-contract errors (invalid declarations) propagate.
+			if (!(error instanceof Error) || !/worktree_workspace_(manifest|pattern)_/.test(error.message)) {
+				throw new Error(
+					`worktree_workspace_manifest_unreadable:${JSON.stringify(shortenPath(pnpmPath))} — the isolation ` +
+						"boundary cannot be built from a malformed manifest.",
+				);
+			}
+			throw error;
+		}
 	}
-	// Dual declarations are merged deterministically (union, declaration order);
-	// conflicting declarations cover a superset of members either way.
-	const merged = [...(packageJsonPatterns ?? []), ...(pnpmPatterns ?? [])];
-	if (merged.length === 0) return null;
+	const sources: Array<{ patterns: string[]; manifestFile: string }> = [];
+	if (packageJsonPatterns !== null) sources.push({ patterns: packageJsonPatterns, manifestFile: "package.json" });
+	if (pnpmPatterns !== null) sources.push({ patterns: pnpmPatterns, manifestFile: "pnpm-workspace.yaml" });
+	if (sources.length === 0) return null;
 	const manifestFile =
-		packageJsonPatterns !== null && pnpmPatterns !== null
-			? "package.json+pnpm-workspace.yaml"
-			: packageJsonPatterns !== null
-				? "package.json"
-				: "pnpm-workspace.yaml";
-	return { patterns: merged, manifestFile };
+		sources.length === 2 ? "package.json+pnpm-workspace.yaml" : (sources[0]?.manifestFile ?? "package.json");
+	return { sources, manifestFile };
 }
 
 /** Strictly extracts a string list of workspace patterns; anything else is an isolation failure. */
-function extractPatternList(value: unknown): string[] | null {
+function extractPatternList(value: unknown, declaringFile: string): string[] | null {
 	if (value === undefined || value === null) return null;
 	const patterns = Array.isArray(value)
 		? value
@@ -1149,16 +1248,25 @@ function extractPatternList(value: unknown): string[] | null {
 			: null;
 	if (!Array.isArray(patterns)) {
 		throw new Error(
-			`worktree_workspace_manifest_invalid:${JSON.stringify(value)} — workspace declarations must be an ` +
-				"array of patterns or a { packages: [...] } object.",
+			`worktree_workspace_manifest_invalid:${JSON.stringify(value)} in ${JSON.stringify(declaringFile)} — ` +
+				"workspace declarations must be an array of patterns or a { packages: [...] } object.",
 		);
 	}
 	const parsed: string[] = [];
 	for (const entry of patterns) {
 		if (typeof entry !== "string" || entry.length === 0) {
 			throw new Error(
-				`worktree_workspace_pattern_invalid:${JSON.stringify(entry)} — workspace patterns must be ` +
-					"non-empty strings.",
+				`worktree_workspace_pattern_invalid:${JSON.stringify(entry)} in ${JSON.stringify(declaringFile)} — ` +
+					"workspace patterns must be non-empty strings.",
+			);
+		}
+		// The negated body must itself be a confined pattern: validating only
+		// the raw entry would let "!/../escape" pass the traversal check.
+		const body = entry.startsWith("!") ? entry.slice(1) : entry;
+		if (body === "" || !isConfinedWorkspacePattern(body)) {
+			throw new Error(
+				`worktree_workspace_pattern_invalid:${JSON.stringify(entry)} in ${JSON.stringify(declaringFile)} — ` +
+					"absolute paths and traversal segments cannot be used for the isolation boundary.",
 			);
 		}
 		parsed.push(entry);
@@ -1207,25 +1315,66 @@ function positivelyResolvesToSourceModules(target: string, sourceRoot: string): 
 	} catch {
 		return false;
 	}
-	return sameFileSystemPath(resolvedTarget, resolvedSourceModules);
+	return sameFileSystemPath(resolvedTarget, resolvedSourceModules, sourceRoot);
 }
 
 /**
- * Case-insensitive path equality on platforms whose filesystems match that way,
- * so an alias-spelled or differently-cased identity is still recognized as the
- * same physical path instead of being classified as unrelated.
+ * Path-equality probe cache: whether paths on the volume holding `probeRoot`
+ * match case-insensitively, measured rather than assumed per-platform.
+ *
+ * Darwin ships both case-insensitive (default APFS/HFS+) and case-sensitive
+ * (APFS case-sensitive) volumes; treating the whole platform as one behavior
+ * lets a case-sensitive volume's distinct paths collide under `toLowerCase`,
+ * which could make an ownership check accept or delete the wrong target. The
+ * probe creates two entries differing only by case inside `probeRoot`; if the
+ * second creation collides the volume folds case. Windows volumes are
+ * case-insensitive by construction and the probe confirms that. The result is
+ * cached per probe root.
  */
-function sameFileSystemPath(a: string, b: string): boolean {
+const caseFoldProbeCache = new Map<string, boolean>();
+
+function volumeMatchesCaseInsensitively(probeRoot: string): boolean {
+	const cached = caseFoldProbeCache.get(probeRoot);
+	if (cached !== undefined) return cached;
+	const probeA = path.join(probeRoot, ".gjc-case-probe-a");
+	const probeB = path.join(probeRoot, ".gjc-CASE-PROBE-a");
+	let folds = false;
+	try {
+		fs.rmSync(probeA, { force: true, recursive: true });
+		fs.rmSync(probeB, { force: true, recursive: true });
+		fs.mkdirSync(probeA);
+		try {
+			fs.mkdirSync(probeB);
+			// Both spellings coexist: the volume distinguishes case.
+			folds = false;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code ?? "";
+			// The case-variant collided with the first probe entry.
+			folds = code === "EEXIST" || code === "ENOTEMPTY" || code === "EISDIR" || code === "EPERM";
+		}
+	} catch {
+		// The probe itself cannot run (read-only root, permission denied):
+		// assume folding, the conservative direction for identity checks that
+		// may otherwise treat a same-volume alias as unrelated and delete or
+		// share the wrong tree.
+		folds = true;
+	} finally {
+		fs.rmSync(probeA, { force: true, recursive: true });
+		fs.rmSync(probeB, { force: true, recursive: true });
+	}
+	caseFoldProbeCache.set(probeRoot, folds);
+	return folds;
+}
+
+/**
+ * Case-insensitive path equality on the volume holding `reference`, so an
+ * alias-spelled or differently-cased identity is still recognized as the same
+ * physical path instead of being classified as unrelated — but only when that
+ * volume actually folds case.
+ */
+function sameFileSystemPath(a: string, b: string, reference: string): boolean {
 	if (a === b) return true;
-	return caseInsensitiveFs() && a.toLowerCase() === b.toLowerCase();
-}
-
-/**
- * True on platforms whose filesystems match paths case-insensitively, where the
- * same physical path can be returned with different casing or alias spelling.
- */
-function caseInsensitiveFs(): boolean {
-	return process.platform === "win32" || process.platform === "darwin";
+	return volumeMatchesCaseInsensitively(reference) && a.toLowerCase() === b.toLowerCase();
 }
 /** `lstat` that returns null instead of throwing for a missing path. */
 function tryLstat(target: string): fs.Stats | null {

@@ -532,10 +532,33 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		const contaminated = prepareLaunchWorktree(repo, ["--worktree"]);
 		expect((await fs.lstat(path.join(contaminated.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
 
+		// A self-link appearing in the origin tree after the first launch makes
+		// the share unsafe: reuse must remove the launcher's own link and
+		// isolate instead of re-sharing.
+		await fs.mkdir(path.join(originModules, "@scope"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(originModules, "@scope", "app"));
+
 		const remediated = prepareLaunchWorktree(repo, ["--worktree"]);
 		await expectEntryState(path.join(remediated.cwd, "node_modules"), "missing");
 		// The origin's own node_modules survives remediation.
 		expect((await fs.stat(originModules)).isDirectory()).toBe(true);
+	});
+
+	it("preserves the proven-safe source dependency tree for plain repositories across reuse", async () => {
+		const repo = await createRepo("gjc-launch-worktree-preserve-plain-");
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(originModules);
+
+		const first = prepareLaunchWorktree(repo, ["--worktree", "preserve-plain"]);
+		const firstLink = path.join(first.cwd, "node_modules");
+		expect((await fs.lstat(firstLink)).isSymbolicLink()).toBe(true);
+
+		// A plain repository whose source tree has no self-links keeps its
+		// shared dependency tree on reuse: removal would strand every import.
+		const second = prepareLaunchWorktree(repo, ["--worktree", "preserve-plain"]);
+		expect((await fs.lstat(path.join(second.cwd, "node_modules"))).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(path.join(second.cwd, "node_modules"))).toBe(originModules);
 	});
 
 	it("leaves a real worktree node_modules directory untouched", async () => {
@@ -896,7 +919,7 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		run("git", ["add", "-A"], repo);
 		run("git", ["commit", "-m", "traversal pattern"], repo);
 
-		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_pattern_unsafe/);
+		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_pattern_invalid/);
 	});
 
 	it("refuses member package names outside the npm grammar", async () => {
@@ -1256,6 +1279,57 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		expect(() => prepareLaunchWorktree(repo, ["--worktree", "partial-reconcile"])).toThrow(
 			/worktree_boundary_incomplete_after_reconcile/,
 		);
+	});
+	it("unions mixed declarations so a negation in one cannot exclude the other's member", async () => {
+		const repo = await createRepo("gjc-launch-worktree-mixed-decl-");
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "legacy"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*", "!packages/legacy"] }),
+		);
+		await Bun.write(path.join(repo, "pnpm-workspace.yaml"), "packages:\n  - 'packages/legacy'\n");
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), '{"name":"@scope/app"}\n');
+		await Bun.write(path.join(repo, "packages", "legacy", "package.json"), '{"name":"@scope/legacy"}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "mixed declarations"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "mixed-decl"]);
+		const modules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(path.join(modules, "@scope", "app"))).isSymbolicLink()).toBe(true);
+		// pnpm-workspace.yaml positively selects legacy, so package.json's
+		// negation must not leave it to ancestor resolution.
+		expect((await fs.lstat(path.join(modules, "@scope", "legacy"))).isSymbolicLink()).toBe(true);
+	});
+
+	it("refuses a selected member without a package name instead of skipping it", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-nameless-member-");
+		await fs.mkdir(path.join(repo, "packages", "nameless"), { recursive: true });
+		await Bun.write(path.join(repo, "packages", "nameless", "package.json"), '{"private":true}\n');
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "nameless member"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(/worktree_workspace_member_name_invalid/);
+	});
+
+	it("never traverses a source node_modules root symlinked outside the repo", async () => {
+		const parent = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-worktree-root-symlink-"));
+		cleanupPaths.push(parent);
+		const externalStore = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-store-root-"));
+		cleanupPaths.push(externalStore);
+		const repo = path.join(parent, "repo");
+		await fs.mkdir(repo, { recursive: true });
+		run("git", ["init"], repo);
+		run("git", ["config", "user.email", "test@example.com"], repo);
+		run("git", ["config", "user.name", "Test User"], repo);
+		await Bun.write(path.join(repo, "README.md"), "hello\n");
+		run("git", ["add", "README.md"], repo);
+		run("git", ["commit", "-m", "init"], repo);
+		// The source tree's node_modules points at an external install graph.
+		await fs.symlink(externalStore, path.join(repo, "node_modules"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		await expectEntryState(path.join(launched.cwd, "node_modules"), "missing");
 	});
 
 	it("rejects symlinked parents that resolve outside the boundary", async () => {
