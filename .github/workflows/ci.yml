@@ -548,6 +548,36 @@ jobs:
               pattern: gjc-binary-*
               path: release-binaries
               merge-multiple: true
+         - name: Derive release notes
+           # A curated release is assembled by cherry-picking onto main, so
+           # generate_release_notes has no merged pull requests to describe and
+           # emits a body containing only a compare link (v0.14.1 shipped that).
+           # Deriving from the range credits the pull requests that actually
+           # shipped, and refuses to credit ones this release excluded.
+           env:
+              GH_TOKEN: ${{ github.token }}
+              TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              # The publish checkout is shallow and tagless, so neither the tag
+              # list nor the commit range exists until history is fetched.
+              git fetch --quiet --tags --prune --unshallow || git fetch --quiet --tags --prune
+              notes="$RUNNER_TEMP/release-notes.md"
+              previous="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
+                 | grep -vFx "$TAG_NAME" | head -1)"
+              if [ -z "$previous" ]; then
+                 echo "No previous stable tag to compare against; leaving notes empty" >&2
+                 : > "$notes"
+              else
+                 bun scripts/release-notes.ts \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --base "$previous" \
+                    --head "$GITHUB_SHA" \
+                    --head-tag "$TAG_NAME" \
+                    --out "$notes"
+              fi
+              echo "RELEASE_NOTES_PATH=$notes" >> "$GITHUB_ENV"
          - name: Create GitHub Release
            uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
            with:
@@ -557,7 +587,8 @@ jobs:
               draft: false
               prerelease: ${{ needs.release_metadata.outputs.channel == 'nightly' }}
               make_latest: ${{ needs.release_metadata.outputs.channel != 'nightly' }}
-              generate_release_notes: true
+              body_path: ${{ env.RELEASE_NOTES_PATH }}
+              generate_release_notes: false
               fail_on_unmatched_files: true
               files: |
                  release-binaries/gjc-*
