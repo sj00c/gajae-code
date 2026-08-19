@@ -1354,6 +1354,172 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		// The outside sentinel directory was not populated.
 		expect(await fs.readdir(outside)).toEqual([]);
 	});
+	it("case-fold probe never deletes user entries at the former fixed probe names", async () => {
+		const repo = await createRepo("gjc-launch-worktree-case-probe-");
+		// A user-owned directory sitting exactly at the probe name the old
+		// implementation removed recursively before probing.
+		const sentinel = path.join(repo, ".gjc-case-probe-a");
+		await fs.mkdir(sentinel);
+		await Bun.write(path.join(sentinel, "keep.txt"), "keep\n");
+		// Force the identity scan (probeRoot = the checkout) with a self-link.
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(path.join(originModules, "@scope"), { recursive: true });
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(originModules, "@scope", "app"));
+
+		prepareLaunchWorktree(repo, ["--worktree", "case-probe"]);
+
+		// The sentinel survives untouched, and no probe residue remains.
+		expect(await fs.readFile(path.join(sentinel, "keep.txt"), "utf8")).toBe("keep\n");
+		const leftovers = (await fs.readdir(repo)).filter(entry => entry.startsWith(".gjc-case-probe"));
+		expect(leftovers).toEqual([".gjc-case-probe-a"]);
+	});
+
+	it("fails closed when the worktree root manifest cannot be lstat'd (non-ENOENT)", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-manifest-eacces-");
+		// An unreadable-at-lstat root manifest must not read as "absent": the old
+		// catch-all tryLstat routed this down the plain-repository sharing path.
+		const realLstat = fsSync.lstatSync.bind(fsSync) as unknown as (...args: unknown[]) => unknown;
+		let reachedManifest = false;
+		const lstatSpy = spyOn(fsSync, "lstatSync").mockImplementation(((pathArg: fsSync.PathLike) => {
+			const asString = String(pathArg);
+			if (asString.includes(".gajae-code-worktrees") && asString.endsWith("package.json")) {
+				reachedManifest = true;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realLstat(pathArg);
+		}) as unknown as typeof fsSync.lstatSync);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "manifest-eacces"])).toThrow(/permission denied/);
+			expect(reachedManifest).toBe(true);
+		} finally {
+			lstatSpy.mockRestore();
+		}
+	});
+
+	it("ignores installed dependency manifests matched by recursive workspace patterns", async () => {
+		const repo = await createRepo("gjc-launch-worktree-recursive-scan-");
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["**"] }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "packages", "app", "package.json"),
+			JSON.stringify({ name: "@scope/app", version: "1.0.0" }, null, "\t"),
+		);
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "workspace"], repo);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "recursive-scan"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect(await fs.realpath(path.join(worktreeModules, "@scope", "app"))).toBe(
+			path.join(launched.cwd, "packages", "app"),
+		);
+
+		// A later worktree-local install drops dependency manifests under
+		// node_modules — including ones without a package name. The recursive
+		// `**` pattern must not adopt them as workspace members (the old scan
+		// threw worktree_workspace_member_name_invalid here).
+		await fs.mkdir(path.join(worktreeModules, "fake-dep"), { recursive: true });
+		await Bun.write(path.join(worktreeModules, "fake-dep", "package.json"), '{"version":"1.0.0"}\n');
+		const relaunched = prepareLaunchWorktree(repo, ["--worktree", "recursive-scan"]);
+		expect(relaunched.worktree.enabled && relaunched.worktree.reused).toBe(true);
+		// The dependency was neither linked into ownership nor deleted.
+		expect((await fs.lstat(path.join(worktreeModules, "fake-dep"))).isDirectory()).toBe(true);
+		const ownership = JSON.parse(
+			await fs.readFile(path.join(worktreeModules, ".gjc-node-modules-links.json"), "utf8"),
+		) as Record<string, string>;
+		expect(Object.keys(ownership)).toEqual(["@scope/app"]);
+	});
+
+	it("breaks an abandoned boundary lock but never a fresh one", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-lock-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "boundary-lock"]);
+		const lockPath = path.join(launched.cwd, ".gjc-node-modules-boundary.lock");
+		// The holder released its lock.
+		await expectEntryState(lockPath, "missing");
+
+		// A lock abandoned by a crashed launcher is broken and the launch proceeds.
+		await fs.mkdir(lockPath);
+		const stale = new Date(Date.now() - 120_000);
+		await fs.utimes(lockPath, stale, stale);
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "boundary-lock"]);
+		expect(reused.worktree.enabled && reused.worktree.reused).toBe(true);
+		await expectEntryState(lockPath, "missing");
+
+		// A fresh lock belongs to a live launch: the contender fails closed and
+		// leaves the held lock alone.
+		await fs.mkdir(lockPath);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "boundary-lock"])).toThrow(
+				/worktree_boundary_lock_busy/,
+			);
+			await expectEntryState(lockPath, "dir");
+		} finally {
+			await fs.rm(lockPath, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("reconciles the ownership map coherently across A→B→A member changes", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-aba-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "aba-reuse"]);
+		const worktreeModules = path.join(first.cwd, "node_modules");
+		expect(await fs.realpath(path.join(worktreeModules, "@scope", "app"))).toBe(
+			path.join(first.cwd, "packages", "app"),
+		);
+
+		// State B: replace @scope/app with @scope/lib on the worktree's own
+		// branch (a named worktree keeps its branch across reuse).
+		await fs.rm(path.join(first.cwd, "packages", "app"), { recursive: true });
+		await fs.mkdir(path.join(first.cwd, "packages", "lib"), { recursive: true });
+		await Bun.write(
+			path.join(first.cwd, "packages", "lib", "package.json"),
+			JSON.stringify({ name: "@scope/lib", version: "1.0.0" }, null, "\t"),
+		);
+		run("git", ["add", "packages"], first.cwd);
+		run("git", ["commit", "-m", "swap app for lib"], first.cwd);
+		prepareLaunchWorktree(repo, ["--worktree", "aba-reuse"]);
+		expect(await fs.realpath(path.join(worktreeModules, "@scope", "lib"))).toBe(
+			path.join(first.cwd, "packages", "lib"),
+		);
+		await expectEntryState(path.join(worktreeModules, "@scope", "app"), "missing");
+
+		// Back to A: the pruned member link must be recreated, not refused on
+		// stale recorded ownership (the split-map defect failed completeness here).
+		await fs.rm(path.join(first.cwd, "packages", "lib"), { recursive: true });
+		await fs.mkdir(path.join(first.cwd, "packages", "app"), { recursive: true });
+		await Bun.write(
+			path.join(first.cwd, "packages", "app", "package.json"),
+			JSON.stringify({ name: "@scope/app", version: "1.0.0" }, null, "\t"),
+		);
+		run("git", ["add", "packages"], first.cwd);
+		run("git", ["commit", "-m", "restore app"], first.cwd);
+		prepareLaunchWorktree(repo, ["--worktree", "aba-reuse"]);
+		expect(await fs.realpath(path.join(worktreeModules, "@scope", "app"))).toBe(
+			path.join(first.cwd, "packages", "app"),
+		);
+		await expectEntryState(path.join(worktreeModules, "@scope", "lib"), "missing");
+		const ownership = JSON.parse(
+			await fs.readFile(path.join(worktreeModules, ".gjc-node-modules-links.json"), "utf8"),
+		) as Record<string, string>;
+		expect(Object.keys(ownership)).toEqual(["@scope/app"]);
+	});
+
+	it("commits boundary metadata atomically without temporary-file residue", async () => {
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-metadata-commit-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "metadata-commit"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		// Reconcile again so both the manifest rewrite and marker path run.
+		prepareLaunchWorktree(repo, ["--worktree", "metadata-commit"]);
+		const entries = await fs.readdir(worktreeModules);
+		expect(entries.filter(entry => entry.includes(".gjc-new-"))).toEqual([]);
+		const ownership = JSON.parse(
+			await fs.readFile(path.join(worktreeModules, ".gjc-node-modules-links.json"), "utf8"),
+		) as Record<string, string>;
+		expect(Object.keys(ownership)).toEqual(["@scope/app"]);
+		expect(entries).toContain(".gjc-node-modules-boundary");
+	});
 });
 
 describe("GJC_WORKTREE_DIR path red-team", () => {
