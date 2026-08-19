@@ -202,6 +202,21 @@ describe("stable release policy", () => {
 		expect(publish).not.toContain("environment:");
 	});
 
+	test("keeps scheduled and manual nightlies out of the stable approval gate", async () => {
+		const ci = await workflow();
+		const approval = jobSection(ci, "release_approval");
+		const publish = jobSection(ci, "publish");
+
+		// The approval environment applies to stable releases only; nightlies
+		// stay unattended once required reviewers are configured.
+		expect(approval).toContain("needs.release_metadata.outputs.channel == 'stable'");
+		// publish runs for nightly without the approval result, but stable
+		// requires it.
+		expect(publish).toContain("needs.release_metadata.outputs.channel == 'nightly' || needs.release_approval.result == 'success'");
+		// release_approval depends on the preparation graph, not the other way.
+		expect(approval).toContain("needs: [release_prepare, release_metadata]");
+	});
+
 	test("keeps dependency resolution out of the publish dispatch", async () => {
 		const publishScript = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
 
