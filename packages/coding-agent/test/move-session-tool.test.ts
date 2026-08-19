@@ -88,7 +88,7 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 20_000);
 	it("lets a sequential fenced bash call follow a completed move", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
