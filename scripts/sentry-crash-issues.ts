@@ -40,6 +40,7 @@
  */
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -440,7 +441,6 @@ export interface ApprovalStore {
 	recordFiled(manifest: ApprovalManifest, url: string): Promise<void>;
 	hasPending(manifest: ApprovalManifest): Promise<boolean>;
 	recordPending(manifest: ApprovalManifest): Promise<void>;
-	clearPending(manifest: ApprovalManifest): Promise<void>;
 }
 
 export interface ApprovalManifest {
@@ -545,11 +545,7 @@ async function loadStoredApprovals(): Promise<StoredApprovals> {
 async function writeStoredApprovals(stored: StoredApprovals): Promise<void> {
 	const target = approvalStorePath();
 	const directory = path.dirname(target);
-	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-	const directoryStat = await fs.lstat(directory);
-	const uid = process.getuid?.();
-	if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0 || (uid !== undefined && directoryStat.uid !== uid))
-		throw new Error("approval store directory is not a private directory owned by the current user");
+	await ensureApprovalStoreDirectory();
 	const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
 	try {
 		await fs.writeFile(temporary, `${JSON.stringify(stored, null, "\t")}\n`, { mode: 0o600, flag: "wx" });
@@ -559,9 +555,19 @@ async function writeStoredApprovals(stored: StoredApprovals): Promise<void> {
 	}
 }
 
-let approvalStoreLockDepth = 0;
+const approvalStoreLockContext = new AsyncLocalStorage<boolean>();
+
+async function ensureApprovalStoreDirectory(): Promise<void> {
+	const directory = path.dirname(approvalStorePath());
+	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	const directoryStat = await fs.lstat(directory);
+	const uid = process.getuid?.();
+	if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0 || (uid !== undefined && directoryStat.uid !== uid))
+		throw new Error("approval store directory is not a private directory owned by the current user");
+}
 
 async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
+	await ensureApprovalStoreDirectory();
 	const lockPath = `${approvalStorePath()}.create.lock`;
 	for (let attempt = 0; attempt < 200; attempt++) {
 		try {
@@ -580,18 +586,11 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 }
 
 async function withCreationLock<T>(action: () => Promise<T>): Promise<T> {
-	return withApprovalStoreLock(async () => {
-		approvalStoreLockDepth++;
-		try {
-			return await action();
-		} finally {
-			approvalStoreLockDepth--;
-		}
-	});
+	return withApprovalStoreLock(() => approvalStoreLockContext.run(true, action));
 }
 
 async function withStoreMutation<T>(action: () => Promise<T>): Promise<T> {
-	return approvalStoreLockDepth > 0 ? action() : withApprovalStoreLock(action);
+	return approvalStoreLockContext.getStore() ? action() : withApprovalStoreLock(action);
 }
 
 function issueUrlFromCreateOutput(output: string): string | undefined {
@@ -650,13 +649,6 @@ const fileApprovalStore: ApprovalStore = {
 		await withStoreMutation(async () => {
 			const stored = await loadStoredApprovals();
 			if (!stored.pending.some(saved => sameManifest(saved, manifest))) stored.pending.push(manifest);
-			await writeStoredApprovals(stored);
-		});
-	},
-	async clearPending(manifest: ApprovalManifest): Promise<void> {
-		await withStoreMutation(async () => {
-			const stored = await loadStoredApprovals();
-			stored.pending = stored.pending.filter(saved => !sameManifest(saved, manifest));
 			await writeStoredApprovals(stored);
 		});
 	},
@@ -850,7 +842,7 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		return skippedMalformed > 0 || collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 1 ? 1 : 0;
 	}
 
-	if (pending.length === 0) {
+	if (pending.length === 0 && recoverableExisting.size === 0) {
 		dependencies.writeStdout("Nothing to file.\n");
 		return incomplete ? 1 : 0;
 	}
@@ -963,8 +955,9 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 			continue;
 		}
 		failed++;
-		await dependencies.approvals.clearPending(manifest);
-		dependencies.writeStderr(`failed ${row.fingerprint}: ${result.stderr.trim() || "unknown error"}\n`);
+		dependencies.writeStderr(
+			`failed ${row.fingerprint}: ${result.stderr.trim() || "unknown error"}; approval and pending-create record retained for a safe retry\n`,
+		);
 	}
 	dependencies.writeStdout(`\ncreated ${created}, failed ${failed}\n`);
 	return failed > 0 || collisions.length > 0 || skippedMalformed > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;

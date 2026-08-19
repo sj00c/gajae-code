@@ -360,10 +360,6 @@ describe("main orchestration", () => {
 					recordPending: async manifest => {
 						if (!pending.some(candidate => JSON.stringify(candidate) === JSON.stringify(manifest))) pending.push(manifest);
 					},
-					clearPending: async manifest => {
-						const index = pending.findIndex(candidate => JSON.stringify(candidate) === JSON.stringify(manifest));
-						if (index >= 0) pending.splice(index, 1);
-					},
 				},
 				withCreationLock: async action => action(),
 				writeStdout: message => stdout.push(message),
@@ -479,7 +475,6 @@ describe("main orchestration", () => {
 				recordFiled: async () => {},
 				hasPending: async () => false,
 				recordPending: async () => {},
-				clearPending: async () => {},
 			},
 		});
 		await expect(main(["--approve", digestMatch![1]!], approving.dependencies)).resolves.toBe(1);
@@ -546,6 +541,33 @@ describe("main orchestration", () => {
 		const results = await Promise.all([main(["--apply"], shared.dependencies), main(["--apply"], shared.dependencies)]);
 		expect(results).toEqual([0, 0]);
 		expect(creates).toBe(1);
+	});
+
+	test("recovers an exact pending create instead of returning early", async () => {
+		const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
+		let recorded = 0;
+		const recovered = mainDependencies(true, {
+			findExistingIssue: async () => ({
+				kind: "untrusted",
+				url: "https://github.com/Yeachan-Heo/gajae-code/issues/1",
+				title: issueTitle({ fingerprint: FINGERPRINT, sentry: sentryIssue() }),
+				body: issueBody({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options()),
+			}),
+			approvals: {
+				loadApprovals: async () => [manifest],
+				recordApprovals: async () => {},
+				consume: async () => {},
+				hasFiled: async () => false,
+				recordFiled: async () => {
+					recorded++;
+				},
+				hasPending: async candidate => JSON.stringify(candidate) === JSON.stringify(manifest),
+				recordPending: async () => {},
+			},
+		});
+		await expect(main(["--apply"], recovered.dependencies)).resolves.toBe(0);
+		expect(recorded).toBe(1);
+		expect(recovered.ghCalls).toHaveLength(0);
 	});
 
 	test("reports malformed rows distinctly from no-fingerprint skips and fails the run", async () => {
