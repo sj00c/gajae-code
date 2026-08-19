@@ -57,6 +57,7 @@ const CRASH_MARKER_PATTERN = /gjc-crash-fp\.v1:(?:[0-9a-f]{32}|<hex>)(?![a-z0-9_
 /** Sentry paginates at 100; a triage batch larger than this wants a saved search, not a bigger flag. */
 const MAX_LIMIT = 100;
 const MAX_RETRIES = 2;
+const LOCK_STALE_MS = 10 * 60 * 1000;
 const MAX_PERMALINK_PATH_LENGTH = 2048;
 const MAX_ISSUE_BODY_BYTES = 48 * 1024;
 const SENTRY_LEVELS = new Set(["fatal", "error", "warning", "info", "debug"]);
@@ -548,8 +549,20 @@ async function writeStoredApprovals(stored: StoredApprovals): Promise<void> {
 	await ensureApprovalStoreDirectory();
 	const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
 	try {
-		await fs.writeFile(temporary, `${JSON.stringify(stored, null, "\t")}\n`, { mode: 0o600, flag: "wx" });
+		const handle = await fs.open(temporary, "wx", 0o600);
+		try {
+			await handle.writeFile(`${JSON.stringify(stored, null, "\t")}\n`);
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
 		await fs.rename(temporary, target);
+		const directoryHandle = await fs.open(directory, "r");
+		try {
+			await directoryHandle.sync();
+		} finally {
+			await directoryHandle.close();
+		}
 	} finally {
 		await fs.rm(temporary, { force: true }).catch(() => undefined);
 	}
@@ -572,17 +585,44 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 	for (let attempt = 0; attempt < 200; attempt++) {
 		try {
 			await fs.mkdir(lockPath, { mode: 0o700 });
+			await fs.writeFile(
+				path.join(lockPath, "owner.json"),
+				`${JSON.stringify({ pid: process.pid, startedAt: Date.now() })}\n`,
+				{ mode: 0o600, flag: "wx" },
+			);
 			try {
 				return await action();
 			} finally {
-				await fs.rmdir(lockPath);
+				await fs.rm(lockPath, { recursive: true, force: true });
 			}
 		} catch (error) {
 			if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+			if (await staleLock(lockPath)) await fs.rm(lockPath, { recursive: true, force: true });
 			await Bun.sleep(25);
 		}
 	}
 	throw new Error("timed out waiting for the crash issue creation lock");
+}
+
+async function staleLock(lockPath: string): Promise<boolean> {
+	try {
+		const stat = await fs.stat(lockPath);
+		if (Date.now() - stat.mtimeMs < LOCK_STALE_MS) return false;
+		try {
+			const owner = JSON.parse(await Bun.file(path.join(lockPath, "owner.json")).text()) as { pid?: unknown };
+			if (typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid < 1) return true;
+			try {
+				process.kill(owner.pid, 0);
+				return false;
+			} catch {
+				return true;
+			}
+		} catch {
+			return true;
+		}
+	} catch {
+		return false;
+	}
 }
 
 async function withCreationLock<T>(action: () => Promise<T>): Promise<T> {
