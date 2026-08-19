@@ -12,6 +12,12 @@ describe("generated tool catalog", () => {
 		const regenerated = await generateToolCatalogData();
 		expect(regenerated).toEqual(TOOL_CATALOG);
 	});
+	test("move_session is generated with essential loadMode and exclusive non-abortable metadata", () => {
+		expect(TOOL_CATALOG.move_session?.loadMode).toBe("essential");
+		expect(TOOL_CATALOG.move_session?.deferrable).toBe(false);
+		expect(TOOL_CATALOG.move_session?.nonAbortable).toBe(true);
+		expect(TOOL_CATALOG.move_session?.concurrency).toBe("exclusive");
+	});
 
 	test("ambient agent fixtures cannot contaminate generated task metadata", async () => {
 		const project = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tool-catalog-project-"));

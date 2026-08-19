@@ -9,6 +9,7 @@ import { createAgentSession } from "../../src/sdk/session";
 import type { ToolSession } from "../../src/tools/index";
 import {
 	BUILTIN_CAPABILITY_CATALOG,
+	BUILTIN_TOOL_DESCRIPTORS,
 	BUILTIN_TOOLS,
 	computeEssentialBuiltinNames,
 	createTools,
@@ -62,6 +63,7 @@ const goalRuntime = new GoalRuntime({
 
 const toolSession: ToolSession = {
 	cwd: "/tmp/test",
+	rescopeSessionCwd: async (target: string) => ({ from: "/tmp/test", to: target }),
 	hasUI: false,
 	getSessionFile: () => null,
 	getSessionSpawns: () => null,
@@ -115,6 +117,14 @@ describe("BUILTIN_TOOLS public factory map", () => {
 		const metadata = await getToolMetadata();
 		const missing = Object.keys(BUILTIN_TOOLS).filter(name => metadata.get(name)?.loadMode === undefined);
 		expect(missing).toEqual([]);
+	});
+	it("declares loadMode on every BUILTIN_TOOLS descriptor independently of session availability", () => {
+		const missing = Object.keys(BUILTIN_TOOLS).filter(name => {
+			const descriptor = BUILTIN_TOOL_DESCRIPTORS[name];
+			return descriptor?.metadata.loadMode !== "essential" && descriptor?.metadata.loadMode !== "discoverable";
+		});
+		expect(missing).toEqual([]);
+		expect(BUILTIN_TOOL_DESCRIPTORS.move_session?.metadata.loadMode).toBe("essential");
 	});
 
 	it("does not expose memory helpers as public built-in tools", async () => {
