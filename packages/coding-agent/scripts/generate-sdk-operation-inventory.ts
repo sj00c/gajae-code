@@ -73,6 +73,14 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setForcedToolChoice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveSkillState": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveSkillPhase": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getEffectiveActiveWorkflowSkillState":
+		"internal restored-or-live workflow guard for session rescope, not a user-facing SDK control seam",
+	"agent_session:replaceOwnedMcpManager":
+		"internal cwd-rebinding helper for owned MCP authority after move_session, not a user-facing SDK control seam",
+	"agent_session:replaceNamedCustomTools":
+		"internal cwd-rebinding helper for named custom tools after move_session, not a user-facing SDK control seam",
+	"agent_session:recreatePythonTool":
+		"internal cwd-rebinding helper that recreates the python tool after move_session, not a user-facing SDK control seam",
 	"agent_session:getDeepInterviewAskStage":
 		"internal AskTool schema-selection accessor, not a user-facing SDK control seam",
 	"agent_session:peekQueueInvoker": "internal accessor/plumbing, not a user-facing control seam",
