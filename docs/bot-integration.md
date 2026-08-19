@@ -213,14 +213,15 @@ Use `gjc_coordinator_read_turn` for polling or `gjc_coordinator_await_turn` for 
   "session_id": "gjc-demo",
   "turn_id": "turn-00000000-0000-0000-0000-000000000000",
   "timeout_ms": 30000,
-  "poll_interval_ms": 1000,
-  "lines": 80
+  "poll_interval_ms": 1000
 }
 ```
 
 Terminal turn statuses are `completed`, `failed`, `cancelled`, and `superseded`. Non-terminal statuses include `queued`, `delivering`, `active`, `waiting_for_answer`, and `completing`.
 
-When the work is done, your bot must call `gjc_coordinator_report_status` with the turn id. This writes the final response/error, evidence paths, and coordinator report that later reads consume:
+`gjc_coordinator_watch_events` accepts a non-negative integer `after_seq`. Persist and resume with `next_after_seq`, not `latest_seq`: `latest_seq` is the snapshot watermark, while a filtered or limited page can intentionally return `next_after_seq < latest_seq`. A cursor ahead of the snapshot returns `reason: "cursor_ahead"` with `snapshot_watermark`; reconcile from that watermark according to your retention policy. Malformed or fractional cursors return the public `invalid_input` error.
+
+When the work is done, your bot must call `gjc_coordinator_report_status` with the turn id. The report idempotency key is crash-recoverable: retrying the identical request after a disconnect repairs the canonical queue/session/report projections and retained event delivery before replaying the committed report/terminal turn response without creating another report. The durable receipt/canonical report is consulted before mutable evidence paths are revalidated, so an evidence file may be deleted or renamed after commit without breaking an identical replay. This writes the final response/error, evidence paths, and coordinator report that later reads consume:
 
 ```json
 {
@@ -281,13 +282,22 @@ GJC does not currently expose a structured stop-reason field on `agent_end`; int
 
 ### Answer structured questions
 
-Pull questions for one required session; every call reconciles durable pending `workflow.gates.list` rows before returning a bounded `questions`, `diagnostics`, and `reconciliation` snapshot. Filter `status: "pending"`; legacy `status: "open"` remains a compatibility alias for pending. A session can return multiple questions, so handle every pending row independently. The public rows include only the safe question shape and a per-pending-row `answer_binding`; they never expose private gate payloads or gate values.
+Pull questions for one required session; every call reconciles durable pending `workflow.gates.list` rows before returning a bounded `questions`, `diagnostics`, and `reconciliation` snapshot. Filter `status: "pending"`; legacy `status: "open"` remains a compatibility alias for pending. A session can return multiple questions, so handle every pending row independently. The public rows include only the safe question shape, a versioned per-question `answer_schema`, and a per-pending-row `answer_binding`; they never expose private gate payloads or gate values. In coordination-status snapshots, inspect each session's `question_snapshots[].reconciliation` and `diagnostics`; when `summary.questions_complete` is false, `summary.questions` and `summary.open_questions` are `null` and must not be treated as zero.
 
 ```json
 { "session_id": "gjc-demo", "status": "pending" }
 ```
 
-Submit the exact identifiers and binding from one pending row. `answer` uses public option ids (`opt_0`, etc.), or the advertised `other`/`clarify` form:
+Submit the exact identifiers and binding from one pending row. Validate `answer` against that row's versioned `answer_schema`; the supported union uses public option ids (`opt_0`, etc.):
+
+```json
+{ "answer": { "selected": ["opt_0"] } }
+{ "answer": { "selected": ["opt_0", "opt_2"] } }
+{ "answer": { "selected": [], "other": true, "custom": "A different approach" } }
+{ "answer": { "action": "clarify", "question": "What does this option change?" } }
+```
+
+A selected answer may contain multiple ids only when the row has `multi: true`; an empty selected answer without `other` is valid only when `allow_empty: true`. The `other` form requires zero selected ids and non-empty `custom`. Both `custom` and clarification `question` strings must contain at least one non-whitespace character, at most 4096 Unicode code points (`maxLength`), and at most 4096 UTF-8 bytes (`x-maxUtf8Bytes`). Controllers must enforce both advertised bounds; the explicit byte-limit extension matches runtime validation for multibyte text.
 
 ```json
 {

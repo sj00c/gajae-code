@@ -49,6 +49,7 @@ export interface CanonicalTurnSnapshotV1 {
 	status: string;
 	prompt: { text: string; created_at: string; source: string };
 	delivery: Record<string, unknown>;
+	runtime_provenance: RuntimeProvenanceTokenV1 | null;
 	question_ids: string[];
 	final_response: Record<string, unknown>;
 	evidence: Record<string, unknown>[];
@@ -73,18 +74,23 @@ export interface CanonicalReportSnapshotV1 {
 	evidence_paths: string[];
 	created_at: string;
 }
+export interface RuntimeProvenanceTokenV1 {
+	namespace_id: string;
+	session_id: string;
+	endpoint_incarnation: string;
+	coordinator_turn_id: string;
+	runtime_turn_id: string;
+	gate_created_at: string;
+	schema_hash: string;
+	stage: string;
+	kind: string;
+}
 export type GateAuthorityEntryV1 = {
 	authority: { namespace_id: string; session_id: string; endpoint_incarnation: string; gate_id: string };
 	observation:
 		| {
 				kind: "valid";
-				first_provenance: {
-					runtime_turn_id: string;
-					gate_created_at: string;
-					schema_hash: string;
-					stage: string;
-					kind: string;
-				};
+				first_provenance: RuntimeProvenanceTokenV1;
 		  }
 		| {
 				kind: "malformed";
@@ -180,6 +186,15 @@ export interface OperationRequestV1 {
 	created_at: string;
 	updated_at: string;
 }
+export type PublicDeliveryStateV1 = "pending" | "claimed" | "acknowledged";
+export interface PublicDeliveryV1 {
+	public_event_id: string;
+	state: PublicDeliveryStateV1;
+	claim_fence: number | null;
+	claim_expires_at: string | null;
+	journal_seq: number | null;
+	acknowledged_at: string | null;
+}
 export interface OutboxEventV1 {
 	id: string;
 	transaction_revision: number;
@@ -188,6 +203,9 @@ export interface OutboxEventV1 {
 	entity_id: string;
 	payload: Record<string, string | number | boolean | null>;
 	emitted: boolean;
+	/** Stable public id; it is independent from journal sequence allocation. */
+	public_event_id: string;
+	public_delivery: PublicDeliveryV1;
 }
 function isOutboxEntity(value: unknown): value is OutboxEventV1["entity"] {
 	return value === "turn" || value === "question" || value === "report" || value === "session" || value === "deletion";
@@ -223,6 +241,10 @@ export interface CoordinatorSessionTransactionV1 {
 		applied_session_revision: number;
 		applied_active_revision: number;
 		applied_events_revision: number;
+		/** Session-WAL-first scheduler repair markers. */
+		scheduler_pending_revision?: number;
+		scheduler_applied_revision?: number;
+		scheduler_digest?: string;
 	};
 	recovery: { prompt_watermark_at: string | null; last_repaired_at: string | null };
 }
@@ -285,6 +307,15 @@ export interface NamespaceRegistryV1 {
 	namespace_id: string;
 	creations: Record<string, CreationRequestV1>;
 	deletions: Record<string, NamespaceDeletionEntryV1>;
+	/** Durable bounded scheduler hints. Lifecycle authority remains in session WALs. */
+	roster?: Record<
+		string,
+		{ session_id: string; revision: number; digest: string; active: boolean; dirty: boolean; updated_at: string }
+	>;
+	scheduler_revision?: number;
+	scheduler_cursor?: string;
+	retained_sessions?: Record<string, { session_id: string; updated_at: string }>;
+	delivery_discovery_cursor?: string;
 }
 export interface CoordinatorStatePaths {
 	root: string;
@@ -297,7 +328,43 @@ export interface CoordinatorStatePaths {
 const MAX_NORMAL_BYTES = 1024 * 1024;
 const EMERGENCY_BYTES = 128 * 1024;
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const PUBLIC_CLAIM_LEASE_MS = 30_000;
+export const COORDINATOR_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+const lockOptions = (signal?: AbortSignal) => (signal ? { signal } : undefined);
+
+function publicDeliveryFor(event: OutboxEventV1): PublicDeliveryV1 {
+	const candidate = event.public_delivery;
+	if (
+		candidate &&
+		(candidate.state === "pending" || candidate.state === "claimed" || candidate.state === "acknowledged") &&
+		(typeof candidate.public_event_id === "string" || typeof event.public_event_id === "string")
+	) {
+		return {
+			public_event_id: candidate.public_event_id || event.public_event_id || event.id,
+			state: candidate.state,
+			claim_fence: Number.isSafeInteger(candidate.claim_fence) ? candidate.claim_fence : null,
+			claim_expires_at: typeof candidate.claim_expires_at === "string" ? candidate.claim_expires_at : null,
+			journal_seq: Number.isSafeInteger(candidate.journal_seq) ? candidate.journal_seq : null,
+			acknowledged_at: typeof candidate.acknowledged_at === "string" ? candidate.acknowledged_at : null,
+		};
+	}
+	return {
+		public_event_id: event.public_event_id || event.id,
+		state: "pending",
+		claim_fence: null,
+		claim_expires_at: null,
+		journal_seq: null,
+		acknowledged_at: null,
+	};
+}
+
+function normalizeOutbox(transaction: CoordinatorSessionTransactionV1): void {
+	for (const event of Object.values(transaction.outbox)) {
+		if (!event.public_event_id) event.public_event_id = event.id;
+		event.public_delivery = publicDeliveryFor(event);
+	}
+}
 export function coordinatorStatePaths(stateRoot: string, namespaceId: string): CoordinatorStatePaths {
 	const root = path.join(stateRoot, "v1", namespaceId);
 	return {
@@ -310,7 +377,7 @@ export function coordinatorStatePaths(stateRoot: string, namespaceId: string): C
 	};
 }
 function safeSessionId(sessionId: string): string {
-	if (!/^[A-Za-z0-9._-]{1,256}$/.test(sessionId)) throw new Error("state_corrupt");
+	if (!COORDINATOR_SESSION_ID_PATTERN.test(sessionId)) throw new Error("state_corrupt");
 	return sessionId;
 }
 export function transactionPath(paths: CoordinatorStatePaths, sessionId: string): string {
@@ -375,6 +442,11 @@ export async function initializeCoordinatorNamespace(paths: CoordinatorStatePath
 				namespace_id: path.basename(paths.root),
 				creations: {},
 				deletions: {},
+				roster: {},
+				scheduler_revision: 0,
+				scheduler_cursor: "",
+				retained_sessions: {},
+				delivery_discovery_cursor: "@session:",
 			});
 		else if (existing.schema_version !== 1 || existing.namespace_id !== path.basename(paths.root))
 			throw new Error("state_corrupt");
@@ -383,33 +455,286 @@ export async function initializeCoordinatorNamespace(paths: CoordinatorStatePath
 export async function withNamespaceRegistry<T>(
 	paths: CoordinatorStatePaths,
 	operation: (registry: NamespaceRegistryV1) => Promise<T>,
+	options: { signal?: AbortSignal } = {},
 ): Promise<T> {
 	await ensureNamespaceParents(paths);
-	return await withFileLock(paths.registryLock, async () => {
-		const registry = await readJson<NamespaceRegistryV1>(paths.registry);
-		if (registry?.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
-			throw new Error("state_corrupt");
-		const result = await operation(registry);
-		await writeAtomic(paths.registry, registry);
-		return result;
-	});
+	return await withFileLock(
+		paths.registryLock,
+		async () => {
+			const registry = await readJson<NamespaceRegistryV1>(paths.registry);
+			if (registry?.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
+				throw new Error("state_corrupt");
+			registry.roster ??= {};
+			registry.scheduler_revision ??= 0;
+			registry.scheduler_cursor ??= "";
+			registry.retained_sessions ??= {};
+			registry.delivery_discovery_cursor ??= "@session:";
+			const result = await operation(registry);
+			await writeAtomic(paths.registry, registry);
+			return result;
+		},
+		lockOptions(options.signal),
+	);
 }
+export async function ensureSchedulerRoster(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<void> {
+	const transaction = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+	if (!transaction) return;
+	await withNamespaceRegistry(
+		paths,
+		async registry => {
+			registry.roster ??= {};
+			const existing = registry.roster[sessionId];
+			registry.scheduler_revision = Math.max(registry.scheduler_revision ?? 0, transaction.revision);
+			registry.roster[sessionId] = {
+				session_id: sessionId,
+				revision: transaction.revision,
+				digest: digest(JSON.stringify(transaction.canonical.queue)),
+				active:
+					transaction.canonical.queue.active_turn_id !== null ||
+					Object.values(transaction.canonical.turns).some(turn =>
+						["queued", "delivering", "active", "waiting_for_answer", "completing"].includes(turn.status),
+					) ||
+					transaction.canonical.desired_session_state === "needs_user_input",
+				dirty: existing?.dirty ?? false,
+				updated_at: new Date().toISOString(),
+			};
+		},
+		options,
+	);
+}
+
+export async function listCanonicalActiveSessions(
+	paths: CoordinatorStatePaths,
+	options: { signal?: AbortSignal } = {},
+): Promise<string[]> {
+	await ensureNamespaceParents(paths);
+	const sessionIds = await withFileLock(
+		paths.registryLock,
+		async () => {
+			const registry = await readJson<NamespaceRegistryV1>(paths.registry);
+			if (!registry || registry.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
+				throw new Error("state_corrupt");
+			return Object.values(registry.roster ?? {})
+				.filter(entry => entry.active || entry.dirty)
+				.map(entry => entry.session_id)
+				.sort();
+		},
+		lockOptions(options.signal),
+	);
+	const active: string[] = [];
+	for (const sessionId of sessionIds) {
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("aborted");
+		const transaction = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+		if (!transaction) continue;
+		assertTransaction(transaction, path.basename(paths.root), sessionId);
+		const hasActiveTurn = Object.values(transaction.canonical.turns).some(turn =>
+			["queued", "delivering", "active", "waiting_for_answer", "completing"].includes(turn.status),
+		);
+		if (
+			hasActiveTurn ||
+			transaction.canonical.queue.active_turn_id !== null ||
+			transaction.canonical.desired_session_state === "needs_user_input"
+		)
+			active.push(sessionId);
+	}
+	return active;
+}
+
+export async function readDeliveryDiscoveryCursor(
+	paths: CoordinatorStatePaths,
+	options: { signal?: AbortSignal } = {},
+): Promise<string> {
+	await ensureNamespaceParents(paths);
+	return await withFileLock(
+		paths.registryLock,
+		async () => {
+			const registry = await readJson<NamespaceRegistryV1>(paths.registry);
+			if (!registry || registry.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
+				throw new Error("state_corrupt");
+			return registry.delivery_discovery_cursor ?? "";
+		},
+		lockOptions(options.signal),
+	);
+}
+
+export async function advanceDeliveryDiscoveryCursor(
+	paths: CoordinatorStatePaths,
+	cursor: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<void> {
+	await withNamespaceRegistry(
+		paths,
+		async registry => {
+			registry.delivery_discovery_cursor = cursor;
+		},
+		options,
+	);
+}
+
+export async function readSchedulerRoster(
+	paths: CoordinatorStatePaths,
+	options: { signal?: AbortSignal } = {},
+): Promise<{
+	roster: Array<{
+		session_id: string;
+		revision: number;
+		digest: string;
+		active: boolean;
+		dirty: boolean;
+		updated_at: string;
+	}>;
+	cursor: string;
+}> {
+	await ensureNamespaceParents(paths);
+	return await withFileLock(
+		paths.registryLock,
+		async () => {
+			const registry = await readJson<NamespaceRegistryV1>(paths.registry);
+			if (registry?.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
+				throw new Error("state_corrupt");
+			return {
+				roster: Object.values(registry.roster ?? {}).sort((left, right) =>
+					left.session_id.localeCompare(right.session_id),
+				),
+				cursor: registry.scheduler_cursor ?? "",
+			};
+		},
+		lockOptions(options.signal),
+	);
+}
+
+export async function advanceSchedulerCursor(
+	paths: CoordinatorStatePaths,
+	cursor: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<void> {
+	await withNamespaceRegistry(
+		paths,
+		async registry => {
+			registry.scheduler_cursor = cursor;
+		},
+		options,
+	);
+}
+
+export async function readSessionTransaction(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+): Promise<CoordinatorSessionTransactionV1 | null> {
+	const transaction = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+	if (!transaction) return null;
+	assertTransaction(transaction, path.basename(paths.root), sessionId);
+	normalizeOutbox(transaction);
+	return transaction;
+}
+
 export async function withSessionTransaction<T>(
 	paths: CoordinatorStatePaths,
 	sessionId: string,
 	operation: (transaction: CoordinatorSessionTransactionV1) => Promise<T>,
+	options: { signal?: AbortSignal } = {},
 ): Promise<T> {
 	const file = transactionPath(paths, sessionId);
-	await ensureCoordinatorDirectory(path.dirname(file));
-	return await withFileLock(transactionLockPath(paths, sessionId), async () => {
-		const transaction = await readJson<CoordinatorSessionTransactionV1>(file);
-		if (!transaction) throw new Error("resource_gone");
-		assertTransaction(transaction, path.basename(paths.root), sessionId);
-		const result = await operation(transaction);
-		transaction.revision++;
-		await writeAtomic(file, transaction);
-		return result;
-	});
+	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	return await withFileLock(
+		transactionLockPath(paths, sessionId),
+		async () => {
+			const transaction = await readJson<CoordinatorSessionTransactionV1>(file);
+			if (!transaction) throw new Error("resource_gone");
+			assertTransaction(transaction, path.basename(paths.root), sessionId);
+			const beforeDigest = digest(JSON.stringify(transaction));
+			normalizeOutbox(transaction);
+			const result = await operation(transaction);
+			normalizeOutbox(transaction);
+			compactTransaction(transaction);
+			if (digest(JSON.stringify(transaction)) === beforeDigest) return result;
+			transaction.projection.scheduler_pending_revision = transaction.revision + 1;
+			transaction.projection.scheduler_digest = digest(
+				JSON.stringify({
+					session_id: transaction.session_id,
+					revision: transaction.revision + 1,
+					active: transaction.canonical.queue.active_turn_id !== null,
+					state: transaction.canonical.desired_session_state,
+				}),
+			);
+			transaction.revision++;
+			await writeAtomic(file, transaction);
+			return result;
+		},
+		lockOptions(options.signal),
+	);
+}
+
+/** Remove a retained-session hint once its WAL has no unacknowledged deliveries. */
+async function pruneRetainedSessionIfEmpty(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<void> {
+	await withNamespaceRegistry(
+		paths,
+		async registry =>
+			await withFileLock(
+				transactionLockPath(paths, sessionId),
+				async () => {
+					const transaction = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+					if (transaction) normalizeOutbox(transaction);
+					if (
+						!transaction ||
+						!Object.values(transaction.outbox).some(event => event.public_delivery.state !== "acknowledged")
+					)
+						delete registry.retained_sessions?.[sessionId];
+				},
+				lockOptions(options.signal),
+			),
+		options,
+	);
+}
+
+/** Atomically admits a session close against the canonical WAL and registry. */
+export async function admitSessionClose(
+	paths: CoordinatorStatePaths,
+	entry: NamespaceDeletionEntryV1,
+	options: { signal?: AbortSignal } = {},
+): Promise<CoordinatorSessionTransactionV1> {
+	return await withNamespaceRegistry(
+		paths,
+		async registry =>
+			await withFileLock(
+				transactionLockPath(paths, entry.session_id),
+				async () => {
+					const transaction = await readJson<CoordinatorSessionTransactionV1>(
+						transactionPath(paths, entry.session_id),
+					);
+					if (!transaction) throw new Error("resource_gone");
+					assertTransaction(transaction, path.basename(paths.root), entry.session_id);
+					const existing = registry.deletions[entry.deletion_id];
+					if (
+						existing &&
+						(existing.key_digest !== entry.key_digest || existing.request_digest !== entry.request_digest)
+					)
+						throw new Error("idempotency_conflict");
+					const active = Object.values(transaction.canonical.turns).find(turn =>
+						["delivering", "active", "waiting_for_answer", "completing"].includes(turn.status),
+					);
+					const reservedPrompt = Object.values(transaction.requests.prompts).some(
+						request =>
+							request.operation !== "turn.follow_up" &&
+							["claimed", "remote_started", "accepted"].includes(request.phase),
+					);
+					if (active || transaction.canonical.queue.active_turn_id !== null || reservedPrompt)
+						throw new Error("active_turn_exists");
+					registry.deletions[entry.deletion_id] = existing ?? entry;
+					return transaction;
+				},
+				lockOptions(options.signal),
+			),
+		options,
+	);
 }
 
 /** Serializes a session mutation with namespace close admission. */
@@ -417,14 +742,50 @@ export async function withAdmittedSessionTransaction<T>(
 	paths: CoordinatorStatePaths,
 	sessionId: string,
 	operation: (transaction: CoordinatorSessionTransactionV1) => Promise<T>,
+	options: { signal?: AbortSignal } = {},
 ): Promise<T> {
 	return await withNamespaceRegistry(
 		paths,
-		async registry =>
-			await withSessionTransaction(paths, sessionId, async transaction => {
-				assertCloseAdmission(registry, transaction);
-				return await operation(transaction);
-			}),
+		async registry => {
+			const latest: { value: CoordinatorSessionTransactionV1 | null } = { value: null };
+			const result = await withSessionTransaction(
+				paths,
+				sessionId,
+				async transaction => {
+					assertCloseAdmission(registry, transaction);
+					const value = await operation(transaction);
+					latest.value = transaction;
+					return value;
+				},
+				options,
+			);
+			if (latest.value) {
+				registry.roster ??= {};
+				registry.scheduler_revision = Math.max(registry.scheduler_revision ?? 0, latest.value.revision);
+				registry.roster[sessionId] = {
+					session_id: sessionId,
+					revision: latest.value.revision,
+					digest: digest(JSON.stringify(latest.value.canonical.queue)),
+					active:
+						latest.value.canonical.queue.active_turn_id !== null ||
+						Object.values(latest.value.canonical.turns).some(turn =>
+							["queued", "delivering", "active", "waiting_for_answer", "completing"].includes(turn.status),
+						) ||
+						latest.value.canonical.desired_session_state === "needs_user_input",
+					dirty: true,
+					updated_at: new Date().toISOString(),
+				};
+				registry.retained_sessions ??= {};
+				if (Object.values(latest.value.outbox).some(event => event.public_delivery.state !== "acknowledged"))
+					registry.retained_sessions[sessionId] = {
+						session_id: sessionId,
+						updated_at: new Date().toISOString(),
+					};
+				else delete registry.retained_sessions?.[sessionId];
+			}
+			return result;
+		},
+		options,
 	);
 }
 
@@ -499,64 +860,82 @@ export async function commitCreationWal(
 ): Promise<CoordinatorSessionTransactionV1> {
 	await bindCreationRequest(paths, keyDigest, intent);
 	return await withNamespaceRegistry(paths, async registry => {
-		const request = registry.creations[keyDigest];
-		if (!request || request.canonical_create_intent === null) throw new Error("state_corrupt");
 		const session = intent.session;
-		let existing = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, session.session_id));
-		if (existing) {
-			assertTransaction(existing, session.namespace_id, session.session_id);
-			if (existing.canonical.session.broker.endpoint_incarnation !== session.broker.endpoint_incarnation) {
-				const priorDeleted = Object.values(registry.deletions).some(
-					entry =>
-						entry.session_id === session.session_id &&
-						entry.endpoint_incarnation === existing!.canonical.session.broker.endpoint_incarnation &&
-						entry.phase === "completed",
-				);
-				if (!priorDeleted) throw new Error("session_closing");
-				await removeCoordinatorStateFile(transactionPath(paths, session.session_id));
-				existing = null;
-			}
+		return await withFileLock(transactionLockPath(paths, session.session_id), async () => {
+			const request = registry.creations[keyDigest];
+			if (!request || request.canonical_create_intent === null) throw new Error("state_corrupt");
+			let existing = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, session.session_id));
 			if (existing) {
-				request.phase = "wal_committed";
-				request.wal_revision = existing.revision;
-				request.wal_digest = digest(JSON.stringify(existing));
-				request.updated_at = new Date().toISOString();
-				return existing;
+				assertTransaction(existing, session.namespace_id, session.session_id);
+				if (existing.canonical.session.broker.endpoint_incarnation !== session.broker.endpoint_incarnation) {
+					const priorDeleted = Object.values(registry.deletions).some(
+						entry =>
+							entry.session_id === session.session_id &&
+							entry.endpoint_incarnation === existing!.canonical.session.broker.endpoint_incarnation &&
+							entry.phase === "completed",
+					);
+					if (!priorDeleted) throw new Error("session_closing");
+					// Keep the session lock held while the new WAL atomically replaces the
+					// old-incarnation record. Never unlink the canonical path first: a crash
+					// in that gap would expose a missing session and permit a successor to
+					// race the replacement.
+					existing = null;
+				}
+				if (existing) {
+					request.phase = "wal_committed";
+					request.wal_revision = existing.revision;
+					request.wal_digest = digest(JSON.stringify(existing));
+					request.updated_at = new Date().toISOString();
+					return existing;
+				}
 			}
-		}
-		const now = new Date().toISOString();
-		const transaction: CoordinatorSessionTransactionV1 = {
-			schema_version: 1,
-			namespace_id: session.namespace_id,
-			session_id: session.session_id,
-			revision: 1,
-			endpoint: { incarnation: session.broker.endpoint_incarnation, observed_at: now },
-			canonical: {
-				session,
-				turns: {},
-				queue: { ordered_turn_ids: [], active_turn_id: null, selected_promotion: null },
-				desired_session_state: intent.initial_state,
-				reports: {},
-				gate_authorities: {},
-				questions: {},
-			},
-			requests: { prompts: {}, answers: {}, operations: {} },
-			outbox: {},
-			projection: {
-				applied_turns_revision: 0,
-				applied_reports_revision: 0,
-				applied_session_revision: 0,
-				applied_active_revision: 0,
-				applied_events_revision: 0,
-			},
-			recovery: { prompt_watermark_at: null, last_repaired_at: null },
-		};
-		await writeAtomic(transactionPath(paths, session.session_id), transaction);
-		request.phase = "wal_committed";
-		request.wal_revision = transaction.revision;
-		request.wal_digest = digest(JSON.stringify(transaction));
-		request.updated_at = now;
-		return transaction;
+			const now = new Date().toISOString();
+			const transaction: CoordinatorSessionTransactionV1 = {
+				schema_version: 1,
+				namespace_id: session.namespace_id,
+				session_id: session.session_id,
+				revision: 1,
+				endpoint: { incarnation: session.broker.endpoint_incarnation, observed_at: now },
+				canonical: {
+					session,
+					turns: {},
+					queue: { ordered_turn_ids: [], active_turn_id: null, selected_promotion: null },
+					desired_session_state: intent.initial_state,
+					reports: {},
+					gate_authorities: {},
+					questions: {},
+				},
+				requests: { prompts: {}, answers: {}, operations: {} },
+				outbox: {},
+				projection: {
+					applied_turns_revision: 0,
+					applied_reports_revision: 0,
+					applied_session_revision: 0,
+					applied_active_revision: 0,
+					applied_events_revision: 0,
+					scheduler_pending_revision: 1,
+					scheduler_applied_revision: 0,
+					scheduler_digest: digest(JSON.stringify({ session_id: session.session_id, revision: 1 })),
+				},
+				recovery: { prompt_watermark_at: null, last_repaired_at: null },
+			};
+			await writeAtomic(transactionPath(paths, session.session_id), transaction);
+			request.phase = "wal_committed";
+			request.wal_revision = transaction.revision;
+			request.wal_digest = digest(JSON.stringify(transaction));
+			request.updated_at = now;
+			registry.roster ??= {};
+			registry.scheduler_revision = Math.max(registry.scheduler_revision ?? 0, transaction.revision);
+			registry.roster[session.session_id] = {
+				session_id: session.session_id,
+				revision: transaction.revision,
+				digest: digest(JSON.stringify(transaction.canonical.queue)),
+				active: transaction.canonical.queue.active_turn_id !== null,
+				dirty: true,
+				updated_at: now,
+			};
+			return transaction;
+		});
 	});
 }
 export async function createSessionTransaction(
@@ -565,66 +944,95 @@ export async function createSessionTransaction(
 ): Promise<CoordinatorSessionTransactionV1> {
 	const session = intent.session;
 	return await withNamespaceRegistry(paths, async registry => {
-		const key = digest(`${intent.kind}\0${session.session_id}\0${session.broker.endpoint_incarnation}`);
-		if (
-			Object.values(registry.deletions).some(
-				entry =>
-					entry.session_id === session.session_id &&
-					entry.endpoint_incarnation === session.broker.endpoint_incarnation,
+		return await withFileLock(transactionLockPath(paths, session.session_id), async () => {
+			const key = digest(`${intent.kind}\0${session.session_id}\0${session.broker.endpoint_incarnation}`);
+			if (
+				Object.values(registry.deletions).some(
+					entry =>
+						entry.session_id === session.session_id &&
+						entry.endpoint_incarnation === session.broker.endpoint_incarnation,
+				)
 			)
-		)
-			throw new Error("session_closing");
-		const prior = registry.creations[key];
-		if (prior?.phase === "completed" || prior?.phase === "projected" || prior?.phase === "wal_committed") {
+				throw new Error("session_closing");
+			const prior = registry.creations[key];
 			const existing = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, session.session_id));
-			if (!existing) throw new Error("state_corrupt");
-			return existing;
-		}
-		const now = new Date().toISOString();
-		registry.creations[key] = {
-			key_digest: key,
-			request_digest: key,
-			tool: intent.kind,
-			phase: "claimed",
-			canonical_create_intent: intent,
-			remote_create_key: `remote_${key}`,
-			session_id: session.session_id,
-			endpoint_incarnation: session.broker.endpoint_incarnation,
-			created_at: now,
-			updated_at: now,
-		};
-		const transaction: CoordinatorSessionTransactionV1 = {
-			schema_version: 1,
-			namespace_id: session.namespace_id,
-			session_id: session.session_id,
-			revision: 1,
-			endpoint: { incarnation: session.broker.endpoint_incarnation, observed_at: now },
-			canonical: {
-				session,
-				turns: {},
-				queue: { ordered_turn_ids: [], active_turn_id: null, selected_promotion: null },
-				desired_session_state: intent.initial_state,
-				reports: {},
-				gate_authorities: {},
-				questions: {},
-			},
-			requests: { prompts: {}, answers: {}, operations: {} },
-			outbox: {},
-			projection: {
-				applied_turns_revision: 0,
-				applied_reports_revision: 0,
-				applied_session_revision: 0,
-				applied_active_revision: 0,
-				applied_events_revision: 0,
-			},
-			recovery: { prompt_watermark_at: null, last_repaired_at: null },
-		};
-		await writeAtomic(transactionPath(paths, session.session_id), transaction);
-		registry.creations[key]!.phase = "wal_committed";
-		registry.creations[key]!.wal_revision = transaction.revision;
-		registry.creations[key]!.wal_digest = digest(JSON.stringify(transaction));
-		registry.creations[key]!.updated_at = now;
-		return transaction;
+			if (existing) {
+				assertTransaction(existing, session.namespace_id, session.session_id);
+				if (existing.canonical.session.broker.endpoint_incarnation !== session.broker.endpoint_incarnation) {
+					const priorDeleted = Object.values(registry.deletions).some(
+						entry =>
+							entry.session_id === session.session_id &&
+							entry.endpoint_incarnation === existing.canonical.session.broker.endpoint_incarnation &&
+							entry.phase === "completed",
+					);
+					if (!priorDeleted) throw new Error("session_closing");
+				} else if (
+					prior?.phase === "completed" ||
+					prior?.phase === "projected" ||
+					prior?.phase === "wal_committed"
+				) {
+					return existing;
+				}
+			}
+			const now = new Date().toISOString();
+			registry.creations[key] = {
+				key_digest: key,
+				request_digest: key,
+				tool: intent.kind,
+				phase: "claimed",
+				canonical_create_intent: intent,
+				remote_create_key: `remote_${key}`,
+				session_id: session.session_id,
+				endpoint_incarnation: session.broker.endpoint_incarnation,
+				created_at: now,
+				updated_at: now,
+			};
+			const transaction: CoordinatorSessionTransactionV1 = {
+				schema_version: 1,
+				namespace_id: session.namespace_id,
+				session_id: session.session_id,
+				revision: 1,
+				endpoint: { incarnation: session.broker.endpoint_incarnation, observed_at: now },
+				canonical: {
+					session,
+					turns: {},
+					queue: { ordered_turn_ids: [], active_turn_id: null, selected_promotion: null },
+					desired_session_state: intent.initial_state,
+					reports: {},
+					gate_authorities: {},
+					questions: {},
+				},
+				requests: { prompts: {}, answers: {}, operations: {} },
+				outbox: {},
+				projection: {
+					applied_turns_revision: 0,
+					applied_reports_revision: 0,
+					applied_session_revision: 0,
+					applied_active_revision: 0,
+					applied_events_revision: 0,
+					scheduler_pending_revision: 1,
+					scheduler_applied_revision: 0,
+					scheduler_digest: digest(JSON.stringify({ session_id: session.session_id, revision: 1 })),
+				},
+				recovery: { prompt_watermark_at: null, last_repaired_at: null },
+			};
+			await writeAtomic(transactionPath(paths, session.session_id), transaction);
+			registry.creations[key]!.phase = "wal_committed";
+			registry.creations[key]!.wal_revision = transaction.revision;
+			registry.creations[key]!.wal_digest = digest(JSON.stringify(transaction));
+			registry.creations[key]!.updated_at = now;
+			registry.roster ??= {};
+			registry.scheduler_revision = Math.max(registry.scheduler_revision ?? 0, transaction.revision);
+			registry.roster[session.session_id] = {
+				session_id: session.session_id,
+				revision: transaction.revision,
+				digest: digest(JSON.stringify(transaction.canonical.queue)),
+				active: transaction.canonical.queue.active_turn_id !== null,
+				dirty: true,
+				updated_at: now,
+			};
+			return transaction;
+		});
 	});
 }
 export function assertCloseAdmission(
@@ -656,98 +1064,220 @@ export function deterministicOutboxId(
 export async function appendOutboxEvents(
 	paths: CoordinatorStatePaths,
 	transaction: CoordinatorSessionTransactionV1,
+	options: { signal?: AbortSignal } = {},
 ): Promise<void> {
-	await ensureCoordinatorDirectory(path.dirname(paths.journal));
-	await withFileLock(paths.journalLock, async () => {
-		const existing = await fs.readFile(paths.journal, "utf8").catch(error => {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
-			throw error;
-		});
-		const existingEvents = new Map<string, OutboxEventV1>();
-		for (const rawLine of existing.split("\n")) {
-			const line = rawLine.trim();
-			if (!line) continue;
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(line);
-			} catch {
-				throw new Error("state_corrupt");
-			}
-			const candidate = parsed as Partial<OutboxEventV1>;
-			const identity = typeof candidate.id === "string" ? candidate.id.split(":") : [];
-			const identityRevision = identity.length >= 6 ? Number(identity[2]) : Number.NaN;
-			const identityEntity = identity.length >= 6 ? identity[4] : undefined;
-			const identityEntityId = identity.length >= 6 ? identity.slice(5).join(":") : "";
-			const identitySession = identity.length >= 6 ? identity[1] : "";
-			const identityKind = identity.length >= 6 ? identity[3] : "";
-			const canonicalIdentity =
-				identity.length >= 6 &&
-				identity[0] === "txn" &&
-				identitySession &&
-				Number.isSafeInteger(identityRevision) &&
-				identityRevision > 0 &&
-				identityKind &&
-				isOutboxEntity(identityEntity) &&
-				identityEntityId &&
-				candidate.id ===
-					deterministicOutboxId(identitySession, identityRevision, identityKind, identityEntity, identityEntityId);
-			if (
-				typeof parsed !== "object" ||
-				parsed === null ||
-				Array.isArray(parsed) ||
-				typeof candidate.id !== "string" ||
-				candidate.id.length === 0 ||
-				typeof candidate.transaction_revision !== "number" ||
-				!Number.isSafeInteger(candidate.transaction_revision) ||
-				candidate.transaction_revision <= 0 ||
-				typeof candidate.kind !== "string" ||
-				!candidate.kind ||
-				!isOutboxEntity(candidate.entity) ||
-				typeof candidate.entity_id !== "string" ||
-				!candidate.entity_id ||
-				typeof candidate.payload !== "object" ||
-				candidate.payload === null ||
-				Array.isArray(candidate.payload) ||
-				typeof candidate.emitted !== "boolean" ||
-				!canonicalIdentity ||
-				candidate.transaction_revision !== identityRevision ||
-				existingEvents.has(candidate.id)
-			)
-				throw new Error("state_corrupt");
-			existingEvents.set(candidate.id, candidate as OutboxEventV1);
-		}
-		for (const event of Object.values(transaction.outbox)) {
-			if (
-				event.id !==
-				deterministicOutboxId(
-					transaction.session_id,
-					event.transaction_revision,
-					event.kind,
-					event.entity,
-					event.entity_id,
-				)
-			)
-				throw new Error("state_corrupt");
-		}
-		const events = Object.values(transaction.outbox).filter(event => {
-			if (event.emitted) return false;
-			const existing = existingEvents.get(event.id);
-			if (!existing) return true;
-			if (JSON.stringify(existing) !== JSON.stringify(event)) throw new Error("state_corrupt");
-			return false;
-		});
-		if (events.length > 0) {
-			await appendCoordinatorFile(paths.journal, `${events.map(event => JSON.stringify(event)).join("\n")}\n`);
-		}
-		for (const event of Object.values(transaction.outbox)) event.emitted = true;
-		transaction.projection.applied_events_revision = transaction.revision;
-	});
+	/*
+	 * `emitted` is a private projection marker, not public-delivery acknowledgement.
+	 * Public rows are appended by the coordinator event journal exporter after a
+	 * canonical claim. Keeping this phase journal-free prevents private payloads from
+	 * becoming malformed public JSONL rows and leaves delivery recoverable after a
+	 * projection/export crash.
+	 */
+	normalizeOutbox(transaction);
+	void paths;
+	void options;
+	for (const event of Object.values(transaction.outbox)) event.emitted = true;
+	transaction.projection.applied_events_revision = transaction.revision + 1;
 }
+
+export interface PublicDeliveryClaimV1 {
+	event: OutboxEventV1;
+	claim_fence: number;
+}
+
+const DELIVERY_REVISION_WIDTH = 20;
+
+function deliveryOrderKey(sessionId: string, event: OutboxEventV1): string {
+	return `${sessionId}\0${String(event.transaction_revision).padStart(DELIVERY_REVISION_WIDTH, "0")}\0${event.public_event_id}`;
+}
+
+function claimExpired(delivery: PublicDeliveryV1, now: number): boolean {
+	return (
+		delivery.state === "claimed" &&
+		typeof delivery.claim_expires_at === "string" &&
+		Date.parse(delivery.claim_expires_at) <= now
+	);
+}
+
+/** Claim one session's retained public intents; claims are fenced and lease based. */
+export async function claimPublicDelivery(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	options: {
+		signal?: AbortSignal;
+		limit?: number;
+		leaseMs?: number;
+		after_order_key?: string;
+	} = {},
+): Promise<PublicDeliveryClaimV1[]> {
+	const limit = Math.max(1, Math.min(options.limit ?? 16, 128));
+	const leaseMs = Math.max(1_000, Math.min(options.leaseMs ?? PUBLIC_CLAIM_LEASE_MS, 5 * 60_000));
+	const now = Date.now();
+	const claims = await withSessionTransaction(
+		paths,
+		sessionId,
+		async transaction => {
+			normalizeOutbox(transaction);
+			const claimed: PublicDeliveryClaimV1[] = [];
+			for (const event of Object.values(transaction.outbox).sort(
+				(a, b) =>
+					a.transaction_revision - b.transaction_revision || a.public_event_id.localeCompare(b.public_event_id),
+			)) {
+				const delivery = event.public_delivery;
+				if (delivery.state === "acknowledged") continue;
+				if (options.after_order_key && deliveryOrderKey(sessionId, event) <= options.after_order_key) continue;
+				if (delivery.state === "claimed" && !claimExpired(delivery, now)) continue;
+				const fence = transaction.revision + claimed.length + 1;
+				delivery.state = "claimed";
+				delivery.claim_fence = fence;
+				delivery.claim_expires_at = new Date(now + leaseMs).toISOString();
+				claimed.push({ event: structuredClone(event), claim_fence: fence });
+				if (claimed.length >= limit) break;
+			}
+			return claimed;
+		},
+		options,
+	);
+	await pruneRetainedSessionIfEmpty(paths, sessionId, options);
+	return claims;
+}
+
+/** Recover expired claims in-place without changing their stable public id. */
+export async function recoverExpiredPublicDelivery(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<number> {
+	const recovered = await withSessionTransaction(
+		paths,
+		sessionId,
+		async transaction => {
+			const now = Date.now();
+			let recovered = 0;
+			for (const event of Object.values(transaction.outbox)) {
+				if (!claimExpired(event.public_delivery, now)) continue;
+				event.public_delivery.state = "pending";
+				event.public_delivery.claim_fence = null;
+				event.public_delivery.claim_expires_at = null;
+				recovered++;
+			}
+			return recovered;
+		},
+		options,
+	);
+	await pruneRetainedSessionIfEmpty(paths, sessionId, options);
+	return recovered;
+}
+
+/** Exact acknowledgement prevents a late exporter from acknowledging a newer claim. */
+export async function acknowledgePublicDelivery(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	input: { public_event_id: string; claim_fence: number; journal_seq: number },
+	options: { signal?: AbortSignal } = {},
+): Promise<OutboxEventV1> {
+	const acknowledged = await withSessionTransaction(
+		paths,
+		sessionId,
+		async transaction => {
+			const event = Object.values(transaction.outbox).find(item => item.public_event_id === input.public_event_id);
+			if (!event) throw new Error("resource_gone");
+			if (event.public_delivery.state === "acknowledged") {
+				if (event.public_delivery.journal_seq !== input.journal_seq) throw new Error("terminal_uncertain");
+				return structuredClone(event);
+			}
+			if (event.public_delivery.state !== "claimed" || event.public_delivery.claim_fence !== input.claim_fence)
+				throw new Error("terminal_uncertain");
+			event.public_delivery.state = "acknowledged";
+			event.public_delivery.journal_seq = input.journal_seq;
+			event.public_delivery.claim_expires_at = null;
+			event.public_delivery.acknowledged_at = new Date().toISOString();
+			return structuredClone(event);
+		},
+		options,
+	);
+	await pruneRetainedSessionIfEmpty(paths, sessionId, options);
+	return acknowledged;
+}
+
+/** Enumerate retained intents independently of the active session roster. */
+export async function enumeratePublicDeliveries(
+	paths: CoordinatorStatePaths,
+	cursor = "",
+	limit = 64,
+	options: { signal?: AbortSignal } = {},
+): Promise<{
+	claims: Array<PublicDeliveryClaimV1 & { session_id: string }>;
+	next_cursor: string | null;
+}> {
+	const boundedLimit = Math.max(1, Math.min(limit, 128));
+	const sessions = await withFileLock(
+		paths.registryLock,
+		async () => {
+			const registry = await readJson<NamespaceRegistryV1>(paths.registry);
+			if (!registry || registry.schema_version !== 1 || registry.namespace_id !== path.basename(paths.root))
+				throw new Error("state_corrupt");
+			return [...new Set([...Object.keys(registry.roster ?? {}), ...Object.keys(registry.retained_sessions ?? {})])]
+				.filter(name => COORDINATOR_SESSION_ID_PATTERN.test(name))
+				.sort();
+		},
+		lockOptions(options.signal),
+	);
+	const roundRobin = cursor.startsWith("@session:");
+	const roundRobinSession = roundRobin ? cursor.slice("@session:".length) : "";
+	const cursorSeparator = cursor.indexOf("\0");
+	const cursorSession = cursorSeparator >= 0 ? cursor.slice(0, cursorSeparator) : cursor;
+	const cursorOrderKey = cursor || "";
+	const orderedSessions = roundRobin
+		? (() => {
+				const start = sessions.indexOf(roundRobinSession);
+				return start < 0 ? sessions : [...sessions.slice(start + 1), ...sessions.slice(0, start + 1)];
+			})()
+		: sessions;
+	const boundedSessions = orderedSessions.slice(0, Math.max(1, boundedLimit * 2));
+	const claims: Array<PublicDeliveryClaimV1 & { session_id: string }> = [];
+	let lastVisitedSession: string | null = null;
+	for (const sessionId of boundedSessions) {
+		lastVisitedSession = sessionId;
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("aborted");
+		if (cursorSession && sessionId < cursorSession) continue;
+		const afterOrderKey = sessionId === cursorSession ? cursorOrderKey : undefined;
+		let batch: PublicDeliveryClaimV1[] = [];
+		try {
+			batch = await claimPublicDelivery(paths, sessionId, {
+				...options,
+				limit: boundedLimit,
+				after_order_key: afterOrderKey,
+			});
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+		}
+		for (const claim of batch) claims.push({ ...claim, session_id: sessionId });
+		if (claims.length >= boundedLimit) break;
+	}
+	const filtered = claims
+		.filter(claim => deliveryOrderKey(claim.session_id, claim.event) > cursor)
+		.slice(0, boundedLimit);
+	const last = filtered.at(-1);
+	return {
+		claims: filtered,
+		next_cursor: roundRobin
+			? lastVisitedSession
+				? `@session:${lastVisitedSession}`
+				: cursor
+			: last
+				? deliveryOrderKey(last.session_id, last.event)
+				: null,
+	};
+}
+
 export function compactTransaction(transaction: CoordinatorSessionTransactionV1, now = Date.now()): void {
+	normalizeOutbox(transaction);
 	const old = (time: string): boolean => Date.parse(time) + RETENTION_MS < now;
 	for (const [id, event] of Object.entries(transaction.outbox))
 		if (
 			event.emitted &&
+			event.public_delivery.state === "acknowledged" &&
 			event.transaction_revision < transaction.revision &&
 			old(String(event.payload.created_at ?? ""))
 		)
@@ -769,15 +1299,41 @@ export async function repairProjections(
 	paths: CoordinatorStatePaths,
 	sessionId: string,
 	project: (canonical: CoordinatorSessionTransactionV1["canonical"]) => Promise<void>,
+	options: { signal?: AbortSignal } = {},
 ): Promise<void> {
-	await withSessionTransaction(paths, sessionId, async transaction => {
-		await project(transaction.canonical);
-		await appendOutboxEvents(paths, transaction);
-		transaction.projection.applied_turns_revision = transaction.revision;
-		transaction.projection.applied_reports_revision = transaction.revision;
-		transaction.projection.applied_session_revision = transaction.revision;
-		transaction.projection.applied_active_revision = transaction.revision;
-		transaction.recovery.last_repaired_at = new Date().toISOString();
+	let repairedRevision = 0;
+	let repairedDigest = "";
+	let repairedActive = false;
+	await withSessionTransaction(
+		paths,
+		sessionId,
+		async transaction => {
+			await project(transaction.canonical);
+			await appendOutboxEvents(paths, transaction);
+			transaction.projection.applied_turns_revision = transaction.revision + 1;
+			transaction.projection.applied_reports_revision = transaction.revision + 1;
+			transaction.projection.applied_session_revision = transaction.revision + 1;
+			transaction.projection.applied_active_revision = transaction.revision + 1;
+			transaction.projection.scheduler_applied_revision = transaction.revision + 1;
+			transaction.recovery.last_repaired_at = new Date().toISOString();
+			repairedRevision = transaction.revision + 1;
+			repairedDigest =
+				transaction.projection.scheduler_digest ?? digest(JSON.stringify(transaction.canonical.queue));
+			repairedActive = transaction.canonical.queue.active_turn_id !== null;
+		},
+		options,
+	);
+	await withNamespaceRegistry(paths, async registry => {
+		registry.roster ??= {};
+		registry.scheduler_revision = Math.max(registry.scheduler_revision ?? 0, repairedRevision);
+		registry.roster[sessionId] = {
+			session_id: sessionId,
+			revision: repairedRevision,
+			digest: repairedDigest,
+			active: repairedActive,
+			dirty: false,
+			updated_at: new Date().toISOString(),
+		};
 	});
 }
 
@@ -839,4 +1395,28 @@ export async function advanceDeletion(
 		entry.updated_at = new Date().toISOString();
 		if (safeResponse) entry.safe_response = safeResponse;
 	});
+}
+
+/** Remove one incarnation's canonical WAL only after broker close is proven. */
+export async function removeSessionTransaction(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	endpointIncarnation: string,
+): Promise<boolean> {
+	return await withNamespaceRegistry(
+		paths,
+		async registry =>
+			await withFileLock(transactionLockPath(paths, sessionId), async () => {
+				const file = transactionPath(paths, sessionId);
+				const transaction = await readJson<CoordinatorSessionTransactionV1>(file);
+				if (!transaction) return false;
+				assertTransaction(transaction, path.basename(paths.root), sessionId);
+				if (transaction.endpoint?.incarnation !== endpointIncarnation) throw new Error("endpoint_stale");
+				await fs.rm(file, { force: true });
+				await fsyncDirectory(path.dirname(file));
+				delete registry.roster?.[sessionId];
+				delete registry.retained_sessions?.[sessionId];
+				return true;
+			}),
+	);
 }

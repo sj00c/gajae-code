@@ -9,6 +9,22 @@ import {
 	registerCodexHandoff,
 } from "../src/coordinator-mcp/codex-handoff";
 import {
+	buildCoordinatorAskAnswerSchema,
+	type PrivateAskGateCodecV1,
+	validateCoordinatorAskAnswer,
+} from "../src/coordinator-mcp/question-gate-codec";
+import {
+	acknowledgePublicDelivery,
+	admitSessionClose,
+	advanceDeliveryDiscoveryCursor,
+	coordinatorStatePaths,
+	enumeratePublicDeliveries,
+	readDeliveryDiscoveryCursor,
+	transactionPath,
+	withNamespaceRegistry,
+	withSessionTransaction,
+} from "../src/coordinator-mcp/question-state";
+import {
 	appendCoordinatorEventForTest,
 	awaitCodexWakePublishesForTest,
 	awaitEventWebhookDeliveriesForTest,
@@ -59,6 +75,47 @@ async function tempRoot(): Promise<string> {
 	return canonical;
 }
 
+async function injectPendingDeliveryForTest(
+	server: ReturnType<typeof createCoordinatorMcpServer>,
+	sessionId: string,
+	publicEventId: string,
+	revision: number,
+): Promise<void> {
+	const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+	await withSessionTransaction(paths, sessionId, async transaction => {
+		transaction.revision = Math.max(transaction.revision, revision - 1);
+		const event = {
+			id: `txn:${sessionId}:${revision}:turn.active:turn:${publicEventId}`,
+			transaction_revision: revision,
+			kind: "turn.active",
+			entity: "turn",
+			entity_id: publicEventId,
+			payload: {
+				session_id: sessionId,
+				turn_id: publicEventId,
+				status: "active",
+				created_at: new Date().toISOString(),
+			},
+			emitted: true,
+			public_event_id: publicEventId,
+			public_delivery: {
+				public_event_id: publicEventId,
+				state: "pending",
+				claim_fence: null,
+				claim_expires_at: null,
+				journal_seq: null,
+				acknowledged_at: null,
+			},
+		};
+		(transaction.outbox as Record<string, unknown>)[event.id] = event;
+	});
+	await withNamespaceRegistry(paths, async registry => {
+		registry.retained_sessions ??= {};
+		registry.retained_sessions[sessionId] = { session_id: sessionId, updated_at: new Date().toISOString() };
+	});
+	await fs.access(transactionPath(paths, sessionId));
+}
+
 /** Real detached-broker fixtures are cleaned solely by cleanupFixtureRoot. */
 async function managedFixtureRoot(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-managed-broker-"));
@@ -85,6 +142,12 @@ type SdkControlServerOptions = {
 	controlOptions?: Array<{ idempotencyKey?: string; timeoutMs?: number }>;
 	/** Per-query transport options, in dispatch order, parallel to the recorded query names. */
 	queryOptions?: Array<{ timeoutMs?: number } | undefined>;
+	/** Deterministic barrier between canonical acknowledgement and projection. */
+	afterCanonicalTurnCommit?: (sessionId: string) => void | Promise<void>;
+	/** Deterministic barrier between a canonical report commit and projection repair. */
+	afterCanonicalReportCommit?: (sessionId: string) => void | Promise<void>;
+	/** Deterministic barrier after canonical report safe response persistence and before outer idempotency completion. */
+	afterCanonicalReportSafeResponse?: (sessionId: string, response: Record<string, unknown>) => void | Promise<void>;
 	/** Every raw session frame the server sent, in order (activation frames included). */
 	sessionFrames?: Array<Record<string, unknown>>;
 	sessionFrameResult?: (frame: Record<string, unknown>) => unknown;
@@ -284,6 +347,9 @@ async function createSdkControlServer(
 			canonicalizePath: serverOptions.canonicalizePath,
 			codexTransportFactory: serverOptions.codexTransportFactory,
 			eventWebhookDelivery: serverOptions.eventWebhookDelivery,
+			afterCanonicalTurnCommit: serverOptions.afterCanonicalTurnCommit,
+			afterCanonicalReportCommit: serverOptions.afterCanonicalReportCommit,
+			afterCanonicalReportSafeResponse: serverOptions.afterCanonicalReportSafeResponse,
 			connectBroker: async () =>
 				({
 					global: async (
@@ -1411,7 +1477,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 
 		await expect(server.callTool("gjc_coordinator_read_status")).resolves.toMatchObject({
 			ok: false,
-			error: { code: "continuation_failed", message: "page two failed" },
+			error: { code: "unavailable", message: "Coordinator service is unavailable." },
 		});
 		expect(controls).toEqual([
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
@@ -1433,7 +1499,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 
 		expect(status).toMatchObject({
 			ok: false,
-			error: { code: "protocol_error", message: "session.list returned a repeated continuation cursor." },
+			error: { code: "protocol_error", message: "Coordinator protocol response is invalid." },
 		});
 		expect(status).not.toHaveProperty("sessions");
 		expect(controls).toEqual([
@@ -1458,7 +1524,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 
 		expect(status).toMatchObject({
 			ok: false,
-			error: { code: "protocol_error", message: "session.list returned a malformed page." },
+			error: { code: "protocol_error", message: "Coordinator protocol response is invalid." },
 		});
 		expect(status).not.toHaveProperty("sessions");
 		expect(controls).toEqual([
@@ -1717,6 +1783,318 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(replay).toEqual(first);
 		expect(lifecycleControls(controls).filter(control => control.operation === "turn.prompt")).toHaveLength(1);
 	});
+	it("recovers a committed report after the outer idempotency receipt is left in progress", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "recover report",
+			idempotency_key: "recover-report-prompt",
+			allow_mutation: true,
+		});
+		const request = {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			status: "completed",
+			summary: "recoverable completion",
+			idempotency_key: "recover-report",
+			allow_mutation: true,
+		};
+		const first = await server.callTool("gjc_coordinator_report_status", request);
+		const receiptPath = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"idempotency",
+			`${createHash("sha256").update(request.idempotency_key).digest("hex")}.json`,
+		);
+		const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8")) as Record<string, unknown>;
+		const { response: _response, ...crashLeft } = receipt;
+		await fs.writeFile(receiptPath, JSON.stringify({ ...crashLeft, state: "in_progress" }));
+		const recovered = await server.callTool("gjc_coordinator_report_status", request);
+		const firstSessionState = first.session_state as Record<string, unknown>;
+		const recoveredSessionState = recovered.session_state as Record<string, unknown>;
+		expect(recovered).toEqual(first);
+		expect(recovered).toMatchObject({
+			ok: true,
+			report: first.report,
+			turn: first.turn,
+			session_state: {
+				session_id: firstSessionState.session_id,
+				state: "completed",
+				ready_for_input: false,
+				current_turn_id: firstSessionState.current_turn_id,
+				last_turn_id: firstSessionState.last_turn_id,
+			},
+		});
+		expect(recovered.report).toEqual(first.report);
+		expect(recovered.turn).toEqual(first.turn);
+		for (const field of ["updated_at", "ended_at"]) {
+			const original = firstSessionState[field];
+			const repaired = recoveredSessionState[field];
+			expect(typeof original).toBe("string");
+			expect(typeof repaired).toBe("string");
+			expect(Number.isFinite(Date.parse(original as string))).toBe(true);
+			expect(Number.isFinite(Date.parse(repaired as string))).toBe(true);
+		}
+
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+			canonical: {
+				reports: Record<string, Record<string, unknown>>;
+				turns: Record<string, Record<string, unknown>>;
+			};
+		};
+		expect(Object.keys(transaction.canonical.reports)).toHaveLength(1);
+		expect(Object.values(transaction.canonical.reports)[0]).toMatchObject({
+			operation_id: "report:recover-report",
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			status: "completed",
+			summary: "recoverable completion",
+		});
+		expect(transaction.canonical.turns[String(sent.turn_id)]).toMatchObject({
+			status: "completed",
+			terminal_fence: { status: "completed" },
+		});
+		const journal = (
+			await fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl"),
+				"utf8",
+			)
+		)
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(journal.filter(event => event.kind === "report.written")).toHaveLength(1);
+		expect(journal.filter(event => event.kind === "turn.completed" && event.turn_id === sent.turn_id)).toHaveLength(
+			1,
+		);
+		await expect(server.callTool("gjc_coordinator_read_coordination_status")).resolves.toMatchObject({
+			summary: { reports: 1 },
+		});
+	});
+
+	it("returns the canonical safe response exactly after a crash before outer report completion", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let persistedSafeResponse: Record<string, unknown> | null = null;
+		let interrupted = true;
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			afterCanonicalReportSafeResponse: async (sessionId, response) => {
+				if (!interrupted) return;
+				interrupted = false;
+				persistedSafeResponse = response;
+				const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+				const transaction = JSON.parse(await fs.readFile(transactionPath(paths, sessionId), "utf8")) as {
+					requests: { operations: Record<string, Record<string, unknown>> };
+				};
+				const operation = Object.values(transaction.requests.operations).find(
+					candidate => candidate.tool === "gjc_coordinator_report_status",
+				);
+				expect(operation).toMatchObject({ phase: "completed", safe_response: response });
+				throw new Error("simulated_report_safe_response_crash");
+			},
+		});
+		await registerSdkSession(server, root);
+		const request = {
+			session_id: "visible-session",
+			status: "blocked",
+			summary: "safe response barrier",
+			idempotency_key: "safe-response-barrier",
+			allow_mutation: true,
+		};
+		await expect(server.callTool("gjc_coordinator_report_status", request)).resolves.toMatchObject({ ok: false });
+		if (!persistedSafeResponse) throw new Error("canonical safe response was not persisted");
+		const receiptPath = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"idempotency",
+			`${createHash("sha256").update(request.idempotency_key).digest("hex")}.json`,
+		);
+		const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8")) as Record<string, unknown>;
+		const { response: _response, ...crashLeft } = receipt;
+		await fs.writeFile(receiptPath, JSON.stringify({ ...crashLeft, state: "in_progress" }));
+		const recovered = await server.callTool("gjc_coordinator_report_status", request);
+		expect(recovered).toEqual(persistedSafeResponse);
+		expect(JSON.stringify(recovered)).toBe(JSON.stringify(persistedSafeResponse));
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+			canonical: { reports: Record<string, Record<string, unknown>> };
+			requests: { operations: Record<string, Record<string, unknown>> };
+		};
+		const operation = Object.values(transaction.requests.operations).find(
+			candidate => candidate.tool === "gjc_coordinator_report_status",
+		);
+		expect(operation).toMatchObject({ phase: "completed", safe_response: persistedSafeResponse });
+		const reportId = Object.keys(transaction.canonical.reports)[0];
+		if (!reportId) throw new Error("missing canonical report");
+		await expect(
+			fs.readFile(path.join(server.config.stateRoot, "local", "repo", "reports", `${reportId}.json`), "utf8"),
+		).resolves.toContain("safe response barrier");
+	});
+
+	it("repairs every projection before sealing a report recovered after the canonical commit barrier", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let interrupted = true;
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			afterCanonicalReportCommit: async () => {
+				if (interrupted) {
+					interrupted = false;
+					throw new Error("simulated_report_crash");
+				}
+			},
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "canonical report barrier",
+			idempotency_key: "barrier-report-prompt",
+			allow_mutation: true,
+		});
+		const queued = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "queued after report",
+			queue: true,
+			idempotency_key: "barrier-report-queued",
+			allow_mutation: true,
+		});
+		const request = {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			status: "completed",
+			summary: "barrier completion",
+			idempotency_key: "barrier-report",
+			allow_mutation: true,
+		};
+		await expect(server.callTool("gjc_coordinator_report_status", request)).resolves.toMatchObject({ ok: false });
+		const receiptPath = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"idempotency",
+			`${createHash("sha256").update(request.idempotency_key).digest("hex")}.json`,
+		);
+		const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8")) as Record<string, unknown>;
+		const { response: _response, ...crashLeft } = receipt;
+		await fs.writeFile(receiptPath, JSON.stringify({ ...crashLeft, state: "in_progress" }));
+		const recovered = await server.callTool("gjc_coordinator_report_status", request);
+		expect(recovered).toMatchObject({ ok: true, report: { summary: "barrier completion" } });
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+			canonical: {
+				turns: Record<string, Record<string, unknown>>;
+				queue: Record<string, unknown>;
+				reports: Record<string, Record<string, unknown>>;
+			};
+		};
+		const queuedTurnId = String(queued.turn_id);
+		const reportId = Object.keys(transaction.canonical.reports)[0];
+		if (!reportId) throw new Error("missing recovered report");
+		const projectionRoot = path.join(server.config.stateRoot, "local", "repo");
+		expect(transaction.canonical.queue).toMatchObject({ active_turn_id: queuedTurnId });
+		expect(transaction.canonical.turns[String(sent.turn_id)]).toMatchObject({ status: "completed" });
+		const activeProjection = JSON.parse(
+			await fs.readFile(path.join(projectionRoot, "active-turns", "visible-session.json"), "utf8"),
+		) as Record<string, unknown>;
+		expect(activeProjection).toMatchObject({ turn_id: queuedTurnId, status: "active" });
+		const sessionState = JSON.parse(
+			await fs.readFile(path.join(projectionRoot, "session-states", "visible-session.json"), "utf8"),
+		) as Record<string, unknown>;
+		expect(sessionState).toMatchObject({ state: "running", current_turn_id: queuedTurnId });
+		expect(await fs.readFile(path.join(projectionRoot, "reports", `${reportId}.json`), "utf8")).toContain(
+			"barrier completion",
+		);
+		const journal = (await fs.readFile(path.join(projectionRoot, "events", "event-journal.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(journal.filter(event => event.kind === "report.written")).toHaveLength(1);
+		expect(journal.filter(event => event.kind === "turn.completed")).toHaveLength(1);
+	});
+
+	it("replays a committed report without revalidating deleted evidence", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const evidencePath = path.join(root, "evidence.txt");
+		await fs.writeFile(evidencePath, "durable evidence");
+		const request = {
+			session_id: "visible-session",
+			status: "blocked",
+			summary: "evidence replay",
+			evidence_paths: [evidencePath],
+			idempotency_key: "evidence-replay",
+			allow_mutation: true,
+		};
+		const first = await server.callTool("gjc_coordinator_report_status", request);
+		await fs.rm(evidencePath);
+		await expect(server.callTool("gjc_coordinator_report_status", request)).resolves.toEqual(first);
+	});
+
+	it("keeps advertised answer text bounds aligned with runtime Unicode and whitespace rules", () => {
+		const codec: PrivateAskGateCodecV1 = {
+			schema_version: 1,
+			labels: ["Continue"],
+			recommended_index: null,
+			multi: false,
+			allow_empty: true,
+			other_allowed: true,
+			clarification_allowed: true,
+		};
+		const schema = buildCoordinatorAskAnswerSchema(["opt_0"], false, true) as {
+			oneOf: Array<{ properties?: Record<string, Record<string, unknown>> }>;
+		};
+		const customSchema = schema.oneOf[1]!.properties!.custom!;
+		const questionSchema = schema.oneOf[2]!.properties!.question!;
+		expect(customSchema).toMatchObject({
+			minLength: 1,
+			maxLength: 4096,
+			pattern: "\\S",
+			"x-maxUtf8Bytes": 4096,
+		});
+		expect(questionSchema).toMatchObject({
+			minLength: 1,
+			maxLength: 4096,
+			pattern: "\\S",
+			"x-maxUtf8Bytes": 4096,
+		});
+		const values = [
+			" \t\n ",
+			"😀".repeat(1024),
+			"😀".repeat(1025),
+			"a".repeat(4096),
+			"a".repeat(4097),
+			`${" ".repeat(4092)}😀`,
+		];
+		for (const value of values) {
+			const schemaAccepts =
+				Array.from(value).length >= Number(customSchema.minLength) &&
+				Array.from(value).length <= Number(customSchema.maxLength) &&
+				Buffer.byteLength(value) <= Number(customSchema["x-maxUtf8Bytes"]) &&
+				new RegExp(String(customSchema.pattern), "u").test(value);
+			const runtimeAccepts =
+				validateCoordinatorAskAnswer(codec, { selected: [], other: true, custom: value }) !== null;
+			const runtimeClarificationAccepts =
+				validateCoordinatorAskAnswer(codec, { action: "clarify", question: value }) !== null;
+			expect(runtimeAccepts).toBe(schemaAccepts);
+			expect(runtimeClarificationAccepts).toBe(schemaAccepts);
+		}
+	});
+
 	it("replays composite start and report mutations without allocating another turn or report", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -2208,6 +2586,20 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 						: undefined,
 			},
 		);
+		const discovery = await server.handleJsonRpc({ jsonrpc: "2.0", id: "schema", method: "tools/list" });
+		const discoveredTools = (discovery.result as { tools: Array<Record<string, unknown>> }).tools;
+		const answerTool = discoveredTools.find(tool => tool.name === "gjc_coordinator_submit_question_answer");
+		if (!answerTool) throw new Error("missing answer tool");
+		const answerInputSchema = answerTool.inputSchema as Record<string, unknown>;
+		const answerProperties = answerInputSchema.properties as Record<string, unknown>;
+		const discoveredAnswerSchema = answerProperties.answer as {
+			type?: unknown;
+			oneOf?: unknown;
+		};
+		expect(discoveredAnswerSchema.type).toBe("object");
+		expect(Array.isArray(discoveredAnswerSchema.oneOf)).toBe(true);
+		if (!Array.isArray(discoveredAnswerSchema.oneOf)) throw new Error("answer schema oneOf is not an array");
+		expect(discoveredAnswerSchema.oneOf).toHaveLength(3);
 		await registerSdkSession(server, root);
 		const sent = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
@@ -2228,6 +2620,15 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			stage: "ralplan",
 			kind: "approval",
 		});
+		const answerSchema = question.answer_schema as { type?: unknown; oneOf?: unknown };
+		expect(answerSchema.type).toBe("object");
+		expect(Array.isArray(answerSchema.oneOf)).toBe(true);
+		if (!Array.isArray(answerSchema.oneOf)) throw new Error("question answer schema oneOf is not an array");
+		expect(answerSchema.oneOf).toHaveLength(3);
+		expect(answerSchema.oneOf[0]).toMatchObject({ required: ["selected"] });
+		expect(answerSchema.oneOf[1]).toMatchObject({ required: ["selected", "other", "custom"] });
+		expect(answerSchema.oneOf[2]).toMatchObject({ required: ["action", "question"] });
+		expect(JSON.stringify(answerSchema)).toContain('"enum":["opt_0","opt_1"]');
 		expect(JSON.stringify(question)).not.toContain("codec");
 		if (typeof question.answer_binding !== "string") throw new Error("missing answer binding");
 		expect(question.answer_binding).toMatch(/^[A-Za-z0-9_-]{43}$/);
@@ -2392,7 +2793,56 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			reconciliation: { attempted: true, complete: false, revision: "partial-q12" },
 		});
 		expect(JSON.stringify(listed)).not.toContain("answer_binding");
-		expect(queries).toEqual(["Q12"]);
+		const status = await server.callTool("gjc_coordinator_read_coordination_status");
+		expect(status).toMatchObject({
+			ok: true,
+			schema_version: 1,
+			questions: [],
+			summary: {
+				questions_complete: false,
+				questions: null,
+				open_questions: null,
+			},
+		});
+		const statusRecord = status as Record<string, unknown>;
+		const summary = statusRecord.summary as Record<string, unknown>;
+		const summaryDiagnostics = summary.question_diagnostics;
+		expect(Array.isArray(summaryDiagnostics)).toBe(true);
+		if (!Array.isArray(summaryDiagnostics)) throw new Error("status diagnostics are not an array");
+		expect(summaryDiagnostics).toHaveLength(1);
+
+		const questionSnapshots = statusRecord.question_snapshots;
+		expect(Array.isArray(questionSnapshots)).toBe(true);
+		if (!Array.isArray(questionSnapshots)) throw new Error("status question snapshots are not an array");
+		expect(questionSnapshots).toHaveLength(1);
+		const snapshot = questionSnapshots[0] as Record<string, unknown>;
+		expect(snapshot.session_id).toBe("visible-session");
+		expect(snapshot.questions).toEqual([]);
+
+		const snapshotDiagnostics = snapshot.diagnostics;
+		expect(Array.isArray(snapshotDiagnostics)).toBe(true);
+		if (!Array.isArray(snapshotDiagnostics)) throw new Error("question snapshot diagnostics are not an array");
+		expect(snapshotDiagnostics).toHaveLength(1);
+		expect(snapshotDiagnostics[0]).toMatchObject({
+			schema_version: 1,
+			session_id: "visible-session",
+			turn_id: null,
+			gate_id: null,
+			reason: "pagination_malformed",
+		});
+		expect(typeof (snapshotDiagnostics[0] as Record<string, unknown>).observed_at).toBe("string");
+		expect(summaryDiagnostics).toEqual(snapshotDiagnostics);
+
+		const reconciliation = snapshot.reconciliation as Record<string, unknown>;
+		expect(reconciliation).toMatchObject({
+			attempted: true,
+			complete: false,
+			revision: "partial-q12",
+			reason: "pagination_malformed",
+		});
+		expect(typeof reconciliation.observed_at).toBe("string");
+		expect(JSON.stringify(status)).not.toContain("answer_binding");
+		expect(queries).toEqual(["Q12", "Q12"]);
 	});
 
 	it("delivers every delegation workflow through broker lifecycle and SDK control", async () => {
@@ -3445,11 +3895,21 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		).resolves.toMatchObject({ ok: true });
 		const sessionsDir = path.join(root, ".gjc", "coordinator-state", "local", "repo", "sessions");
 		const idleFile = path.join(sessionsDir, "idle-session.json");
+		const staleAt = new Date(Date.now() - 31 * 60_000).toISOString();
 		const idle = JSON.parse(await fs.readFile(idleFile, "utf8"));
-		await Bun.write(
-			idleFile,
-			JSON.stringify({ ...idle, ephemeral: true, created_at: new Date(Date.now() - 31 * 60_000).toISOString() }),
-		);
+		await Bun.write(idleFile, JSON.stringify({ ...idle, ephemeral: true, created_at: staleAt }));
+		const idlePaths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await withSessionTransaction(idlePaths, "idle-session", async transaction => {
+			const nextRevision = transaction.revision + 1;
+			transaction.canonical.session.ephemeral = true;
+			transaction.canonical.session.created_at = staleAt;
+			transaction.canonical.session.updated_at = staleAt;
+			transaction.projection.applied_turns_revision = nextRevision;
+			transaction.projection.applied_reports_revision = nextRevision;
+			transaction.projection.applied_session_revision = nextRevision;
+			transaction.projection.applied_active_revision = nextRevision;
+			transaction.projection.applied_events_revision = nextRevision;
+		});
 		await fs.rm(path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "idle-session.json"));
 		await Bun.write(
 			path.join(sessionsDir, "registered-session.json"),
@@ -3741,8 +4201,8 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			{
 				stage: "request",
 				error: new SdkClientError("transport_secret", "request public message"),
-				code: "transport_secret",
-				message: "request public message",
+				code: "unavailable",
+				message: "Coordinator service is unavailable.",
 			},
 		];
 		for (const testCase of cases) {
@@ -3781,7 +4241,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 		await expect(nullServer.callTool("gjc_coordinator_list_sessions", {})).resolves.toMatchObject({
 			ok: false,
-			error: { code: "broker_unavailable", message: "SDK broker is unavailable after bootstrap." },
+			error: { code: "broker_unavailable", message: "SDK broker is unavailable." },
 		});
 	});
 
@@ -3809,7 +4269,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			const result = await server.callTool("gjc_coordinator_list_sessions", {});
 			expect(result).toMatchObject({
 				ok: false,
-				error: { code: requestError instanceof SdkClientError ? "request_failed" : "broker_request_unavailable" },
+				error: {
+					code: requestError instanceof SdkClientError ? "unavailable" : "broker_request_unavailable",
+					message: expect.any(String),
+				},
 			});
 			expect(closeCalls).toBe(1);
 		}
@@ -4330,4 +4793,935 @@ it("issue-4351: completed coordinator session reports ready_for_input false and 
 	});
 	const publicState = (status as { session_state?: Record<string, unknown> }).session_state;
 	expect(typeof publicState?.ended_at).toBe("string");
+});
+
+describe("Coordinator MCP retained-delivery ordering", () => {
+	it("advances the discovery cursor across an empty bounded sweep", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [
+			{ sessionId: "alpha-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+			{ sessionId: "beta-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+			{ sessionId: "gamma-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+		]);
+		for (const [sessionId, key] of [
+			["alpha-session", "register-empty-alpha"],
+			["beta-session", "register-empty-beta"],
+			["gamma-session", "register-empty-gamma"],
+		] as const)
+			await server.callTool("gjc_coordinator_register_session", {
+				session_id: sessionId,
+				cwd: root,
+				idempotency_key: key,
+				allow_mutation: true,
+			});
+		await injectPendingDeliveryForTest(server, "gamma-session", "event-gamma-empty", 1);
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const empty = await enumeratePublicDeliveries(paths, "@session:", 1);
+		expect(empty.claims).toHaveLength(0);
+		expect(empty.next_cursor).toBe("@session:beta-session");
+		if (!empty.next_cursor) throw new Error("missing empty-sweep cursor");
+		await advanceDeliveryDiscoveryCursor(paths, empty.next_cursor);
+		expect(await readDeliveryDiscoveryCursor(paths)).toBe(empty.next_cursor);
+	});
+
+	it("rediscovers a new pending event in an earlier session after later-session delivery", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [
+			{ sessionId: "alpha-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+			{ sessionId: "zeta-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+		]);
+		for (const [sessionId, key] of [
+			["alpha-session", "register-alpha-ordering"],
+			["zeta-session", "register-zeta-ordering"],
+		] as const)
+			await expect(
+				server.callTool("gjc_coordinator_register_session", {
+					session_id: sessionId,
+					cwd: root,
+					idempotency_key: key,
+					allow_mutation: true,
+				}),
+			).resolves.toMatchObject({ ok: true });
+		await injectPendingDeliveryForTest(server, "zeta-session", "event-zeta-1", 1);
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const first = await enumeratePublicDeliveries(paths, "", 10);
+		const zetaClaim = first.claims.find(claim => claim.session_id === "zeta-session");
+		expect(zetaClaim).toBeDefined();
+		if (!zetaClaim) throw new Error("missing zeta delivery claim");
+		await acknowledgePublicDelivery(paths, "zeta-session", {
+			public_event_id: zetaClaim.event.public_event_id,
+			claim_fence: zetaClaim.claim_fence,
+			journal_seq: 1,
+		});
+		await injectPendingDeliveryForTest(server, "alpha-session", "event-alpha-2", 2);
+		const second = await enumeratePublicDeliveries(paths, "", 10);
+		expect(second.claims.map(claim => claim.session_id)).toContain("alpha-session");
+	});
+
+	it("orders unpadded transaction revisions numerically so revision 9 precedes 10", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		await injectPendingDeliveryForTest(server, "visible-session", "event-revision-9", 9);
+		await injectPendingDeliveryForTest(server, "visible-session", "event-revision-10", 10);
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const first = await enumeratePublicDeliveries(paths, "", 1);
+		expect(first.claims.map(claim => claim.event.transaction_revision)).toEqual([9]);
+		if (!first.next_cursor) throw new Error("missing continuation cursor");
+		const second = await enumeratePublicDeliveries(paths, first.next_cursor, 1);
+		expect(second.claims.map(claim => claim.event.transaction_revision)).toEqual([10]);
+	});
+
+	it("reconciles newly opened session-scoped questions after a filesystem wake", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let gateAvailable = false;
+		let runtimeTurnId = "unbound";
+		const server = await createSdkControlServer(root, controls, [], query => {
+			if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
+			if (!gateAvailable) return { ok: true, page: { items: [], complete: true, revision: "q12-empty" } };
+			return {
+				ok: true,
+				page: {
+					items: [sharedAskGate("wake-gate", runtimeTurnId)],
+					complete: true,
+					revision: "q12-open",
+				},
+			};
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "wait for gate",
+			idempotency_key: "wake-gate-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String(
+			(sent.turn as Record<string, unknown>).delivery &&
+				((sent.turn as Record<string, unknown>).delivery as Record<string, unknown>).runtime_turn_id,
+		);
+		const sessionStateFile = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"session-states",
+			"visible-session.json",
+		);
+		const sessionState = JSON.parse(await fs.readFile(sessionStateFile, "utf8")) as Record<string, unknown>;
+		await fs.writeFile(
+			sessionStateFile,
+			JSON.stringify({
+				...sessionState,
+				state: "needs_user_input",
+				ready_for_input: false,
+				live: true,
+				source: "agent_session_event",
+				current_turn_id: String(sent.turn_id),
+				activity: {
+					seq: 1,
+					phase: "waiting",
+					active_tool_count: 0,
+					active_tools: [],
+				},
+			}),
+		);
+		const initial = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
+		const cursor = Number(initial.next_after_seq);
+		gateAvailable = true;
+		const pending = server.callTool("gjc_coordinator_watch_events", {
+			session_id: "visible-session",
+			after_seq: cursor,
+			timeout_ms: 500,
+		});
+		await appendCoordinatorEventForTest(path.join(root, ".gjc", "coordinator-state", "local", "repo"), {
+			kind: "session.state_changed",
+			sessionId: "visible-session",
+			summary: "wake",
+		});
+		const result = await pending;
+		expect(result).toMatchObject({
+			ok: true,
+			events: expect.arrayContaining([
+				expect.objectContaining({ kind: "question.opened", question_id: "wake-gate" }),
+			]),
+		});
+	});
+
+	it("does not admit Q12 when the sidecar session provenance is mismatched", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "provenance mismatch",
+			idempotency_key: "provenance-mismatch-prompt",
+			allow_mutation: true,
+		});
+		const stateFile = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"session-states",
+			"visible-session.json",
+		);
+		const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
+		await fs.writeFile(
+			stateFile,
+			JSON.stringify({
+				...state,
+				state: "needs_user_input",
+				current_turn_id: sent.turn_id,
+				source: "agent_session_event",
+				live: true,
+				session_id: "wrong-session",
+			}),
+		);
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(listed).toMatchObject({ reconciliation: { complete: false, reason: "terminal_uncertain" } });
+	});
+
+	it("does not admit a gate whose runtime turn differs from the waiting admission token", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], query => {
+			if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
+			return {
+				ok: true,
+				page: {
+					items: [sharedAskGate("wrong-runtime-gate", "runtime-not-owner")],
+					complete: true,
+					revision: "q12-wrong-owner",
+				},
+			};
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "wrong runtime owner",
+			idempotency_key: "wrong-runtime-owner-prompt",
+			allow_mutation: true,
+		});
+		const turn = sent.turn as Record<string, unknown>;
+		const delivery = turn.delivery as Record<string, unknown>;
+		const stateFile = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"session-states",
+			"visible-session.json",
+		);
+		const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
+		await fs.writeFile(
+			stateFile,
+			JSON.stringify({
+				...state,
+				state: "needs_user_input",
+				live: true,
+				source: "agent_session_event",
+				current_turn_id: sent.turn_id,
+				activity: { seq: 1, phase: "waiting", active_tool_count: 0, active_tools: [] },
+			}),
+		);
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(listed).toMatchObject({
+			questions: [],
+			reconciliation: { complete: false, reason: "terminal_uncertain" },
+		});
+		expect(delivery.runtime_turn_id).not.toBe("runtime-not-owner");
+	});
+});
+
+describe("Coordinator MCP deep-audit regressions", () => {
+	it("keeps an unrelated active turn when a queued turn receives a terminal report", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const active = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "active work",
+			idempotency_key: "audit-active-report",
+			allow_mutation: true,
+		});
+		const queued = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "queued work",
+			queue: true,
+			idempotency_key: "audit-queued-report",
+			allow_mutation: true,
+		});
+		const queuedTurnId = String(queued.turn_id);
+		const report = await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			turn_id: queuedTurnId,
+			status: "completed",
+			summary: "queued receipt",
+			idempotency_key: "audit-queued-terminal",
+			allow_mutation: true,
+		});
+		expect(report).toMatchObject({ ok: true, turn: { turn_id: queuedTurnId, status: "completed" } });
+		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: active.turn_id })).resolves.toMatchObject({
+			ok: true,
+			turn: { turn_id: active.turn_id, status: "active" },
+		});
+		await expect(
+			server.callTool("gjc_coordinator_read_coordination_status", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			summary: { active_turns: 1, terminal_turns: 1 },
+		});
+	});
+
+	it("serializes active and queued terminal reports without losing either turn", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const active = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "active race",
+			idempotency_key: "audit-race-active",
+			allow_mutation: true,
+		});
+		const queued = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "queued race",
+			queue: true,
+			idempotency_key: "audit-race-queued",
+			allow_mutation: true,
+		});
+		const [activeReport, queuedReport] = await Promise.all([
+			server.callTool("gjc_coordinator_report_status", {
+				session_id: "visible-session",
+				turn_id: active.turn_id,
+				status: "completed",
+				summary: "active race receipt",
+				idempotency_key: "audit-race-active-report",
+				allow_mutation: true,
+			}),
+			server.callTool("gjc_coordinator_report_status", {
+				session_id: "visible-session",
+				turn_id: queued.turn_id,
+				status: "completed",
+				summary: "queued race receipt",
+				idempotency_key: "audit-race-queued-report",
+				allow_mutation: true,
+			}),
+		]);
+		expect(activeReport).toMatchObject({ ok: true });
+		expect(queuedReport).toMatchObject({ ok: true });
+		await expect(
+			server.callTool("gjc_coordinator_read_coordination_status", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			summary: { active_turns: 0, terminal_turns: 2 },
+		});
+	});
+
+	it("promotes exactly the queued successor when the active turn reports terminal", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const active = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "active work",
+			idempotency_key: "audit-promotion-active",
+			allow_mutation: true,
+		});
+		const queued = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "queued successor",
+			queue: true,
+			idempotency_key: "audit-promotion-queued",
+			allow_mutation: true,
+		});
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			turn_id: active.turn_id,
+			status: "completed",
+			summary: "active receipt",
+			idempotency_key: "audit-promotion-report",
+			allow_mutation: true,
+		});
+		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: queued.turn_id })).resolves.toMatchObject({
+			ok: true,
+			turn: { turn_id: queued.turn_id, status: "active" },
+		});
+	});
+
+	it("returns a real event watermark for zero-time and deadline watches", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const discovery = await server.handleJsonRpc({ jsonrpc: "2.0", id: "watch-schema", method: "tools/list" });
+		const watchTool = (discovery.result as { tools: Array<Record<string, unknown>> }).tools.find(
+			tool => tool.name === "gjc_coordinator_watch_events",
+		);
+		expect(watchTool).toMatchObject({
+			inputSchema: { properties: { after_seq: { type: "integer", minimum: 0 } } },
+		});
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await appendCoordinatorEventForTest(namespace, {
+			stableId: "audit-watermark-event",
+			kind: "session.registered",
+			sessionId: "visible-session",
+			summary: "watermark",
+		});
+		await expect(
+			server.callTool("gjc_coordinator_watch_events", { after_seq: 1.5, timeout_ms: 0 }),
+		).resolves.toMatchObject({
+			ok: false,
+			error: { code: "invalid_input" },
+		});
+		const immediate = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
+		if (
+			immediate.ok !== true ||
+			!Number.isSafeInteger(immediate.latest_seq) ||
+			!Number.isSafeInteger(immediate.next_after_seq)
+		)
+			throw new Error(`watch_events returned an invalid immediate snapshot: ${JSON.stringify(immediate)}`);
+		expect(immediate.next_after_seq as number).toBeLessThanOrEqual(immediate.latest_seq as number);
+		const deadline = await server.callTool("gjc_coordinator_watch_events", {
+			after_seq: immediate.next_after_seq,
+			timeout_ms: 1,
+		});
+		if (
+			deadline.ok !== true ||
+			!Number.isSafeInteger(deadline.latest_seq) ||
+			!Number.isSafeInteger(deadline.next_after_seq)
+		)
+			throw new Error(`watch_events returned an invalid deadline snapshot: ${JSON.stringify(deadline)}`);
+		expect(deadline.next_after_seq as number).toBeLessThanOrEqual(deadline.latest_seq as number);
+	});
+
+	it("scopes coordination status and preserves evidence fields", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [
+			{ sessionId: "visible-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+			{ sessionId: "other-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+		]);
+		await registerSdkSession(server, root);
+		await server.callTool("gjc_coordinator_register_session", {
+			session_id: "other-session",
+			cwd: root,
+			idempotency_key: "audit-status-register-other",
+			allow_mutation: true,
+		});
+		const evidencePath = path.join(root, "audit-evidence.txt");
+		await fs.writeFile(evidencePath, "evidence");
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			status: "blocked",
+			summary: "visible report",
+			evidence_paths: [evidencePath],
+			idempotency_key: "audit-status-visible",
+			allow_mutation: true,
+		});
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "other-session",
+			status: "blocked",
+			summary: "other report",
+			idempotency_key: "audit-status-other",
+			allow_mutation: true,
+		});
+		const global = await server.callTool("gjc_coordinator_read_coordination_status");
+		expect(global).toMatchObject({ ok: true, summary: { sessions: 2, reports: 2 } });
+		const scoped = await server.callTool("gjc_coordinator_read_coordination_status", {
+			session_id: "visible-session",
+		});
+		expect(scoped).toMatchObject({
+			ok: true,
+			scope: { session_id: "visible-session" },
+			summary: { sessions: 1, reports: 1 },
+		});
+		expect(JSON.stringify(scoped)).toContain("audit-evidence.txt");
+	});
+
+	it("maps hostile SDK failures to fixed public errors", async () => {
+		const root = await tempRoot();
+		const hostile = "Bearer secret-token https://controller.example.test/private /Users/secret/project";
+		const server = createBrokerTestServer(root, {
+			ensureBroker: async () => testBrokerDiscovery(),
+			readSdkBrokerDiscovery: async () => testBrokerDiscovery(),
+			connectBroker: async () =>
+				({
+					global: async () => {
+						throw new SdkClientError("hostile_sdk_code", hostile);
+					},
+					close: async () => {},
+				}) as unknown as SdkClient,
+		});
+		const response = await server.callTool("gjc_coordinator_list_sessions");
+		expect(response).toEqual({
+			ok: false,
+			error: { code: "unavailable", message: "Coordinator service is unavailable." },
+		});
+		expect(JSON.stringify(response)).not.toContain("secret-token");
+		expect(JSON.stringify(response)).not.toContain("https://controller.example.test");
+		expect(JSON.stringify(response)).not.toContain("/Users/secret/project");
+	});
+
+	it("recovers an accepted prompt receipt without redispatching the remote command", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const args = {
+			session_id: "visible-session",
+			prompt: "receipt recovery",
+			queue: true,
+			idempotency_key: "receipt-recovery",
+			allow_mutation: true,
+		};
+		const first = await server.callTool("gjc_coordinator_send_prompt", args);
+		const receiptFile = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"idempotency",
+			`${createHash("sha256").update(args.idempotency_key).digest("hex")}.json`,
+		);
+		const receipt = JSON.parse(await fs.readFile(receiptFile, "utf8")) as Record<string, unknown>;
+		await fs.writeFile(receiptFile, JSON.stringify({ ...receipt, state: "in_progress" }));
+		const recovered = await server.callTool("gjc_coordinator_send_prompt", args);
+		expect(recovered).toEqual(first);
+		const remoteDispatches = lifecycleControls(controls).filter(
+			control =>
+				control.operation === "turn.prompt" ||
+				control.operation === "turn.follow_up" ||
+				control.operation === "turn.abort_and_prompt",
+		);
+		expect(remoteDispatches).toHaveLength(1);
+		expect(remoteDispatches[0]).toMatchObject({
+			operation: "turn.follow_up",
+			idempotencyKey: args.idempotency_key,
+		});
+	});
+
+	it("recovers retained public deliveries without duplicating journal events", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		await injectPendingDeliveryForTest(server, "visible-session", "audit-retained-event", 1);
+		const first = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
+		const firstEvents = first.events as Array<{ id: string }>;
+		expect(firstEvents.filter(event => event.id === "audit-retained-event")).toHaveLength(1);
+		const cursor = Number(first.next_after_seq);
+		const second = await server.callTool("gjc_coordinator_watch_events", { after_seq: cursor, timeout_ms: 0 });
+		const secondEvents = second.events as Array<{ id: string }>;
+		expect(secondEvents.some(event => event.id === "audit-retained-event")).toBe(false);
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const registry = JSON.parse(await fs.readFile(paths.registry, "utf8")) as Record<string, unknown>;
+		expect((registry.retained_sessions as Record<string, unknown> | undefined)?.["visible-session"]).toBeUndefined();
+	});
+
+	it("reserves the non-queued prompt slot across coordinator processes", async () => {
+		const root = await tempRoot();
+		const controlsA: SdkControl[] = [];
+		const controlsB: SdkControl[] = [];
+		const brokerSessions = [
+			{
+				sessionId: "visible-session",
+				locator: { repo: root },
+				live: true,
+				endpointGeneration: 1,
+				pid: 101,
+				endpointMtimeMs: 1,
+			},
+		];
+		const serverA = await createSdkControlServer(root, controlsA, [], undefined, brokerSessions);
+		const serverB = await createSdkControlServer(root, controlsB, [], undefined, brokerSessions);
+		await registerSdkSession(serverA, root);
+		const [first, second] = await Promise.all([
+			serverA.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "cross-process A",
+				idempotency_key: "cross-process-a",
+				allow_mutation: true,
+			}),
+			serverB.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "cross-process B",
+				idempotency_key: "cross-process-b",
+				allow_mutation: true,
+			}),
+		]);
+		const responses = [first, second];
+		expect(responses.filter(response => response.ok === true)).toHaveLength(1);
+		expect(
+			responses.filter(
+				response => (response.error as Record<string, unknown> | undefined)?.code === "active_turn_exists",
+			),
+		).toHaveLength(1);
+		const dispatches = [...controlsA, ...controlsB].filter(control => control.operation === "turn.prompt");
+		expect(dispatches).toHaveLength(1);
+	});
+
+	it("preserves a terminal fence when a reserved prompt is acknowledged after sidecar reconciliation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let server!: ReturnType<typeof createCoordinatorMcpServer>;
+		let reconciledTurnId: string | null = null;
+		server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: async control => {
+				if (control.operation !== "turn.prompt")
+					return { accepted: true, command_id: "sdk-command-unrelated", turn_id: "sdk-turn-unrelated" };
+				const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+				const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+					canonical: {
+						turns: Record<string, Record<string, unknown>>;
+					};
+				};
+				const reservation = Object.values(transaction.canonical.turns).find(turn => turn.status === "delivering");
+				if (!reservation || typeof reservation.turn_id !== "string")
+					throw new Error("missing delivering reservation");
+				reconciledTurnId = reservation.turn_id;
+				const stateFile = path.join(
+					root,
+					".gjc",
+					"coordinator-state",
+					"local",
+					"repo",
+					"session-states",
+					"visible-session.json",
+				);
+				const priorState = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
+				await fs.writeFile(
+					stateFile,
+					JSON.stringify({
+						...priorState,
+						state: "completed",
+						ready_for_input: false,
+						current_turn_id: reservation.turn_id,
+						last_turn_id: reservation.turn_id,
+						source: "agent_session_event",
+						live: true,
+						updated_at: "2026-08-19T00:00:00.000Z",
+						final_response: {
+							text: "terminal sidecar result",
+							format: "markdown",
+							source: "runtime",
+							artifact_path: null,
+							truncated: false,
+						},
+					}),
+				);
+				await expect(
+					server.callTool("gjc_coordinator_read_turn", {
+						session_id: "visible-session",
+						turn_id: reservation.turn_id,
+					}),
+				).resolves.toMatchObject({
+					ok: true,
+					turn: { turn_id: reservation.turn_id, status: "completed" },
+				});
+				return { accepted: true, command_id: "barrier-command", turn_id: "barrier-runtime-turn" };
+			},
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "terminal barrier prompt",
+			idempotency_key: "terminal-barrier-prompt",
+			allow_mutation: true,
+		});
+		expect(typeof reconciledTurnId).toBe("string");
+		expect(sent).toMatchObject({
+			ok: true,
+			turn_id: reconciledTurnId,
+			active_turn_id: null,
+			status: "completed",
+			turn: { turn_id: reconciledTurnId, status: "completed" },
+			result: { accepted: true, command_id: "barrier-command", turn_id: "barrier-runtime-turn" },
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+			canonical: {
+				turns: Record<string, Record<string, unknown>>;
+				queue: Record<string, unknown>;
+			};
+			requests: { prompts: Record<string, Record<string, unknown>> };
+		};
+		const turn = transaction.canonical.turns[reconciledTurnId!];
+		expect(turn).toMatchObject({
+			status: "completed",
+			terminal_fence: { status: "completed" },
+			delivery: {
+				runtime_command_id: "barrier-command",
+				runtime_turn_id: "barrier-runtime-turn",
+				state: "acknowledged",
+			},
+		});
+		expect(transaction.canonical.queue).toMatchObject({ active_turn_id: null, ordered_turn_ids: [] });
+		const activeProjection = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"active-turns",
+			"visible-session.json",
+		);
+		await expect(fs.access(activeProjection)).rejects.toThrow();
+		const turnProjection = JSON.parse(
+			await fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${reconciledTurnId}.json`),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(turnProjection).toMatchObject({ turn_id: reconciledTurnId, status: "completed" });
+		const journal = path.join(root, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl");
+		const lifecycleEvents = (await fs.readFile(journal, "utf8"))
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>)
+			.filter(event => event.turn_id === reconciledTurnId);
+		expect(lifecycleEvents.some(event => event.kind === "turn.active")).toBe(false);
+		expect(lifecycleEvents.filter(event => event.kind === "turn.completed")).toHaveLength(1);
+		expect(lifecycleEvents.filter(event => event.kind === "turn.acknowledged")).toHaveLength(1);
+		const promptRequest = Object.values(transaction.requests.prompts)[0];
+		expect(promptRequest).toMatchObject({
+			phase: "completed",
+			runtime_receipt: { accepted: true, command_id: "barrier-command", turn_id: "barrier-runtime-turn" },
+		});
+		expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+	});
+
+	it("repairs projections when terminal reconciliation wins after accepted finalization", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let server!: ReturnType<typeof createCoordinatorMcpServer>;
+		let finalizedTurnId: string | null = null;
+		let barrierCalls = 0;
+		server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			afterCanonicalTurnCommit: async sessionId => {
+				barrierCalls += 1;
+				const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+				const transaction = JSON.parse(await fs.readFile(transactionPath(paths, sessionId), "utf8")) as {
+					canonical: { turns: Record<string, Record<string, unknown>> };
+				};
+				const finalized = Object.values(transaction.canonical.turns).find(
+					turn => turn.status === "active" && turn.terminal_fence === null,
+				);
+				expect(finalized).toBeDefined();
+				finalizedTurnId = String(finalized!.turn_id);
+				const stateFile = path.join(
+					root,
+					".gjc",
+					"coordinator-state",
+					"local",
+					"repo",
+					"session-states",
+					`${sessionId}.json`,
+				);
+				const priorState = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
+				await fs.writeFile(
+					stateFile,
+					JSON.stringify({
+						...priorState,
+						state: "completed",
+						ready_for_input: false,
+						current_turn_id: finalizedTurnId,
+						last_turn_id: finalizedTurnId,
+						source: "agent_session_event",
+						live: true,
+						updated_at: "2026-08-19T00:00:00.000Z",
+						final_response: {
+							text: "terminal after finalization",
+							format: "markdown",
+							source: "runtime",
+							artifact_path: null,
+							truncated: false,
+						},
+					}),
+				);
+				await expect(
+					server.callTool("gjc_coordinator_read_turn", {
+						session_id: sessionId,
+						turn_id: finalizedTurnId,
+					}),
+				).resolves.toMatchObject({
+					ok: true,
+					turn: { turn_id: finalizedTurnId, status: "completed" },
+				});
+			},
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "terminal after finalization",
+			idempotency_key: "terminal-after-finalization",
+			allow_mutation: true,
+		});
+		expect(barrierCalls).toBe(1);
+		expect(finalizedTurnId).not.toBeNull();
+		expect(sent).toMatchObject({
+			ok: true,
+			turn_id: finalizedTurnId,
+			active_turn_id: null,
+			status: "completed",
+			turn: { turn_id: finalizedTurnId, status: "completed" },
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+			canonical: {
+				turns: Record<string, Record<string, unknown>>;
+				queue: Record<string, unknown>;
+			};
+		};
+		const turn = transaction.canonical.turns[finalizedTurnId!];
+		expect(turn).toMatchObject({ status: "completed", terminal_fence: { status: "completed" } });
+		expect(transaction.canonical.queue).toMatchObject({ active_turn_id: null, ordered_turn_ids: [] });
+		const activeProjection = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"active-turns",
+			"visible-session.json",
+		);
+		await expect(fs.access(activeProjection)).rejects.toThrow();
+		const turnProjection = JSON.parse(
+			await fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${finalizedTurnId}.json`),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(turnProjection).toMatchObject({ turn_id: finalizedTurnId, status: "completed" });
+		const sessionState = JSON.parse(
+			await fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json"),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(sessionState).toMatchObject({ state: "completed", current_turn_id: null });
+	});
+
+	it("atomically rejects close admission while a canonical turn is active", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "close admission",
+			idempotency_key: "close-admission-prompt",
+			allow_mutation: true,
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const deletionId = "delete:visible-session:test-incarnation";
+		const entry = {
+			deletion_id: deletionId,
+			session_id: "visible-session",
+			endpoint_incarnation: "test-incarnation",
+			operation_id: deletionId,
+			key_digest: createHash("sha256").update(deletionId).digest("hex"),
+			request_digest: createHash("sha256").update(deletionId).digest("hex"),
+			close_key: deletionId,
+			phase: "intent" as const,
+			cleanup: { wal: false, turns: false, reports: false, session: false, events: false },
+			authority_digest: createHash("sha256").update(deletionId).digest("hex"),
+			created_at: new Date().toISOString(),
+			updated_at: new Date().toISOString(),
+		};
+		await expect(admitSessionClose(paths, entry)).rejects.toThrow("active_turn_exists");
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			status: "completed",
+			summary: "close admission can proceed",
+			idempotency_key: "close-admission-terminal",
+			allow_mutation: true,
+		});
+		await expect(admitSessionClose(paths, entry)).resolves.toMatchObject({ session_id: "visible-session" });
+	});
+
+	it("dedupes repeated acknowledgement observations by logical turn edge", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "ack edge",
+			idempotency_key: "ack-edge-prompt",
+			allow_mutation: true,
+		});
+		await server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id });
+		await server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id });
+		const journal = path.join(root, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl");
+		const acknowledged = (await fs.readFile(journal, "utf8"))
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>)
+			.filter(event => event.kind === "turn.acknowledged" && event.turn_id === sent.turn_id);
+		expect(acknowledged).toHaveLength(1);
+	});
+
+	it("accepts a filtered limited-page watch cursor below the journal watermark", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await appendCoordinatorEventForTest(namespace, {
+			stableId: "audit-filtered-match",
+			kind: "delegation.started",
+			sessionId: "visible-session",
+			summary: "filtered match",
+		});
+		await appendCoordinatorEventForTest(namespace, {
+			stableId: "audit-filtered-tail",
+			kind: "session.state_changed",
+			sessionId: "visible-session",
+			summary: "nonmatching tail",
+		});
+		const first = await server.callTool("gjc_coordinator_watch_events", {
+			after_seq: 0,
+			event_types: ["delegation.started"],
+			limit: 1,
+			timeout_ms: 0,
+		});
+		expect(first).toMatchObject({ ok: true, events: [expect.objectContaining({ id: "audit-filtered-match" })] });
+		expect(Number(first.next_after_seq)).toBeLessThan(Number(first.latest_seq));
+		const resumed = await server.callTool("gjc_coordinator_watch_events", {
+			after_seq: first.next_after_seq,
+			event_types: ["delegation.started"],
+			limit: 1,
+			timeout_ms: 0,
+		});
+		expect(resumed).toMatchObject({ ok: true, events: [] });
+	});
+
+	it("rejects colon-containing session ids before durable creation state", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const response = await server.callTool("gjc_coordinator_register_session", {
+			session_id: "colon:session",
+			cwd: root,
+			idempotency_key: "colon-session",
+			allow_mutation: true,
+		});
+		expect(response).toMatchObject({ ok: false, error: { code: "invalid_session_id" } });
+	});
 });

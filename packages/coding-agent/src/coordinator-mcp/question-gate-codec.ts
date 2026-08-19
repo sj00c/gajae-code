@@ -43,6 +43,8 @@ export interface CoordinatorQuestionPublicV1 extends Record<string, unknown> {
 	options: CoordinatorQuestionOptionPublicV1[];
 	other_allowed: boolean;
 	clarification_allowed: boolean;
+	/** Exact versioned schema for the public answer union. */
+	answer_schema: JsonSchema;
 	created_at: string;
 	updated_at: string;
 	answered_at: string | null;
@@ -125,7 +127,7 @@ const MAX_TEXT = 4096;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
 	typeof value === "object" && value !== null && !Array.isArray(value);
 const boundedText = (value: unknown, max = 256): value is string =>
-	typeof value === "string" && value.length > 0 && Buffer.byteLength(value) <= max;
+	typeof value === "string" && /\S/u.test(value) && Buffer.byteLength(value) <= max;
 function sameKeys(value: Record<string, unknown>, permitted: readonly string[]): boolean {
 	return Object.keys(value).every(key => permitted.includes(key));
 }
@@ -144,6 +146,76 @@ function validStageState(value: unknown, labels: string[]): value is Record<stri
 }
 function askSchema(labels: string[], multi: boolean, allowEmpty: boolean): JsonSchema {
 	return buildAskGateAnswerSchema({ multi, allowEmpty }, labels);
+}
+
+/**
+ * Build the public answer schema. Runtime gate schemas use option labels because
+ * that is the wire format consumed by the SDK; public coordinator rows expose
+ * stable opt_N identifiers instead, so controllers can validate without seeing
+ * private gate labels.
+ */
+export function buildCoordinatorAskAnswerSchema(
+	optionIds: readonly string[] | undefined = undefined,
+	multi = true,
+	allowEmpty = true,
+): JsonSchema {
+	const selectedItems: JsonSchema =
+		optionIds !== undefined
+			? { type: "string", enum: [...optionIds] }
+			: { type: "string", pattern: "^opt_(?:[0-9]|[12][0-9]|3[01])$" };
+	const selectedBase: JsonSchema = { type: "array", items: selectedItems, uniqueItems: true };
+	const selectedOnly: JsonSchema = {
+		...selectedBase,
+		minItems: allowEmpty ? 0 : 1,
+		...(multi ? {} : { maxItems: 1 }),
+	};
+	const selectedWithOther: JsonSchema = { ...selectedBase, maxItems: 0 };
+	const boundedAnswerText = (description: string): JsonSchema =>
+		({
+			type: "string",
+			minLength: 1,
+			maxLength: MAX_TEXT,
+			pattern: "\\S",
+			description,
+			"x-maxUtf8Bytes": MAX_TEXT,
+		}) as JsonSchema;
+	return {
+		title: "CoordinatorQuestionAnswerV1",
+		type: "object",
+		additionalProperties: false,
+		oneOf: [
+			{
+				type: "object",
+				properties: { selected: selectedOnly, other: { const: false }, action: { const: "answer" } },
+				required: ["selected"],
+				additionalProperties: false,
+			},
+			{
+				type: "object",
+				properties: {
+					selected: selectedWithOther,
+					other: { const: true },
+					custom: boundedAnswerText(
+						"At least one non-whitespace character; maxLength counts Unicode code points and x-maxUtf8Bytes counts UTF-8 bytes.",
+					),
+					action: { const: "answer" },
+				},
+				required: ["selected", "other", "custom"],
+				additionalProperties: false,
+			},
+			{
+				type: "object",
+				properties: {
+					action: { const: "clarify" },
+					question: boundedAnswerText(
+						"At least one non-whitespace character; maxLength counts Unicode code points and x-maxUtf8Bytes counts UTF-8 bytes.",
+					),
+				},
+				required: ["action", "question"],
+				additionalProperties: false,
+			},
+		],
+	};
 }
 
 const ASK_GATE_STAGE_KINDS = new Set([
@@ -226,6 +298,11 @@ export function projectAskGateQuestion(input: {
 		})),
 		other_allowed: true,
 		clarification_allowed: true,
+		answer_schema: buildCoordinatorAskAnswerSchema(
+			input.codec.labels.map((_label, index) => `opt_${index}`),
+			input.codec.multi,
+			input.codec.allow_empty,
+		),
 		created_at: input.created_at,
 		updated_at: input.updated_at,
 		answered_at: input.answered_at,

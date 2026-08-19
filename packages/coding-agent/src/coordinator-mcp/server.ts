@@ -82,6 +82,7 @@ import {
 } from "./policy";
 import {
 	answerBindingMatches,
+	buildCoordinatorAskAnswerSchema,
 	type CoordinatorQuestionDiagnosticPublicV1,
 	type CoordinatorQuestionPublicV1,
 	createAnswerBinding,
@@ -93,20 +94,33 @@ import {
 	validateCoordinatorAskAnswer,
 } from "./question-gate-codec";
 import {
+	acknowledgePublicDelivery,
+	admitSessionClose,
 	advanceCreationReceipt,
 	advanceDeletion,
+	advanceDeliveryDiscoveryCursor,
+	advanceSchedulerCursor,
 	bindCreationRequest,
 	type CanonicalCreateIntentV1,
 	type CanonicalReportSnapshotV1,
 	type CanonicalSessionSnapshotV1,
+	COORDINATOR_SESSION_ID_PATTERN,
 	type CoordinatorSessionTransactionV1,
 	claimCreationRequest,
 	commitCreationWal,
 	coordinatorStatePaths,
 	createSessionTransaction,
 	deterministicOutboxId,
+	ensureSchedulerRoster,
+	enumeratePublicDeliveries,
 	initializeCoordinatorNamespace,
-	recordDeletionIntent,
+	listCanonicalActiveSessions,
+	type OperationRequestV1,
+	type RuntimeProvenanceTokenV1,
+	readDeliveryDiscoveryCursor,
+	readSchedulerRoster,
+	readSessionTransaction,
+	removeSessionTransaction,
 	repairProjections,
 	withAdmittedSessionTransaction,
 	withNamespaceRegistry,
@@ -208,6 +222,12 @@ interface CoordinatorServices {
 	canonicalizePath?: (value: string) => Promise<string>;
 	codexTransportFactory?: CodexTransportFactory;
 	eventWebhookDelivery?: WebhookDelivery;
+	/** Test barrier invoked after accepted canonical finalization and before projection. */
+	afterCanonicalTurnCommit?: (sessionId: string) => void | Promise<void>;
+	/** Test barrier invoked after a canonical report commit and before projection repair. */
+	afterCanonicalReportCommit?: (sessionId: string) => void | Promise<void>;
+	/** Test barrier invoked after a canonical report safe response is durable and before outer idempotency completion. */
+	afterCanonicalReportSafeResponse?: (sessionId: string, response: Record<string, unknown>) => void | Promise<void>;
 }
 
 interface CoordinatorMcpServerOptions {
@@ -385,6 +405,8 @@ const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
  * so transport reconnect time sits outside it.
  */
 const Q12_SNAPSHOT_BUDGET_MS = 5_000;
+const MAX_RUNTIME_SESSIONS_PER_WATCH_PASS = 4;
+const MAX_Q12_ATTEMPTS_PER_WATCH_PASS = 2;
 const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
 const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
@@ -575,7 +597,7 @@ function toolSchema(name: CoordinatorToolName): {
 					turn_id: { type: "string" },
 					question_id: { type: "string" },
 					answer_binding: { type: "string" },
-					answer: {},
+					answer: buildCoordinatorAskAnswerSchema(),
 					idempotency_key: idempotencyKey,
 					allow_mutation: allowMutation,
 				},
@@ -649,7 +671,15 @@ function toolSchema(name: CoordinatorToolName): {
 		return { name, description: "List known safe artifact roots for coordinator coordination.", inputSchema: common };
 	}
 	if (name === "gjc_coordinator_read_coordination_status") {
-		return { name, description: "Read coordinator coordination reports.", inputSchema: common };
+		return {
+			name,
+			description:
+				"Read coordinator coordination status. Omit session_id for an all-session namespace snapshot, or provide it to scope sessions, turns, questions, reports, and event summaries.",
+			inputSchema: {
+				type: "object",
+				properties: { session_id: sessionId },
+			},
+		};
 	}
 	if (name === "gjc_coordinator_watch_events") {
 		return {
@@ -658,7 +688,7 @@ function toolSchema(name: CoordinatorToolName): {
 			inputSchema: {
 				type: "object",
 				properties: {
-					after_seq: { type: "number" },
+					after_seq: { type: "integer", minimum: 0 },
 					session_id: sessionId,
 					event_types: { type: "array", items: { type: "string" } },
 					timeout_ms: {
@@ -929,6 +959,62 @@ async function writeJsonFile(file: string, value: unknown): Promise<void> {
 
 const COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP = 64 * 1024;
 const COORDINATOR_IDEMPOTENCY_STRING_BYTE_CAP = 8 * 1024;
+const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
+	invalid_input: "Coordinator request input is invalid.",
+	invalid_request: "Coordinator request is invalid.",
+	invalid_session_id: "Coordinator session id is invalid.",
+	unknown_operation: "Coordinator operation is unsupported.",
+	not_found: "Coordinator resource was not found.",
+	resource_gone: "Coordinator resource is no longer available.",
+	unavailable: "Coordinator service is unavailable.",
+	timeout: "Coordinator request timed out.",
+	connection_closed: "Coordinator connection closed before completion.",
+	uncertain_after_send: "Coordinator request outcome is uncertain.",
+	endpoint_credential_forbidden: "Coordinator endpoint credentials are not public.",
+	endpoint_stale: "Coordinator session endpoint is stale.",
+	ambiguous: "Coordinator request outcome is ambiguous.",
+	terminal_uncertain: "Coordinator state is uncertain.",
+	idempotency_conflict: "Idempotency key conflicts with a different request.",
+	idempotency_in_progress: "A previous coordinator mutation is still in progress.",
+	protocol_error: "Coordinator protocol response is invalid.",
+	broker_unavailable: "SDK broker is unavailable.",
+	broker_bootstrap_failed: "SDK broker bootstrap failed.",
+	broker_cleanup_unverified: "SDK broker cleanup could not be verified.",
+	broker_discovery_unsupported: "SDK broker discovery state is unsupported.",
+	broker_discovery_access_denied: "SDK broker discovery cannot be accessed.",
+	broker_discovery_unavailable: "SDK broker discovery is unavailable.",
+	broker_request_unavailable: "SDK broker request is unavailable.",
+	broker_transport_unavailable: "SDK broker transport is unavailable.",
+	session_closing: "Coordinator session is closing.",
+	session_unavailable: "Coordinator session is unavailable.",
+	session_not_activatable: "Coordinator session cannot be activated.",
+	session_not_live: "Coordinator session is not live.",
+	not_prepared: "Coordinator session is not prepared for activation.",
+	not_bound: "Coordinator session has no existing-thread binding.",
+	activation_unavailable: "Coordinator activation authority is unavailable.",
+	activation_outcome_unknown: "Coordinator activation outcome is uncertain.",
+	workspace_mismatch: "Coordinator session is bound to another workspace.",
+	active_turn_exists: "Coordinator session already has an active turn.",
+	artifact_unavailable: "Coordinator artifact could not be read.",
+	event_snapshot_unavailable: "Coordinator event snapshot is unavailable.",
+	unsupported_gate: "Coordinator question gate is unsupported.",
+	query_unavailable: "Coordinator question state is unavailable.",
+	pagination_malformed: "Coordinator question pagination is malformed.",
+	row_unrepresentable: "Coordinator question row cannot be represented safely.",
+	missing_runtime_turn: "Coordinator question has no runtime turn owner.",
+	invalid_runtime_turn: "Coordinator question runtime turn is invalid.",
+	invalid_gate_row: "Coordinator question row is invalid.",
+	wrong_session: "Coordinator question belongs to another session.",
+	ownership_unavailable: "Coordinator question ownership is unavailable.",
+	ownership_conflict: "Coordinator question ownership conflicts.",
+	gate_provenance_changed: "Coordinator question provenance changed.",
+	turn_terminal: "Coordinator turn is terminal.",
+	endpoint_changed: "Coordinator session endpoint changed.",
+	terminal_race: "Coordinator turn changed terminal state concurrently.",
+	reported_failure: "Coordinator reported a turn failure.",
+	validation_rejected: "Coordinator answer failed workflow validation.",
+	ownership_mismatch: "Coordinator ownership does not match the request.",
+};
 
 interface CoordinatorToolIdempotencyRecord {
 	schema_version: 1;
@@ -1006,9 +1092,18 @@ function boundedPublicValue(value: unknown, budget: { remaining: number }, depth
 	if (typeof value !== "object") return null;
 	const output: Record<string, unknown> = {};
 	for (const key of Object.keys(value as Record<string, unknown>).slice(0, 128)) {
-		output[key] = sensitivePublicField(key)
-			? "[redacted]"
-			: boundedPublicValue((value as Record<string, unknown>)[key], budget, depth + 1);
+		const field = (value as Record<string, unknown>)[key];
+		if (key === "error") {
+			const rawCode =
+				field && typeof field === "object" && !Array.isArray(field)
+					? (field as Record<string, unknown>).code
+					: undefined;
+			const code =
+				typeof rawCode === "string" && Object.hasOwn(PUBLIC_ERROR_MESSAGES, rawCode) ? rawCode : "unavailable";
+			output[key] = { code, message: PUBLIC_ERROR_MESSAGES[code] };
+		} else {
+			output[key] = sensitivePublicField(key) ? "[redacted]" : boundedPublicValue(field, budget, depth + 1);
+		}
 	}
 	if (Object.keys(value as Record<string, unknown>).length > 128) output.truncated = true;
 	return output;
@@ -1275,7 +1370,7 @@ function capabilityFreeStatusValue(value: unknown): unknown {
 	if (!value || typeof value !== "object") return value;
 	const result: Record<string, unknown> = {};
 	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-		if (/^(?:answer_binding|cwd|path|payload_ref|evidence_paths|artifact_path|state_root)$/i.test(key)) continue;
+		if (/^(?:answer_binding|cwd|path|payload_ref|state_root)$/i.test(key)) continue;
 		result[key] = capabilityFreeStatusValue(child);
 	}
 	return result;
@@ -1377,8 +1472,33 @@ function eventSequenceFile(namespaceDir: string): string {
 	return path.join(eventsDir(namespaceDir), "latest-seq.json");
 }
 
-function eventJournalLockFile(namespaceDir: string): string {
-	return path.join(eventsDir(namespaceDir), "event-journal.lock");
+function eventJournalIndexFile(namespaceDir: string): string {
+	return path.join(eventsDir(namespaceDir), "event-journal-index.v1.json");
+}
+
+function fixedEventSummary(kind: CoordinatorEventKind): string {
+	if (kind.startsWith("session.")) return "Coordinator session lifecycle changed.";
+	if (kind.startsWith("turn.")) return "Coordinator turn lifecycle changed.";
+	if (kind === "question.opened") return "A coordinator question is awaiting an answer.";
+	if (kind === "question.answered") return "A coordinator question was answered.";
+	if (kind === "report.written") return "A coordination report was recorded.";
+	if (kind.startsWith("delegation.")) return "A coordinator delegation was admitted.";
+	return "Coordinator event recorded.";
+}
+
+function publicCoordinatorEvent(event: CoordinatorEvent): CoordinatorEvent {
+	return {
+		schema_version: 1,
+		seq: event.seq,
+		id: event.id,
+		timestamp: event.timestamp,
+		kind: event.kind,
+		...(event.session_id ? { session_id: event.session_id } : {}),
+		...(event.turn_id ? { turn_id: event.turn_id } : {}),
+		...(event.question_id ? { question_id: event.question_id } : {}),
+		...(event.report_id ? { report_id: event.report_id } : {}),
+		summary: fixedEventSummary(event.kind),
+	};
 }
 
 function boundSummary(value: string): string {
@@ -1389,19 +1509,178 @@ function boundSummary(value: string): string {
 	return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
 }
 
-async function readLatestEventSeq(namespaceDir: string): Promise<number> {
-	let sequence: Record<string, unknown> | null = null;
+type EventJournalSnapshot = { events: CoordinatorEvent[]; watermark: number; offsets: number[] };
+
+function normalizedEventWatermark(snapshot: unknown): number | null {
+	if (!snapshot || typeof snapshot !== "object") return null;
+	const watermark = (snapshot as { watermark?: unknown }).watermark;
+	if (
+		typeof watermark !== "number" ||
+		!Number.isFinite(watermark) ||
+		!Number.isSafeInteger(watermark) ||
+		watermark < 0
+	)
+		return null;
+	return Math.trunc(watermark);
+}
+
+function publicWatchWatermark(
+	snapshot: unknown,
+	afterSeq: number,
+): { latest_seq: number; next_after_seq: number } | null {
+	const latestSeq = normalizedEventWatermark(snapshot);
+	if (latestSeq === null || !Number.isSafeInteger(afterSeq) || afterSeq < 0) return null;
+	const nextAfterSeq = Math.max(afterSeq, latestSeq);
+	return Number.isSafeInteger(nextAfterSeq) && nextAfterSeq >= latestSeq
+		? { latest_seq: latestSeq, next_after_seq: nextAfterSeq }
+		: null;
+}
+
+function publicWatchSuccess(
+	events: CoordinatorEvent[],
+	watermark: unknown,
+	nextAfterSeq: unknown,
+	timedOut: boolean,
+): Record<string, unknown> {
+	if (
+		typeof watermark !== "number" ||
+		!Number.isFinite(watermark) ||
+		!Number.isSafeInteger(watermark) ||
+		watermark < 0 ||
+		typeof nextAfterSeq !== "number" ||
+		!Number.isFinite(nextAfterSeq) ||
+		!Number.isSafeInteger(nextAfterSeq) ||
+		nextAfterSeq < 0 ||
+		nextAfterSeq > watermark
+	)
+		return {
+			ok: false,
+			error: { code: "event_snapshot_unavailable", message: "Coordinator event snapshot is unavailable." },
+		};
+	return {
+		ok: true,
+		events,
+		latest_seq: Number(watermark),
+		next_after_seq: Number(nextAfterSeq),
+		timed_out: Boolean(timedOut),
+		transport: { mcp: "long_poll", push_subscriptions: false },
+	};
+}
+
+type EventJournalIndex = { schema_version: 1; by_id: Record<string, { seq: number; offset: number }> };
+
+async function fsyncDirectoryForJournal(directory: string): Promise<void> {
+	const handle = await fs.open(directory, "r");
 	try {
-		sequence = asRecord(await readJsonFile(eventSequenceFile(namespaceDir)));
-	} catch (error) {
-		logger.warn("Coordinator sequence cache unreadable; recovering from journal", { error: String(error) });
+		await handle.sync();
+	} finally {
+		await handle.close();
 	}
-	const events = await readCoordinatorEvents(namespaceDir);
-	const journalSeq = events.at(-1)?.seq ?? 0;
-	const seq = sequence?.seq;
-	if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0 && seq > journalSeq)
-		throw new Error("state_corrupt");
-	return journalSeq;
+}
+
+async function writeJournalJsonAtomic(file: string, value: unknown): Promise<void> {
+	await ensureDir(path.dirname(file));
+	const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+	const handle = await fs.open(temporary, "wx", 0o600);
+	try {
+		await handle.writeFile(`${JSON.stringify(value)}\n`);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	await fs.rename(temporary, file);
+	await fsyncDirectoryForJournal(path.dirname(file));
+}
+
+function parseJournalLines(raw: string): { events: CoordinatorEvent[]; offsets: number[]; tornTail: boolean } {
+	const events: CoordinatorEvent[] = [];
+	const offsets: number[] = [];
+	let offset = 0;
+	let previousSeq = 0;
+	const lines = raw.split("\n");
+	const tornTail = raw.length > 0 && !raw.endsWith("\n");
+	const completeLines = tornTail ? lines.slice(0, -1) : lines;
+	for (const line of completeLines) {
+		const bytes = Buffer.byteLength(line) + 1;
+		if (!line.trim()) {
+			offset += bytes;
+			continue;
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(line);
+		} catch {
+			throw new Error("event_journal_corrupt");
+		}
+		const event = asRecord(value);
+		if (
+			event?.schema_version !== 1 ||
+			typeof event.seq !== "number" ||
+			!Number.isSafeInteger(event.seq) ||
+			event.seq <= previousSeq ||
+			typeof event.id !== "string" ||
+			event.id.length === 0 ||
+			typeof event.kind !== "string" ||
+			typeof event.timestamp !== "string" ||
+			!Number.isFinite(Date.parse(String(event.timestamp))) ||
+			typeof event.summary !== "string"
+		)
+			throw new Error("event_journal_corrupt");
+		previousSeq = event.seq;
+		events.push(event as unknown as CoordinatorEvent);
+		offsets.push(offset);
+		offset += bytes;
+	}
+	return { events, offsets, tornTail };
+}
+
+async function readJournalSnapshotLocked(namespaceDir: string, repairTail = true): Promise<EventJournalSnapshot> {
+	const file = eventJournalFile(namespaceDir);
+	let raw = "";
+	try {
+		raw = await fs.readFile(file, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { events: [], watermark: 0, offsets: [] };
+		throw error;
+	}
+	const parsed = parseJournalLines(raw);
+	if (parsed.tornTail && repairTail) {
+		const lastNewline = raw.lastIndexOf("\n");
+		const handle = await fs.open(file, "r+");
+		try {
+			await handle.truncate(Math.max(0, Buffer.byteLength(raw.slice(0, lastNewline + 1))));
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+	}
+	const byId: Record<string, { seq: number; offset: number }> = {};
+	for (const [index, event] of parsed.events.entries()) {
+		if (byId[event.id]) throw new Error("event_journal_corrupt");
+		byId[event.id] = { seq: event.seq, offset: parsed.offsets[index] ?? 0 };
+	}
+	const index: EventJournalIndex = { schema_version: 1, by_id: byId };
+	const cachedIndex = asRecord(await readJsonFile(eventJournalIndexFile(namespaceDir)));
+	if (cachedIndex?.schema_version !== 1 || canonicalJson(cachedIndex.by_id) !== canonicalJson(index.by_id))
+		await writeJournalJsonAtomic(eventJournalIndexFile(namespaceDir), index);
+	const watermark = parsed.events.at(-1)?.seq ?? 0;
+	if (!Number.isSafeInteger(watermark) || watermark < 0) throw new Error("event_journal_corrupt");
+	const cachedSeq = asRecord(await readJsonFile(eventSequenceFile(namespaceDir)));
+	if (cachedSeq?.seq !== watermark)
+		await writeJournalJsonAtomic(eventSequenceFile(namespaceDir), {
+			seq: watermark,
+			updated_at: new Date().toISOString(),
+		});
+	return { events: parsed.events, watermark, offsets: parsed.offsets };
+}
+
+async function readJournalSnapshot(namespaceDir: string, signal?: AbortSignal): Promise<EventJournalSnapshot> {
+	await ensureDir(eventsDir(namespaceDir));
+	return await withFileLock(
+		path.join(eventsDir(namespaceDir), "event-journal.lock"),
+		async () => await readJournalSnapshotLocked(namespaceDir),
+		signal ? { signal } : undefined,
+	);
 }
 
 const eventAppendQueues = new Map<string, Promise<unknown>>();
@@ -1721,7 +2000,11 @@ export async function awaitCodexWakePublishesForTest(namespaceDir: string): Prom
 	);
 }
 
-async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEventInput): Promise<CoordinatorEvent> {
+async function appendCoordinatorEvent(
+	namespaceDir: string,
+	input: CoordinatorEventInput & { stableId?: string },
+	options: { signal?: AbortSignal } = {},
+): Promise<CoordinatorEvent> {
 	const previous = eventAppendQueues.get(namespaceDir) ?? Promise.resolve();
 	let release!: () => void;
 	const current = new Promise<void>(resolve => {
@@ -1732,32 +2015,69 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 		() => current,
 	);
 	eventAppendQueues.set(namespaceDir, queued);
-
 	await previous.catch(() => undefined);
+	let event: CoordinatorEvent | null = null;
 	try {
-		await ensureCoordinatorDirectory(eventsDir(namespaceDir));
-		const event = await withFileLock(eventJournalLockFile(namespaceDir), async () => {
-			const latestSeq = await readLatestEventSeq(namespaceDir);
-			if (!Number.isSafeInteger(latestSeq) || latestSeq >= Number.MAX_SAFE_INTEGER) throw new Error("state_corrupt");
-			const seq = latestSeq + 1;
-			const timestamp = new Date().toISOString();
-			const event: CoordinatorEvent = {
-				schema_version: 1,
-				seq,
-				id: `event-${seq.toString().padStart(12, "0")}`,
-				timestamp,
-				kind: input.kind,
-				summary: boundSummary(input.summary),
-				...(input.sessionId ? { session_id: input.sessionId } : {}),
-				...(input.turnId ? { turn_id: input.turnId } : {}),
-				...(input.questionId ? { question_id: input.questionId } : {}),
-				...(input.reportId ? { report_id: input.reportId } : {}),
-				...(input.payloadRef ? { payload_ref: input.payloadRef } : {}),
-				...(input.metadata ? { metadata: input.metadata } : {}),
-			};
-			await appendCoordinatorFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
-			await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
-			return event;
+		await ensureDir(eventsDir(namespaceDir));
+		await withFileLock(
+			path.join(eventsDir(namespaceDir), "event-journal.lock"),
+			async () => {
+				const snapshot = await readJournalSnapshotLocked(namespaceDir);
+				if (input.stableId) {
+					const prior = snapshot.events.find(candidate => candidate.id === input.stableId);
+					if (prior) {
+						event = prior;
+						return;
+					}
+				}
+				const seq = snapshot.watermark + 1;
+				const timestamp = new Date().toISOString();
+				event = {
+					schema_version: 1,
+					seq,
+					id: input.stableId ?? `event-${seq.toString().padStart(12, "0")}`,
+					timestamp,
+					kind: input.kind,
+					summary: boundSummary(input.summary),
+					...(input.sessionId ? { session_id: input.sessionId } : {}),
+					...(input.turnId ? { turn_id: input.turnId } : {}),
+					...(input.questionId ? { question_id: input.questionId } : {}),
+					...(input.reportId ? { report_id: input.reportId } : {}),
+					...(input.payloadRef ? { payload_ref: input.payloadRef } : {}),
+					...(input.metadata ? { metadata: input.metadata } : {}),
+				};
+				const currentSize = await fs
+					.stat(eventJournalFile(namespaceDir))
+					.then(stat => stat.size)
+					.catch(() => 0);
+				const handle = await fs.open(eventJournalFile(namespaceDir), "a", 0o600);
+				try {
+					await handle.writeFile(`${JSON.stringify(event)}\n`);
+					await handle.sync();
+				} finally {
+					await handle.close();
+				}
+				const nextIndex: EventJournalIndex = {
+					schema_version: 1,
+					by_id: {
+						...Object.fromEntries(
+							snapshot.events.map((item, index) => [
+								item.id,
+								{ seq: item.seq, offset: snapshot.offsets[index] ?? 0 },
+							]),
+						),
+						[event.id]: { seq, offset: currentSize },
+					},
+				};
+				await writeJournalJsonAtomic(eventJournalIndexFile(namespaceDir), nextIndex);
+				await writeJournalJsonAtomic(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
+			},
+			options.signal ? { signal: options.signal } : undefined,
+		);
+		if (!event) throw new Error("event_journal_corrupt");
+		const codexWake = await maybeRecordCodexWake(namespaceDir, event).catch(async error => {
+			await appendCodexWakeDiagnostic(namespaceDir, event!, error);
+			return null;
 		});
 		let codexWake: { handoff: CodexHandoffRegistrationV1; event: CodexWakeEventV1 | null } | null;
 		try {
@@ -1776,8 +2096,8 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 			codexWake = null;
 		}
 		if (codexWake) enqueueCodexWakePublish(namespaceDir, codexWake.handoff);
-		if (eventWebhookConfigs.has(namespaceDir)) enqueueEventWebhook(namespaceDir, event);
-		return event;
+		if (eventWebhookConfigs.has(namespaceDir)) enqueueEventWebhook(namespaceDir, event!);
+		return event!;
 	} finally {
 		release();
 		if (eventAppendQueues.get(namespaceDir) === queued) eventAppendQueues.delete(namespaceDir);
@@ -1786,59 +2106,11 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 /** Test-only event injection for coordinator wake-pipeline coverage. */
 export async function appendCoordinatorEventForTest(
 	namespaceDir: string,
-	input: CoordinatorEventInput,
+	input: CoordinatorEventInput & { stableId?: string },
 ): Promise<CoordinatorEvent> {
 	return appendCoordinatorEvent(namespaceDir, input);
 }
 
-function parseCoordinatorEvent(line: string): CoordinatorEvent | null {
-	try {
-		const event = JSON.parse(line) as Partial<CoordinatorEvent>;
-		if (
-			event.schema_version !== 1 ||
-			typeof event.seq !== "number" ||
-			!Number.isSafeInteger(event.seq) ||
-			event.seq < 0 ||
-			typeof event.id !== "string" ||
-			event.id.length === 0 ||
-			typeof event.timestamp !== "string" ||
-			typeof event.summary !== "string" ||
-			typeof event.kind !== "string" ||
-			!COORDINATOR_EVENT_KINDS.has(event.kind) ||
-			event.id !== `event-${event.seq.toString().padStart(12, "0")}`
-		)
-			return null;
-		return event as CoordinatorEvent;
-	} catch {
-		return null;
-	}
-}
-
-async function readCoordinatorEvents(namespaceDir: string): Promise<CoordinatorEvent[]> {
-	try {
-		const content = await fs.readFile(eventJournalFile(namespaceDir), "utf8");
-		const events: CoordinatorEvent[] = [];
-		const seenIds = new Set<string>();
-		const seenSeqs = new Set<number>();
-		for (const rawLine of content.split("\n")) {
-			const line = rawLine.trim();
-			if (!line) continue;
-			const event = parseCoordinatorEvent(line);
-			if (!event) throw new Error("state_corrupt");
-			if (seenIds.has(event.id) || seenSeqs.has(event.seq)) throw new Error("state_corrupt");
-			seenIds.add(event.id);
-			seenSeqs.add(event.seq);
-			events.push(event);
-		}
-		events.sort((left, right) => left.seq - right.seq);
-		for (let index = 0; index < events.length; index += 1)
-			if (events[index]!.seq !== index + 1) throw new Error("state_corrupt");
-		return events;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw error;
-	}
-}
 
 function boundedEventLimit(value: unknown): number {
 	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
@@ -1852,18 +2124,23 @@ function eventTypeFilter(value: unknown): Set<string> | null {
 	return types.length > 0 ? new Set(types) : null;
 }
 
+function eventCursor(value: unknown): number {
+	if (value === undefined || value === null) return 0;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+		throw new SdkClientError("invalid_input", "after_seq must be a non-negative integer.");
+	return value;
+}
+
 function filterCoordinatorEvents(
 	events: CoordinatorEvent[],
+	afterSeq: number,
 	args: Record<string, unknown>,
 	limit: number,
 ): CoordinatorEvent[] {
-	const afterSeq =
-		typeof args.after_seq === "number" ? args.after_seq : Number.parseInt(String(args.after_seq ?? "0"), 10);
-	const safeAfterSeq = Number.isFinite(afterSeq) && afterSeq > 0 ? afterSeq : 0;
 	const sessionId = args.session_id == null ? null : safeExternalId("session", args.session_id);
 	const eventTypes = eventTypeFilter(args.event_types);
 	return events
-		.filter(event => event.seq > safeAfterSeq)
+		.filter(event => event.seq > afterSeq)
 		.filter(event => !sessionId || event.session_id === sessionId)
 		.filter(event => !eventTypes || eventTypes.has(event.kind))
 		.slice(0, limit);
@@ -1877,21 +2154,25 @@ function eventSummaries(
 		"seq" | "id" | "timestamp" | "kind" | "session_id" | "turn_id" | "question_id" | "report_id" | "summary"
 	>
 > {
-	return events.map(event => ({
-		seq: event.seq,
-		id: event.id,
-		timestamp: event.timestamp,
-		kind: event.kind,
-		...(event.session_id ? { session_id: event.session_id } : {}),
-		...(event.turn_id ? { turn_id: event.turn_id } : {}),
-		...(event.question_id ? { question_id: event.question_id } : {}),
-		...(event.report_id ? { report_id: event.report_id } : {}),
-		summary: event.summary,
-	}));
+	return events.map(event => {
+		const publicEvent = publicCoordinatorEvent(event);
+		return {
+			seq: publicEvent.seq,
+			id: publicEvent.id,
+			timestamp: publicEvent.timestamp,
+			kind: publicEvent.kind,
+			...(publicEvent.session_id ? { session_id: publicEvent.session_id } : {}),
+			...(publicEvent.turn_id ? { turn_id: publicEvent.turn_id } : {}),
+			...(publicEvent.question_id ? { question_id: publicEvent.question_id } : {}),
+			...(publicEvent.report_id ? { report_id: publicEvent.report_id } : {}),
+			summary: publicEvent.summary,
+		};
+	});
 }
 
 function safeExternalId(kind: "session" | "question", value: unknown): string {
-	if (typeof value !== "string" || !SAFE_EXTERNAL_ID_PATTERN.test(value)) throw new Error(`invalid_${kind}_id`);
+	const pattern = kind === "session" ? COORDINATOR_SESSION_ID_PATTERN : SAFE_EXTERNAL_ID_PATTERN;
+	if (typeof value !== "string" || !pattern.test(value)) throw new Error(`invalid_${kind}_id`);
 	return value;
 }
 
@@ -1951,23 +2232,9 @@ function turnEventKind(status: TurnStatus): CoordinatorEventKind | null {
 }
 
 async function writeTurnRecord(namespaceDir: string, turn: TurnRecord): Promise<void> {
-	const previous = (await readJsonFile(turnFile(namespaceDir, turn.turn_id))) as TurnRecord | null;
 	await writeJsonFile(turnFile(namespaceDir, turn.turn_id), turn);
-	const kind = previous?.status === turn.status ? null : turnEventKind(turn.status);
-	if (kind) {
-		await appendCoordinatorEvent(namespaceDir, {
-			kind,
-			sessionId: turn.session_id,
-			turnId: turn.turn_id,
-			summary: `Turn ${turn.turn_id} is ${turn.status}`,
-			payloadRef: path.relative(namespaceDir, turnFile(namespaceDir, turn.turn_id)),
-			metadata: {
-				status: turn.status,
-				queued: turn.delivery.queued,
-				tmux_keys_sent: turn.delivery.tmux_keys_sent ?? null,
-			},
-		});
-	}
+	// Public lifecycle rows are emitted from canonical outbox intents only. Legacy
+	// projection writes must never allocate a second journal sequence.
 }
 
 async function readActiveTurn(namespaceDir: string, sessionId: string): Promise<TurnRecord | null> {
@@ -2054,28 +2321,6 @@ async function writeSessionStateUnlocked(
 			: { activity: activity.kind === "valid" ? activity.activity : persisted?.activity }),
 	};
 	await writeJsonFile(sessionStateFile(namespaceDir, sessionId), payload);
-	if (
-		!previous ||
-		previous.state !== payload.state ||
-		previous.current_turn_id !== payload.current_turn_id ||
-		previous.last_turn_id !== payload.last_turn_id ||
-		previous.live !== payload.live ||
-		previous.reason !== payload.reason
-	) {
-		await appendCoordinatorEvent(namespaceDir, {
-			kind: "session.state_changed",
-			sessionId,
-			turnId: payload.current_turn_id ?? payload.last_turn_id,
-			summary: `Session ${sessionId} state changed to ${payload.state}`,
-			payloadRef: path.relative(namespaceDir, sessionStateFile(namespaceDir, sessionId)),
-			metadata: {
-				state: payload.state,
-				ready_for_input: payload.ready_for_input,
-				live: payload.live,
-				reason: payload.reason,
-			},
-		});
-	}
 	return payload;
 }
 
@@ -2110,13 +2355,38 @@ async function writeSessionState(
 		reason?: string | null;
 		source?: CoordinatorSessionState["source"];
 		overwrite?: boolean;
+		emitEvent?: boolean;
 	} = {},
 ): Promise<CoordinatorSessionState> {
 	const file = sessionStateFile(namespaceDir, sessionId);
-	return await withSessionStateLock(
-		file,
-		async () => await writeSessionStateUnlocked(namespaceDir, sessionId, state, options),
-	);
+	let changed = false;
+	const payload = await withSessionStateLock(file, async () => {
+		const previous = await readSessionState(namespaceDir, sessionId);
+		const next = await writeSessionStateUnlocked(namespaceDir, sessionId, state, options);
+		changed =
+			!previous ||
+			previous.state !== next.state ||
+			previous.current_turn_id !== next.current_turn_id ||
+			previous.last_turn_id !== next.last_turn_id ||
+			previous.live !== next.live ||
+			previous.reason !== next.reason;
+		return next;
+	});
+	if (options.emitEvent !== false && changed) {
+		await appendCoordinatorEvent(namespaceDir, {
+			kind: "session.state_changed",
+			sessionId,
+			turnId: payload.current_turn_id ?? payload.last_turn_id,
+			summary: `Session ${sessionId} state changed to ${payload.state}`,
+			metadata: {
+				state: payload.state,
+				ready_for_input: payload.ready_for_input,
+				live: payload.live,
+				reason: payload.reason,
+			},
+		});
+	}
+	return payload;
 }
 
 async function markTurnFailedForUnavailableSession(turn: TurnRecord, reason: string): Promise<TurnRecord> {
@@ -2177,11 +2447,11 @@ async function markTurnTerminalFromSessionState(
 						recoverable: true,
 					}
 				: terminalStatus === "failed"
-					? (runtimeState.error ?? {
+					? {
 							code: "runtime_errored",
-							message: sessionState.reason ?? "runtime_errored",
+							message: "Runtime turn failed.",
 							recoverable: true,
-						})
+						}
 					: null,
 		updated_at: timestamp,
 		completed_at: timestamp,
@@ -2229,18 +2499,6 @@ async function markTurnAcknowledgedFromRuntimeState(
 	};
 	await writeTurnRecord(namespaceDir, acknowledged);
 	await writeActiveTurn(namespaceDir, acknowledged);
-	await appendCoordinatorEvent(namespaceDir, {
-		kind: "turn.acknowledged",
-		sessionId: acknowledged.session_id,
-		turnId: acknowledged.turn_id,
-		summary: `Turn ${acknowledged.turn_id} was acknowledged by the GJC runtime`,
-		payloadRef: path.relative(namespaceDir, turnFile(namespaceDir, acknowledged.turn_id)),
-		metadata: {
-			status: acknowledged.status,
-			tmux_keys_sent: acknowledged.delivery.tmux_keys_sent ?? null,
-			prompt_acknowledged: true,
-		},
-	});
 	return acknowledged;
 }
 
@@ -2308,10 +2566,15 @@ async function reconcileRuntimeAcknowledgement(
 	turn: TurnRecord,
 	sessionState: CoordinatorSessionState | null,
 	ackTimeoutMs: number,
-	options: { failOnTimeout: boolean } = { failOnTimeout: true },
+	options: {
+		failOnTimeout: boolean;
+		onAcknowledged?: (turn: TurnRecord) => Promise<void>;
+	} = { failOnTimeout: true },
 ): Promise<TurnRecord> {
 	if (sessionState && runtimeStateAcknowledgesTurn(turn, sessionState)) {
-		return await markTurnAcknowledgedFromRuntimeState(namespaceDir, turn, sessionState);
+		const acknowledged = await markTurnAcknowledgedFromRuntimeState(namespaceDir, turn, sessionState);
+		await options.onAcknowledged?.(acknowledged);
+		return acknowledged;
 	}
 	if (options.failOnTimeout && turnAwaitingRuntimeAckExpired(turn, Date.now(), ackTimeoutMs)) {
 		return await markTurnFailedForUnacknowledgedDelivery(turn, ackTimeoutMs);
@@ -2385,7 +2648,9 @@ export function boundedRuntimePromptAckTimeoutMs(value: unknown): number {
 }
 
 export function boundedEventWatchTimeoutMs(value: unknown): number {
-	return Math.min(parsePositiveIntegerMs(value, 1000), COORDINATOR_EVENT_WATCH_TIMEOUT_MAX_MS);
+	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+	if (parsed === 0) return 0;
+	return Math.min(Number.isFinite(parsed) && parsed > 0 ? parsed : 1000, COORDINATOR_EVENT_WATCH_TIMEOUT_MAX_MS);
 }
 
 export function boundedPollIntervalMs(value: unknown): number {
@@ -2501,10 +2766,10 @@ export async function readCoordinatorArtifact(
 			bytes: Buffer.byteLength(text),
 			truncated: bytesRead > config.artifactByteCap,
 		};
-	} catch (error) {
+	} catch {
 		return {
 			ok: false,
-			reason: (error instanceof Error ? error.message.split(":")[0] : String(error)).replace(/^coordinator_/, ""),
+			error: { code: "artifact_unavailable", message: "Coordinator artifact could not be read." },
 		};
 	} finally {
 		await handle?.close();
@@ -2598,6 +2863,55 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return questionStateReady;
 	}
 
+	let retainedDeliveryRecovery: Promise<void> | null = null;
+	async function exportRetainedDeliveries(limit = 32, signal?: AbortSignal): Promise<void> {
+		// Recovery is lazy and single-flight. Do not start a detached startup pass:
+		// callers must observe the current registry under the same lock, and a detached
+		// pass can outlive a server/test namespace and touch a removed root.
+		if (retainedDeliveryRecovery) return await retainedDeliveryRecovery;
+		const operation = (async () => {
+			await ensureQuestionStateReady();
+			// Delivery discovery is a bounded registry round-robin, not a global
+			// lexical high-water cursor: new intents can appear in earlier sessions.
+			const storedDiscoveryCursor = await readDeliveryDiscoveryCursor(questionPaths, { signal });
+			const discoveryCursor = storedDiscoveryCursor.startsWith("@session:") ? storedDiscoveryCursor : "@session:";
+			const discovered = await enumeratePublicDeliveries(questionPaths, discoveryCursor, limit, { signal });
+			for (const claim of discovered.claims) {
+				if (signal?.aborted) throw signal.reason ?? new Error("aborted");
+				const payload = claim.event.payload;
+				const kind = claim.event.kind as CoordinatorEventKind;
+				const event = await appendCoordinatorEvent(
+					namespaceDir,
+					{
+						stableId: claim.event.public_event_id,
+						kind,
+						sessionId: typeof payload.session_id === "string" ? payload.session_id : claim.session_id,
+						turnId: typeof payload.turn_id === "string" ? payload.turn_id : null,
+						questionId: typeof payload.question_id === "string" ? payload.question_id : null,
+						reportId: typeof payload.report_id === "string" ? payload.report_id : null,
+						summary: "Coordinator event recorded.",
+					},
+					{ signal },
+				);
+				await acknowledgePublicDelivery(
+					questionPaths,
+					claim.session_id,
+					{ public_event_id: claim.event.public_event_id, claim_fence: claim.claim_fence, journal_seq: event.seq },
+					{ signal },
+				);
+			}
+			// Advance once for every successful bounded sweep, including an empty page,
+			// so inactive sessions cannot pin discovery ahead of later retained work.
+			if (discovered.next_cursor)
+				await advanceDeliveryDiscoveryCursor(questionPaths, discovered.next_cursor, { signal });
+		})();
+		const current = operation.finally(() => {
+			retainedDeliveryRecovery = null;
+		});
+		retainedDeliveryRecovery = current;
+		return await current;
+	}
+
 	function creationDigests(
 		tool: string,
 		idempotencyKey: string,
@@ -2681,10 +2995,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
+	async function readCanonicalActiveTurn(sessionId: string): Promise<TurnRecord | null> {
+		const transaction = await readSessionTransaction(questionPaths, sessionId);
+		if (!transaction) return null;
+		const activeId = transaction.canonical.queue.active_turn_id;
+		const active = activeId ? transaction.canonical.turns[activeId] : undefined;
+		if (active && ACTIVE_TURN_STATUSES.has(active.status as TurnStatus)) return turnFromCanonical(active);
+		const fallback = Object.values(transaction.canonical.turns).find(turn =>
+			ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+		);
+		return fallback ? turnFromCanonical(fallback) : null;
+	}
+
 	async function ensureQuestionTransaction(sessionId: string): Promise<void> {
 		await ensureQuestionStateReady();
 		try {
-			await withSessionTransaction(questionPaths, sessionId, async () => undefined);
+			const transaction = await readSessionTransaction(questionPaths, sessionId);
+			if (!transaction) throw new Error("resource_gone");
+			await ensureSchedulerRoster(questionPaths, sessionId);
 			return;
 		} catch (error) {
 			if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
@@ -2726,6 +3054,316 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		});
 	}
 
+	type RuntimeAdmissionToken = {
+		session_id: string;
+		coordinator_turn_id: string;
+		runtime_turn_id: string;
+		transaction_revision: number;
+		sidecar_schema_version: 1;
+		sidecar_session_id: string;
+		sidecar_endpoint_incarnation: string;
+		sidecar_observed_at: string;
+		accepted_delivery: true;
+	};
+
+	type RuntimeReconciliationResult = {
+		session_id: string;
+		session_state: CoordinatorSessionState | null;
+		terminal: boolean;
+		active_turn_id: string | null;
+		waiting_token: RuntimeAdmissionToken | null;
+	};
+
+	/**
+	 * Sole lifecycle admission gateway. It reads sidecar state, then rechecks the
+	 * canonical WAL before admitting any waiting/Q12/read/answer work. A terminal
+	 * observation is projected first; roster/index state is never used as authority.
+	 */
+	async function reconcileSessionRuntime(
+		sessionId: string,
+		_options: {
+			absoluteDeadline?: number;
+			signal?: AbortSignal;
+			source?: string;
+			observeQuestions?: boolean;
+		} = {},
+	): Promise<RuntimeReconciliationResult> {
+		await ensureQuestionTransaction(sessionId);
+		let sessionState = await readSessionState(namespaceDir, sessionId);
+		const transaction = await withSessionTransaction(questionPaths, sessionId, async tx => tx, {
+			signal: _options.signal,
+		});
+		const active = Object.values(transaction.canonical.turns).filter(turn =>
+			ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+		);
+		const unfencedActive = active.filter(turn => turn.terminal_fence === null);
+		if (
+			_options.signal?.aborted ||
+			(_options.absoluteDeadline !== undefined && Date.now() >= _options.absoluteDeadline)
+		)
+			return {
+				session_id: sessionId,
+				session_state: sessionState,
+				terminal:
+					transaction.canonical.desired_session_state === "completed" ||
+					transaction.canonical.desired_session_state === "errored",
+				active_turn_id: active[0]?.turn_id ?? null,
+				waiting_token: null,
+			};
+		const current = sessionState?.current_turn_id;
+		const candidate = current
+			? transaction.canonical.turns[current]
+			: sessionState?.state === "errored" && sessionState.last_turn_id
+				? transaction.canonical.turns[sessionState.last_turn_id]
+				: active.length === 1
+					? active[0]
+					: undefined;
+		const terminalObservation =
+			sessionState?.schema_version === 1 &&
+			sessionState.source === "agent_session_event" &&
+			sessionState.session_id === sessionId &&
+			Number.isFinite(Date.parse(sessionState.updated_at)) &&
+			(sessionState.state === "completed" || sessionState.state === "errored") &&
+			candidate &&
+			candidate.terminal_fence === null &&
+			(!current || candidate.turn_id === current) &&
+			(current !== null ||
+				(sessionState.state === "errored" &&
+					unfencedActive.length === 1 &&
+					candidate === unfencedActive[0] &&
+					candidate.turn_id === sessionState.last_turn_id &&
+					candidate.delivery.prompt_acknowledged === true &&
+					typeof candidate.delivery.runtime_turn_id === "string"));
+		if (
+			terminalObservation &&
+			candidate &&
+			sessionState &&
+			!_options.signal?.aborted &&
+			(_options.absoluteDeadline === undefined || Date.now() < _options.absoluteDeadline)
+		) {
+			const terminalTurn = await markTurnTerminalFromSessionState(turnFromCanonical(candidate), sessionState);
+			await projectTerminalTransition(terminalTurn, {
+				desiredState: sessionState.state,
+				reason: sessionState.reason ? "terminal_uncertain" : null,
+				live: sessionState.live,
+				signal: _options.signal,
+			});
+			sessionState = await readSessionState(namespaceDir, sessionId);
+		}
+		let waitingTransitioned = false;
+		if (
+			!_options.signal?.aborted &&
+			(_options.absoluteDeadline === undefined || Date.now() < _options.absoluteDeadline) &&
+			sessionState?.schema_version === 1 &&
+			sessionState.session_id === sessionId &&
+			sessionState.source === "agent_session_event" &&
+			sessionState.live === true &&
+			Number.isFinite(Date.parse(sessionState.updated_at)) &&
+			sessionState.state === "needs_user_input" &&
+			sessionState.current_turn_id
+		) {
+			await withAdmittedSessionTransaction(questionPaths, sessionId, async tx => {
+				const waitingTurn = tx.canonical.turns[sessionState!.current_turn_id!];
+				if (
+					!waitingTurn ||
+					waitingTurn.terminal_fence ||
+					!ACTIVE_TURN_STATUSES.has(waitingTurn.status as TurnStatus) ||
+					waitingTurn.status === "waiting_for_answer"
+				)
+					return;
+				waitingTurn.status = "waiting_for_answer";
+				waitingTurn.updated_at = sessionState!.updated_at;
+				tx.canonical.desired_session_state = "needs_user_input";
+				const waitingEventId = deterministicOutboxId(
+					sessionId,
+					tx.revision + 1,
+					"turn.waiting_for_answer",
+					"turn",
+					waitingTurn.turn_id,
+				);
+				tx.outbox[waitingEventId] ??= {
+					id: waitingEventId,
+					transaction_revision: tx.revision + 1,
+					kind: "turn.waiting_for_answer",
+					entity: "turn",
+					entity_id: waitingTurn.turn_id,
+					payload: {
+						session_id: sessionId,
+						turn_id: waitingTurn.turn_id,
+						status: "waiting_for_answer",
+						created_at: waitingTurn.updated_at,
+					},
+					emitted: false,
+					public_event_id: waitingEventId,
+					public_delivery: {
+						public_event_id: waitingEventId,
+						state: "pending",
+						claim_fence: null,
+						claim_expires_at: null,
+						journal_seq: null,
+						acknowledged_at: null,
+					},
+				};
+				waitingTransitioned = true;
+			});
+			if (waitingTransitioned) {
+				// Repair from the latest canonical snapshot under its lock. A terminal
+				// transition that wins after the waiting commit must never be overwritten
+				// by a stale legacy projection write.
+				await repairCanonicalProjections(sessionId, { signal: _options.signal });
+				sessionState = await readSessionState(namespaceDir, sessionId);
+			}
+		}
+		const refreshed = await withSessionTransaction(questionPaths, sessionId, async tx => tx, {
+			signal: _options.signal,
+		});
+		const activeTurn = Object.values(refreshed.canonical.turns).find(turn =>
+			ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+		);
+		const waitingTurnId = sessionState?.state === "needs_user_input" ? sessionState.current_turn_id : null;
+		const waitingTurn = waitingTurnId ? refreshed.canonical.turns[waitingTurnId] : null;
+		const runtimeTurnId = waitingTurn?.delivery.runtime_turn_id;
+		const waitingToken =
+			sessionState?.schema_version === 1 &&
+			sessionState.live === true &&
+			sessionState.source === "agent_session_event" &&
+			sessionState.state === "needs_user_input" &&
+			sessionState.current_turn_id === waitingTurnId &&
+			typeof sessionState.session_id === "string" &&
+			sessionState.session_id === sessionId &&
+			Number.isFinite(Date.parse(sessionState.updated_at)) &&
+			waitingTurn?.status === "waiting_for_answer" &&
+			waitingTurn.delivery.prompt_acknowledged === true &&
+			typeof runtimeTurnId === "string" &&
+			runtimeTurnId.length > 0
+				? {
+						session_id: sessionId,
+						coordinator_turn_id: waitingTurn.turn_id,
+						runtime_turn_id: runtimeTurnId,
+						transaction_revision: refreshed.revision,
+						sidecar_schema_version: 1 as const,
+						sidecar_session_id: sessionState.session_id,
+						sidecar_endpoint_incarnation: refreshed.canonical.session.broker.endpoint_incarnation,
+						sidecar_observed_at: sessionState.updated_at,
+						accepted_delivery: true as const,
+					}
+				: null;
+		return {
+			session_id: sessionId,
+			session_state: sessionState,
+			terminal:
+				refreshed.canonical.desired_session_state === "completed" ||
+				refreshed.canonical.desired_session_state === "errored",
+			active_turn_id: activeTurn?.turn_id ?? null,
+			waiting_token: waitingToken,
+		};
+	}
+
+	async function publishAcknowledgedTurnIntent(turn: TurnRecord): Promise<void> {
+		await publishCanonicalLifecycleIntent(turn.session_id, {
+			kind: "turn.acknowledged",
+			entity: "turn",
+			entityId: turn.turn_id,
+			payload: {
+				session_id: turn.session_id,
+				turn_id: turn.turn_id,
+				status: turn.status,
+				created_at: turn.updated_at,
+			},
+		});
+	}
+
+	function runtimeProvenanceToken(
+		sessionId: string,
+		transaction: CoordinatorSessionTransactionV1,
+		turn: CoordinatorSessionTransactionV1["canonical"]["turns"][string] | null,
+		gate: WorkflowGate,
+	): RuntimeProvenanceTokenV1 {
+		return {
+			namespace_id: config.namespace.identity,
+			session_id: sessionId,
+			endpoint_incarnation: transaction.canonical.session.broker.endpoint_incarnation,
+			coordinator_turn_id: turn?.turn_id ?? "",
+			runtime_turn_id: gate.runtime_turn_id ?? "",
+			gate_created_at: gate.created_at,
+			schema_hash: gate.schema_hash,
+			stage: gate.stage,
+			kind: gate.kind,
+		};
+	}
+
+	async function publishCanonicalLifecycleIntent(
+		sessionId: string,
+		input: {
+			kind: CoordinatorEventKind;
+			entity: "turn" | "question" | "report" | "session" | "deletion";
+			entityId: string;
+			payload: Record<string, string | number | boolean | null>;
+		},
+	): Promise<void> {
+		await ensureQuestionTransaction(sessionId);
+		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+			const existingEdge = Object.values(transaction.outbox).find(
+				event => event.kind === input.kind && event.entity === input.entity && event.entity_id === input.entityId,
+			);
+			if (input.kind === "turn.acknowledged") {
+				const turn = transaction.canonical.turns[input.entityId];
+				const delivery = turn?.delivery as Record<string, unknown> | undefined;
+				const intentId =
+					typeof delivery?.acknowledgement_intent_id === "string" ? delivery.acknowledgement_intent_id : null;
+				if (intentId) return;
+				const eventId = existingEdge?.public_event_id ?? `edge:${sessionId}:turn.acknowledged:${input.entityId}`;
+				if (delivery) delivery.acknowledgement_intent_id = eventId;
+				if (existingEdge) return;
+				transaction.outbox[eventId] = {
+					id: eventId,
+					transaction_revision: transaction.revision + 1,
+					kind: input.kind,
+					entity: input.entity,
+					entity_id: input.entityId,
+					payload: input.payload,
+					emitted: false,
+					public_event_id: eventId,
+					public_delivery: {
+						public_event_id: eventId,
+						state: "pending",
+						claim_fence: null,
+						claim_expires_at: null,
+						journal_seq: null,
+						acknowledged_at: null,
+					},
+				};
+				return;
+			}
+			const eventId = deterministicOutboxId(
+				sessionId,
+				transaction.revision + 1,
+				input.kind,
+				input.entity,
+				input.entityId,
+			);
+			transaction.outbox[eventId] ??= {
+				id: eventId,
+				transaction_revision: transaction.revision + 1,
+				kind: input.kind,
+				entity: input.entity,
+				entity_id: input.entityId,
+				payload: input.payload,
+				emitted: false,
+				public_event_id: eventId,
+				public_delivery: {
+					public_event_id: eventId,
+					state: "pending",
+					claim_fence: null,
+					claim_expires_at: null,
+					journal_seq: null,
+					acknowledged_at: null,
+				},
+			};
+		});
+		await exportRetainedDeliveries();
+	}
+
 	function publicQuestions(
 		transaction: CoordinatorSessionTransactionV1,
 		status: string | null,
@@ -2753,7 +3391,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			);
 	}
 
-	async function reconcileQuestions(sessionId: string): Promise<ListQuestionsSuccessV1> {
+	async function reconcileQuestions(
+		sessionId: string,
+		options: { absoluteDeadline?: number; signal?: AbortSignal } = {},
+	): Promise<ListQuestionsSuccessV1> {
 		const observedAt = new Date().toISOString();
 		const diagnostics: CoordinatorQuestionDiagnosticPublicV1[] = [];
 		const diagnostic = (
@@ -2773,9 +3414,67 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 		try {
 			await ensureQuestionTransaction(sessionId);
+			if (
+				options.signal?.aborted ||
+				(options.absoluteDeadline !== undefined && Date.now() >= options.absoluteDeadline)
+			) {
+				diagnostic("query_unavailable");
+				return {
+					ok: true,
+					schema_version: 1,
+					questions: await withSessionTransaction(questionPaths, sessionId, async tx => publicQuestions(tx, null)),
+					diagnostics,
+					reconciliation: {
+						attempted: false,
+						complete: false,
+						revision: null,
+						observed_at: observedAt,
+						reason: "query_unavailable",
+					},
+				};
+			}
+			const admission = await reconcileSessionRuntime(sessionId, {
+				observeQuestions: true,
+				...options,
+			});
+			const admissionToken = admission.waiting_token;
+			if (
+				admission.session_state?.source === "agent_session_event" &&
+				admission.session_state.live === true &&
+				admission.session_state.state === "needs_user_input" &&
+				!admission.waiting_token
+			)
+				return {
+					ok: true,
+					schema_version: 1,
+					questions: [],
+					diagnostics,
+					reconciliation: {
+						attempted: false,
+						complete: false,
+						revision: null,
+						observed_at: observedAt,
+						reason: "terminal_uncertain",
+					},
+				};
+			if (admission.terminal) {
+				return {
+					ok: true,
+					schema_version: 1,
+					questions: await withSessionTransaction(questionPaths, sessionId, async tx => publicQuestions(tx, null)),
+					diagnostics,
+					reconciliation: {
+						attempted: false,
+						complete: true,
+						revision: null,
+						observed_at: observedAt,
+						reason: null,
+					},
+				};
+			}
 			const session = asRecord(await readJsonFile(sessionFile(sessionId)));
 			if (!session) throw new Error("resource_gone");
-			const snapshot = await readCompleteQ12Snapshot(session);
+			const snapshot = await readCompleteQ12Snapshot(session, options);
 			const { items, complete, revision } = snapshot;
 			if (!complete) {
 				diagnostic(snapshot.reason ?? "query_unavailable");
@@ -2794,204 +3493,323 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 			}
 			const projectedTurnQuestions = new Map<string, string[]>();
-			const openedQuestions: Array<{ turnId: string; questionId: string }> = [];
-			await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
-				const seen = new Set<string>();
-				const byRuntimeTurn = new Map<string, Array<(typeof transaction.canonical.turns)[string]>>();
-				for (const turn of Object.values(transaction.canonical.turns)) {
-					const runtimeTurnId = turn.delivery.runtime_turn_id;
-					if (typeof runtimeTurnId !== "string") continue;
-					const owners = byRuntimeTurn.get(runtimeTurnId) ?? [];
-					owners.push(turn);
-					byRuntimeTurn.set(runtimeTurnId, owners);
-				}
-				for (const row of items as WorkflowGateQueryRecord[]) {
-					if (!row || typeof row !== "object" || row.tag !== "pending" || typeof row.gate_id !== "string") {
-						diagnostic("invalid_gate_row");
-						continue;
-					}
-					const gate = row as WorkflowGateQueryRecord & WorkflowGate;
-					const authorityId = createHash("sha256")
-						.update(
-							`${config.namespace.identity}\0${sessionId}\0${transaction.canonical.session.broker.endpoint_incarnation}\0${gate.gate_id}`,
-						)
-						.digest("hex");
-					seen.add(authorityId);
-					const runtimeTurnId = gate.runtime_turn_id;
-					const existing = transaction.canonical.gate_authorities[authorityId];
-					const authority = existing ?? {
-						authority: {
-							namespace_id: config.namespace.identity,
-							session_id: sessionId,
-							endpoint_incarnation: transaction.canonical.session.broker.endpoint_incarnation,
-							gate_id: gate.gate_id,
-						},
-						observation:
-							typeof runtimeTurnId === "string" && runtimeTurnId
-								? {
-										kind: "valid" as const,
-										first_provenance: {
-											runtime_turn_id: runtimeTurnId,
-											gate_created_at: gate.created_at,
-											schema_hash: gate.schema_hash,
-											stage: gate.stage,
-											kind: gate.kind,
-										},
-									}
-								: {
-										kind: "malformed" as const,
-										immutable_observation_digest: createHash("sha256")
-											.update(canonicalJson(row))
-											.digest("hex"),
-										malformed: "missing_runtime_turn" as const,
-									},
-						outcome: { state: "deferred_link" as const, first_seen_at: observedAt },
-						first_seen_at: observedAt,
-						updated_at: observedAt,
-					};
-					transaction.canonical.gate_authorities[authorityId] = authority;
-					if (typeof runtimeTurnId !== "string" || !runtimeTurnId) {
-						authority.outcome = { state: "stale", reason: "missing_runtime_turn" };
-						authority.updated_at = observedAt;
-						diagnostic("missing_runtime_turn", null, gate.gate_id);
-						continue;
+			const openedQuestions: Array<{
+				turnId: string;
+				questionId: string;
+				eventId: string;
+			}> = [];
+			let q12Admitted = true;
+			await withAdmittedSessionTransaction(
+				questionPaths,
+				sessionId,
+				async transaction => {
+					const liveState = await readSessionState(namespaceDir, sessionId);
+					const waitingToken = admissionToken;
+					const waitingTurn = waitingToken ? transaction.canonical.turns[waitingToken.coordinator_turn_id] : null;
+					if (
+						waitingToken &&
+						(!liveState ||
+							liveState.schema_version !== waitingToken.sidecar_schema_version ||
+							liveState.session_id !== waitingToken.sidecar_session_id ||
+							liveState.source !== "agent_session_event" ||
+							liveState.state !== "needs_user_input" ||
+							liveState.current_turn_id !== waitingToken.coordinator_turn_id ||
+							liveState.updated_at !== waitingToken.sidecar_observed_at ||
+							!waitingTurn ||
+							waitingTurn.status !== "waiting_for_answer" ||
+							waitingTurn.delivery.prompt_acknowledged !== true ||
+							waitingTurn.delivery.runtime_turn_id !== waitingToken.runtime_turn_id ||
+							waitingToken.sidecar_endpoint_incarnation !==
+								transaction.canonical.session.broker.endpoint_incarnation ||
+							transaction.revision < waitingToken.transaction_revision)
+					) {
+						q12Admitted = false;
+						return;
 					}
 					if (
-						existing?.observation.kind === "malformed" ||
-						(existing?.observation.kind === "valid" &&
-							(existing.observation.first_provenance.runtime_turn_id !== runtimeTurnId ||
-								existing.observation.first_provenance.gate_created_at !== gate.created_at ||
-								existing.observation.first_provenance.schema_hash !== gate.schema_hash ||
-								existing.observation.first_provenance.stage !== gate.stage ||
-								existing.observation.first_provenance.kind !== gate.kind))
+						liveState?.source === "agent_session_event" &&
+						liveState.live === true &&
+						(liveState.state !== "needs_user_input" || liveState.current_turn_id !== admission.active_turn_id)
 					) {
-						authority.outcome = { state: "stale", reason: "gate_provenance_changed" };
-						authority.updated_at = observedAt;
-						diagnostic("gate_provenance_changed", null, gate.gate_id);
-						continue;
+						q12Admitted = false;
+						return;
 					}
-					const owners = byRuntimeTurn.get(runtimeTurnId) ?? [];
-					if (owners.length !== 1) {
-						const watermarkAt = transaction.recovery.prompt_watermark_at;
-						const gateCreatedAt = Date.parse(gate.created_at);
-						const watermarkBeyondGate =
-							watermarkAt !== null && Number.isFinite(gateCreatedAt) && Date.parse(watermarkAt) > gateCreatedAt;
-						const boundedAbsenceProved =
-							watermarkBeyondGate &&
-							Number.isFinite(gateCreatedAt) &&
-							Date.now() - gateCreatedAt >= 5 * 60 * 1000;
-						if (owners.length === 0 && !boundedAbsenceProved) {
-							authority.outcome = { state: "deferred_link", first_seen_at: authority.first_seen_at };
-							authority.updated_at = observedAt;
+					const seen = new Set<string>();
+					const byRuntimeTurn = new Map<string, Array<(typeof transaction.canonical.turns)[string]>>();
+					for (const turn of Object.values(transaction.canonical.turns)) {
+						const runtimeTurnId = turn.delivery.runtime_turn_id;
+						if (typeof runtimeTurnId !== "string") continue;
+						const owners = byRuntimeTurn.get(runtimeTurnId) ?? [];
+						owners.push(turn);
+						byRuntimeTurn.set(runtimeTurnId, owners);
+					}
+					for (const row of items as WorkflowGateQueryRecord[]) {
+						if (!row || typeof row !== "object" || row.tag !== "pending" || typeof row.gate_id !== "string") {
+							diagnostic("invalid_gate_row");
 							continue;
 						}
-						authority.outcome =
-							owners.length === 0
-								? { state: "ownership_unavailable", reason: "ownership_unavailable" }
-								: { state: "ownership_conflict", reason: "ownership_conflict" };
+						const gate = row as WorkflowGateQueryRecord & WorkflowGate;
+						const authorityId = createHash("sha256")
+							.update(
+								`${config.namespace.identity}\0${sessionId}\0${transaction.canonical.session.broker.endpoint_incarnation}\0${gate.gate_id}`,
+							)
+							.digest("hex");
+						seen.add(authorityId);
+						const runtimeTurnId = gate.runtime_turn_id;
+						const existing = transaction.canonical.gate_authorities[authorityId];
+						const authority = existing ?? {
+							authority: {
+								namespace_id: config.namespace.identity,
+								session_id: sessionId,
+								endpoint_incarnation: transaction.canonical.session.broker.endpoint_incarnation,
+								gate_id: gate.gate_id,
+							},
+							observation:
+								typeof runtimeTurnId === "string" && runtimeTurnId
+									? {
+											kind: "valid" as const,
+											first_provenance: runtimeProvenanceToken(
+												sessionId,
+												transaction,
+												byRuntimeTurn.get(runtimeTurnId)?.[0] ?? null,
+												gate,
+											),
+										}
+									: {
+											kind: "malformed" as const,
+											immutable_observation_digest: createHash("sha256")
+												.update(canonicalJson(row))
+												.digest("hex"),
+											malformed: "missing_runtime_turn" as const,
+										},
+							outcome: { state: "deferred_link" as const, first_seen_at: observedAt },
+							first_seen_at: observedAt,
+							updated_at: observedAt,
+						};
+						transaction.canonical.gate_authorities[authorityId] = authority;
+						if (typeof runtimeTurnId !== "string" || !runtimeTurnId) {
+							authority.outcome = { state: "stale", reason: "missing_runtime_turn" };
+							authority.updated_at = observedAt;
+							diagnostic("missing_runtime_turn", null, gate.gate_id);
+							continue;
+						}
+						const owners = byRuntimeTurn.get(runtimeTurnId) ?? [];
+						if (
+							admissionToken &&
+							(owners.length !== 1 ||
+								owners[0]?.turn_id !== admissionToken.coordinator_turn_id ||
+								runtimeTurnId !== admissionToken.runtime_turn_id ||
+								transaction.revision < admissionToken.transaction_revision)
+						) {
+							q12Admitted = false;
+							return;
+						}
+						const expectedProvenance = runtimeProvenanceToken(
+							sessionId,
+							transaction,
+							owners.length === 1 ? owners[0]! : null,
+							gate,
+						);
+						if (
+							existing?.observation.kind === "malformed" ||
+							(existing?.observation.kind === "valid" &&
+								owners.length === 1 &&
+								canonicalJson(existing.observation.first_provenance) !== canonicalJson(expectedProvenance))
+						) {
+							authority.outcome = { state: "stale", reason: "gate_provenance_changed" };
+							authority.updated_at = observedAt;
+							diagnostic("gate_provenance_changed", null, gate.gate_id);
+							continue;
+						}
+						if (owners.length !== 1) {
+							if (admissionToken) {
+								q12Admitted = false;
+								return;
+							}
+							const watermarkAt = transaction.recovery.prompt_watermark_at;
+							const gateCreatedAt = Date.parse(gate.created_at);
+							const watermarkBeyondGate =
+								watermarkAt !== null &&
+								Number.isFinite(gateCreatedAt) &&
+								Date.parse(watermarkAt) > gateCreatedAt;
+							const boundedAbsenceProved =
+								watermarkBeyondGate &&
+								Number.isFinite(gateCreatedAt) &&
+								Date.now() - gateCreatedAt >= 5 * 60 * 1000;
+							if (owners.length === 0 && !boundedAbsenceProved) {
+								authority.outcome = { state: "deferred_link", first_seen_at: authority.first_seen_at };
+								authority.updated_at = observedAt;
+								continue;
+							}
+							authority.outcome =
+								owners.length === 0
+									? { state: "ownership_unavailable", reason: "ownership_unavailable" }
+									: { state: "ownership_conflict", reason: "ownership_conflict" };
+							authority.updated_at = observedAt;
+							diagnostic(
+								owners.length === 0 ? "ownership_unavailable" : "ownership_conflict",
+								null,
+								gate.gate_id,
+							);
+							continue;
+						}
+						const turn = owners[0]!;
+						const provenance = runtimeProvenanceToken(sessionId, transaction, turn, gate);
+						if (!turn.runtime_provenance || canonicalJson(turn.runtime_provenance) !== canonicalJson(provenance))
+							turn.runtime_provenance = provenance;
+						if (TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus)) {
+							authority.outcome = { state: "stale", reason: "turn_terminal", turn_id: turn.turn_id };
+							authority.updated_at = observedAt;
+							diagnostic("turn_terminal", turn.turn_id, gate.gate_id);
+							continue;
+						}
+						const codec = decodeAskGateV1(gate);
+						if (!codec) {
+							authority.outcome = { state: "stale", reason: "unsupported_gate", turn_id: turn.turn_id };
+							authority.updated_at = observedAt;
+							diagnostic("unsupported_gate", turn.turn_id, gate.gate_id);
+							continue;
+						}
+						if (
+							existing &&
+							existing.outcome.state !== "pending" &&
+							existing.outcome.state !== "answered" &&
+							existing.outcome.state !== "deferred_link"
+						)
+							continue;
+						const questionId =
+							existing?.outcome.state === "pending" || existing?.outcome.state === "answered"
+								? existing.outcome.question_id
+								: gate.gate_id;
+						if (!existing || authority.outcome.state === "deferred_link") {
+							const provenance = runtimeProvenanceToken(sessionId, transaction, turn, gate);
+							authority.observation = {
+								kind: "valid",
+								first_provenance: provenance,
+							};
+							turn.runtime_provenance = provenance;
+							authority.outcome = { state: "pending", turn_id: turn.turn_id, question_id: questionId };
+						}
 						authority.updated_at = observedAt;
-						diagnostic(owners.length === 0 ? "ownership_unavailable" : "ownership_conflict", null, gate.gate_id);
-						continue;
-					}
-					const turn = owners[0]!;
-					if (TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus)) {
-						authority.outcome = { state: "stale", reason: "turn_terminal", turn_id: turn.turn_id };
-						authority.updated_at = observedAt;
-						diagnostic("turn_terminal", turn.turn_id, gate.gate_id);
-						continue;
-					}
-					const codec = decodeAskGateV1(gate);
-					if (!codec) {
-						authority.outcome = { state: "stale", reason: "unsupported_gate", turn_id: turn.turn_id };
-						authority.updated_at = observedAt;
-						diagnostic("unsupported_gate", turn.turn_id, gate.gate_id);
-						continue;
-					}
-					if (
-						existing &&
-						existing.outcome.state !== "pending" &&
-						existing.outcome.state !== "answered" &&
-						existing.outcome.state !== "deferred_link"
-					)
-						continue;
-					const questionId =
-						existing?.outcome.state === "pending" || existing?.outcome.state === "answered"
-							? existing.outcome.question_id
-							: gate.gate_id;
-					if (!existing || authority.outcome.state === "deferred_link") {
-						authority.observation = {
-							kind: "valid",
-							first_provenance: {
-								runtime_turn_id: runtimeTurnId,
-								gate_created_at: gate.created_at,
-								schema_hash: gate.schema_hash,
+						transaction.canonical.gate_authorities[authorityId] = authority;
+						if (!transaction.canonical.questions[questionId]) {
+							const binding = createAnswerBinding();
+							transaction.canonical.questions[questionId] = {
+								question_id: questionId,
+								authority_id: authorityId,
+								session_id: sessionId,
+								turn_id: turn.turn_id,
+								endpoint_incarnation: transaction.canonical.session.broker.endpoint_incarnation,
 								stage: gate.stage,
 								kind: gate.kind,
-							},
-						};
-						authority.outcome = { state: "pending", turn_id: turn.turn_id, question_id: questionId };
-					}
-					authority.updated_at = observedAt;
-					transaction.canonical.gate_authorities[authorityId] = authority;
-					if (!transaction.canonical.questions[questionId]) {
-						const binding = createAnswerBinding();
-						transaction.canonical.questions[questionId] = {
-							question_id: questionId,
-							authority_id: authorityId,
-							session_id: sessionId,
-							turn_id: turn.turn_id,
-							endpoint_incarnation: transaction.canonical.session.broker.endpoint_incarnation,
-							stage: gate.stage,
-							kind: gate.kind,
-							prompt: typeof gate.context.prompt === "string" ? gate.context.prompt : "",
-							status: "pending",
-							binding_plaintext: binding,
-							binding_sha256: createHash("sha256").update(binding).digest("hex"),
-							codec,
-							claim_fence_epoch: null,
-							answer_request_id: null,
-							created_at: observedAt,
-							updated_at: observedAt,
-							answered_at: null,
-							history: [{ at: observedAt, status: "pending", reason: null }],
-						};
-						turn.question_ids = [...new Set([...turn.question_ids, questionId])];
-						projectedTurnQuestions.set(turn.turn_id, turn.question_ids);
-						openedQuestions.push({ turnId: turn.turn_id, questionId });
-					}
-				}
-				if (complete)
-					for (const [authorityId, authority] of Object.entries(transaction.canonical.gate_authorities))
-						if (!seen.has(authorityId) && authority.outcome.state === "pending") {
-							const question = transaction.canonical.questions[authority.outcome.question_id];
-							if (question?.status === "pending") {
-								question.status = "stale";
-								question.updated_at = observedAt;
-								question.history.push({ at: observedAt, status: "stale", reason: "terminal_uncertain" });
-								authority.outcome = {
-									state: "stale",
-									reason: "terminal_uncertain",
-									turn_id: question.turn_id,
-									question_id: question.question_id,
-								};
-								authority.updated_at = observedAt;
-							}
+								prompt: typeof gate.context.prompt === "string" ? gate.context.prompt : "",
+								status: "pending",
+								binding_plaintext: binding,
+								binding_sha256: createHash("sha256").update(binding).digest("hex"),
+								codec,
+								claim_fence_epoch: null,
+								answer_request_id: null,
+								created_at: observedAt,
+								updated_at: observedAt,
+								answered_at: null,
+								history: [{ at: observedAt, status: "pending", reason: null }],
+							};
+							turn.question_ids = [...new Set([...turn.question_ids, questionId])];
+							projectedTurnQuestions.set(turn.turn_id, turn.question_ids);
+							const questionEventId = deterministicOutboxId(
+								sessionId,
+								transaction.revision + 1,
+								"question.opened",
+								"question",
+								questionId,
+							);
+							openedQuestions.push({ turnId: turn.turn_id, questionId, eventId: questionEventId });
+							transaction.outbox[questionEventId] ??= {
+								id: questionEventId,
+								transaction_revision: transaction.revision + 1,
+								kind: "question.opened",
+								entity: "question",
+								entity_id: questionId,
+								payload: {
+									session_id: sessionId,
+									turn_id: turn.turn_id,
+									question_id: questionId,
+									created_at: observedAt,
+								},
+								emitted: false,
+								public_event_id: questionEventId,
+								public_delivery: {
+									public_event_id: questionEventId,
+									state: "pending",
+									claim_fence: null,
+									claim_expires_at: null,
+									journal_seq: null,
+									acknowledged_at: null,
+								},
+							};
 						}
-			});
+					}
+					if (complete)
+						for (const [authorityId, authority] of Object.entries(transaction.canonical.gate_authorities))
+							if (!seen.has(authorityId) && authority.outcome.state === "pending") {
+								const question = transaction.canonical.questions[authority.outcome.question_id];
+								if (question?.status === "pending") {
+									question.status = "stale";
+									question.updated_at = observedAt;
+									question.history.push({ at: observedAt, status: "stale", reason: "terminal_uncertain" });
+									authority.outcome = {
+										state: "stale",
+										reason: "terminal_uncertain",
+										turn_id: question.turn_id,
+										question_id: question.question_id,
+									};
+									authority.updated_at = observedAt;
+								}
+							}
+				},
+				options,
+			);
+			if (!q12Admitted)
+				return {
+					ok: true,
+					schema_version: 1,
+					questions: await withSessionTransaction(questionPaths, sessionId, async tx => publicQuestions(tx, null)),
+					diagnostics,
+					reconciliation: {
+						attempted: false,
+						complete: false,
+						revision,
+						observed_at: observedAt,
+						reason: "terminal_uncertain",
+					},
+				};
 			for (const [turnId, questionIds] of projectedTurnQuestions) {
+				if (
+					options.signal?.aborted ||
+					(options.absoluteDeadline !== undefined && Date.now() >= options.absoluteDeadline)
+				)
+					break;
 				const legacyTurn = await readTurnRecord(namespaceDir, turnId);
 				if (!legacyTurn) continue;
 				legacyTurn.question_ids = questionIds;
 				await writeTurnRecord(namespaceDir, legacyTurn);
 			}
-			for (const question of openedQuestions)
-				await appendCoordinatorEvent(namespaceDir, {
-					kind: "question.opened",
-					sessionId,
-					turnId: question.turnId,
-					questionId: question.questionId,
-					summary: "A coordinator question is awaiting an answer.",
-				});
+			await exportRetainedDeliveries(32, options.signal);
+			for (const opened of openedQuestions) {
+				if (options.signal?.aborted) break;
+				await appendCoordinatorEvent(
+					namespaceDir,
+					{
+						stableId: opened.eventId,
+						kind: "question.opened",
+						sessionId,
+						turnId: opened.turnId,
+						questionId: opened.questionId,
+						summary: "A coordinator question is awaiting an answer.",
+					},
+					options.signal ? { signal: options.signal } : undefined,
+				);
+			}
 			return {
 				ok: true,
 				schema_version: 1,
@@ -3167,13 +3985,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return sdkResponse(response, query);
 	}
 
-	async function readCompleteQ12Snapshot(session: Record<string, unknown>): Promise<{
+	async function readCompleteQ12Snapshot(
+		session: Record<string, unknown>,
+		options: { absoluteDeadline?: number; signal?: AbortSignal } = {},
+	): Promise<{
 		items: unknown[];
 		revision: string | null;
 		complete: boolean;
 		reason: "pagination_malformed" | "query_unavailable" | null;
 	}> {
-		const deadline = Date.now() + Q12_SNAPSHOT_BUDGET_MS;
+		const deadline = Math.min(
+			Date.now() + Q12_SNAPSHOT_BUDGET_MS,
+			options.absoluteDeadline ?? Number.POSITIVE_INFINITY,
+		);
 		const items: unknown[] = [];
 		const cursors = new Set<string>();
 		let cursor: string | undefined;
@@ -3186,7 +4010,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return { items: [], revision, complete: false, reason: "query_unavailable" };
 		}
 		try {
-			for (let pageCount = 0; pageCount < 8 && Date.now() <= deadline; pageCount++) {
+			for (
+				let pageCount = 0;
+				pageCount < MAX_Q12_ATTEMPTS_PER_WATCH_PASS * 4 && Date.now() <= deadline;
+				pageCount++
+			) {
+				if (options.signal?.aborted) return { items: [], revision, complete: false, reason: "query_unavailable" };
 				// The snapshot deadline is only checked between pages, so each page has to
 				// carry what is left of it. Without that budget the page inherits the
 				// Router's session reply budget and one wedged page outlives the whole
@@ -3292,14 +4121,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return asRecord(response.error)?.code === "ambiguous";
 	}
 
+	function publicErrorCode(code: unknown): string {
+		return typeof code === "string" && Object.hasOwn(PUBLIC_ERROR_MESSAGES, code) ? code : "unavailable";
+	}
+	function publicError(error: unknown): Record<string, unknown> {
+		const directCode = error instanceof SdkClientError ? error.code : sinkErrorCode(error);
+		const messageCode =
+			error instanceof Error && Object.hasOwn(PUBLIC_ERROR_MESSAGES, error.message) ? error.message : undefined;
+		const code = publicErrorCode(directCode ?? messageCode);
+		return { ok: false, error: { code, message: PUBLIC_ERROR_MESSAGES[code] } };
+	}
 	function sdkError(error: unknown): Record<string, unknown> {
-		if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
-		if (error instanceof CoordinatorPublicationUncertainError)
-			return { ok: false, error: { code: "ambiguous", message: error.message } };
-		return {
-			ok: false,
-			error: { code: "unavailable", message: error instanceof Error ? error.message : String(error) },
-		};
+		return publicError(error);
 	}
 
 	function requiredIdempotencyKey(args: Record<string, unknown>): string {
@@ -3379,7 +4212,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					};
 				if (existing.state === "completed") {
 					const replay = asRecord(existing.response);
-					if (replay) return replay;
+					if (replay) return boundedToolResponse(tool, replay);
 					return {
 						ok: false,
 						error: {
@@ -3397,6 +4230,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						},
 					};
 				if (existing.state === "in_progress") {
+					// A crash can leave the receipt phase behind a fully materialized
+					// response. Replaying that response is safer than re-running the
+					// operation and changing volatile projection timestamps.
+					const persistedResponse = asRecord(existing.response);
+					if (persistedResponse && !isNonterminal(persistedResponse)) {
+						await writeCoordinatorIdempotencyFile(file, {
+							...existing,
+							state: "completed",
+							response: persistedResponse,
+							completed_at: new Date().toISOString(),
+						} as CoordinatorToolIdempotencyRecord);
+						return boundedToolResponse(tool, persistedResponse);
+					}
 					const response = boundedToolResponse(tool, await operation().catch(error => sdkError(error)));
 					// The receipt keeps its original key and request digests, so a
 					// reused key still conflicts and a later settled answer still seals.
@@ -3702,6 +4548,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	function sessionFile(sessionId: unknown): string {
 		return path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`);
 	}
+	async function removeReapedProjection(
+		sessionId: string,
+		turnIds: readonly string[],
+		reportIds: readonly string[],
+	): Promise<void> {
+		for (const turnId of turnIds) await fs.rm(turnFile(namespaceDir, turnId), { force: true });
+		for (const reportId of reportIds)
+			await fs.rm(path.join(namespaceDir, "reports", `${reportId}.json`), { force: true });
+		await fs.rm(sessionFile(sessionId), { force: true });
+		await fs.rm(sessionStateFile(namespaceDir, sessionId), { force: true });
+		await fs.rm(activeTurnFile(namespaceDir, sessionId), { force: true });
+	}
 	async function reapSession(
 		rawId: unknown,
 		opts: { force?: boolean; reason?: string } = {},
@@ -3714,25 +4572,30 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const deletion = await withNamespaceRegistry(
 					questionPaths,
 					async registry =>
-						Object.values(registry.deletions).find(
-							entry => entry.session_id === id && entry.phase !== "completed",
-						) ?? null,
+						Object.values(registry.deletions)
+							.filter(entry => entry.session_id === id)
+							.sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0] ?? null,
 				);
+				if (deletion?.phase === "completed" && deletion.safe_response)
+					return deletion.safe_response as { ok: boolean; closed: boolean };
 				if (deletion?.phase === "broker_closed" || deletion?.phase === "cleanup_pending") {
-					await removeCoordinatorFile(sessionFile(id));
-					await removeCoordinatorFile(sessionStateFile(namespaceDir, id));
-					await removeCoordinatorFile(activeTurnFile(namespaceDir, id));
-					await appendCoordinatorEvent(namespaceDir, {
-						kind: "session.reaped",
-						sessionId: id,
-						summary: `Session ${id} cleanup resumed`,
-						metadata: { recovered: true, closed: true },
+					const projectionIds = await withSessionTransaction(questionPaths, id, async transaction => ({
+						turnIds: Object.keys(transaction.canonical.turns),
+						reportIds: Object.keys(transaction.canonical.reports),
+					})).catch(error => {
+						if (error instanceof Error && error.message === "resource_gone")
+							return { turnIds: [] as string[], reportIds: [] as string[] };
+						throw error;
 					});
+					await removeSessionTransaction(questionPaths, id, deletion.endpoint_incarnation).catch(error => {
+						if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+					});
+					await removeReapedProjection(id, projectionIds.turnIds, projectionIds.reportIds);
 					await advanceDeletion(
 						questionPaths,
 						deletion.deletion_id,
 						"completed",
-						{ wal: true, turns: true, reports: false, session: true, events: true },
+						{ wal: true, turns: true, reports: true, session: true, events: true },
 						{ ok: true, closed: true },
 					);
 					return { ok: true, closed: true };
@@ -3753,8 +4616,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 			if (session.ephemeral !== true && opts.force !== true)
 				return { ok: false, reason: "not_ephemeral", closed: false };
-			const activeTurn = await readActiveTurn(namespaceDir, id);
-			if (activeTurn) return { ok: false, reason: "active_turn", closed: false, active_turn_id: activeTurn.turn_id };
+			await ensureQuestionStateReady();
+			await ensureQuestionTransaction(id);
+			// Rebuild legacy projections before reaper eligibility checks. A crash after
+			// canonical terminal commit must not leave a stale active-turn file blocking reap.
+			await recoverCanonicalSessionProjection(id);
 			const cwd = optionalString(session.cwd);
 			const persistedWorkspace = optionalString(session.broker_workspace);
 			const persistedGeneration =
@@ -3766,13 +4632,87 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const persistedIncarnation = optionalString(session.endpoint_incarnation);
 			if (!cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
 				return { ok: false, reason: "endpoint_stale", closed: false };
+			// Endpoint identity is the authority for any lifecycle mutation. Check it
+			// before consulting a possibly stale active-turn projection so a successor
+			// incarnation cannot be blocked by old local state.
+			let preflightWorkspace: string;
+			try {
+				preflightWorkspace = await canonicalBrokerWorkspace(cwd);
+				const authority = await exactBrokerSessionAuthority(id, preflightWorkspace);
+				if (
+					!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
+					authority.endpointGeneration !== persistedGeneration ||
+					authority.endpointIncarnation !== persistedIncarnation
+				)
+					return { ok: false, reason: "endpoint_stale", closed: false };
+			} catch (error) {
+				if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale"))
+					return { ok: false, reason: "endpoint_stale", closed: false };
+				throw error;
+			}
+			const canonicalTransaction = await readSessionTransaction(questionPaths, id);
+			const canonicalActiveTurn = (canonicalTransaction
+				? Object.values(canonicalTransaction.canonical.turns).find(turn =>
+						ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+					)
+				: undefined) as unknown as { turn_id: string } | undefined;
+			const activeTurn = await readActiveTurn(namespaceDir, id);
+			if (activeTurn || canonicalActiveTurn)
+				return {
+					ok: false,
+					reason: "active_turn",
+					closed: false,
+					active_turn_id: activeTurn?.turn_id ?? canonicalActiveTurn?.turn_id,
+				};
 			const deletionId = `delete:${id}:${persistedIncarnation}`;
 			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
-			const deletionPhase = await withNamespaceRegistry(
-				questionPaths,
-				async registry => registry.deletions[deletionId]?.phase,
-			);
-			const closeAlreadyProven = deletionPhase === "broker_closed" || deletionPhase === "cleanup_pending";
+			const deletionEntry = {
+				deletion_id: deletionId,
+				session_id: id,
+				endpoint_incarnation: persistedIncarnation,
+				operation_id: deletionId,
+				key_digest: deletionKey,
+				request_digest: deletionKey,
+				close_key: deletionId,
+				phase: "intent" as const,
+				cleanup: { wal: false, turns: false, reports: false, session: false, events: false },
+				authority_digest: deletionKey,
+				created_at: new Date().toISOString(),
+				updated_at: new Date().toISOString(),
+			};
+			let admitted: CoordinatorSessionTransactionV1;
+			try {
+				admitted = await admitSessionClose(questionPaths, deletionEntry);
+			} catch (error) {
+				if (error instanceof Error && error.message === "active_turn_exists") {
+					return { ok: false, reason: "active_turn", closed: false };
+				}
+				throw error;
+			}
+			const projectionIds = {
+				turnIds: Object.keys(admitted.canonical.turns),
+				reportIds: Object.keys(admitted.canonical.reports),
+			};
+			await withSessionTransaction(questionPaths, id, async transaction => {
+				const now = new Date().toISOString();
+				transaction.requests.operations[deletionId] = {
+					operation_id: deletionId,
+					tool: "gjc_coordinator_stop_session",
+					key_digest: deletionKey,
+					request_digest: deletionKey,
+					local_id: id,
+					phase: "claimed",
+					intent: { kind: "reap", endpoint_incarnation: persistedIncarnation },
+					created_at: now,
+					updated_at: now,
+				};
+			});
+			await withSessionTransaction(questionPaths, id, async transaction => {
+				const operation = transaction.requests.operations[deletionId];
+				if (!operation) throw new Error("state_corrupt");
+				if (operation.phase === "claimed") operation.phase = "remote_started";
+				operation.updated_at = new Date().toISOString();
+			});
 			let workspace = "";
 			try {
 				workspace = await canonicalBrokerWorkspace(cwd);
@@ -3841,7 +4781,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return {
 					ok: false,
 					reason: "close_failed",
-					detail: error instanceof SdkClientError ? error.code : "unavailable",
+					detail: publicErrorCode(error instanceof SdkClientError ? error.code : sinkErrorCode(error)),
 					closed: false,
 				};
 			}
@@ -3886,13 +4826,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					if (!isTerminal || isLive) return { ok: false, reason: "endpoint_stale", closed: false };
 				}
 			} catch (error) {
-				if (error instanceof SdkClientError)
-					return { ok: false, reason: "close_failed", detail: error.code, closed: false };
-				return { ok: false, reason: "close_failed", detail: "unavailable", closed: false };
+				return {
+					ok: false,
+					reason: "close_failed",
+					detail: publicErrorCode(error instanceof SdkClientError ? error.code : sinkErrorCode(error)),
+					closed: false,
+				};
 			}
-			await removeCoordinatorFile(sessionFile(id));
-			await removeCoordinatorFile(sessionStateFile(namespaceDir, id));
-			await removeCoordinatorFile(activeTurnFile(namespaceDir, id));
+			await exportRetainedDeliveries();
+			await removeSessionTransaction(questionPaths, id, persistedIncarnation);
+			await removeReapedProjection(id, projectionIds.turnIds, projectionIds.reportIds);
 			await appendCoordinatorEvent(namespaceDir, {
 				kind: "session.reaped",
 				sessionId: id,
@@ -3906,7 +4849,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				{
 					wal: true,
 					turns: true,
-					reports: false,
+					reports: true,
 					session: true,
 					events: true,
 				},
@@ -3925,6 +4868,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					const session = asRecord(raw);
 					const sessionId = optionalString(session?.session_id);
 					if (session?.ephemeral !== true || !sessionId) continue;
+					try {
+						await ensureQuestionTransaction(sessionId);
+					} catch (error) {
+						if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+					}
+					try {
+						await recoverCanonicalSessionProjection(sessionId);
+					} catch (error) {
+						if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+					}
 					const state = await readSessionState(namespaceDir, sessionId);
 					const stamp = optionalString(state?.updated_at) ?? optionalString(session.created_at);
 					const lastActivityMs = stamp ? Date.parse(stamp) : Number.NaN;
@@ -3953,9 +4906,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return {
 			...reconciled,
 			questions: reconciled.questions
-				.filter(question => question.status === status || (status === "open" && question.status === "pending"))
+				.filter(
+					question =>
+						status === "all" ||
+						question.status === status ||
+						(status === "open" && question.status === "pending"),
+				)
 				.filter(question => turnId === null || question.turn_id === turnId),
 		};
+	}
+
+	function canonicalReportEvidencePaths(value: unknown): unknown {
+		if (value == null) return [];
+		if (!Array.isArray(value)) return value;
+		return value.map(item => (typeof item === "string" ? path.resolve(item) : item));
 	}
 
 	async function validateEvidencePaths(value: unknown): Promise<Array<{ path: string }>> {
@@ -3970,8 +4934,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 
 	async function readTurnPayload(turnId: unknown, sessionId: unknown): Promise<Record<string, unknown>> {
+		const requestedSession = sessionId == null ? null : safeExternalId("session", sessionId);
+		if (requestedSession) {
+			await reconcileSessionRuntime(requestedSession, { observeQuestions: true }).catch(error => {
+				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+			});
+			await recoverCanonicalSessionProjection(requestedSession);
+		}
 		const turn = await readTurnRecord(namespaceDir, turnId);
 		if (!turn) return { ok: false, reason: "unknown_turn" };
+		if (!requestedSession) {
+			await reconcileSessionRuntime(turn.session_id, { observeQuestions: true });
+			await recoverCanonicalSessionProjection(turn.session_id);
+		}
 		if (sessionId != null && turn.session_id !== safeExternalId("session", sessionId)) {
 			return { ok: false, reason: "turn_session_mismatch" };
 		}
@@ -3991,7 +4966,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				advisoryStatus = {
 					authority: "sdk",
 					live: null,
-					reason: error instanceof SdkClientError ? error.code : "unavailable",
+					reason: publicErrorCode(error instanceof SdkClientError ? error.code : sinkErrorCode(error)),
 				};
 			}
 		} else {
@@ -4002,20 +4977,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			resolvedTurn,
 			sessionState,
 			promptAckTimeoutMs,
-			{ failOnTimeout: false },
+			{ failOnTimeout: false, onAcknowledged: publishAcknowledgedTurnIntent },
 		);
 		if (resolvedTurn !== turn) sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
-		if (
-			sessionState?.state === "needs_user_input" &&
-			sessionState.current_turn_id === resolvedTurn.turn_id &&
-			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
-			resolvedTurn.status !== "waiting_for_answer"
-		) {
-			const timestamp = new Date().toISOString();
-			resolvedTurn = { ...resolvedTurn, status: "waiting_for_answer", updated_at: timestamp };
-			await writeTurnRecord(namespaceDir, resolvedTurn);
-			await writeActiveTurn(namespaceDir, resolvedTurn);
-		}
 		if (
 			sessionState &&
 			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
@@ -4047,6 +5011,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				resolvedTurn,
 				sessionState,
 				promptAckTimeoutMs,
+				{ failOnTimeout: true, onAcknowledged: publishAcknowledgedTurnIntent },
 			);
 			if (!ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
 				await projectTerminalTransition(resolvedTurn, {
@@ -4123,13 +5088,60 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (existing) {
 				if (existing.request_digest !== requestDigest) throw new Error("idempotency_conflict");
 				if (existing.phase === "uncertain") throw new Error("terminal_uncertain");
-				// The host deduplicates this key, so a post-send Router ambiguity may re-dispatch it to recover the receipt.
+				// An accepted receipt is durable authority. It is recovered below instead
+				// of sending the same remote idempotency key a second time.
+				if (existing.phase === "accepted" || existing.phase === "completed" || existing.phase === "claimed") return;
 				if (existing.phase === "remote_started") {
 					existing.updated_at = new Date().toISOString();
 					return;
 				}
 			}
+			const activeTurnId = transaction.canonical.queue.active_turn_id;
+			const anotherActiveTurn = Object.values(transaction.canonical.turns).some(turn =>
+				ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+			);
+			const reservedPrompt = Object.values(transaction.requests.prompts).some(
+				request =>
+					request.operation !== "turn.follow_up" &&
+					["claimed", "remote_started", "accepted"].includes(request.phase),
+			);
+			if (operation === "turn.prompt" && (activeTurnId !== null || anotherActiveTurn || reservedPrompt))
+				throw new Error("active_turn_exists");
+			if (operation === "turn.abort_and_prompt" && reservedPrompt) throw new Error("active_turn_exists");
 			const now = new Date().toISOString();
+			const reserved = makeTurnRecord(
+				config,
+				sessionId,
+				prompt,
+				operation === "turn.follow_up" ? "queued" : "delivering",
+			);
+			reserved.delivery.state = "queued";
+			reserved.delivery.queued = operation === "turn.follow_up";
+			transaction.canonical.turns[reserved.turn_id] = {
+				schema_version: 1,
+				turn_id: reserved.turn_id,
+				session_id: sessionId,
+				namespace_id: config.namespace.identity,
+				status: reserved.status,
+				prompt: reserved.prompt,
+				delivery: { ...reserved.delivery },
+				runtime_provenance: null,
+				question_ids: [],
+				final_response: { ...reserved.final_response },
+				evidence: [],
+				error: null,
+				liveness: { ...reserved.liveness },
+				created_at: reserved.created_at,
+				updated_at: reserved.updated_at,
+				started_at: reserved.started_at,
+				completed_at: null,
+				terminal_fence: null,
+			};
+			transaction.canonical.queue.ordered_turn_ids = [
+				...transaction.canonical.queue.ordered_turn_ids,
+				...(operation === "turn.follow_up" ? [reserved.turn_id] : []),
+			];
+			if (operation !== "turn.follow_up") transaction.canonical.queue.active_turn_id = reserved.turn_id;
 			transaction.requests.prompts[keyDigest] = {
 				request_id: `prompt:${keyDigest}`,
 				key_digest: keyDigest,
@@ -4137,12 +5149,114 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				operation,
 				canonical_prompt: { text: prompt },
 				sdk_idempotency_key: idempotencyKey,
-				phase: "remote_started",
+				phase: "claimed",
+				coordinator_turn_id: reserved.turn_id,
 				created_at: now,
 				updated_at: now,
 			};
 		});
 		return keyDigest;
+	}
+
+	/** Remove a reservation when the remote endpoint returned a decided, malformed
+	 * acknowledgement. Ambiguous transport outcomes retain the reservation so an
+	 * exact-key retry can reconcile the same remote command instead. */
+	async function discardUnacceptedPromptReservation(sessionId: string, promptKey: string): Promise<void> {
+		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+			const request = transaction.requests.prompts[promptKey];
+			if (!request || request.phase === "accepted" || request.phase === "completed") return;
+			const turnId = request.coordinator_turn_id;
+			if (turnId) {
+				delete transaction.canonical.turns[turnId];
+				transaction.canonical.queue.ordered_turn_ids = transaction.canonical.queue.ordered_turn_ids.filter(
+					candidate => candidate !== turnId,
+				);
+				if (transaction.canonical.queue.active_turn_id === turnId)
+					transaction.canonical.queue.active_turn_id = null;
+			}
+			delete transaction.requests.prompts[promptKey];
+		});
+	}
+
+	async function promptReceipt(sessionId: string, promptKey: string): Promise<RuntimePromptAcknowledgement | null> {
+		return await withSessionTransaction(questionPaths, sessionId, async transaction => {
+			const request = transaction.requests.prompts[promptKey];
+			if (
+				!request ||
+				(request.phase !== "accepted" && request.phase !== "completed") ||
+				request.runtime_receipt?.accepted !== true
+			)
+				return null;
+			const receipt = request.runtime_receipt;
+			if (!SAFE_EXTERNAL_ID_PATTERN.test(receipt.command_id) || !SAFE_EXTERNAL_ID_PATTERN.test(receipt.turn_id))
+				throw new Error("terminal_uncertain");
+			if (request.phase === "completed") {
+				const turn = request.coordinator_turn_id ? transaction.canonical.turns[request.coordinator_turn_id] : null;
+				if (
+					!turn ||
+					turn.delivery.runtime_command_id !== receipt.command_id ||
+					turn.delivery.runtime_turn_id !== receipt.turn_id
+				)
+					throw new Error("terminal_uncertain");
+			}
+			return { accepted: true, command_id: receipt.command_id, turn_id: receipt.turn_id };
+		});
+	}
+
+	async function persistPromptReceipt(
+		sessionId: string,
+		promptKey: string,
+		acknowledgement: RuntimePromptAcknowledgement,
+	): Promise<void> {
+		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+			const request = transaction.requests.prompts[promptKey];
+			if (!request) throw new Error("state_corrupt");
+			if (request.phase === "completed" && request.runtime_receipt) return;
+			if (request.phase !== "remote_started" && request.phase !== "accepted") throw new Error("terminal_uncertain");
+			request.phase = "accepted";
+			request.runtime_receipt = {
+				accepted: true,
+				command_id: acknowledgement.command_id,
+				turn_id: acknowledgement.turn_id,
+			};
+			request.updated_at = new Date().toISOString();
+		});
+	}
+
+	async function dispatchOrRecoverPrompt(
+		session: Record<string, unknown>,
+		sessionId: string,
+		operation: "turn.prompt" | "turn.follow_up" | "turn.abort_and_prompt",
+		prompt: string,
+		idempotencyKey: string,
+		promptKey: string,
+	): Promise<RuntimePromptAcknowledgement> {
+		const recovered = await promptReceipt(sessionId, promptKey);
+		if (recovered) return recovered;
+		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+			const request = transaction.requests.prompts[promptKey];
+			if (!request) throw new Error("state_corrupt");
+			if (request.phase === "claimed") request.phase = "remote_started";
+			if (request.phase !== "remote_started") throw new Error("terminal_uncertain");
+			request.updated_at = new Date().toISOString();
+		});
+		let acknowledgement: RuntimePromptAcknowledgement;
+		try {
+			acknowledgement = requirePromptAcknowledgement(
+				await controlSession(session, operation, { text: prompt }, idempotencyKey),
+			);
+		} catch (error) {
+			// A malformed or explicitly failed acknowledgement is a decided local
+			// failure, not a remote outcome to replay. Leave only ambiguous Router
+			// responses retryable under the same prompt idempotency key.
+			if (!(error instanceof SdkClientError) || error.code !== "ambiguous")
+				await discardUnacceptedPromptReservation(sessionId, promptKey);
+			throw error;
+		}
+		// Persist the receipt before touching projections. A crash after the SDK
+		// accepts the command can then rebuild the turn without dispatching again.
+		await persistPromptReceipt(sessionId, promptKey, acknowledgement);
+		return acknowledgement;
 	}
 
 	/** Commits terminal fencing, question revocation, report, and promotion together before legacy projection. */
@@ -4154,10 +5268,60 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			report?: CanonicalReportSnapshotV1;
 			promoteQueuedTurn?: boolean;
 		},
-	): Promise<{ promotedTurnId: string | null; desiredState: CoordinatorSessionStateValue }> {
+	): Promise<{
+		promotedTurnId: string | null;
+		desiredState: CoordinatorSessionStateValue;
+		transitioned: boolean;
+	}> {
 		await ensureQuestionTransaction(turn.session_id);
 		return await withAdmittedSessionTransaction(questionPaths, turn.session_id, async transaction => {
+			const existing = transaction.canonical.turns[turn.turn_id];
+			if (existing?.terminal_fence) {
+				/* First terminal, including cancellation, owns the fence. A later report
+				 * is retained as evidence but cannot overwrite canonical receipt/state. */
+				if (input.report) {
+					transaction.canonical.reports[input.report.report_id] = input.report;
+					const reportEventId = deterministicOutboxId(
+						turn.session_id,
+						transaction.revision + 1,
+						"report.written",
+						"report",
+						input.report.report_id,
+					);
+					transaction.outbox[reportEventId] ??= {
+						id: reportEventId,
+						transaction_revision: transaction.revision + 1,
+						kind: "report.written",
+						entity: "report",
+						entity_id: input.report.report_id,
+						payload: {
+							session_id: turn.session_id,
+							turn_id: turn.turn_id,
+							report_id: input.report.report_id,
+							status: input.report.status,
+							created_at: input.report.created_at,
+						},
+						emitted: false,
+						public_event_id: reportEventId,
+						public_delivery: {
+							public_event_id: reportEventId,
+							state: "pending",
+							claim_fence: null,
+							claim_expires_at: null,
+							journal_seq: null,
+							acknowledged_at: null,
+						},
+					};
+				}
+				return {
+					promotedTurnId: transaction.canonical.queue.active_turn_id,
+					desiredState: transaction.canonical.desired_session_state,
+					transitioned: false,
+				};
+			}
 			const terminalEpoch = transaction.revision + 1;
+			const activeTurnId = transaction.canonical.queue.active_turn_id;
+			const isActiveTurn = activeTurnId === turn.turn_id;
 			transaction.canonical.turns[turn.turn_id] = {
 				schema_version: 1,
 				turn_id: turn.turn_id,
@@ -4166,6 +5330,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				status: turn.status,
 				prompt: turn.prompt,
 				delivery: { ...turn.delivery },
+				runtime_provenance: null,
 				question_ids: Object.values(transaction.canonical.questions)
 					.filter(question => question.turn_id === turn.turn_id)
 					.map(question => question.question_id),
@@ -4197,11 +5362,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (input.report) transaction.canonical.reports[input.report.report_id] = input.report;
 			const next =
-				input.promoteQueuedTurn === false
-					? null
-					: (Object.values(transaction.canonical.turns)
+				isActiveTurn && input.promoteQueuedTurn !== false
+					? (Object.values(transaction.canonical.turns)
 							.filter(candidate => candidate.status === "queued")
-							.sort((left, right) => left.created_at.localeCompare(right.created_at))[0] ?? null);
+							.sort((left, right) => left.created_at.localeCompare(right.created_at))[0] ?? null)
+					: null;
 			if (next) {
 				const timestamp = new Date().toISOString();
 				next.status = "active";
@@ -4211,11 +5376,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			transaction.canonical.queue.ordered_turn_ids = Object.values(transaction.canonical.turns)
 				.filter(candidate => candidate.status === "queued")
 				.map(candidate => candidate.turn_id);
-			transaction.canonical.queue.active_turn_id = next?.turn_id ?? null;
-			transaction.canonical.queue.selected_promotion = next
-				? { from_turn_id: turn.turn_id, to_turn_id: next.turn_id, revision: terminalEpoch }
-				: null;
-			transaction.canonical.desired_session_state = next ? "running" : input.desiredState;
+			transaction.canonical.queue.active_turn_id = isActiveTurn ? (next?.turn_id ?? null) : activeTurnId;
+			transaction.canonical.queue.selected_promotion =
+				isActiveTurn && next
+					? { from_turn_id: turn.turn_id, to_turn_id: next.turn_id, revision: terminalEpoch }
+					: null;
+			transaction.canonical.desired_session_state = isActiveTurn
+				? next
+					? "running"
+					: input.desiredState
+				: transaction.canonical.desired_session_state;
 			const eventKind = turnEventKind(turn.status) ?? "turn.terminal";
 			const eventId = deterministicOutboxId(turn.session_id, terminalEpoch, eventKind, "turn", turn.turn_id);
 			transaction.outbox[eventId] ??= {
@@ -4231,6 +5401,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					created_at: turn.updated_at,
 				},
 				emitted: false,
+				public_event_id: eventId,
+				public_delivery: {
+					public_event_id: eventId,
+					state: "pending",
+					claim_fence: null,
+					claim_expires_at: null,
+					journal_seq: null,
+					acknowledged_at: null,
+				},
 			};
 			if (input.report) {
 				const reportEventId = deterministicOutboxId(
@@ -4254,9 +5433,22 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						created_at: input.report.created_at,
 					},
 					emitted: false,
+					public_event_id: reportEventId,
+					public_delivery: {
+						public_event_id: reportEventId,
+						state: "pending",
+						claim_fence: null,
+						claim_expires_at: null,
+						journal_seq: null,
+						acknowledged_at: null,
+					},
 				};
 			}
-			return { promotedTurnId: next?.turn_id ?? null, desiredState: next ? "running" : input.desiredState };
+			return {
+				promotedTurnId: next?.turn_id ?? null,
+				desiredState: isActiveTurn && next ? "running" : transaction.canonical.desired_session_state,
+				transitioned: true,
+			};
 		});
 	}
 
@@ -4282,72 +5474,176 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 
 	/** Rebuild every legacy projection from the committed canonical snapshot. */
-	async function repairCanonicalProjections(sessionId: string): Promise<void> {
-		await repairProjections(questionPaths, sessionId, async canonical => {
-			await writeJsonFile(sessionFile(sessionId), sessionFromCreationSnapshot(canonical.session));
-			for (const turn of Object.values(canonical.turns))
-				await writeTurnRecord(namespaceDir, turnFromCanonical(turn));
-			for (const report of Object.values(canonical.reports))
-				await writeJsonFile(path.join(namespaceDir, "reports", `${report.report_id}.json`), report);
-			const canonicalTurnIds = new Set(Object.keys(canonical.turns));
-			const turnEntries = await fs.readdir(turnsDir(namespaceDir)).catch(error => {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-				throw error;
-			});
-			for (const entry of turnEntries) {
-				if (!entry.endsWith(".json")) continue;
-				const turnId = entry.slice(0, -5);
-				if (canonicalTurnIds.has(turnId)) continue;
-				const projected = asRecord(await readJsonFile(path.join(turnsDir(namespaceDir), entry)));
-				if (projected?.session_id === sessionId)
-					await removeCoordinatorFile(path.join(turnsDir(namespaceDir), entry));
+	async function repairCanonicalProjections(sessionId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+		await repairProjections(
+			questionPaths,
+			sessionId,
+			async canonical => {
+				await writeJsonFile(sessionFile(sessionId), sessionFromCreationSnapshot(canonical.session));
+				for (const turn of Object.values(canonical.turns))
+					await writeTurnRecord(namespaceDir, turnFromCanonical(turn));
+				for (const report of Object.values(canonical.reports))
+					await writeJsonFile(path.join(namespaceDir, "reports", `${report.report_id}.json`), report);
+				const activeId = canonical.queue.selected_promotion?.to_turn_id ?? canonical.queue.active_turn_id;
+				const active = activeId ? canonical.turns[activeId] : null;
+				if (active) await writeActiveTurn(namespaceDir, turnFromCanonical(active));
+				else {
+					const prior = await readActiveTurn(namespaceDir, sessionId);
+					if (prior) await clearActiveTurn(namespaceDir, prior);
+				}
+				// A runtime sidecar can advance a live session while the canonical WAL still
+				// needs projection repair. Preserve that observed lifecycle state (and its
+				// activity snapshot) instead of letting a repair briefly roll it back to the
+				// WAL's older desired state, unless the WAL already proves a terminal state.
+				const runtimeState = await readSessionState(namespaceDir, sessionId);
+				const canonicalTerminal =
+					canonical.desired_session_state === "completed" || canonical.desired_session_state === "errored";
+				const runtimeStateToPreserve =
+					!canonicalTerminal &&
+					runtimeState &&
+					runtimeState.source === "agent_session_event" &&
+					runtimeState.live === true &&
+					(runtimeState.state === "ready_for_input" ||
+						runtimeState.state === "running" ||
+						runtimeState.state === "needs_user_input")
+						? runtimeState
+						: null;
+				await writeSessionState(
+					namespaceDir,
+					sessionId,
+					runtimeStateToPreserve?.state ?? canonical.desired_session_state,
+					{
+						currentTurnId: runtimeStateToPreserve
+							? runtimeStateToPreserve.current_turn_id
+							: (active?.turn_id ?? null),
+						lastTurnId: runtimeStateToPreserve
+							? runtimeStateToPreserve.last_turn_id
+							: (canonical.queue.selected_promotion?.from_turn_id ?? null),
+						live: runtimeStateToPreserve ? runtimeStateToPreserve.live : null,
+						reason: runtimeStateToPreserve ? runtimeStateToPreserve.reason : null,
+						source: runtimeStateToPreserve?.source,
+						overwrite: runtimeStateToPreserve === null,
+						emitEvent: false,
+					},
+				);
+			},
+			options,
+		);
+		await exportRetainedDeliveries(32, options.signal);
+	}
+
+	async function recoverCanonicalSessionProjection(sessionId: string): Promise<void> {
+		const transaction = await readSessionTransaction(questionPaths, sessionId);
+		if (!transaction) return;
+		const applied = Math.min(
+			transaction.projection.applied_turns_revision,
+			transaction.projection.applied_reports_revision,
+			transaction.projection.applied_session_revision,
+			transaction.projection.applied_active_revision,
+			transaction.projection.applied_events_revision,
+		);
+		if (applied < transaction.revision) await repairCanonicalProjections(sessionId);
+	}
+
+	async function recoverCanonicalNamespaceProjections(): Promise<void> {
+		await ensureQuestionStateReady();
+		const roster = await readSchedulerRoster(questionPaths);
+		const persisted = await fs.readdir(questionPaths.sessions).catch(() => []);
+		const sessions = [
+			...new Set([
+				...roster.roster.map(entry => entry.session_id),
+				...persisted.filter(entry => COORDINATOR_SESSION_ID_PATTERN.test(entry)),
+			]),
+		];
+		for (const sessionId of sessions) {
+			try {
+				await recoverCanonicalSessionProjection(sessionId);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
 			}
-			const reportsDirectory = path.join(namespaceDir, "reports");
-			const canonicalReportIds = new Set(Object.keys(canonical.reports));
-			const reportEntries = await fs.readdir(reportsDirectory).catch(error => {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-				throw error;
-			});
-			for (const entry of reportEntries) {
-				if (!entry.endsWith(".json")) continue;
-				const reportId = entry.slice(0, -5);
-				if (canonicalReportIds.has(reportId)) continue;
-				const projected = asRecord(await readJsonFile(path.join(reportsDirectory, entry)));
-				if (projected?.session_id === sessionId) await removeCoordinatorFile(path.join(reportsDirectory, entry));
-			}
-			const activeId = canonical.queue.selected_promotion?.to_turn_id ?? canonical.queue.active_turn_id;
-			const active = activeId ? canonical.turns[activeId] : null;
-			if (active) await writeActiveTurn(namespaceDir, turnFromCanonical(active));
-			else {
-				const prior = await readActiveTurn(namespaceDir, sessionId);
-				if (prior) await clearActiveTurn(namespaceDir, prior);
-			}
-			await writeSessionState(namespaceDir, sessionId, canonical.desired_session_state, {
-				currentTurnId: active?.turn_id ?? null,
-				lastTurnId: canonical.queue.selected_promotion?.from_turn_id ?? null,
-				live: null,
-				reason: null,
-				overwrite: true,
-			});
-		});
+		}
 	}
 
 	async function projectTerminalTransition(
 		turn: TurnRecord,
-
-		input: Parameters<typeof commitTerminalTransition>[1] & { live?: boolean | null },
-	): Promise<void> {
-		await commitTerminalTransition(turn, input);
-		await repairCanonicalProjections(turn.session_id);
+		input: Parameters<typeof commitTerminalTransition>[1] & {
+			live?: boolean | null;
+			signal?: AbortSignal;
+		},
+	): Promise<Awaited<ReturnType<typeof commitTerminalTransition>>> {
+		const result = await commitTerminalTransition(turn, input);
+		if (input.report) await services.afterCanonicalReportCommit?.(turn.session_id);
+		await repairCanonicalProjections(turn.session_id, { signal: input.signal });
+		return result;
 	}
 
 	async function commitCanonicalTurn(
 		sessionId: string,
 		turn: TurnRecord,
 		promptKey: string | null = null,
-	): Promise<void> {
+	): Promise<{ turn: TurnRecord; acknowledgementLinked: boolean }> {
 		await ensureQuestionTransaction(sessionId);
-		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+		return await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+			const existing = transaction.canonical.turns[turn.turn_id];
+			if (existing?.terminal_fence) {
+				/* A sidecar terminal observation owns this turn. Finalization may only
+				 * link the accepted receipt when the reservation and runtime identities
+				 * still correlate; it must never rebuild status, fencing, or queue state. */
+				let acknowledgementLinked = false;
+				if (promptKey) {
+					const request = transaction.requests.prompts[promptKey];
+					const commandId = turn.delivery.runtime_command_id;
+					const runtimeTurnId = turn.delivery.runtime_turn_id;
+					const receipt = request?.runtime_receipt;
+					const requestOwnsTurn = request?.coordinator_turn_id === existing.turn_id;
+					const receiptMatches =
+						!receipt || (receipt.command_id === commandId && receipt.turn_id === runtimeTurnId);
+					const existingCommandId =
+						typeof existing.delivery.runtime_command_id === "string"
+							? existing.delivery.runtime_command_id
+							: null;
+					const existingRuntimeTurnId =
+						typeof existing.delivery.runtime_turn_id === "string" ? existing.delivery.runtime_turn_id : null;
+					const deliveryMatches =
+						(existingCommandId === null || existingCommandId === commandId) &&
+						(existingRuntimeTurnId === null || existingRuntimeTurnId === runtimeTurnId);
+					if (request && requestOwnsTurn && receiptMatches && deliveryMatches && commandId && runtimeTurnId) {
+						const attempts = Array.isArray(existing.delivery.attempts) ? existing.delivery.attempts : [];
+						const hasRuntimeAcknowledgement = attempts.some(candidate => {
+							const attempt = asRecord(candidate);
+							return attempt?.channel === "runtime_ack" && attempt.reason === "runtime_acknowledged";
+						});
+						existing.delivery = {
+							...existing.delivery,
+							delivered: true,
+							prompt_acknowledged: true,
+							runtime_command_id: commandId,
+							runtime_turn_id: runtimeTurnId,
+							state: "acknowledged",
+							attempts: hasRuntimeAcknowledgement
+								? attempts
+								: [
+										...attempts,
+										{
+											delivered: true,
+											created_at: turn.updated_at,
+											channel: "runtime_ack",
+											reason: "runtime_acknowledged",
+										},
+									],
+						};
+						request.phase = "completed";
+						request.runtime_receipt = {
+							accepted: true,
+							command_id: commandId,
+							turn_id: runtimeTurnId,
+						};
+						request.updated_at = turn.updated_at;
+						acknowledgementLinked = true;
+					}
+				}
+				return { turn: turnFromCanonical(existing), acknowledgementLinked };
+			}
 			const terminal = TERMINAL_TURN_STATUSES.has(turn.status);
 			transaction.canonical.turns[turn.turn_id] = {
 				schema_version: 1,
@@ -4357,6 +5653,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				status: turn.status,
 				prompt: turn.prompt,
 				delivery: { ...turn.delivery },
+				runtime_provenance: null,
 				question_ids: Object.values(transaction.canonical.questions)
 					.filter(question => question.turn_id === turn.turn_id)
 					.map(question => question.question_id),
@@ -4385,7 +5682,41 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				: turn.delivery.queued
 					? transaction.canonical.queue.active_turn_id
 					: turn.turn_id;
+			if (!terminal && !turn.delivery.queued) transaction.canonical.desired_session_state = "running";
 			transaction.recovery.prompt_watermark_at = turn.updated_at;
+			const lifecycleKind = turnEventKind(turn.status);
+			if (lifecycleKind) {
+				const lifecycleEventId = deterministicOutboxId(
+					sessionId,
+					transaction.revision + 1,
+					lifecycleKind,
+					"turn",
+					turn.turn_id,
+				);
+				transaction.outbox[lifecycleEventId] ??= {
+					id: lifecycleEventId,
+					transaction_revision: transaction.revision + 1,
+					kind: lifecycleKind,
+					entity: "turn",
+					entity_id: turn.turn_id,
+					payload: {
+						session_id: sessionId,
+						turn_id: turn.turn_id,
+						status: turn.status,
+						created_at: turn.updated_at,
+					},
+					emitted: false,
+					public_event_id: lifecycleEventId,
+					public_delivery: {
+						public_event_id: lifecycleEventId,
+						state: "pending",
+						claim_fence: null,
+						claim_expires_at: null,
+						journal_seq: null,
+						acknowledged_at: null,
+					},
+				};
+			}
 			if (terminal)
 				for (const question of Object.values(transaction.canonical.questions)) {
 					if (question.turn_id !== turn.turn_id || question.status === "answered") continue;
@@ -4406,6 +5737,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 				request.updated_at = turn.updated_at;
 			}
+			return {
+				turn: turnFromCanonical(transaction.canonical.turns[turn.turn_id]),
+				acknowledgementLinked: true,
+			};
 		});
 	}
 
@@ -4417,6 +5752,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		acknowledgement: RuntimePromptAcknowledgement,
 		promptKey: string | null = null,
 	): Promise<TurnRecord> {
+		if (promptKey) {
+			const recovered = await withSessionTransaction(questionPaths, sessionId, async transaction => {
+				const request = transaction.requests.prompts[promptKey];
+				const turnId = request?.coordinator_turn_id;
+				const canonical = turnId ? transaction.canonical.turns[turnId] : undefined;
+				return request?.phase === "completed" && canonical ? canonical : null;
+			});
+			if (recovered) {
+				await repairCanonicalProjections(sessionId);
+				return turnFromCanonical(recovered);
+			}
+		}
 		const timestamp = new Date().toISOString();
 		if (operation === "turn.abort_and_prompt" && previousActiveTurn) {
 			const superseded: TurnRecord = {
@@ -4432,7 +5779,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			});
 		}
 		const queued = operation === "turn.follow_up";
-		const turn = makeTurnRecord(config, sessionId, prompt, queued ? "queued" : "active");
+		let turn: TurnRecord | null = null;
+		if (promptKey) {
+			const reservation = await withSessionTransaction(questionPaths, sessionId, async transaction => {
+				const request = transaction.requests.prompts[promptKey];
+				const canonical = request?.coordinator_turn_id
+					? transaction.canonical.turns[request.coordinator_turn_id]
+					: undefined;
+				return request?.phase === "accepted" && canonical ? turnFromCanonical(canonical) : null;
+			});
+			if (reservation) turn = reservation;
+		}
+		turn ??= makeTurnRecord(config, sessionId, prompt, queued ? "queued" : "active");
+		turn.status = queued ? "queued" : "active";
+		turn.started_at ??= queued ? null : timestamp;
+		turn.updated_at = timestamp;
 		turn.delivery = {
 			delivered: true,
 			queued,
@@ -4443,31 +5804,255 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			state: "acknowledged",
 			attempts: [{ delivered: true, channel: "runtime_ack", created_at: timestamp, reason: null }],
 		};
-		await commitCanonicalTurn(sessionId, turn, promptKey);
-		await writeTurnRecord(namespaceDir, turn);
-		if (!queued) {
-			await writeActiveTurn(namespaceDir, turn);
-			await writeSessionState(namespaceDir, sessionId, "running", {
-				currentTurnId: turn.turn_id,
-				live: null,
-				reason: null,
-			});
+		const committed = await commitCanonicalTurn(sessionId, turn, promptKey);
+		turn = committed.turn;
+		if (TERMINAL_TURN_STATUSES.has(turn.status)) {
+			// The sidecar terminal fence won while the prompt was in flight. Keep the
+			// canonical terminal outcome and rebuild every legacy projection from it;
+			// never restore the reserved turn as active or running.
+			if (committed.acknowledgementLinked) await publishAcknowledgedTurnIntent(turn);
+			await repairCanonicalProjections(sessionId);
+			await exportRetainedDeliveries();
+			return turn;
 		}
+		const acceptedTurnId = turn?.turn_id;
+		if (!acceptedTurnId) throw new Error("accepted_turn_missing");
+		// Test-only barrier for the terminal-after-finalization interleaving. The
+		// projection repair below still re-reads canonical state under the WAL lock.
+		await services.afterCanonicalTurnCommit?.(sessionId);
+		// Re-read canonical state while holding the WAL transaction lock before every
+		// legacy projection. A terminal reconciliation that commits after the accepted
+		// turn cannot be followed by stale active/running writes.
+		await repairCanonicalProjections(sessionId);
+		// A terminal reconciliation may have won at the barrier; return the current
+		// canonical turn and publish the acknowledgement against that durable state.
+		const projectedCanonical = await withSessionTransaction(
+			questionPaths,
+			sessionId,
+			async transaction => transaction.canonical.turns[acceptedTurnId] ?? null,
+		);
+		if (projectedCanonical) turn = turnFromCanonical(projectedCanonical);
+		// The broker acknowledgement is a logical lifecycle edge, not a projection
+		// observation. Persist its outbox intent after the accepted receipt so a
+		// prompt that was acknowledged before any runtime sidecar event still has
+		// exactly one durable `turn.acknowledged` event.
+		await publishAcknowledgedTurnIntent(turn);
+		await exportRetainedDeliveries();
 		return turn;
 	}
 
-	async function reconcileActiveTurnAcknowledgements(): Promise<void> {
-		const turns = (await listJsonFiles(turnsDir(namespaceDir)))
-			.map(turn => asRecord(turn) as TurnRecord | null)
-			.filter((turn): turn is TurnRecord => turn !== null && ACTIVE_TURN_STATUSES.has(turn.status));
-		for (const turn of turns) {
+	async function reconcileWatchAdmissions(
+		prioritySessionId: string | undefined,
+		options: { absoluteDeadline?: number; signal?: AbortSignal } = {},
+	): Promise<void> {
+		const rosterState = await readSchedulerRoster(questionPaths, { signal: options.signal });
+		const canonicalActiveIds = await listCanonicalActiveSessions(questionPaths, {
+			signal: options.signal,
+		});
+		const rosterById = new Map(rosterState.roster.map(entry => [entry.session_id, entry]));
+		for (const sessionId of canonicalActiveIds)
+			if (!rosterById.has(sessionId))
+				rosterById.set(sessionId, {
+					session_id: sessionId,
+					revision: 0,
+					digest: "",
+					active: true,
+					dirty: true,
+					updated_at: "",
+				});
+		const all = [...rosterById.values()].sort((left, right) => left.session_id.localeCompare(right.session_id));
+		const prioritized = prioritySessionId
+			? [
+					...all.filter(entry => entry.session_id === prioritySessionId),
+					...all.filter(entry => entry.session_id !== prioritySessionId),
+				]
+			: all;
+		const start = prioritized.findIndex(entry => entry.session_id > rosterState.cursor);
+		const ordered = [...prioritized.slice(start < 0 ? 0 : start), ...prioritized.slice(0, start < 0 ? 0 : start)];
+		let processedCursor: string | null = null;
+		for (const entry of ordered.slice(0, MAX_RUNTIME_SESSIONS_PER_WATCH_PASS)) {
+			if (
+				options.signal?.aborted ||
+				(options.absoluteDeadline !== undefined && Date.now() >= options.absoluteDeadline)
+			)
+				break;
+			processedCursor = entry.session_id;
+			try {
+				await ensureCanonicalWaitingTurn(entry.session_id, options);
+				await reconcileSessionRuntime(entry.session_id, options);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+			}
+		}
+		if (processedCursor && !options.signal?.aborted)
+			await advanceSchedulerCursor(questionPaths, processedCursor, { signal: options.signal });
+	}
+
+	async function ensureCanonicalWaitingTurn(
+		sessionId: string,
+		options: { absoluteDeadline?: number; signal?: AbortSignal } = {},
+	): Promise<void> {
+		const state = await readSessionState(namespaceDir, sessionId);
+		if (
+			state?.schema_version !== 1 ||
+			state.session_id !== sessionId ||
+			state.source !== "agent_session_event" ||
+			state.live !== true ||
+			!Number.isFinite(Date.parse(state.updated_at)) ||
+			state.state !== "needs_user_input" ||
+			!state.current_turn_id ||
+			options.signal?.aborted
+		)
+			return;
+		let transitioned = false;
+		await withAdmittedSessionTransaction(
+			questionPaths,
+			sessionId,
+			async transaction => {
+				const turn = transaction.canonical.turns[state.current_turn_id!];
+				if (
+					!turn ||
+					turn.terminal_fence ||
+					!ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus) ||
+					turn.status === "waiting_for_answer"
+				)
+					return;
+				turn.status = "waiting_for_answer";
+				turn.updated_at = state.updated_at;
+				transaction.canonical.desired_session_state = "needs_user_input";
+				const eventId = deterministicOutboxId(
+					sessionId,
+					transaction.revision + 1,
+					"turn.waiting_for_answer",
+					"turn",
+					turn.turn_id,
+				);
+				transaction.outbox[eventId] ??= {
+					id: eventId,
+					transaction_revision: transaction.revision + 1,
+					kind: "turn.waiting_for_answer",
+					entity: "turn",
+					entity_id: turn.turn_id,
+					payload: {
+						session_id: sessionId,
+						turn_id: turn.turn_id,
+						status: "waiting_for_answer",
+						created_at: turn.updated_at,
+					},
+					emitted: false,
+					public_event_id: eventId,
+					public_delivery: {
+						public_event_id: eventId,
+						state: "pending",
+						claim_fence: null,
+						claim_expires_at: null,
+						journal_seq: null,
+						acknowledged_at: null,
+					},
+				};
+				transitioned = true;
+			},
+			{ signal: options.signal },
+		);
+		if (transitioned) {
+			// Reacquire canonical authority immediately before projection so a terminal
+			// commit between the two phases cannot be resurrected as waiting.
+			await repairCanonicalProjections(sessionId, { signal: options.signal });
+		}
+	}
+
+	async function reconcileWatchEventSessions(
+		snapshot: EventJournalSnapshot,
+		afterSeq: number,
+		options: { absoluteDeadline?: number; signal?: AbortSignal } = {},
+	): Promise<void> {
+		const sessionIds = [
+			...new Set(
+				snapshot.events
+					.filter(event => event.seq > afterSeq && typeof event.session_id === "string")
+					.map(event => event.session_id as string),
+			),
+		].slice(0, MAX_RUNTIME_SESSIONS_PER_WATCH_PASS);
+		for (const sessionId of sessionIds) {
+			if (
+				options.signal?.aborted ||
+				(options.absoluteDeadline !== undefined && Date.now() >= options.absoluteDeadline)
+			)
+				break;
+			try {
+				await ensureCanonicalWaitingTurn(sessionId, options);
+				await reconcileSessionRuntime(sessionId, options);
+				await reconcileQuestions(sessionId, options);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+			}
+		}
+	}
+
+	async function reconcileWatchQuestions(
+		prioritySessionId: string | undefined,
+		options: { absoluteDeadline?: number; signal?: AbortSignal } = {},
+	): Promise<void> {
+		const rosterState = await readSchedulerRoster(questionPaths, { signal: options.signal });
+		const eligible = rosterState.roster;
+		const prioritized = prioritySessionId
+			? [
+					...eligible.filter(entry => entry.session_id === prioritySessionId),
+					...eligible.filter(entry => entry.session_id !== prioritySessionId),
+				]
+			: eligible;
+		for (const entry of prioritized.slice(0, MAX_Q12_ATTEMPTS_PER_WATCH_PASS)) {
+			if (
+				options.signal?.aborted ||
+				(options.absoluteDeadline !== undefined && Date.now() >= options.absoluteDeadline)
+			)
+				break;
+			try {
+				await reconcileQuestions(entry.session_id, options);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+			}
+		}
+	}
+
+	async function reconcileActiveTurnAcknowledgements(
+		maxSessions = MAX_RUNTIME_SESSIONS_PER_WATCH_PASS,
+		prioritySessionId?: string,
+		options: { absoluteDeadline?: number; signal?: AbortSignal } = {},
+	): Promise<void> {
+		const rosterState = await readSchedulerRoster(questionPaths, { signal: options.signal });
+		const eligible = rosterState.roster.sort((left, right) => left.session_id.localeCompare(right.session_id));
+		const prioritized = prioritySessionId
+			? [
+					...eligible.filter(entry => entry.session_id === prioritySessionId),
+					...eligible.filter(entry => entry.session_id !== prioritySessionId),
+				]
+			: eligible;
+		const start = prioritized.findIndex(entry => entry.session_id > rosterState.cursor);
+		const ordered = [...prioritized.slice(start < 0 ? 0 : start), ...prioritized.slice(0, start < 0 ? 0 : start)];
+		const entries = ordered.slice(0, Math.max(1, maxSessions));
+		let processedCursor: string | null = null;
+		for (const entry of entries) {
+			if (
+				options.signal?.aborted ||
+				(options.absoluteDeadline !== undefined && Date.now() >= options.absoluteDeadline)
+			)
+				break;
+			let turn: TurnRecord | null = null;
+			try {
+				turn = await readActiveTurn(namespaceDir, entry.session_id);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+			}
+			processedCursor = entry.session_id;
+			if (!turn) continue;
 			let sessionState = await readSessionState(namespaceDir, turn.session_id);
 			let resolvedTurn = await reconcileRuntimeAcknowledgement(
 				namespaceDir,
 				turn,
 				sessionState,
 				promptAckTimeoutMs,
-				{ failOnTimeout: false },
+				{ failOnTimeout: false, onAcknowledged: publishAcknowledgedTurnIntent },
 			);
 			if (!ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
 				await projectTerminalTransition(resolvedTurn, {
@@ -4493,6 +6078,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				resolvedTurn,
 				sessionState,
 				promptAckTimeoutMs,
+				{ failOnTimeout: true, onAcknowledged: publishAcknowledgedTurnIntent },
 			);
 			if (!ACTIVE_TURN_STATUSES.has(resolvedTurn.status))
 				await projectTerminalTransition(resolvedTurn, {
@@ -4501,6 +6087,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					live: resolvedTurn.liveness.live,
 				});
 		}
+		if (processedCursor && !options.signal?.aborted)
+			await advanceSchedulerCursor(questionPaths, processedCursor, { signal: options.signal });
 	}
 
 	async function callTool(name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
@@ -4695,6 +6283,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				);
 			}
 			if (name === "gjc_coordinator_read_status") {
+				await recoverCanonicalNamespaceProjections();
 				const sessionId = args.session_id;
 				if (sessionId) {
 					const canonicalSessionId = safeExternalId("session", sessionId);
@@ -4705,10 +6294,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							ok: false,
 							error: { code: "not_found", message: `Coordinator session not found: ${String(sessionId)}` },
 						};
+					await reconcileSessionRuntime(canonicalSessionId, { observeQuestions: false });
 					try {
-						const indexedSession = (await listSessions(cwd)).find(
+						let indexedSession = (await listSessions(cwd)).find(
 							candidate => brokerSessionId(candidate) === canonicalSessionId,
 						);
+						// Windows broker locators may differ in drive-letter casing or separator
+						// spelling even after the injected canonical workspace seam has resolved
+						// the coordinator path. The scoped listing request is still authoritative;
+						// only its local path filter is relaxed for the exact requested session.
+						if (!indexedSession && platform === "win32") {
+							const listing = await paginatedBrokerSessionList(cwd, { cwd });
+							indexedSession = jsonRecords(Array.isArray(listing.sessions) ? listing.sessions : []).find(
+								candidate => brokerSessionId(candidate) === canonicalSessionId,
+							);
+						}
 						return {
 							ok: true,
 							session: publicCoordinatorStatusSession(session),
@@ -4744,6 +6344,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						ok: false,
 						error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
 					};
+				await reconcileSessionRuntime(sessionId, { observeQuestions: false });
 				try {
 					const text = await queryLastAssistant(session);
 					return {
@@ -4760,23 +6361,91 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (name === "gjc_coordinator_read_artifact")
 				return await readCoordinatorArtifact(config, { path: args.path });
 			if (name === "gjc_coordinator_read_coordination_status") {
+				await recoverCanonicalNamespaceProjections();
 				await reconcileActiveTurnAcknowledgements();
-				const brokerSessions = await listSessions();
-				const sessionStates = jsonRecords(await listJsonFiles(path.join(namespaceDir, "session-states")));
-				const turns = jsonRecords(await listJsonFiles(turnsDir(namespaceDir)));
-				const questions =
-					args.session_id == null
-						? []
-						: (await listQuestions(args)).questions.map(
-								({ answer_binding: _answerBinding, ...question }) => question,
-							);
-				const reports = jsonRecords(await listJsonFiles(path.join(namespaceDir, "reports")));
-				const events = await readCoordinatorEvents(namespaceDir);
+				const scopedSessionId = args.session_id == null ? null : safeExternalId("session", args.session_id);
+				const allBrokerSessions = await listSessions();
+				const brokerSessions = scopedSessionId
+					? allBrokerSessions.filter(session => brokerSessionId(session) === scopedSessionId)
+					: allBrokerSessions;
+				const sessionStates = jsonRecords(await listJsonFiles(path.join(namespaceDir, "session-states"))).filter(
+					state => scopedSessionId === null || state.session_id === scopedSessionId,
+				);
+				const turns = jsonRecords(await listJsonFiles(turnsDir(namespaceDir))).filter(
+					turn => scopedSessionId === null || turn.session_id === scopedSessionId,
+				);
+				const questionSessionIds = scopedSessionId
+					? [scopedSessionId]
+					: [
+							...new Set(
+								[...allBrokerSessions.map(brokerSessionId), ...sessionStates, ...turns]
+									.map(value =>
+										typeof value === "string"
+											? value
+											: value && typeof value === "object"
+												? optionalString((value as Record<string, unknown>).session_id)
+												: null,
+									)
+									.filter((value): value is string => value !== null && value.length > 0),
+							),
+						];
+				const questionResults = await Promise.all(
+					questionSessionIds.map(async session_id => {
+						try {
+							const result = await listQuestions({ session_id, status: "all" });
+							return { session_id, ...result };
+						} catch {
+							return {
+								session_id,
+								ok: true as const,
+								schema_version: 1 as const,
+								questions: [] as CoordinatorQuestionPublicV1[],
+								diagnostics: [
+									{
+										schema_version: 1 as const,
+										session_id,
+										turn_id: null,
+										gate_id: null,
+										reason: "query_unavailable" as const,
+										observed_at: new Date().toISOString(),
+									},
+								],
+								reconciliation: {
+									attempted: true,
+									complete: false,
+									revision: null,
+									observed_at: new Date().toISOString(),
+									reason: "query_unavailable" as const,
+								},
+							};
+						}
+					}),
+				);
+				const questionSnapshots = questionResults.map(result => ({
+					session_id: result.session_id,
+					questions: result.questions.map(({ answer_binding: _answerBinding, ...question }) => question),
+					diagnostics: result.diagnostics,
+					reconciliation: result.reconciliation,
+				}));
+				const questions = questionResults
+					.flatMap(result => result.questions)
+					.map(({ answer_binding: _answerBinding, ...question }) => question);
+				const questionSnapshotComplete = questionResults.every(result => result.reconciliation.complete);
+				const questionDiagnostics = questionResults.flatMap(result => result.diagnostics);
+				const reports = jsonRecords(await listJsonFiles(path.join(namespaceDir, "reports"))).filter(
+					report => scopedSessionId === null || report.session_id === scopedSessionId,
+				);
+				await exportRetainedDeliveries();
+				const journalSnapshot = await readJournalSnapshot(namespaceDir);
+				const scopedJournalEvents = scopedSessionId
+					? journalSnapshot.events.filter(event => event.session_id === scopedSessionId)
+					: journalSnapshot.events;
 				return capabilityFreeStatusValue({
 					ok: true,
 					schema_version: 1,
 					namespace: config.namespace,
-					transport: { mcp: "polling", push_subscriptions: false },
+					scope: scopedSessionId ? { session_id: scopedSessionId } : { session_id: null },
+					transport: { mcp: "long_poll", push_subscriptions: false },
 					summary: {
 						sessions: brokerSessions.length,
 						active_sessions: activeSessionStates(sessionStates).length,
@@ -4784,8 +6453,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						active_turns: turns.filter(turn => ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus)).length,
 						queued_turns: turns.filter(turn => turn.status === "queued").length,
 						terminal_turns: turns.filter(turn => TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus)).length,
-						open_questions: questions.filter(question => question.status === "pending").length,
+						questions: questionSnapshotComplete ? questions.length : null,
+						open_questions: questionSnapshotComplete
+							? questions.filter(question => question.status === "pending").length
+							: null,
 						reports: reports.length,
+						questions_complete: questionSnapshotComplete,
+						question_diagnostics: questionDiagnostics,
 					},
 					sessions: brokerSessions.map(publicBrokerSession),
 					session_states: sessionStates.map(state =>
@@ -4797,39 +6471,243 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					questions: questions.map(question =>
 						boundedPublicValue(question, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
 					),
+					question_snapshots: questionSnapshots.map(snapshot =>
+						boundedPublicValue(snapshot, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+					),
 					reports: reports.map(report =>
 						boundedPublicValue(report, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
 					),
 					events: buildCanonicalCoordinatorEvents({ sessionStates, turns, questions, reports }),
-					latest_event_seq: await readLatestEventSeq(namespaceDir),
-					recent_events: eventSummaries(events.slice(-10)),
+					latest_event_seq: journalSnapshot.watermark,
+					recent_events: eventSummaries(scopedJournalEvents.slice(-10)),
 				}) as Record<string, unknown>;
 			}
 			if (name === "gjc_coordinator_watch_events") {
-				await reconcileActiveTurnAcknowledgements();
-				if (args.session_id != null) await reconcileQuestions(safeExternalId("session", args.session_id));
-				const limit = boundedEventLimit(args.limit);
+				await recoverCanonicalNamespaceProjections();
 				const timeoutMs = boundedEventWatchTimeoutMs(args.timeout_ms);
-				let events = await readCoordinatorEvents(namespaceDir);
-				let matched = filterCoordinatorEvents(events, args, limit);
+				const absoluteDeadline = Date.now() + timeoutMs;
+				const limit = boundedEventLimit(args.limit);
+				const afterSeq = eventCursor(args.after_seq);
+				const watchController = new AbortController();
+				const deadlineTimer = setTimeout(() => watchController.abort(new Error("deadline_exceeded")), timeoutMs);
+				deadlineTimer.unref?.();
+				const prioritySessionId = args.session_id == null ? undefined : safeExternalId("session", args.session_id);
+				try {
+					await exportRetainedDeliveries(32, timeoutMs > 0 ? watchController.signal : undefined);
+				} catch (error) {
+					if (
+						!(timeoutMs > 0 && watchController.signal.aborted) &&
+						!(error instanceof Error && error.message === "resource_gone")
+					)
+						throw error;
+				}
+				if (timeoutMs > 0 && !watchController.signal.aborted && Date.now() < absoluteDeadline) {
+					try {
+						await reconcileWatchAdmissions(prioritySessionId, {
+							absoluteDeadline,
+							signal: watchController.signal,
+						});
+						await reconcileActiveTurnAcknowledgements(MAX_RUNTIME_SESSIONS_PER_WATCH_PASS, prioritySessionId, {
+							absoluteDeadline,
+							signal: watchController.signal,
+						});
+					} catch (error) {
+						if (!watchController.signal.aborted && !(error instanceof Error && error.message === "resource_gone"))
+							throw error;
+					}
+					try {
+						await exportRetainedDeliveries(32, watchController.signal);
+					} catch (error) {
+						if (!watchController.signal.aborted && !(error instanceof Error && error.message === "resource_gone"))
+							throw error;
+					}
+					try {
+						if (args.session_id != null)
+							await reconcileQuestions(safeExternalId("session", args.session_id), {
+								absoluteDeadline,
+								signal: watchController.signal,
+							});
+						else
+							await reconcileWatchQuestions(undefined, {
+								absoluteDeadline,
+								signal: watchController.signal,
+							});
+					} catch (error) {
+						if (!watchController.signal.aborted && !(error instanceof Error && error.message === "resource_gone"))
+							throw error;
+					}
+				}
+				let snapshot: EventJournalSnapshot;
+				try {
+					snapshot = await readJournalSnapshot(namespaceDir);
+				} catch {
+					clearTimeout(deadlineTimer);
+					return {
+						ok: false,
+						error: { code: "event_snapshot_unavailable", message: "Coordinator event snapshot is unavailable." },
+					};
+				}
+				const initialCursor = publicWatchWatermark(snapshot, afterSeq);
+				if (initialCursor === null) {
+					clearTimeout(deadlineTimer);
+					return {
+						ok: false,
+						error: { code: "event_snapshot_unavailable", message: "Coordinator event snapshot is unavailable." },
+					};
+				}
+				const initialWatermark = initialCursor.latest_seq;
+				if (afterSeq > initialWatermark) {
+					clearTimeout(deadlineTimer);
+					return {
+						ok: false,
+						reason: "cursor_ahead",
+						snapshot_watermark: initialWatermark,
+						transport: { mcp: "long_poll", push_subscriptions: false },
+					};
+				}
+				if (watchController.signal.aborted || Date.now() >= absoluteDeadline) {
+					const publicEvents = filterCoordinatorEvents(snapshot.events, afterSeq, args, limit).map(
+						publicCoordinatorEvent,
+					);
+					const lastMatching = publicEvents.at(-1)?.seq;
+					clearTimeout(deadlineTimer);
+					return publicWatchSuccess(
+						publicEvents,
+						initialCursor.latest_seq,
+						lastMatching ?? initialCursor.next_after_seq,
+						timeoutMs > 0,
+					);
+				}
+				if (afterSeq <= initialWatermark && args.session_id == null) {
+					try {
+						await reconcileWatchEventSessions(snapshot, afterSeq, {
+							absoluteDeadline,
+							signal: watchController.signal,
+						});
+						await exportRetainedDeliveries(32, watchController.signal);
+						snapshot = await readJournalSnapshot(namespaceDir, watchController.signal);
+					} catch (error) {
+						if (!watchController.signal.aborted && !(error instanceof Error && error.message === "resource_gone"))
+							throw error;
+					}
+				}
+				const reconciledWatermark = normalizedEventWatermark(snapshot);
+				if (reconciledWatermark === null) {
+					clearTimeout(deadlineTimer);
+					return {
+						ok: false,
+						error: { code: "event_snapshot_unavailable", message: "Coordinator event snapshot is unavailable." },
+					};
+				}
+				if (afterSeq > reconciledWatermark) {
+					clearTimeout(deadlineTimer);
+					return {
+						ok: false,
+						reason: "cursor_ahead",
+						snapshot_watermark: reconciledWatermark,
+						transport: { mcp: "long_poll", push_subscriptions: false },
+					};
+				}
+				let matched = filterCoordinatorEvents(snapshot.events, afterSeq, args, limit);
 				let timedOut = false;
 				if (matched.length === 0 && timeoutMs > 0) {
-					const deadline = Date.now() + timeoutMs;
-					while (matched.length === 0 && Date.now() < deadline) {
+					const deadline = absoluteDeadline;
+					while (matched.length === 0 && Date.now() < deadline && !watchController.signal.aborted) {
 						await waitForCoordinatorEvents(namespaceDir, Math.min(50, Math.max(1, deadline - Date.now())));
-						await reconcileActiveTurnAcknowledgements();
-						events = await readCoordinatorEvents(namespaceDir);
-						matched = filterCoordinatorEvents(events, args, limit);
+						if (Date.now() >= deadline || watchController.signal.aborted) break;
+						try {
+							await exportRetainedDeliveries(32, watchController.signal);
+						} catch (error) {
+							if (
+								!watchController.signal.aborted &&
+								!(error instanceof Error && error.message === "resource_gone")
+							)
+								throw error;
+						}
+						try {
+							await reconcileWatchAdmissions(prioritySessionId, {
+								absoluteDeadline,
+								signal: watchController.signal,
+							});
+							await reconcileActiveTurnAcknowledgements(MAX_RUNTIME_SESSIONS_PER_WATCH_PASS, prioritySessionId, {
+								absoluteDeadline,
+								signal: watchController.signal,
+							});
+							if (prioritySessionId)
+								await reconcileQuestions(prioritySessionId, {
+									absoluteDeadline,
+									signal: watchController.signal,
+								});
+						} catch (error) {
+							if (
+								!watchController.signal.aborted &&
+								!(error instanceof Error && error.message === "resource_gone")
+							)
+								throw error;
+						}
+						try {
+							await exportRetainedDeliveries(32, watchController.signal);
+						} catch (error) {
+							if (
+								!watchController.signal.aborted &&
+								!(error instanceof Error && error.message === "resource_gone")
+							)
+								throw error;
+						}
+						if (watchController.signal.aborted) break;
+						try {
+							snapshot = await readJournalSnapshot(namespaceDir, watchController.signal);
+						} catch (error) {
+							if (
+								!watchController.signal.aborted &&
+								!(error instanceof Error && error.message === "resource_gone")
+							)
+								throw error;
+						}
+						if (!Number.isSafeInteger(snapshot.watermark) || snapshot.watermark < 0) break;
+						if (afterSeq > snapshot.watermark) break;
+						if (args.session_id == null) {
+							try {
+								await reconcileWatchEventSessions(snapshot, afterSeq, {
+									absoluteDeadline,
+									signal: watchController.signal,
+								});
+								await exportRetainedDeliveries(32, watchController.signal);
+								snapshot = await readJournalSnapshot(namespaceDir, watchController.signal);
+							} catch (error) {
+								if (
+									!watchController.signal.aborted &&
+									!(error instanceof Error && error.message === "resource_gone")
+								)
+									throw error;
+							}
+						}
+						if (args.session_id == null)
+							await reconcileWatchQuestions(undefined, {
+								absoluteDeadline,
+								signal: watchController.signal,
+							});
+						matched = filterCoordinatorEvents(snapshot.events, afterSeq, args, limit);
 					}
 					timedOut = matched.length === 0;
 				}
-				return {
-					ok: true,
-					events: matched,
-					latest_seq: await readLatestEventSeq(namespaceDir),
-					timed_out: timedOut,
-					transport: { mcp: "long_poll", push_subscriptions: false },
-				};
+				const finalCursor = publicWatchWatermark(snapshot, afterSeq);
+				if (finalCursor === null) {
+					clearTimeout(deadlineTimer);
+					return {
+						ok: false,
+						error: { code: "event_snapshot_unavailable", message: "Coordinator event snapshot is unavailable." },
+					};
+				}
+				clearTimeout(deadlineTimer);
+				const publicEvents = matched.map(publicCoordinatorEvent);
+				const lastMatching = publicEvents.at(-1)?.seq;
+				return publicWatchSuccess(
+					publicEvents,
+					finalCursor.latest_seq,
+					lastMatching ?? finalCursor.next_after_seq,
+					timedOut,
+				);
 			}
 			const delegateWorkflow = workflowForDelegateTool(name);
 			if (delegateWorkflow) {
@@ -5018,62 +6896,57 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										await commitCreationWal(questionPaths, creation.keyDigest, intent);
 									}
 								}
-								await writeJsonFile(sessionFile(sessionId), session);
-								const previousActiveTurn = await readActiveTurn(namespaceDir, sessionId);
-								if (previousActiveTurn && args.queue !== true && args.force !== true) {
-									return {
-										ok: false,
-										error: {
-											code: "active_turn_exists",
-											message: `Session ${sessionId} already has active turn ${previousActiveTurn.turn_id}.`,
-										},
-										turn_id: previousActiveTurn.turn_id,
-									};
-								}
-								const operation =
-									args.force === true
-										? "turn.abort_and_prompt"
-										: args.queue === true
-											? "turn.follow_up"
-											: "turn.prompt";
-								const promptKey = await claimCanonicalPrompt(
-									sessionId,
-									taggedPrompt,
-									operation,
-									idempotencyKey,
-								);
-								const result = await controlSession(session, operation, { text: taggedPrompt }, idempotencyKey);
-								const acknowledgement = requirePromptAcknowledgement(result);
-								const turn = await recordAcceptedPrompt(
-									sessionId,
-									taggedPrompt,
-									operation,
-									previousActiveTurn,
-									acknowledgement,
-									promptKey,
-								);
-								const codexHandoff = await autoBindDelegateCodexHandoff(
-									namespaceDir,
-									canonicalCwd,
-									sessionId,
-									turn.turn_id,
-									delegateWorkflow,
-									explicitHostWorkUnit,
-								);
-								await appendCoordinatorEvent(namespaceDir, {
-									kind: "delegation.started",
-									sessionId,
-									turnId: turn.turn_id,
-									summary: `Delegated ${delegateWorkflow} via ${name} on session ${sessionId}`,
-									metadata: {
-										workflow: delegateWorkflow,
-										tool_name: name,
-										reused_session: reusedSession,
-										sdk_operation: operation,
+							}
+							await writeJsonFile(sessionFile(sessionId), session);
+							const previousActiveTurn =
+								(await readActiveTurn(namespaceDir, sessionId)) ?? (await readCanonicalActiveTurn(sessionId));
+							if (previousActiveTurn && args.queue !== true && args.force !== true) {
+								return {
+									ok: false,
+									error: {
+										code: "active_turn_exists",
+										message: `Session ${sessionId} already has active turn ${previousActiveTurn.turn_id}.`,
 									},
-								});
-								const response = {
-									ok: true,
+									turn_id: previousActiveTurn.turn_id,
+								};
+							}
+							const operation =
+								args.force === true
+									? "turn.abort_and_prompt"
+									: args.queue === true
+										? "turn.follow_up"
+										: "turn.prompt";
+							const promptKey = await claimCanonicalPrompt(sessionId, taggedPrompt, operation, idempotencyKey);
+							const acknowledgement = await dispatchOrRecoverPrompt(
+								session,
+								sessionId,
+								operation,
+								taggedPrompt,
+								idempotencyKey,
+								promptKey,
+							);
+							const turn = await recordAcceptedPrompt(
+								sessionId,
+								taggedPrompt,
+								operation,
+								previousActiveTurn,
+								acknowledgement,
+								promptKey,
+							);
+							const codexHandoff = await autoBindDelegateCodexHandoff(
+								namespaceDir,
+								canonicalCwd,
+								sessionId,
+								turn.turn_id,
+								delegateWorkflow,
+								explicitHostWorkUnit,
+							);
+							await appendCoordinatorEvent(namespaceDir, {
+								kind: "delegation.started",
+								sessionId,
+								turnId: turn.turn_id,
+								summary: `Delegated ${delegateWorkflow} via ${name} on session ${sessionId}`,
+								metadata: {
 									workflow: delegateWorkflow,
 									tool_name: name,
 									session_id: sessionId,
@@ -5108,6 +6981,44 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										}
 									: response;
 							});
+							const response = {
+								ok: true,
+								workflow: delegateWorkflow,
+								tool_name: name,
+								session_id: sessionId,
+								turn_id: turn.turn_id,
+								active_turn_id: turn.delivery.queued
+									? (previousActiveTurn?.turn_id ?? null)
+									: TERMINAL_TURN_STATUSES.has(turn.status)
+										? null
+										: turn.turn_id,
+								status: turn.status,
+								queued: turn.delivery.queued,
+								delivered: turn.delivery.delivered,
+								delivery: turn.delivery,
+								session: publicCoordinatorSession(session),
+								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
+								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+								result: publicSdkAcknowledgement(acknowledgement),
+								codex_handoff: codexHandoff,
+								...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
+							};
+							if (creationKey) {
+								await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
+								await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
+							}
+							return args.await_completion === true
+								? {
+										...response,
+										completion: await awaitTurnPayload(
+											turn.turn_id,
+											sessionId,
+											args.timeout_ms,
+											args.poll_interval_ms,
+										),
+									}
+								: response;
+						};
 						return reusedSessionId ? await withSessionTransition(reusedSessionId, delegate) : await delegate();
 					},
 					true,
@@ -5286,58 +7197,43 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									endpoint_incarnation: binding.endpointIncarnation,
 								});
 							}
-							const intent: CanonicalCreateIntentV1 = {
-								kind: "start",
-								session: canonicalCreationSnapshot(session),
-								remote_create_key: creation.request.remote_create_key,
-								initial_state: prompt ? "running" : preparesExistingThread ? "prepared" : "ready_for_input",
-								initial_prompt: prompt
-									? {
-											text: prompt,
-											caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
-										}
-									: null,
-								initial_events: [],
-							};
-							await bindCreationRequest(questionPaths, creation.keyDigest, intent);
-							await commitCreationWal(questionPaths, creation.keyDigest, intent);
-							await writeJsonFile(sessionFile(sessionId), session);
-							const lifecycle = publicLifecycleReceipt(created, sessionId);
-							if (prompt) {
-								const promptKey = await claimCanonicalPrompt(sessionId, prompt, "turn.prompt", idempotencyKey);
-								const result = await controlSession(session, "turn.prompt", { text: prompt }, idempotencyKey);
-								const acknowledgement = requirePromptAcknowledgement(result);
-								const turn = await recordAcceptedPrompt(
-									sessionId,
-									prompt,
-									"turn.prompt",
-									null,
-									acknowledgement,
-									promptKey,
-								);
-								const response = {
-									ok: true,
-									session: publicCoordinatorSession(session),
-									session_id: sessionId,
-									lifecycle,
-									turn_id: turn.turn_id,
-									active_turn_id: turn.turn_id,
-									status: turn.status,
-									queued: turn.delivery.queued,
-									delivered: turn.delivery.delivered,
-									operation: "turn.prompt",
-									turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
-									result: publicSdkAcknowledgement(acknowledgement),
-									session_state: publicCoordinatorSessionState(
-										await readSessionState(namespaceDir, sessionId),
-									),
-								};
-								await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
-								await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
-								return response;
-							}
-							const sessionState = await writeSessionState(
-								namespaceDir,
+							sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
+							const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
+							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
+							session = normalizeSession({
+								session_id: sessionId,
+								cwd: sessionCwd,
+								...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+								broker_workspace: binding.workspace,
+								endpoint_generation: binding.endpointGeneration,
+								endpoint_incarnation: binding.endpointIncarnation,
+							});
+						}
+						const intent: CanonicalCreateIntentV1 = {
+							kind: "start",
+							session: canonicalCreationSnapshot(session),
+							remote_create_key: creation.request.remote_create_key,
+							initial_state: prompt ? "running" : preparesExistingThread ? "prepared" : "ready_for_input",
+							initial_prompt: prompt
+								? { text: prompt, caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex") }
+								: null,
+							initial_events: [],
+						};
+						await bindCreationRequest(questionPaths, creation.keyDigest, intent);
+						await commitCreationWal(questionPaths, creation.keyDigest, intent);
+						await writeJsonFile(sessionFile(sessionId), session);
+						const lifecycle = publicLifecycleReceipt(created, sessionId);
+						if (prompt) {
+							const promptKey = await claimCanonicalPrompt(sessionId, prompt, "turn.prompt", idempotencyKey);
+							const acknowledgement = await dispatchOrRecoverPrompt(
+								session,
+								sessionId,
+								"turn.prompt",
+								prompt,
+								idempotencyKey,
+								promptKey,
+							);
+							const turn = await recordAcceptedPrompt(
 								sessionId,
 								preparesExistingThread ? "prepared" : "ready_for_input",
 								{ live: null, reason: null },
@@ -5355,7 +7251,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								session: publicCoordinatorSession(session),
 								session_state: publicCoordinatorSessionState(sessionState),
 								lifecycle,
-								...(preparesExistingThread ? { session_id: sessionId, state: "prepared" as const } : {}),
+								turn_id: turn.turn_id,
+								active_turn_id: TERMINAL_TURN_STATUSES.has(turn.status) ? null : turn.turn_id,
+								status: turn.status,
+								queued: turn.delivery.queued,
+								delivered: turn.delivery.delivered,
+								operation: "turn.prompt",
+								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+								result: publicSdkAcknowledgement(acknowledgement),
+								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
 							};
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
@@ -5412,7 +7316,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									session_id: sessionId,
 									state: before?.state ?? "unknown",
 									session_state: publicCoordinatorSessionState(before),
-									error: { code: error.code, message: error.message },
+									error: {
+										code: publicErrorCode(error.code),
+										message: PUBLIC_ERROR_MESSAGES[publicErrorCode(error.code)],
+									},
 								};
 							}
 							/**
@@ -5510,8 +7417,31 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									session_state: publicCoordinatorSessionState(preparedState),
 								};
 							}
-							const previousActiveTurn = await readActiveTurn(namespaceDir, sessionId);
-							if (previousActiveTurn && args.queue !== true && args.force !== true) {
+							const operation =
+								args.force === true
+									? "turn.abort_and_prompt"
+									: args.queue === true
+										? "turn.follow_up"
+										: "turn.prompt";
+							const promptKeyDigest = createHash("sha256")
+								.update(`${idempotencyKey}\0${operation}`)
+								.digest("hex");
+							const existingPromptTurnId = await withSessionTransaction(
+								questionPaths,
+								sessionId,
+								async transaction => transaction.requests.prompts[promptKeyDigest]?.coordinator_turn_id ?? null,
+							);
+							const previousActiveTurn =
+								(await readActiveTurn(namespaceDir, sessionId)) ?? (await readCanonicalActiveTurn(sessionId));
+							// A retry of an in-progress Router request owns its reservation. Do
+							// not mistake that reservation for an unrelated active turn before
+							// dispatchOrRecoverPrompt gets a chance to reconcile it.
+							if (
+								previousActiveTurn &&
+								args.queue !== true &&
+								args.force !== true &&
+								existingPromptTurnId !== previousActiveTurn.turn_id
+							) {
 								return {
 									ok: false,
 									error: {
@@ -5521,15 +7451,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									turn_id: previousActiveTurn.turn_id,
 								};
 							}
-							const operation =
-								args.force === true
-									? "turn.abort_and_prompt"
-									: args.queue === true
-										? "turn.follow_up"
-										: "turn.prompt";
 							const promptKey = await claimCanonicalPrompt(sessionId, prompt, operation, idempotencyKey);
-							const result = await controlSession(currentSession, operation, { text: prompt }, idempotencyKey);
-							const acknowledgement = requirePromptAcknowledgement(result);
+							const acknowledgement = await dispatchOrRecoverPrompt(
+								currentSession,
+								sessionId,
+								operation,
+								prompt,
+								idempotencyKey,
+								promptKey,
+							);
 							const turn = await recordAcceptedPrompt(
 								sessionId,
 								prompt,
@@ -5542,7 +7472,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								ok: true,
 								session_id: sessionId,
 								turn_id: turn.turn_id,
-								active_turn_id: turn.delivery.queued ? (previousActiveTurn?.turn_id ?? null) : turn.turn_id,
+								active_turn_id: turn.delivery.queued
+									? (previousActiveTurn?.turn_id ?? null)
+									: TERMINAL_TURN_STATUSES.has(turn.status)
+										? null
+										: turn.turn_id,
 								status: turn.status,
 								queued: turn.delivery.queued,
 								delivered: turn.delivery.delivered,
@@ -5652,6 +7586,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						});
 						if (replay) return replay;
 
+						const admission = await reconcileSessionRuntime(sessionId, { observeQuestions: true });
+						const admissionToken = admission.waiting_token;
+						const liveAdmissionRequired =
+							admission.session_state?.source === "agent_session_event" &&
+							admission.session_state.live === true &&
+							admission.session_state.state === "needs_user_input";
+						if (liveAdmissionRequired && !admissionToken)
+							return {
+								ok: false,
+								error: {
+									code: "terminal_uncertain",
+									message: "Runtime waiting provenance is not admitted.",
+								},
+							};
 						const reconciliation = await reconcileQuestions(sessionId);
 						if (!reconciliation.reconciliation.complete)
 							return {
@@ -5661,6 +7609,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						let translated: unknown;
 						let session: Record<string, unknown> | null = null;
 						const claimed = await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+							const liveState = await readSessionState(namespaceDir, sessionId);
 							const question = transaction.canonical.questions[questionId];
 							if (!question)
 								return {
@@ -5739,8 +7688,39 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								authority?.observation.kind === "valid"
 									? authority.observation.first_provenance.runtime_turn_id
 									: null;
+							const liveWaitingOwned =
+								liveState?.source !== "agent_session_event" ||
+								liveState.live !== true ||
+								(liveState.state === "needs_user_input" && liveState.current_turn_id === turnId);
+							const provenanceMatches =
+								admissionToken === null ||
+								(Boolean(canonicalTurn?.runtime_provenance) &&
+									transaction.revision >= admissionToken.transaction_revision &&
+									canonicalJson(
+										authority?.observation.kind === "valid" ? authority.observation.first_provenance : null,
+									) === canonicalJson(canonicalTurn.runtime_provenance));
 							if (
+								!liveWaitingOwned ||
+								(liveState?.source === "agent_session_event" &&
+									liveState.live === true &&
+									canonicalTurn?.status !== "waiting_for_answer") ||
 								!authority ||
+								authority.observation.kind !== "valid" ||
+								!canonicalTurn ||
+								!provenanceMatches ||
+								(admissionToken !== null &&
+									canonicalJson(canonicalTurn.runtime_provenance) !==
+										canonicalJson({
+											namespace_id: admissionToken.session_id === sessionId ? config.namespace.identity : "",
+											session_id: admissionToken.session_id,
+											endpoint_incarnation: admissionToken.sidecar_endpoint_incarnation,
+											coordinator_turn_id: admissionToken.coordinator_turn_id,
+											runtime_turn_id: admissionToken.runtime_turn_id,
+											gate_created_at: authority.observation.first_provenance.gate_created_at,
+											schema_hash: authority.observation.first_provenance.schema_hash,
+											stage: authority.observation.first_provenance.stage,
+											kind: authority.observation.first_provenance.kind,
+										})) ||
 								!turn ||
 								canonicalTurn?.terminal_fence ||
 								TERMINAL_TURN_STATUSES.has(canonicalTurn?.status as TurnStatus) ||
@@ -5815,13 +7795,43 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						const gateId = (claimed as { gateId: string }).gateId;
 						await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
 							const request = transaction.requests.answers[keyDigest];
-							if (!request || request.claim_fence_epoch !== (claimed as { fence: number }).fence)
+							const guardedQuestion = transaction.canonical.questions[questionId];
+							const guardedTurn = transaction.canonical.turns[turnId];
+							if (
+								!request ||
+								request.claim_fence_epoch !== (claimed as { fence: number }).fence ||
+								!guardedQuestion ||
+								guardedQuestion.status !== "resolving" ||
+								guardedQuestion.claim_fence_epoch !== (claimed as { fence: number }).fence ||
+								guardedTurn?.terminal_fence
+							)
 								throw new Error("terminal_uncertain");
 							if (request.phase === "claimed") request.phase = "remote_started";
 							if (request.phase !== "remote_started" && request.phase !== "accepted")
 								throw new Error("terminal_uncertain");
 							request.updated_at = new Date().toISOString();
 						});
+						const latestAdmission = await reconcileSessionRuntime(sessionId, { observeQuestions: true });
+						const latestState = latestAdmission.session_state;
+						const latestToken = latestAdmission.waiting_token;
+						const latestLiveRequired =
+							latestState?.source === "agent_session_event" &&
+							latestState.live === true &&
+							latestState.state === "needs_user_input";
+						if (
+							latestAdmission.terminal ||
+							(latestLiveRequired && (!latestToken || latestToken.coordinator_turn_id !== turnId)) ||
+							(latestState?.source === "agent_session_event" &&
+								latestState.live === true &&
+								(latestState.state !== "needs_user_input" || latestState.current_turn_id !== turnId))
+						)
+							return {
+								ok: false,
+								error: {
+									code: "terminal_uncertain",
+									message: "Turn became non-answerable before answer dispatch.",
+								},
+							};
 
 						try {
 							const result = await controlSession(
@@ -5947,23 +7957,167 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (name === "gjc_coordinator_report_status") {
 				requireCoordinatorMutation(config, "reports", args);
 				const idempotencyKey = requiredIdempotencyKey(args);
-				const evidence = await validateEvidencePaths(args.evidence_paths);
 				const sessionId = args.session_id == null ? null : safeExternalId("session", args.session_id);
+				const canonicalEvidencePaths = canonicalReportEvidencePaths(args.evidence_paths);
+				const canonicalArgs = {
+					session_id: sessionId,
+					turn_id: args.turn_id ?? null,
+					status: args.status,
+					summary: args.summary,
+					blocker: args.blocker,
+					pr_url: args.pr_url,
+					evidence_paths: canonicalEvidencePaths,
+				};
+				const reportRequestDigest = createHash("sha256").update(canonicalJson(canonicalArgs)).digest("hex");
 				return await withToolIdempotency(
 					name,
 					idempotencyKey,
-					{
-						session_id: sessionId,
-						turn_id: args.turn_id ?? null,
-						status: args.status,
-						summary: args.summary,
-						blocker: args.blocker,
-						pr_url: args.pr_url,
-						evidence_paths: evidence.map(item => item.path),
-						allow_mutation: true,
-					},
+					{ ...canonicalArgs, allow_mutation: true },
 					async () => {
-						const reportId = `report-${randomUUID()}`;
+						const reportKeyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
+						const operationId = `report:${reportKeyDigest}`;
+						const publicOperationId = `report:${idempotencyKey}`;
+						const requestDigest = reportRequestDigest;
+						let reportId = `report-${createHash("sha256").update(`report\\0${idempotencyKey}`).digest("hex")}`;
+						const reportFromCanonical = (canonical: CanonicalReportSnapshotV1) => ({
+							session_id: canonical.session_id,
+							turn_id: canonical.turn_id || undefined,
+							status: canonical.status,
+							summary: canonical.summary,
+							blocker: canonical.blocker,
+							pr_url: canonical.pr_url,
+							evidence_paths: canonical.evidence_paths.map(path => ({ path })),
+							created_at: canonical.created_at,
+						});
+						const responseFor = async (
+							report: Record<string, unknown>,
+							turn: TurnRecord | null,
+						): Promise<Record<string, unknown>> => ({
+							ok: true,
+							report: boundedPublicValue(report, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+							...(turn
+								? {
+										turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+										session_state: publicCoordinatorSessionState(
+											await readSessionState(namespaceDir, turn.session_id),
+										),
+									}
+								: {}),
+						});
+						let turn: TurnRecord | null = null;
+						if (args.turn_id != null) {
+							turn = await readTurnRecord(namespaceDir, args.turn_id);
+							if (!turn) return { ok: false, reason: "unknown_turn" };
+							if (sessionId != null && turn.session_id !== sessionId)
+								return { ok: false, reason: "turn_session_mismatch" };
+						}
+						const ledgerSessionId = sessionId ?? turn?.session_id ?? null;
+						const recoveredCanonicalReport: {
+							value: { report: CanonicalReportSnapshotV1; turn: TurnRecord | null } | null;
+						} = { value: null };
+						let completedResponse: Record<string, unknown> | null = null;
+						if (ledgerSessionId) {
+							await ensureQuestionTransaction(ledgerSessionId);
+							const recovered = await withAdmittedSessionTransaction(
+								questionPaths,
+								ledgerSessionId,
+								async transaction => {
+									let operation: OperationRequestV1 | undefined = transaction.requests.operations[operationId];
+									if (!operation)
+										operation = Object.values(transaction.requests.operations).find(
+											candidate => candidate.tool === name && candidate.key_digest === reportKeyDigest,
+										);
+									if (operation && operation.request_digest !== requestDigest)
+										throw new Error("idempotency_conflict");
+									if (operation) reportId = operation.local_id;
+									completedResponse =
+										operation?.phase === "completed" ? asRecord(operation.safe_response) : null;
+									const candidateReport =
+										(operation ? transaction.canonical.reports[operation.local_id] : undefined) ??
+										transaction.canonical.reports[reportId] ??
+										Object.values(transaction.canonical.reports).find(
+											candidate =>
+												candidate.operation_id === operationId ||
+												candidate.operation_id === `report:${idempotencyKey}`,
+										);
+									if (candidateReport) {
+										reportId = candidateReport.report_id;
+										const recoveredTurn = transaction.canonical.turns[candidateReport.turn_id];
+										recoveredCanonicalReport.value = {
+											report: candidateReport,
+											turn: recoveredTurn ? turnFromCanonical(recoveredTurn) : null,
+										};
+										if (!operation) {
+											const now = new Date().toISOString();
+											transaction.requests.operations[operationId] = {
+												operation_id: operationId,
+												tool: name,
+												key_digest: reportKeyDigest,
+												request_digest: requestDigest,
+												local_id: reportId,
+												phase: "claimed",
+												intent: canonicalArgs,
+												created_at: now,
+												updated_at: now,
+											};
+										}
+										return { report_id: reportId };
+									}
+									if (completedResponse) return completedResponse;
+									if (!operation) {
+										const now = new Date().toISOString();
+										const request: OperationRequestV1 = {
+											operation_id: operationId,
+											tool: name,
+											key_digest: reportKeyDigest,
+											request_digest: requestDigest,
+											local_id: reportId,
+											phase: "claimed",
+											intent: canonicalArgs,
+											created_at: now,
+											updated_at: now,
+										};
+										transaction.requests.operations[operationId] = request;
+									}
+									return null;
+								},
+							);
+							if (recoveredCanonicalReport.value) {
+								// Canonical state is authoritative for repair, but a completed safe response is
+								// the exact public replay and must never be reconstructed or overwritten.
+								await repairCanonicalProjections(ledgerSessionId);
+								if (completedResponse) return completedResponse;
+								const repairedTurn = recoveredCanonicalReport.value.report.turn_id
+									? ((await readTurnRecord(namespaceDir, recoveredCanonicalReport.value.report.turn_id)) ??
+										recoveredCanonicalReport.value.turn)
+									: recoveredCanonicalReport.value.turn;
+								const repairedResponse = await responseFor(
+									reportFromCanonical(recoveredCanonicalReport.value.report),
+									repairedTurn,
+								);
+								await withAdmittedSessionTransaction(questionPaths, ledgerSessionId, async transaction => {
+									const operation =
+										transaction.requests.operations[operationId] ??
+										Object.values(transaction.requests.operations).find(
+											candidate => candidate.tool === name && candidate.key_digest === reportKeyDigest,
+										);
+									if (!operation || operation.request_digest !== requestDigest)
+										throw new Error("terminal_uncertain");
+									operation.phase = "completed";
+									operation.local_id = recoveredCanonicalReport.value!.report.report_id;
+									operation.safe_response = repairedResponse;
+									operation.updated_at = new Date().toISOString();
+								});
+								return repairedResponse;
+							}
+							if (recovered) return recovered;
+						} else {
+							const persisted = asRecord(
+								await readJsonFile(path.join(namespaceDir, "reports", `${reportId}.json`)),
+							);
+							if (persisted) return responseFor(persisted, turn);
+						}
+						const evidence = await validateEvidencePaths(args.evidence_paths);
 						const report = {
 							session_id: sessionId,
 							turn_id: args.turn_id,
@@ -5974,12 +8128,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							evidence_paths: evidence.map(item => item.path),
 							created_at: new Date().toISOString(),
 						};
-						let turn: TurnRecord | null = null;
-						if (args.turn_id != null) {
-							turn = await readTurnRecord(namespaceDir, args.turn_id);
-							if (!turn) return { ok: false, reason: "unknown_turn" };
-							if (sessionId != null && turn.session_id !== sessionId)
-								return { ok: false, reason: "turn_session_mismatch" };
+						if (turn) {
+							report.session_id = turn.session_id;
 							const terminalStatus = asTerminalTurnStatus(args.status);
 							if (terminalStatus) {
 								const timestamp = new Date().toISOString();
@@ -6014,34 +8164,33 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									updated_at: timestamp,
 									completed_at: timestamp,
 								};
-								const canonicalReport: CanonicalReportSnapshotV1 = {
-									schema_version: 1,
-									report_id: reportId,
-									operation_id: `report:${idempotencyKey}`,
-									session_id: turn.session_id,
-									turn_id: turn.turn_id,
-									status: String(args.status ?? "unknown"),
-									summary: typeof args.summary === "string" ? args.summary : "",
-									blocker: optionalString(args.blocker),
-									pr_url: optionalString(args.pr_url),
-									evidence_paths: evidence.map(item => item.path),
-									created_at: report.created_at,
-								};
 								await projectTerminalTransition(turn, {
 									desiredState: terminalStatus === "failed" ? "errored" : "completed",
 									reason: terminalStatus === "failed" ? "reported_failure" : null,
-									report: canonicalReport,
+									report: {
+										schema_version: 1,
+										report_id: reportId,
+										operation_id: publicOperationId,
+										session_id: turn.session_id,
+										turn_id: turn.turn_id,
+										status: String(args.status ?? "unknown"),
+										summary: typeof args.summary === "string" ? args.summary : "",
+										blocker: optionalString(args.blocker),
+										pr_url: optionalString(args.pr_url),
+										evidence_paths: evidence.map(item => item.path),
+										created_at: report.created_at,
+									},
 								});
+								turn = (await readTurnRecord(namespaceDir, turn.turn_id)) ?? turn;
 							}
 						}
-						if (sessionId && (!args.turn_id || !asTerminalTurnStatus(args.status))) {
-							await ensureQuestionTransaction(sessionId);
-							await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+						if (ledgerSessionId && (!args.turn_id || !asTerminalTurnStatus(args.status))) {
+							await withAdmittedSessionTransaction(questionPaths, ledgerSessionId, async transaction => {
 								transaction.canonical.reports[reportId] = {
 									schema_version: 1,
 									report_id: reportId,
-									operation_id: `report:${idempotencyKey}`,
-									session_id: sessionId,
+									operation_id: publicOperationId,
+									session_id: ledgerSessionId,
 									turn_id: typeof args.turn_id === "string" ? args.turn_id : "",
 									status: String(args.status ?? "unknown"),
 									summary: typeof args.summary === "string" ? args.summary : "",
@@ -6050,41 +8199,66 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									evidence_paths: evidence.map(item => item.path),
 									created_at: report.created_at,
 								};
+								const reportEventId = deterministicOutboxId(
+									ledgerSessionId,
+									transaction.revision + 1,
+									"report.written",
+									"report",
+									reportId,
+								);
+								transaction.outbox[reportEventId] ??= {
+									id: reportEventId,
+									transaction_revision: transaction.revision + 1,
+									kind: "report.written",
+									entity: "report",
+									entity_id: reportId,
+									payload: {
+										session_id: ledgerSessionId,
+										turn_id: typeof args.turn_id === "string" ? args.turn_id : null,
+										report_id: reportId,
+										status: String(args.status ?? "unknown"),
+										created_at: report.created_at,
+									},
+									emitted: false,
+									public_event_id: reportEventId,
+									public_delivery: {
+										public_event_id: reportEventId,
+										state: "pending",
+										claim_fence: null,
+										claim_expires_at: null,
+										journal_seq: null,
+										acknowledged_at: null,
+									},
+								};
 							});
+						}
+						const response = await responseFor(report, turn);
+						if (ledgerSessionId) {
+							await withAdmittedSessionTransaction(questionPaths, ledgerSessionId, async transaction => {
+								const operation =
+									transaction.requests.operations[operationId] ??
+									Object.values(transaction.requests.operations).find(
+										candidate => candidate.tool === name && candidate.key_digest === reportKeyDigest,
+									);
+								if (!operation || operation.request_digest !== requestDigest)
+									throw new Error("terminal_uncertain");
+								operation.phase = "completed";
+								operation.safe_response = response;
+								operation.updated_at = new Date().toISOString();
+							});
+							await services.afterCanonicalReportSafeResponse?.(ledgerSessionId, response);
 						}
 						const reportPath = path.join(namespaceDir, "reports", `${reportId}.json`);
 						await writeJsonFile(reportPath, report);
-						await appendCoordinatorEvent(namespaceDir, {
-							kind: "report.written",
-							sessionId,
-							turnId: typeof args.turn_id === "string" ? args.turn_id : null,
-							reportId,
-							summary:
-								typeof args.summary === "string"
-									? args.summary
-									: `Report ${String(args.status ?? "unknown")} written`,
-							payloadRef: path.relative(namespaceDir, reportPath),
-							metadata: { status: typeof args.status === "string" ? args.status : null },
-						});
-						return {
-							ok: true,
-							report: boundedPublicValue(report, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
-							...(turn
-								? {
-										turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
-										session_state: publicCoordinatorSessionState(
-											await readSessionState(namespaceDir, turn.session_id),
-										),
-									}
-								: {}),
-						};
+						await exportRetainedDeliveries();
+						return response;
 					},
+					true,
 				);
 			}
 			return { ok: false, reason: "unknown_tool", tool: name };
 		} catch (error) {
-			if (error instanceof SdkClientError) return sdkError(error);
-			return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+			return publicError(error);
 		}
 	}
 
