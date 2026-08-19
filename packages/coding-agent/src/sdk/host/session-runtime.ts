@@ -2943,6 +2943,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// No in-flight run visible and this is an in-run consumption
 				// racing agent_end (review P1): do not park in pending for the
 				// next unrelated run. Drop and terminalize boundedly.
+				const pendingIdx = pending.findIndex(
+					entry =>
+						entry.correlation.commandId === correlation.commandId &&
+						entry.correlation.turnId === correlation.turnId,
+				);
+				if (pendingIdx >= 0) pending.splice(pendingIdx, 1);
 				deadlineManager.clear(correlation);
 				void (active?.reconciliation ?? reconciliation).noteTransition(kind, correlation, {
 					type: "agent_failed",
