@@ -113,6 +113,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import type { LspStartupServerInfo } from "../lsp";
+import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -135,7 +136,6 @@ import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
-
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
@@ -2169,6 +2169,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										moveConsumed = true;
 										if (ownsProcessCwd) setProjectDir(canonicalTarget);
 										resetCapabilities();
+										await shutdownAllLspClients();
 										const projectRegistry = await resolveActiveProjectRegistryPath(sessionManager.getCwd());
 										clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
 										try {

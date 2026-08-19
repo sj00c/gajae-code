@@ -89,6 +89,45 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await session.dispose();
 		}
 	});
+	it("lets a sequential fenced bash call follow a completed move", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session", "bash"] });
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			await moveTool.execute("move-then-bash", { path: "repo-b" });
+			const bashTool = session.getToolForExecution("bash")!;
+			const pwd = await bashTool.execute("pwd-after-fenced-move", { command: "pwd" });
+			expect(textContent(pwd)).toContain("repo-b");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("refuses an unreadable target without moving", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const locked = path.join(cwdA, "locked");
+		fs.mkdirSync(locked, { recursive: true });
+		fs.chmodSync(locked, 0);
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			await expect(moveTool.execute("move-unreadable", { path: "locked" })).rejects.toThrow(
+				/access unavailable|permission|EACCES/i,
+			);
+			expect(sessionManager.getCwd()).toBe(cwdA);
+		} finally {
+			fs.chmodSync(locked, 0o755);
+			await session.dispose();
+		}
+	});
 
 	it("resolves a relative target against the current session cwd", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
