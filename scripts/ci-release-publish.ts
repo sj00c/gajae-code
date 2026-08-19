@@ -1187,8 +1187,12 @@ async function main(): Promise<void> {
 		await dryRun();
 		return;
 	}
-	await checkTypeDeclarations();
 	if (command.mode === "prepare-evidence") {
+		// Declaration checks (`bun x tsc`) resolve and execute packages, so they
+		// belong in the credential-free preparation job. The publish job runs
+		// with contents: write + id-token: write and no dependency install, so
+		// dependency resolution must never re-enter that boundary.
+		await checkTypeDeclarations();
 		await prepareExpectedEvidence(command.evidenceDir, command.releaseChannel);
 		return;
 	}

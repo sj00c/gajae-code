@@ -34,7 +34,8 @@ describe("stable release policy", () => {
 		expect(jobSection(ci, "native")).toContain("needs: [release_metadata]");
 		expect(jobSection(ci, "binaries")).toContain("needs: [native, release_metadata]");
 		expect(jobSection(ci, "release_prepare")).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
-		expect(jobSection(ci, "publish")).toContain("needs: [release_prepare, release_metadata]");
+		expect(jobSection(ci, "release_prepare")).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
+		expect(jobSection(ci, "publish")).toContain("needs: [release_prepare, release_approval, release_metadata]");
 		for (const stage of ["native", "binaries"]) {
 			const section = jobSection(ci, stage);
 			expect(section).toContain("startsWith(github.ref, 'refs/tags/v')");
@@ -105,7 +106,7 @@ describe("stable release policy", () => {
 		expect(publish).toContain("id-token: write");
 		expect(publish).not.toContain("pull-requests");
 		expect(publish).not.toContain("release-notes.ts");
-		expect(publish).toContain("needs: [release_prepare, release_metadata]");
+		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
 	});
 
 	test("resolves and validates release notes before the irreversible npm publication", async () => {
@@ -127,9 +128,9 @@ describe("stable release policy", () => {
 		expect(publish.indexOf("Verify release notes integrity")).toBeLessThan(publish.indexOf("Publish packages to npm"));
 		expect(publish).toContain("body_path: ${{ runner.temp }}/release-notes/release-notes.md");
 		expect(publish).toContain("generate_release_notes: false");
-		// publish needs release_prepare, which guarantees notes exist and passed
-		// validation before npm publish can start.
-		expect(publish).toContain("needs.release_prepare.result == 'success'");
+		// publish needs release_prepare (via release_approval), which guarantees
+		// notes exist and passed validation before npm publish can start.
+		expect(publish).toContain("needs.release_approval.result == 'success'");
 	});
 
 	test("selects the previous release anchor as an exact stable ancestor tag with a shell-safe empty fallback", async () => {
@@ -161,7 +162,7 @@ describe("stable release policy", () => {
 		expect(metadata).toContain("Validate stable tag protected-main provenance");
 		expect(metadata).toContain("+refs/heads/main:refs/remotes/origin/main");
 		expect(metadata).toContain('git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main');
-		expect(publish).toContain("needs: [release_prepare, release_metadata]");
+		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
 
 		// The OIDC subject must stay ref-scoped: an `environment:` would change
 		// the token subject away from the identity the npm trusted-publisher
@@ -183,6 +184,35 @@ describe("stable release policy", () => {
 		expect(publish).not.toContain("actions/cache@");
 		expect(publish).not.toContain("npm ci");
 		expect(publish).not.toContain("node_modules");
+	});
+
+	test("gates the OIDC boundary on the approval environment without changing the publish subject", async () => {
+		const ci = await workflow();
+		const approval = jobSection(ci, "release_approval");
+		const publish = jobSection(ci, "publish");
+
+		// The approval gate runs before publish and holds the environment hook
+		// with no permissions and no OIDC token, so publish's OIDC subject stays
+		// ref-scoped and the trusted-publisher registrations remain valid.
+		expect(approval).toContain("environment: npm-release");
+		expect(approval).toContain("permissions: {}");
+		expect(approval).not.toContain("id-token");
+		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
+		expect(publish).toContain("needs.release_approval.result == 'success'");
+		expect(publish).not.toContain("environment:");
+	});
+
+	test("keeps dependency resolution out of the publish dispatch", async () => {
+		const publishScript = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
+
+		// Declaration checks (`bun x tsc`) resolve/execute packages: they must be
+		// dispatched only on the prepare path, never on --publish-from-evidence.
+		const prepareBranch = publishScript.slice(
+			publishScript.indexOf('command.mode === "prepare-evidence"'),
+			publishScript.indexOf("await publishFromExpectedEvidence"),
+		);
+		expect(prepareBranch).toContain("await checkTypeDeclarations()");
+		expect(publishScript.slice(publishScript.indexOf("await publishFromExpectedEvidence"))).not.toContain("checkTypeDeclarations");
 	});
 
 	test("pins the OIDC-capable Node bootstrap to an exact patch", async () => {

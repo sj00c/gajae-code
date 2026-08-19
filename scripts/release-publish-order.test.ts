@@ -479,7 +479,7 @@ describe("native release binary coverage", () => {
 		expect(native).toContain("needs: [release_metadata]");
 		expect(binaries).toContain("needs: [native, release_metadata]");
 		expect(prepare).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
-		expect(publish).toContain("needs: [release_prepare, release_metadata]");
+		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
 
 		expect(prepare).toContain("--prepare-evidence --evidence-dir");
 		expect(prepare).toContain("Persist pre-publication package evidence");

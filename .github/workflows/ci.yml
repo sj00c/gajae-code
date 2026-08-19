@@ -609,6 +609,27 @@ jobs:
               retention-days: 30
               overwrite: true
 
+   release_approval:
+      # Approval gate BEFORE the credential boundary. The environment's
+      # protection rules (required reviewers, restricted deployment refs) are
+      # owner-controlled repository settings and are NOT evaluated from the
+      # tagged revision. This job holds no permissions and no OIDC token, so
+      # placing the environment HERE — not on publish — keeps the publish
+      # job's OIDC subject ref-scoped (repo:...:ref:refs/tags/v*), the
+      # identity the npm trusted-publisher registrations and the shipped
+      # v0.14.1 exchange already prove. Owner prerequisite (documented
+      # blocker, verified absent at review time): configure the npm-release
+      # environment with required reviewers; until then this gate is a hook.
+      if: ${{ needs.release_prepare.result == 'success' }}
+      needs: [release_prepare]
+      timeout-minutes: 30
+      runs-on: ubuntu-22.04
+      permissions: {}
+      environment: npm-release
+      steps:
+         - name: Record release approval
+           run: echo "Release approved for ${{ github.ref }} via the npm-release environment gate"
+
    publish:
       # Minimal credential boundary: the only job holding contents: write and
       # the OIDC identity token. All untrusted work (dependency installs,
@@ -630,8 +651,8 @@ jobs:
       #      maintainers. Do NOT scope this job to a GitHub environment
       #      without first re-registering every published package's trusted
       #      publisher for the environment-scoped OIDC subject.
-      if: ${{ needs.release_prepare.result == 'success' }}
-      needs: [release_prepare, release_metadata]
+      if: ${{ needs.release_approval.result == 'success' }}
+      needs: [release_prepare, release_approval, release_metadata]
       timeout-minutes: 45
       runs-on: ubuntu-22.04
       permissions:
