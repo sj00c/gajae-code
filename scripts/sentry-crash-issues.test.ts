@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	approvalManifest,
+	fileApprovalStore,
 	fingerprintOf,
 	fingerprintFromTagPayload,
 	issueBody,
@@ -116,20 +120,20 @@ describe("fingerprintFromTagPayload", () => {
 
 	test("refuses a value that is not a v1 fingerprint", () => {
 		for (const value of [FINGERPRINT.toUpperCase(), FINGERPRINT.slice(0, 31), `${FINGERPRINT}0`, "zzzz"])
-			expect(fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [{ value }] })).toBeUndefined();
+			expect(() => fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [{ value }] })).toThrow("malformed");
 	});
 
-	test("handles a missing or empty topValues without throwing", () => {
-		expect(fingerprintFromTagPayload({ key: "gjc.fingerprint" })).toBeUndefined();
-		expect(fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [] })).toBeUndefined();
-		expect(fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [null] })).toBeUndefined();
-		expect(fingerprintFromTagPayload(null)).toBeUndefined();
+	test("rejects malformed successful tag payloads instead of treating them as absent", () => {
+		expect(() => fingerprintFromTagPayload({ key: "gjc.fingerprint" })).toThrow("malformed");
+		expect(() => fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [] })).toThrow("malformed");
+		expect(() => fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [null] })).toThrow("malformed");
+		expect(() => fingerprintFromTagPayload(null)).toThrow("malformed");
 	});
 
 	test("quarantines multi-valued tags instead of selecting one", () => {
-		expect(
+		expect(() =>
 			fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [{ value: FINGERPRINT }, { value: FORGED_FINGERPRINT }] }),
-		).toBeUndefined();
+		).toThrow("malformed");
 	});
 });
 
@@ -317,6 +321,28 @@ describe("batch safety", () => {
 });
 
 describe("main orchestration", () => {
+	test("persists approvals atomically with private file-backed state", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-store-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		const target = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		process.env.GJC_SENTRY_APPROVAL_STORE = target;
+		try {
+			const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
+			await Promise.all([fileApprovalStore.recordApprovals([manifest]), fileApprovalStore.recordApprovals([manifest])]);
+			const stat = await fs.stat(target);
+			expect(stat.mode & 0o077).toBe(0);
+			expect(await fileApprovalStore.loadApprovals()).toEqual([manifest]);
+			await fileApprovalStore.recordFiled(manifest, "https://github.com/Yeachan-Heo/gajae-code/issues/1");
+			expect(await fileApprovalStore.hasAnyFiled(manifest)).toBe(true);
+			await fileApprovalStore.consume(manifest);
+			expect(await fileApprovalStore.loadApprovals()).toEqual([]);
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
 	function mainDependencies(
 		approved: boolean,
 		overrides: Partial<MainDependencies> = {},
@@ -353,6 +379,7 @@ describe("main orchestration", () => {
 					},
 					hasFiled: async (manifest, url) =>
 						filed.some(candidate => candidate.url === url && JSON.stringify(candidate.manifest) === JSON.stringify(manifest)),
+					hasAnyFiled: async manifest => filed.some(candidate => JSON.stringify(candidate.manifest) === JSON.stringify(manifest)),
 					recordFiled: async (manifest, url) => {
 						filed.push({ manifest, url });
 					},
@@ -423,6 +450,15 @@ describe("main orchestration", () => {
 		expect(tagFailure.ghCalls).toHaveLength(0);
 	});
 
+	test("fails closed on every saturated bounded page", async () => {
+		const saturated = mainDependencies(true, {
+			sentryGet: async () => Array.from({ length: 25 }, (_, index) => sentryIssue({ id: String(index + 1) })),
+		});
+		await expect(main([], saturated.dependencies)).resolves.toBe(1);
+		expect(saturated.stderr.join(" ")).toContain("bounded page");
+		expect(saturated.ghCalls).toHaveLength(0);
+	});
+
 	test("fails closed when a body-marker search is uncertain or a create fails", async () => {
 		// An UNAPPROVED fingerprint with a planted marker stays withheld.
 		const bodyMarker = mainDependencies(false, {
@@ -472,12 +508,13 @@ describe("main orchestration", () => {
 				},
 				consume: async () => {},
 				hasFiled: async () => false,
+				hasAnyFiled: async () => false,
 				recordFiled: async () => {},
 				hasPending: async () => false,
 				recordPending: async () => {},
 			},
 		});
-		await expect(main(["--approve", digestMatch![1]!], approving.dependencies)).resolves.toBe(1);
+		await expect(main(["--approve", digestMatch![1]!], approving.dependencies)).resolves.toBe(0);
 		expect(recorded).toHaveLength(1);
 		expect(recorded[0]?.[0]?.fingerprint).toBe(FINGERPRINT);
 
@@ -543,7 +580,7 @@ describe("main orchestration", () => {
 		expect(creates).toBe(1);
 	});
 
-	test("recovers an exact pending create instead of returning early", async () => {
+	test("requires acknowledgement for an exact pending public issue match", async () => {
 		const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
 		let recorded = 0;
 		const recovered = mainDependencies(true, {
@@ -558,6 +595,7 @@ describe("main orchestration", () => {
 				recordApprovals: async () => {},
 				consume: async () => {},
 				hasFiled: async () => false,
+				hasAnyFiled: async () => false,
 				recordFiled: async () => {
 					recorded++;
 				},
@@ -565,8 +603,8 @@ describe("main orchestration", () => {
 				recordPending: async () => {},
 			},
 		});
-		await expect(main(["--apply"], recovered.dependencies)).resolves.toBe(0);
-		expect(recorded).toBe(1);
+		await expect(main(["--apply"], recovered.dependencies)).resolves.toBe(1);
+		expect(recorded).toBe(0);
 		expect(recovered.ghCalls).toHaveLength(0);
 	});
 

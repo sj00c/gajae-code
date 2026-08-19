@@ -62,6 +62,25 @@ const MAX_PERMALINK_PATH_LENGTH = 2048;
 const MAX_ISSUE_BODY_BYTES = 48 * 1024;
 const SENTRY_LEVELS = new Set(["fatal", "error", "warning", "info", "debug"]);
 const SENTRY_SLUG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const GH_ENV_ALLOWLIST = [
+	"PATH",
+	"HOME",
+	"USERPROFILE",
+	"HOMEDRIVE",
+	"HOMEPATH",
+	"XDG_CONFIG_HOME",
+	"XDG_DATA_HOME",
+	"XDG_STATE_HOME",
+	"TMP",
+	"TEMP",
+	"TMPDIR",
+	"SYSTEMROOT",
+	"ComSpec",
+	"PATHEXT",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
+	"GH_HOST",
+] as const;
 
 interface Options {
 	apply: boolean;
@@ -268,15 +287,16 @@ export function toSentryIssue(raw: unknown): SentryIssue | undefined {
  * poison the dedup key the interactive flow depends on.
  */
 export function fingerprintFromTagPayload(raw: unknown): string | undefined {
-	if (typeof raw !== "object" || raw === null) return undefined;
+	if (typeof raw !== "object" || raw === null) throw new Error("Sentry fingerprint tag payload is malformed");
 	const record = raw as Record<string, unknown>;
 	if (asString(record.key) !== "gjc.fingerprint") return undefined;
 	const top = record.topValues;
-	if (!Array.isArray(top) || top.length !== 1) return undefined;
+	if (!Array.isArray(top) || top.length !== 1) throw new Error("Sentry fingerprint tag values are malformed");
 	const first = top[0];
-	if (typeof first !== "object" || first === null) return undefined;
+	if (typeof first !== "object" || first === null) throw new Error("Sentry fingerprint tag value is malformed");
 	const value = asString((first as { value?: unknown }).value);
-	return FINGERPRINT.test(value) ? value : undefined;
+	if (!FINGERPRINT.test(value)) throw new Error("Sentry fingerprint tag value is malformed");
+	return value;
 }
 
 interface FingerprintObservation {
@@ -298,7 +318,13 @@ export async function fingerprintOf(issueId: string, token: string): Promise<Fin
 }
 
 async function gh(args: readonly string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-	const child = Bun.spawn(["gh", ...args], { stdout: "pipe", stderr: "pipe" });
+	const env = Object.fromEntries(
+		GH_ENV_ALLOWLIST.flatMap(name => {
+			const value = Bun.env[name];
+			return value === undefined ? [] : [[name, value]];
+		}),
+	);
+	const child = Bun.spawn(["gh", ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore", env });
 	const timer = setTimeout(() => child.kill(), GH_TIMEOUT_MS);
 	try {
 		const [stdout, stderr, exitCode] = await Promise.all([
@@ -439,6 +465,7 @@ export interface ApprovalStore {
 	recordApprovals(manifests: readonly ApprovalManifest[]): Promise<void>;
 	consume(manifest: ApprovalManifest): Promise<void>;
 	hasFiled(manifest: ApprovalManifest, url: string): Promise<boolean>;
+	hasAnyFiled(manifest: ApprovalManifest): Promise<boolean>;
 	recordFiled(manifest: ApprovalManifest, url: string): Promise<void>;
 	hasPending(manifest: ApprovalManifest): Promise<boolean>;
 	recordPending(manifest: ApprovalManifest): Promise<void>;
@@ -557,11 +584,16 @@ async function writeStoredApprovals(stored: StoredApprovals): Promise<void> {
 			await handle.close();
 		}
 		await fs.rename(temporary, target);
-		const directoryHandle = await fs.open(directory, "r");
 		try {
-			await directoryHandle.sync();
-		} finally {
-			await directoryHandle.close();
+			const directoryHandle = await fs.open(directory, "r");
+			try {
+				await directoryHandle.sync();
+			} finally {
+				await directoryHandle.close();
+			}
+		} catch (error) {
+			const code = error instanceof Error && "code" in error ? error.code : undefined;
+			if (process.platform !== "win32" || !["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EPERM"].includes(String(code))) throw error;
 		}
 	} finally {
 		await fs.rm(temporary, { force: true }).catch(() => undefined);
@@ -587,49 +619,65 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 			await fs.mkdir(lockPath, { mode: 0o700 });
 		} catch (error) {
 			if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
-			if (await staleLock(lockPath)) await fs.rm(lockPath, { recursive: true, force: true });
+			const stale = await staleLock(lockPath);
+			if (stale.stale) await removeLockIfOwner(lockPath, stale.token);
 			await Bun.sleep(25);
 			continue;
 		}
+		const ownerToken = randomUUID();
 		try {
 			await fs.writeFile(
 				path.join(lockPath, "owner.json"),
-				`${JSON.stringify({ pid: process.pid, startedAt: Date.now(), processStart: await processStartIdentity(process.pid) })}\n`,
+				`${JSON.stringify({ token: ownerToken, pid: process.pid, startedAt: Date.now(), processStart: await processStartIdentity(process.pid) })}\n`,
 				{ mode: 0o600, flag: "wx" },
 			);
 			return await action();
 		} finally {
-			await fs.rm(lockPath, { recursive: true, force: true });
+			await removeLockIfOwner(lockPath, ownerToken);
 		}
 	}
 	throw new Error("timed out waiting for the crash issue creation lock");
 }
 
-async function staleLock(lockPath: string): Promise<boolean> {
+async function staleLock(lockPath: string): Promise<{ stale: boolean; token?: string }> {
 	try {
 		const stat = await fs.stat(lockPath);
-		if (Date.now() - stat.mtimeMs < LOCK_STALE_MS) return false;
+		if (Date.now() - stat.mtimeMs < LOCK_STALE_MS) return { stale: false };
 		try {
 			const owner = JSON.parse(await Bun.file(path.join(lockPath, "owner.json")).text()) as {
+				token?: unknown;
 				pid?: unknown;
 				processStart?: unknown;
 			};
-			if (typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid < 1) return true;
+			const token = typeof owner.token === "string" ? owner.token : undefined;
+			if (typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid < 1) return { stale: true, token };
 			if (typeof owner.processStart === "string") {
 				const currentStart = await processStartIdentity(owner.pid);
-				if (currentStart !== undefined && currentStart !== owner.processStart) return true;
+				if (currentStart !== undefined && currentStart !== owner.processStart) return { stale: true, token };
 			}
 			try {
 				process.kill(owner.pid, 0);
-				return false;
+				return { stale: false };
 			} catch {
-				return true;
+				return { stale: true, token };
 			}
 		} catch {
-			return true;
+			return { stale: true };
 		}
 	} catch {
-		return false;
+		return { stale: false };
+	}
+}
+
+async function removeLockIfOwner(lockPath: string, token: string | undefined): Promise<void> {
+	try {
+		const ownerPath = path.join(lockPath, "owner.json");
+		const owner = JSON.parse(await Bun.file(ownerPath).text()) as { token?: unknown };
+		if (token !== undefined && owner.token !== token) return;
+		if (token === undefined && owner.token !== undefined) return;
+		await fs.rm(lockPath, { recursive: true, force: true });
+	} catch {
+		// Teardown is best effort; never mask the action's result.
 	}
 }
 
@@ -670,10 +718,10 @@ function usage(): string {
 }
 
 function approvalStorePath(): string {
-	return path.join(os.homedir(), ".gjc", "sentry-triage-approvals.json");
+	return Bun.env.GJC_SENTRY_APPROVAL_STORE ?? path.join(os.homedir(), ".gjc", "sentry-triage-approvals.json");
 }
 
-const fileApprovalStore: ApprovalStore = {
+export const fileApprovalStore: ApprovalStore = {
 	async loadApprovals(): Promise<readonly ApprovalManifest[]> {
 		return (await loadStoredApprovals()).approvals;
 	},
@@ -693,6 +741,9 @@ const fileApprovalStore: ApprovalStore = {
 	},
 	async hasFiled(manifest: ApprovalManifest, url: string): Promise<boolean> {
 		return (await loadStoredApprovals()).filed.some(entry => entry.url === url && sameManifest(entry.manifest, manifest));
+	},
+	async hasAnyFiled(manifest: ApprovalManifest): Promise<boolean> {
+		return (await loadStoredApprovals()).filed.some(entry => sameManifest(entry.manifest, manifest));
 	},
 	async recordFiled(manifest: ApprovalManifest, url: string): Promise<void> {
 		await withStoreMutation(async () => {
@@ -770,9 +821,9 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		dependencies.writeStderr("Sentry returned an unexpected issue list shape.\n");
 		return 1;
 	}
-	if (raw.length === options.limit && options.limit === MAX_LIMIT) {
+	if (raw.length === options.limit) {
 		dependencies.writeStderr(
-			`Sentry returned the maximum ${MAX_LIMIT} rows; refusing to continue because the unresolved issue set may be truncated. Narrow the upstream query before approving a batch.\n`,
+			`Sentry returned ${options.limit} rows, filling the bounded page; refusing to continue because the unresolved issue set may be truncated. Narrow the upstream query before approving a batch.\n`,
 		);
 		return 1;
 	}
@@ -819,7 +870,6 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 	const approvals = await dependencies.approvals.loadApprovals();
 	const manifests = new Map(rows.map(row => [row, approvalManifest(row, options)]));
 	const untrustedBodyMarkers: TriageRow[] = [];
-	const recoverableExisting = new Set<TriageRow>();
 	let already = 0;
 	for (const row of rows) {
 		let existing: ExistingIssueSearch;
@@ -835,14 +885,6 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 			row.existingIssueUrl = existing.url;
 			const manifest = manifests.get(row);
 			if (manifest && existing.url && (await dependencies.approvals.hasFiled(manifest, existing.url))) already++;
-			else if (
-				manifest &&
-				existing.url &&
-				(await dependencies.approvals.hasPending(manifest)) &&
-				existing.title === issueTitle(row) &&
-				existing.body === issueBody(row, options)
-			)
-				recoverableExisting.add(row);
 			else untrustedBodyMarkers.push(row);
 		}
 	}
@@ -884,7 +926,9 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		);
 	if (untrustedBodyMarkers.length > 0)
 		dependencies.writeStderr(
-			`\n${untrustedBodyMarkers.length} issue-body marker(s) withheld; acknowledge the exact issue URL explicitly.\n`,
+			`\n${untrustedBodyMarkers.length} issue-body marker(s) withheld; acknowledge the exact issue URL explicitly:\n${untrustedBodyMarkers
+				.map(row => `  ${row.fingerprint}  ${row.existingIssueUrl ?? "<unknown URL>"}`)
+				.join("\n")}\n`,
 		);
 
 	if (options.acknowledge !== undefined) {
@@ -903,7 +947,7 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		return skippedMalformed > 0 || collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 1 ? 1 : 0;
 	}
 
-	if (pending.length === 0 && recoverableExisting.size === 0) {
+	if (pending.length === 0) {
 		dependencies.writeStdout("Nothing to file.\n");
 		return incomplete ? 1 : 0;
 	}
@@ -922,7 +966,7 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		}
 		await dependencies.approvals.recordApprovals(pendingManifests);
 		dependencies.writeStdout(`recorded ${pending.length} fingerprint(s) as operator-approved. --apply may now file them.\n`);
-		return incomplete ? 1 : 0;
+		return skippedMalformed > 0 || collisions.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
 	}
 
 	if (!options.apply) {
@@ -948,7 +992,7 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		return (
 			manifest &&
 			approvals.some(approval => sameManifest(approval, manifest)) &&
-			(row.existingIssueUrl === undefined || recoverableExisting.has(row))
+			row.existingIssueUrl === undefined
 		);
 	});
 	if (fileable.length === 0) {
@@ -967,18 +1011,10 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		try {
 			result = await dependencies.withCreationLock(async () => {
 				const existing = await dependencies.findExistingIssue(options.repo, row.fingerprint);
+				if (await dependencies.approvals.hasAnyFiled(manifest)) return undefined;
 				if (existing.kind === "untrusted" && existing.url && (await dependencies.approvals.hasFiled(manifest, existing.url)))
 					return undefined;
 				if (existing.kind === "untrusted") {
-					if (
-						recoverableExisting.has(row) &&
-						existing.url &&
-						existing.title === issueTitle(row) &&
-						existing.body === issueBody(row, options)
-					) {
-						await dependencies.approvals.recordFiled(manifest, existing.url);
-						return undefined;
-					}
 					throw new Error(`untrusted marker at ${existing.url ?? "unknown URL"}`);
 				}
 				await dependencies.approvals.recordPending(manifest);
