@@ -72,6 +72,8 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
+	"packages/coding-agent/src/tools/tool-catalog.generated.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
+	"packages/coding-agent/scripts/generate-tool-catalog.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
 };
 
 export interface PackageManifest {

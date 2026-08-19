@@ -1977,6 +1977,74 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (model) return formatModelString(model);
 			return undefined;
 		};
+		let mcpManager: MCPManager | undefined = options.mcpManager;
+		let ownsMcpManager = false;
+		const cwdCapturingToolNames: string[] = [];
+		const rebindCwdCapturingAuthority = async (to: string): Promise<void> => {
+			if (!session) return;
+			if (options.mcpManager && !ownsMcpManager) {
+				throw new Error(
+					"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
+				);
+			}
+			await session.recreatePythonTool();
+			await session.refreshGjcSubskillTools();
+			const previousCwdCapturing = [...cwdCapturingToolNames];
+			const nextCwdCapturing: string[] = [];
+			const nextCustomTools: CustomTool[] = [];
+			try {
+				const declarations = await getGjcPluginToolDeclarations(to);
+				const pluginToolResult = await loadAlwaysOnPluginTools({
+					cwd: to,
+					reservedToolNames: session.getAllToolNames().filter(name => !previousCwdCapturing.includes(name)),
+					declarations,
+				});
+				nextCustomTools.push(...pluginToolResult.tools);
+				nextCwdCapturing.push(...pluginToolResult.tools.map(tool => tool.name));
+			} catch (error) {
+				logger.warn("Failed to reload always-on plugin tools after session rescope", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			if (ownsMcpManager) {
+				const previousManager = mcpManager;
+				if (previousManager) await previousManager.disconnectAll().catch(() => {});
+				let nextManager: MCPManager | undefined;
+				try {
+					const loaded = await loadAllMCPConfigs(to, {
+						enableProjectConfig: settings.has("mcp.enableProjectConfig")
+							? settings.get("mcp.enableProjectConfig")
+							: true,
+						autoloadOnly: true,
+						nativeOnly: true,
+					});
+					const { configs } = await buildPluginMcpConfigs({ cwd: to });
+					const mergedConfigs = { ...loaded.configs, ...configs };
+					if (Object.keys(mergedConfigs).length > 0) {
+						nextManager = new MCPManager(to, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
+						nextManager.setAuthStorage(authStorage);
+						const result = await nextManager.connectServers(mergedConfigs, loaded.sources as never);
+						nextCustomTools.push(...(result.tools as CustomTool[]));
+						nextCwdCapturing.push(...result.tools.map(tool => tool.name));
+					}
+				} catch (error) {
+					logger.warn("Failed to recreate MCP authority after session rescope", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+				mcpManager = nextManager;
+				ownsMcpManager = Boolean(nextManager);
+				await session.replaceOwnedMcpManager(nextManager);
+				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[]);
+			}
+			cwdCapturingToolNames.length = 0;
+			cwdCapturingToolNames.push(...nextCwdCapturing);
+			await session.replaceNamedCustomTools(
+				previousCwdCapturing.filter(name => !nextCustomTools.some(tool => tool.name === name)),
+				nextCustomTools,
+			);
+		};
+
 		const toolSession: ToolSession = {
 			get cwd() {
 				return sessionManager.getCwd();
@@ -2018,7 +2086,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			(options.bashAllowedPrefixes ?? []).length === 0
 				? {
 						rescopeSessionCwd: (() => {
-							let moveInFlight = false;
 							let moveConsumed = false;
 							return async (target: string): Promise<{ from: string; to: string }> => {
 								if (moveConsumed) {
@@ -2026,21 +2093,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										"This session has already been rescoped; only one agent-invoked move is allowed per session.",
 									);
 								}
-								if (moveInFlight) {
-									throw new Error("A session move is already in progress; wait for it to finish.");
-								}
-								// Workflow skills keep cwd-local state and mutation guards under
-								// the launch root's .gjc/_session-<id>; moving out from under a
-								// live workflow would strand that state and let later guarded
-								// mutations run from an unguarded cwd. Refuse until the skill
-								// reaches its terminal phase.
-								if (session?.getActiveSkillState()) {
+								if (session?.getEffectiveActiveWorkflowSkillState()) {
 									throw new Error(
 										"A workflow skill is active in this session; finish or exit it before rescoping.",
 									);
 								}
-								moveInFlight = true;
-								try {
+								if (options.mcpManager && !ownsMcpManager) {
+									throw new Error(
+										"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
+									);
+								}
+								return sessionManager.runExclusiveCwdTransition(async () => {
+									if (moveConsumed) {
+										throw new Error(
+											"This session has already been rescoped; only one agent-invoked move is allowed per session.",
+										);
+									}
 									const from = sessionManager.getCwd();
 									const resolvedPath = path.resolve(from, target);
 									let canonicalFrom: string;
@@ -2065,11 +2133,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											`Refusing to rescope outside the current session directory: ${canonicalTarget} is not within ${canonicalFrom}. move_session only narrows the session scope; ask the user to restart or /move for a broader relocation.`,
 										);
 									}
+									let expectedIdentity: { dev: bigint; ino: bigint };
+									try {
+										const observed = await fs.lstat(canonicalTarget, { bigint: true });
+										if (observed.isSymbolicLink() || !observed.isDirectory()) {
+											throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
+										}
+										expectedIdentity = { dev: observed.dev, ino: observed.ino };
+									} catch (error) {
+										if (error instanceof Error && error.message.startsWith("Directory does not exist")) {
+											throw error;
+										}
+										throw new Error(`Directory identity unavailable: ${canonicalTarget}`);
+									}
 									await sessionManager.flush();
-									await sessionManager.moveTo(canonicalTarget);
-									// The move committed; consume the one-move bound before the
-									// best-effort follow-up steps so a later refresh failure
-									// cannot be misread as "not moved" and retried.
+									await sessionManager.moveTo(canonicalTarget, {
+										alreadyExclusive: true,
+										expectedIdentity,
+									});
 									moveConsumed = true;
 									setProjectDir(canonicalTarget);
 									resetCapabilities();
@@ -2081,10 +2162,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										// Non-fatal: the session has moved; the SSH tool refreshes
 										// on its next activation attempt.
 									}
+									try {
+										await rebindCwdCapturingAuthority(sessionManager.getCwd());
+									} catch (error) {
+										logger.warn("Failed to rebind cwd-capturing authority after session rescope", {
+											error: error instanceof Error ? error.message : String(error),
+										});
+									}
 									return { from, to: sessionManager.getCwd() };
-								} finally {
-									moveInFlight = false;
-								}
+								});
 							};
 						})(),
 					}
@@ -2265,8 +2351,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// written by `gjc mcp add`; disabled by `--no-mcp`), and plugin-bundle
 		// MCP servers (created below after `customTools` is populated). Existing
 		// caller-supplied managers remain available for legacy in-process callers.
-		let mcpManager: MCPManager | undefined = options.mcpManager;
-		let ownsMcpManager = false;
 		const customTools: CustomTool[] = [];
 		const exactMcpToolNames: string[] = [];
 		const pluginMcpToolNames: string[] = [];
@@ -2356,7 +2440,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				reservedToolNames: [...getReservedSubskillToolNames(), ...customTools.map(tool => tool.name)],
 				declarations: gjcToolDeclarations,
 			});
-			if (pluginToolResult.tools.length > 0) customTools.push(...pluginToolResult.tools);
+			if (pluginToolResult.tools.length > 0) {
+				customTools.push(...pluginToolResult.tools);
+				cwdCapturingToolNames.push(...pluginToolResult.tools.map(tool => tool.name));
+			}
 			for (const q of pluginToolResult.quarantine) {
 				gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 				logger.warn("Quarantined GJC plugin surface", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
@@ -2386,6 +2473,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const resultTools = result.tools as CustomTool[];
 				exactMcpToolNames.push(...resultTools.map(tool => tool.name));
 				customTools.push(...resultTools);
+				cwdCapturingToolNames.push(...resultTools.map(tool => tool.name));
 				if (result.errors.size > 0 || result.tools.length === 0) {
 					logger.warn("MCP tools could not be loaded.");
 				}
@@ -2480,6 +2568,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							mcpManager = owned;
 							ownsMcpManager = true;
 							customTools.push(...(result.tools as CustomTool[]));
+							cwdCapturingToolNames.push(...result.tools.map(tool => tool.name));
 							const connectedPluginNames = new Set(
 								result.connectedServers.filter(name => pluginNames.has(name)),
 							);
@@ -3697,7 +3786,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
 			getMcpServerInstructions:
-				explicitMcpConfigPath === undefined && mcpManager ? () => mcpManager.getServerInstructions() : undefined,
+				explicitMcpConfigPath === undefined ? () => mcpManager?.getServerInstructions() : undefined,
 			workspaceTree: options.workspaceTree ?? (workspaceTreeMode === "eager" ? resolvedWorkspaceTree : undefined),
 			workspaceTreeService: options.workspaceTree ? undefined : runtimeServices.workspaceTree,
 			networkPrewarmService: runtimeServices.networkPrewarm,
@@ -3890,8 +3979,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				});
 			}
 			// Wire prompt refresh → rebuild MCP prompt slash commands
-			mcpManager.setOnPromptsChanged(serverName => {
-				const promptCommands = buildMCPPromptCommands(mcpManager);
+			const liveMcpManager = mcpManager;
+			liveMcpManager.setOnPromptsChanged(serverName => {
+				const promptCommands = buildMCPPromptCommands(liveMcpManager);
 				session.setMCPPromptCommands(promptCommands);
 				logger.debug("MCP prompt commands refreshed", { path: `mcp:${serverName}` });
 			});

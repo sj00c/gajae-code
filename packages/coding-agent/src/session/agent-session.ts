@@ -197,6 +197,7 @@ import {
 	asyncJobEndpointId as deriveAsyncJobEndpointId,
 	type OwnerSubagentShutdownLease,
 } from "../async";
+import { createAutoresearchSessionPythonTool } from "../autoresearch/python-tool";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
@@ -381,6 +382,7 @@ import {
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
+import { evictCachedTool } from "../tools/descriptors";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
 import { registerResourceGcSession } from "../tools/resource-gc";
@@ -2297,7 +2299,7 @@ export class AgentSession {
 	 */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	readonly #disposeAsyncJobManager: boolean;
-	readonly #ownedMcpManager: MCPManager | undefined;
+	#ownedMcpManager: MCPManager | undefined;
 	#startupTurnBarrier: Promise<void> | undefined;
 	#pendingPythonMessages: Array<{
 		message: PythonExecutionMessage;
@@ -3761,6 +3763,81 @@ export class AgentSession {
 			...(this.#activeSkillState.sessionId ? { session_id: this.#activeSkillState.sessionId } : {}),
 		};
 	}
+	/**
+	 * Live prompt marker or restored durable workflow — the effective state the
+	 * cwd-local mutation guard must honor after resume.
+	 */
+	getEffectiveActiveWorkflowSkillState(): { skill: string; sessionId: string } | undefined {
+		const currentSessionId = this.sessionManager.getSessionId();
+		const inMemory = this.#activeSkillState;
+		if (
+			inMemory &&
+			(!inMemory.sessionId || inMemory.sessionId === currentSessionId) &&
+			isCanonicalGjcWorkflowSkill(inMemory.skill)
+		) {
+			return { skill: inMemory.skill, sessionId: inMemory.sessionId ?? currentSessionId };
+		}
+		if (
+			this.#restoredWorkflowSkillState?.sessionId === currentSessionId &&
+			isCanonicalGjcWorkflowSkill(this.#restoredWorkflowSkillState.skill)
+		) {
+			return this.#restoredWorkflowSkillState;
+		}
+		return undefined;
+	}
+
+	/** Replace the session-owned MCP manager after a cwd rescope. */
+	async replaceOwnedMcpManager(next: MCPManager | undefined): Promise<void> {
+		const previous = this.#ownedMcpManager;
+		if (previous && previous !== next) {
+			await previous.disconnectAll().catch(() => {});
+			if (MCPManager.instance() === previous) MCPManager.setInstance(undefined);
+		}
+		this.#ownedMcpManager = next;
+		if (next && MCPManager.instance() === undefined) MCPManager.setInstance(next);
+	}
+
+	/** Swap named custom/project tools after a cwd rescope. */
+	async replaceNamedCustomTools(previousNames: readonly string[], nextTools: CustomTool[]): Promise<void> {
+		const previous = new Set(previousNames);
+		const previousActive = this.getActiveToolNames();
+		for (const name of previous) this.#toolRegistry.delete(name);
+		const getCustomToolContext = () => this.#getCustomToolContext();
+		const added: string[] = [];
+		for (const customTool of nextTools) {
+			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
+			const finalTool = (
+				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
+			) as AgentTool;
+			this.#toolRegistry.set(finalTool.name, finalTool);
+			added.push(finalTool.name);
+		}
+		this.#invalidateDiscoveryCaches();
+		await this.#applyActiveToolsByName([
+			...previousActive.filter(name => !previous.has(name)),
+			...added.filter(name => !previous.has(name) || previousActive.includes(name)),
+		]);
+	}
+
+	/** Recreate the python descriptor so it no longer holds launch-root cwd. */
+	async recreatePythonTool(): Promise<void> {
+		if (!this.#toolRegistry.has("python")) return;
+		evictCachedTool("python");
+		const next = createAutoresearchSessionPythonTool({
+			cwd: this.sessionManager.getCwd(),
+			getCwd: () => this.sessionManager.getCwd(),
+			getSessionId: () => this.sessionManager.getSessionId(),
+			registerSessionCleanup: cleanup => {
+				this.registerToolSessionCleanup(cleanup);
+			},
+		});
+		this.#toolRegistry.set(next.name, next);
+		this.#builtinToolIdentities.add(next);
+		this.#invalidateDiscoveryCaches();
+		if (this.getActiveToolNames().includes("python")) {
+			await this.#applyActiveToolsByName(this.getActiveToolNames());
+		}
+	}
 
 	/** Best-effort accessor for the active skill's `current_phase` field from
 	 *  its persisted mode-state file. Used by the `skill` tool to enforce the
@@ -3791,13 +3868,7 @@ export class AgentSession {
 	/** Provider-facing ask metadata must expose only the active deep-interview phase. */
 	getDeepInterviewAskStage(): "topology" | "post-topology" | undefined {
 		const currentSessionId = this.sessionManager.getSessionId();
-		const inMemory = this.#activeSkillState;
-		const active =
-			inMemory && (!inMemory.sessionId || inMemory.sessionId === currentSessionId)
-				? inMemory
-				: this.#restoredWorkflowSkillState?.sessionId === currentSessionId
-					? this.#restoredWorkflowSkillState
-					: undefined;
+		const active = this.getEffectiveActiveWorkflowSkillState();
 		if (active?.skill !== "deep-interview") return undefined;
 		try {
 			assertNonEmptyGjcSessionId(currentSessionId, "AgentSession.getDeepInterviewAskStage");
@@ -7358,6 +7429,7 @@ export class AgentSession {
 	}
 
 	async #dispose(): Promise<void> {
+		await this.sessionManager.joinCwdTransition();
 		const admissionClosed = this.#closeSessionAdmission();
 		this.#isDisposed = true;
 		// Reject new direct Python starts as soon as disposal begins (synchronously,

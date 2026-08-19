@@ -8,6 +8,8 @@ import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
+import { syncSkillActiveState } from "../src/skill-state/active-state";
+import { moveSessionToolRenderer } from "../src/tools/move-session";
 
 function textContent(result: { content?: Array<{ type: string; text?: string }> }): string {
 	return (
@@ -370,5 +372,155 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 		}
+	});
+	it("does not expose move_session under bashAllowedPrefixes", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		fs.mkdirSync(cwdA, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, {
+			toolNames: ["move_session"],
+			bashAllowedPrefixes: ["/usr/bin"],
+		});
+		try {
+			expect(session.getToolByName("move_session")).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("refuses to move when a restored workflow is active without a live prompt marker", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		await syncSkillActiveState({
+			cwd: cwdA,
+			sessionId: sessionManager.getSessionId(),
+			skill: "deep-interview",
+			phase: "interview",
+			active: true,
+		});
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			expect(session.getActiveSkillState()).toBeUndefined();
+			expect(session.getEffectiveActiveWorkflowSkillState()).toMatchObject({ skill: "deep-interview" });
+			const moveTool = session.getToolByName("move_session")!;
+			let error: unknown;
+			try {
+				await moveTool.execute("move-restored-workflow", { path: "repo-b" });
+			} catch (err) {
+				error = err;
+			}
+			expect(error).toBeDefined();
+			expect(String((error as Error)?.message ?? error)).toContain("workflow skill is active");
+			expect(sessionManager.getCwd()).toBe(cwdA);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("serializes overlapping model and SessionManager moves", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		const repoC = path.join(cwdA, "repo-c");
+		fs.mkdirSync(repoB, { recursive: true });
+		fs.mkdirSync(repoC, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const original = sessionManager.runExclusiveCwdTransition.bind(sessionManager);
+			sessionManager.runExclusiveCwdTransition = async <T>(fn: () => Promise<T>): Promise<T> => {
+				started.resolve();
+				await release.promise;
+				return original(fn);
+			};
+			const modelMove = moveTool.execute("move-overlap", { path: "repo-b" });
+			await started.promise;
+			const acpMove = sessionManager.moveTo(repoC);
+			release.resolve();
+			await modelMove;
+			await acpMove;
+			const final = sessionManager.getCwd();
+			expect([fs.realpathSync(repoB), fs.realpathSync(repoC)]).toContain(final);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("keeps a committed move when abort and dispose race it", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const moveTool = session.getToolByName("move_session")!;
+		const moving = moveTool.execute("move-abort-dispose", { path: "repo-b" });
+		session.agent.abort();
+		const disposed = session.dispose();
+		await expect(moving).resolves.toBeDefined();
+		await disposed;
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+	});
+
+	it("does not fail the committed move when SSH refresh throws", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			session.refreshSshTool = async () => {
+				throw new Error("ssh refresh exploded");
+			};
+			const moveTool = session.getToolByName("move_session")!;
+			const result = await moveTool.execute("move-ssh-fail", { path: "repo-b" });
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+			expect(textContent(result)).toContain("repo-b");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("refuses a move when the no-follow target identity changed", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdA, { recursive: true });
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		await expect(sessionManager.moveTo(repoB, { expectedIdentity: { dev: 0n, ino: 0n } })).rejects.toThrow(
+			/identity changed/,
+		);
+		expect(sessionManager.getCwd()).toBe(cwdA);
+	});
+
+	it("sanitizes control characters in the renderer preview and error output", () => {
+		const dirty = "repo-\tname\x1b[31mred";
+		const preview = moveSessionToolRenderer.renderCall({ path: dirty }).render(200).join("\n");
+		expect(preview).not.toContain("\t");
+		expect(preview).not.toContain("\x1b");
+		expect(preview).toContain("move_session");
+		const failed = moveSessionToolRenderer
+			.renderResult({ isError: true, details: { from: dirty, to: dirty } }, { expanded: false, isPartial: false }, {
+				fg: (_k: string, text: string) => text,
+			} as never)
+			.render(200)
+			.join("\n");
+		expect(failed).toContain("move_session failed");
+		expect(failed).not.toContain("\x1b");
 	});
 });

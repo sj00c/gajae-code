@@ -7180,6 +7180,9 @@ export class SessionManager {
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
+	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
+	#cwdTransitionTail: Promise<void> = Promise.resolve();
+	#cwdTransitionDepth = 0;
 	/** Depth of the non-yielding same-session persistence fence (reentrancy counter). */
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
@@ -10450,12 +10453,71 @@ export class SessionManager {
 	}
 
 	/**
+	 * Serialize every cwd transition (model, TUI, SDK/ACP) and keep the
+	 * committed work non-abortable: later callers queue, dispose joins the tail.
+	 */
+	async runExclusiveCwdTransition<T>(fn: () => Promise<T>): Promise<T> {
+		if (this.#cwdTransitionDepth > 0) {
+			this.#cwdTransitionDepth += 1;
+			try {
+				return await fn();
+			} finally {
+				this.#cwdTransitionDepth -= 1;
+			}
+		}
+		const previous = this.#cwdTransitionTail;
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#cwdTransitionTail = previous.then(
+			() => promise,
+			() => promise,
+		);
+		await previous.catch(() => {});
+		this.#cwdTransitionDepth = 1;
+		try {
+			return await fn();
+		} finally {
+			this.#cwdTransitionDepth = 0;
+			resolve();
+		}
+	}
+
+	/** Wait for any in-flight exclusive cwd transition to settle. */
+	async joinCwdTransition(): Promise<void> {
+		await this.#cwdTransitionTail;
+	}
+
+	/**
 	 * Move the session to a new working directory.
 	 * Moves session files and artifacts on disk, updates all internal references,
 	 * and rewrites the session header with the new cwd.
+	 *
+	 * All callers (model `move_session`, TUI `/move`, SDK/ACP `session.cwd.move`)
+	 * share this exclusive transition so concurrent moves cannot interleave.
 	 */
-	async moveTo(newCwd: string): Promise<void> {
+	async moveTo(
+		newCwd: string,
+		options?: { alreadyExclusive?: boolean; expectedIdentity?: { dev: bigint; ino: bigint } },
+	): Promise<void> {
+		if (!options?.alreadyExclusive) {
+			return this.runExclusiveCwdTransition(() => this.moveTo(newCwd, { ...options, alreadyExclusive: true }));
+		}
 		const resolvedCwd = path.resolve(newCwd);
+		if (options?.expectedIdentity) {
+			let observed: fs.BigIntStats;
+			try {
+				observed = await fs.promises.lstat(resolvedCwd, { bigint: true });
+			} catch {
+				throw new Error(`Directory identity unavailable at state-changing boundary: ${resolvedCwd}`);
+			}
+			if (observed.isSymbolicLink() || !observed.isDirectory()) {
+				throw new Error(
+					`Refusing to move through a replaced path: ${resolvedCwd} is no longer the validated directory.`,
+				);
+			}
+			if (observed.dev !== options.expectedIdentity.dev || observed.ino !== options.expectedIdentity.ino) {
+				throw new Error(`Refusing to move: target identity changed at ${resolvedCwd}.`);
+			}
+		}
 		if (resolvedCwd === this.cwd) return;
 		const previousCwd = this.cwd;
 		const previousSessionDir = this.sessionDir;
@@ -15216,6 +15278,7 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
+		await this.joinCwdTransition();
 		// Drain any uncommitted prepared successors before releasing resources so
 		// dispose/shutdown retains exact cleanup authority (#3138).
 		try {

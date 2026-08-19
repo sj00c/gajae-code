@@ -297,6 +297,9 @@ function cached(key: string, load: () => Promise<any>): Promise<any> {
 	}
 	return promise;
 }
+export function evictCachedTool(key: string): void {
+	moduleCache.delete(key);
+}
 
 const loaders: Record<string, Loader> = {
 	read: session => cached("read", () => import("./read")).then(module => new module.ReadTool(session)),
@@ -329,6 +332,7 @@ const loaders: Record<string, Loader> = {
 		cached("python", () => import("../autoresearch/python-tool")).then(module =>
 			module.createAutoresearchSessionPythonTool({
 				cwd: session.cwd,
+				getCwd: () => session.cwd,
 				getSessionId: () => session.getSessionId?.() ?? null,
 				registerSessionCleanup: (cleanup: () => Promise<void> | void) => {
 					session.registerSessionCleanup?.(cleanup);

@@ -1,7 +1,7 @@
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { prompt } from "@gajae-code/utils";
+import { prompt, sanitizeText } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
@@ -77,7 +77,11 @@ export const moveSessionToolRenderer = {
 			typeof args === "object" && args !== null && typeof (args as { path?: unknown }).path === "string"
 				? (args as { path: string }).path
 				: "";
-		const text = truncateToWidth(replaceTabs(`move_session ${target}`), MOVE_SESSION_PREVIEW_WIDTH, Ellipsis.Omit);
+		const text = truncateToWidth(
+			replaceTabs(sanitizeText(`move_session ${target}`)),
+			MOVE_SESSION_PREVIEW_WIDTH,
+			Ellipsis.Omit,
+		);
 		return new Text(text, 1, 1);
 	},
 	renderResult: (
@@ -88,11 +92,13 @@ export const moveSessionToolRenderer = {
 		const details = (result.details ?? {}) as Partial<MoveSessionRenderArgs>;
 		const from = typeof details.from === "string" ? details.from : "";
 		const to = typeof details.to === "string" ? details.to : "";
-		const body = result.isError ? "move_session failed" : `Session moved: ${shortenPath(from)} → ${shortenPath(to)}`;
+		const body = result.isError
+			? "move_session failed"
+			: `Session moved: ${shortenPath(sanitizeText(from))} → ${shortenPath(sanitizeText(to))}`;
 		return new Text(
 			theme.fg(
 				result.isError ? "error" : "accent",
-				truncateToWidth(replaceTabs(body), MOVE_SESSION_PREVIEW_WIDTH, Ellipsis.Omit),
+				truncateToWidth(replaceTabs(sanitizeText(body)), MOVE_SESSION_PREVIEW_WIDTH, Ellipsis.Omit),
 			),
 			1,
 			1,

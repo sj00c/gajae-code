@@ -55,6 +55,8 @@ export interface AutoresearchPythonToolMissionContext {
 export interface AutoresearchPythonToolContext {
 	/** Working directory for kernel execution. */
 	cwd: string;
+	/** Live cwd resolver; used after session rescope so the kernel follows the session. */
+	getCwd?: () => string;
 	/** Effective artifacts directory for kernel execution (mission-bound path). */
 	artifactsDir?: string;
 	/** Live notebook writer that records every executed cell (mission-bound path). */
@@ -209,7 +211,7 @@ export function createAutoresearchPythonTool(
 				};
 			}
 			const result = await executePython(code, {
-				cwd: context.cwd,
+				cwd: context.getCwd?.() ?? context.cwd,
 				kernelMode: "session",
 				sessionId: ownerId,
 				kernelOwnerId: ownerId,
@@ -236,6 +238,7 @@ export function createAutoresearchPythonTool(
 export interface AutoresearchSessionPythonToolInput {
 	/** Working directory for kernel execution (session cwd). */
 	cwd: string;
+	getCwd?: () => string;
 	/** Resolve the session id used to locate `.gjc/_session-{id}/autoresearch/`. */
 	getSessionId: () => string | null;
 	/**
@@ -258,20 +261,23 @@ export interface AutoresearchSessionPythonToolInput {
  * owner (spec f33 / AC-19).
  */
 export function createAutoresearchSessionPythonTool(input: AutoresearchSessionPythonToolInput): AgentTool {
+	const cwd = () => input.getCwd?.() ?? input.cwd;
 	const definition = createAutoresearchPythonTool({
 		cwd: input.cwd,
+		getCwd: cwd,
 		getMissionContext: async () => {
 			const [{ autoresearchRead }, { openMissionNotebook, missionArtifactsDir }] = await Promise.all([
 				import("../gjc-runtime/autoresearch-runtime"),
 				import("./session"),
 			]);
-			const receipt = await autoresearchRead(input.cwd, input.getSessionId());
+			const liveCwd = cwd();
+			const receipt = await autoresearchRead(liveCwd, input.getSessionId());
 			if (!receipt.exists || !receipt.mission) return null;
-			const { writer } = await openMissionNotebook(input.cwd, receipt.mission);
+			const { writer } = await openMissionNotebook(liveCwd, receipt.mission);
 			return {
 				missionId: receipt.mission.slug,
 				sessionId: receipt.sessionId,
-				artifactsDir: missionArtifactsDir(input.cwd, receipt.mission),
+				artifactsDir: missionArtifactsDir(liveCwd, receipt.mission),
 				notebook: writer,
 			};
 		},
