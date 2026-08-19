@@ -2739,13 +2739,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", async (_event, ctx) => await emitLifecycle("agent_start", ctx));
 	api.on("agent_end", async (_event, ctx) => await emitLifecycle("agent_end", ctx));
-	(
-		api as unknown as {
-			on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void>) => void;
-		}
-	).on("agent_failed", async (event, ctx) =>
-		emitLifecycle("agent_failed", ctx, (event as { error?: unknown } | null | undefined)?.error),
-	);
+	api.on("agent_failed", async (event, ctx) => emitLifecycle("agent_failed", ctx, event.error));
 	api.on("turn_start", async (_event, ctx) => {
 		const current = active;
 		if (!current) return;

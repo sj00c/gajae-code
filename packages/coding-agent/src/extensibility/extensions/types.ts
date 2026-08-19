@@ -642,6 +642,12 @@ export interface AgentStartEvent extends SharedAgentStartEvent {
 	sdkRunToken?: string;
 }
 
+/** Fired when an agent run fails before emitting agent_end. */
+export interface AgentFailedEvent {
+	type: "agent_failed";
+	error?: unknown;
+}
+
 /** Fired when a message starts (user, assistant, or toolResult) */
 export interface MessageStartEvent {
 	type: "message_start";
@@ -918,6 +924,7 @@ export type ExtensionEvent =
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
 	| AgentStartEvent
+	| AgentFailedEvent
 	| AgentEndEvent
 	| TurnStartEvent
 	| TurnEndEvent
@@ -1083,6 +1090,7 @@ export interface ExtensionAPI {
 	on(event: "after_provider_response", handler: ExtensionHandler<AfterProviderResponseEvent>): void;
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
+	on(event: "agent_failed", handler: ExtensionHandler<AgentFailedEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
