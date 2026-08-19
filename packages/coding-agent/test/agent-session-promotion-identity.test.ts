@@ -135,6 +135,52 @@ describe("queued promotion run identity (#4668)", () => {
 		expect(promotions).toEqual([false]);
 	});
 
+	it("fires startsOwnRun:false synchronously when a plain prompt is diverted to steering mid-dispatch", async () => {
+		// Dispatch-race (#4668 review P1): the SDK snapshots isIdle() before
+		// dispatch, but the session starts streaming before sendUserMessage
+		// runs, so the plain prompt is diverted into the steering queue. The
+		// submission promise resolves at queue time — before any consumption
+		// hook fires — so the divert must report the in-run disposition
+		// synchronously, or the SDK terminalizes the accepted request as an
+		// own-run completion before it is consumed.
+		const gate = Promise.withResolvers<void>();
+		const tool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute(_toolCallId, params) {
+				await gate.promise;
+				return { content: [{ type: "text", text: `echoed: ${params.value}` }] };
+			},
+		};
+		session = buildSession(
+			[
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["handled steering"] },
+			],
+			tool,
+		);
+		const promotions: boolean[] = [];
+		const promptDone = session.prompt("first task");
+		while (!session.isStreaming) await Bun.sleep(5);
+		// A PLAIN prompt: no deliverAs, no queuedAtDispatch snapshot — the exact
+		// SDK dispatch-race shape.
+		await session.sendUserMessage("raced prompt", {
+			onQueuedPromoted: promotion => promotions.push(promotion.startsOwnRun),
+		});
+		// The divert disposition must already be reported: the submission has
+		// resolved, so a synchronous settlement reading the disposition now must
+		// see in-run consumption, not an unknown (own-run) outcome.
+		expect(promotions[0]).toBe(false);
+		gate.resolve();
+		await promptDone;
+		await session.waitForIdle();
+		// Every disposition reported for this submission stays in-run.
+		expect(promotions.length).toBeGreaterThan(0);
+		expect(promotions.every(startsOwnRun => startsOwnRun === false)).toBe(true);
+	});
+
 	it("fires startsOwnRun:true when a queued follow-up is promoted to its own run via continueQueuedMessages", async () => {
 		// The continuation path promotes the queued batch to a NEW run (its own
 		// agent_start); the promotion must report own-run so the SDK creates the

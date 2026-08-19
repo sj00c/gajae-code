@@ -2390,7 +2390,7 @@ interface ResponseFrame {
 interface InvocationHarness {
 	control(operation: string, input: Record<string, unknown>): Promise<ResponseFrame>;
 	query(name: string, input: Record<string, unknown>): Promise<ResponseFrame>;
-	emit(event: string): Promise<void>;
+	emit(event: string, payload?: unknown): Promise<void>;
 	stop(): Promise<void>;
 }
 
@@ -2462,8 +2462,8 @@ async function invocationHarness(
 	return {
 		control: (operation, input) => request({ type: "control_request", operation, input }),
 		query: (name, input) => request({ type: "query_request", query: name, input }),
-		emit: async event => {
-			await handlers.get(event)?.({}, ctx);
+		emit: async (event, payload) => {
+			await handlers.get(event)?.(payload ?? {}, ctx);
 		},
 		stop: async () => {
 			await handlers.get("session_shutdown")?.({}, ctx);
@@ -3187,6 +3187,110 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(seamCalls).toHaveLength(0);
 		} finally {
 			await handlers.get("session_shutdown")?.({}, ctx);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a prompt diverted to steering by the dispatch race is not terminalized before consumption", async () => {
+		// Exact-head review (#4668 P1): isIdle() is sampled before dispatch, but a
+		// stream can begin before sendUserMessage() runs. The diverted submission
+		// resolves at queue time with no promotion hook fired yet; the settlement
+		// path must NOT treat it as an own-run completion. The synchronous
+		// in-run disposition (startsOwnRun:false, reported by agent-session at
+		// the divert) attaches the correlation to the in-flight run instead, and
+		// it terminalizes with that run's agent_end.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-dispatch-race-"));
+		try {
+			const harness = await invocationHarness("dispatch-race", cwd, {
+				sendUserMessage: async (content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					if (content === "raced") {
+						// Production divert: agent-session reports the actual queue
+						// disposition synchronously when the plain prompt lands in the
+						// steering queue of a session that started streaming mid-dispatch.
+						(
+							options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined
+						)?.onQueuedPromoted?.({ startsOwnRun: false });
+						return;
+					}
+					// The first turn accepts and then keeps streaming.
+					await new Promise<void>(() => {});
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			const raced = await harness.control("turn.prompt", { text: "raced" });
+			expect(raced.ok).toBe(true);
+			const idsRaced = { commandId: raced.result?.commandId, turnId: raced.result?.turnId };
+			// Settlement ran (the submission resolved) but the raced prompt must
+			// still be non-terminal: with the bug it was already agent_end here.
+			const midRun = await harness.query("turn.prompt_status", idsRaced);
+			expect(midRun.result?.status).not.toBe("terminal_ok");
+			expect(midRun.result?.status).not.toBe("failed");
+			// The in-flight run ends: the diverted correlation terminalizes with it.
+			await harness.emit("agent_end");
+			expect(await settledStatus(harness, "turn.prompt_status", idsRaced)).toMatchObject({
+				status: "terminal_ok",
+			});
+			const idsFirst = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			expect(await settledStatus(harness, "turn.prompt_status", idsFirst)).toMatchObject({
+				status: "terminal_ok",
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("agent_failed is a terminal lifecycle boundary that preserves the failure cause", async () => {
+		// Exact-head review (#4668 P1): the agent_failed listener discarded the
+		// failure event and only cleared leases, leaving lifecycleActive, the
+		// tracked invocation batch, and owner connection IDs live. A failed run
+		// without a subsequent agent_end must still terminalize with its real
+		// reason and full terminal teardown.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-agent-failed-"));
+		try {
+			let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
+			const harness = await invocationHarness("agent-failed", cwd, {
+				sendUserMessage: async (content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
+						promoted = (
+							options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined
+						)?.onQueuedPromoted;
+						return;
+					}
+					// The failing turn accepts and then never makes progress on its own.
+					await new Promise<void>(() => {});
+				},
+			});
+			const failing = await harness.control("turn.prompt", { text: "failing" });
+			expect(failing.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
+			});
+			const idsFailing = { commandId: failing.result?.commandId, turnId: failing.result?.turnId };
+			expect(await settledStatus(harness, "turn.prompt_status", idsFailing)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_unavailable" },
+			});
+			// Teardown proof: with lifecycleActive cleared, an in-run consumption
+			// reported after the failure has no live run to attach to and takes the
+			// bounded no-active-run terminal path instead of joining a zombie run.
+			const followUp = await harness.control("turn.follow_up", { text: "late" });
+			expect(followUp.ok).toBe(true);
+			promoted?.({ startsOwnRun: false });
+			const idsFollowUp = { commandId: followUp.result?.commandId, turnId: followUp.result?.turnId };
+			expect(await settledStatus(harness, "turn.prompt_status", idsFollowUp)).toMatchObject({
+				status: "failed",
+				error: { code: "busy" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
