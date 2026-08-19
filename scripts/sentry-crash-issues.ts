@@ -594,7 +594,7 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 		try {
 			await fs.writeFile(
 				path.join(lockPath, "owner.json"),
-				`${JSON.stringify({ pid: process.pid, startedAt: Date.now() })}\n`,
+				`${JSON.stringify({ pid: process.pid, startedAt: Date.now(), processStart: await processStartIdentity(process.pid) })}\n`,
 				{ mode: 0o600, flag: "wx" },
 			);
 			return await action();
@@ -610,8 +610,15 @@ async function staleLock(lockPath: string): Promise<boolean> {
 		const stat = await fs.stat(lockPath);
 		if (Date.now() - stat.mtimeMs < LOCK_STALE_MS) return false;
 		try {
-			const owner = JSON.parse(await Bun.file(path.join(lockPath, "owner.json")).text()) as { pid?: unknown };
+			const owner = JSON.parse(await Bun.file(path.join(lockPath, "owner.json")).text()) as {
+				pid?: unknown;
+				processStart?: unknown;
+			};
 			if (typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid < 1) return true;
+			if (typeof owner.processStart === "string") {
+				const currentStart = await processStartIdentity(owner.pid);
+				if (currentStart !== undefined && currentStart !== owner.processStart) return true;
+			}
 			try {
 				process.kill(owner.pid, 0);
 				return false;
@@ -623,6 +630,19 @@ async function staleLock(lockPath: string): Promise<boolean> {
 		}
 	} catch {
 		return false;
+	}
+}
+
+async function processStartIdentity(pid: number): Promise<string | undefined> {
+	if (process.platform !== "linux") return undefined;
+	try {
+		const stat = await Bun.file(`/proc/${pid}/stat`).text();
+		const closingParen = stat.lastIndexOf(")");
+		if (closingParen < 0) return undefined;
+		const fields = stat.slice(closingParen + 1).trim().split(/\s+/);
+		return fields[19];
+	} catch {
+		return undefined;
 	}
 }
 
