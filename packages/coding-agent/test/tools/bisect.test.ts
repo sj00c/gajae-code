@@ -84,6 +84,18 @@ describe("parseFirstBadCommit", () => {
 		expect(parseFirstBadCommit("abc1234 is the first 'bad' commit\ncommit abc1234")).toBe("abc1234");
 	});
 
+	it("accepts the non-default and operator-renamed bisect terms git can report", () => {
+		// `git bisect start --term-new`/`--term-old` and the built-in new/old pair
+		// both reach convergence with a term other than "bad".
+		expect(parseFirstBadCommit("abc1234 is the first new commit\ncommit abc1234")).toBe("abc1234");
+		expect(parseFirstBadCommit("abc1234 is the first 'broken' commit\ncommit abc1234")).toBe("abc1234");
+	});
+
+	it("does not accept an unquoted arbitrary word as a bisect term", () => {
+		// Widening to any bare word would make ordinary prose parse as convergence.
+		expect(parseFirstBadCommit("abc1234 is the first broken commit\ncommit abc1234")).toBeNull();
+	});
+
 	it("returns null before the search has converged", () => {
 		expect(parseFirstBadCommit("Bisecting: 3 revisions left to test after this (roughly 2 steps)")).toBeNull();
 	});

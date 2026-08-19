@@ -89,7 +89,7 @@ export interface BisectToolDetails {
 	reason?: string;
 }
 
-const FIRST_BAD_RE = /^\s*([0-9a-f]{7,40})\s+is the first (?:bad|'bad') commit\b/m;
+const FIRST_BAD_RE = /^\s*([0-9a-f]{7,40})\s+is the first (?:bad|new|'[^']+') commit\b/m;
 const ONLY_SKIPPED_RE = /only '?skip'?ped commits left to test/i;
 
 /** Parse the culprit SHA from `git bisect good|bad` output, or null when not yet converged. */
