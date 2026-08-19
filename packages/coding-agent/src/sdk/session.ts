@@ -1,3 +1,4 @@
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -2049,6 +2050,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			get cwd() {
 				return sessionManager.getCwd();
 			},
+			awaitCwdTransition: () => sessionManager.joinCwdTransition(),
 			hasUI: options.hasUI ?? false,
 			workflowGateEligible: true,
 			enableLsp,
@@ -2133,43 +2135,51 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											`Refusing to rescope outside the current session directory: ${canonicalTarget} is not within ${canonicalFrom}. move_session only narrows the session scope; ask the user to restart or /move for a broader relocation.`,
 										);
 									}
+									let targetHandle: nodeFs.promises.FileHandle | undefined;
 									let expectedIdentity: { dev: bigint; ino: bigint };
 									try {
-										const observed = await fs.lstat(canonicalTarget, { bigint: true });
-										if (observed.isSymbolicLink() || !observed.isDirectory()) {
+										targetHandle = await SessionManager.openNoFollowDirectory(canonicalTarget);
+										const opened = await targetHandle.stat({ bigint: true });
+										if (!opened.isDirectory()) {
 											throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
 										}
-										expectedIdentity = { dev: observed.dev, ino: observed.ino };
+										expectedIdentity = { dev: opened.dev, ino: opened.ino };
+										await fs.access(canonicalTarget, nodeFs.constants.R_OK | nodeFs.constants.X_OK);
 									} catch (error) {
+										await targetHandle?.close().catch(() => {});
 										if (error instanceof Error && error.message.startsWith("Directory does not exist")) {
 											throw error;
 										}
-										throw new Error(`Directory identity unavailable: ${canonicalTarget}`);
+										throw new Error(
+											`Directory identity or access unavailable: ${canonicalTarget}${
+												error instanceof Error ? ` (${error.message})` : ""
+											}`,
+										);
 									}
-									await sessionManager.flush();
-									await sessionManager.moveTo(canonicalTarget, {
-										alreadyExclusive: true,
-										expectedIdentity,
-									});
-									moveConsumed = true;
-									setProjectDir(canonicalTarget);
-									resetCapabilities();
-									const projectRegistry = await resolveActiveProjectRegistryPath(sessionManager.getCwd());
-									clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
+									const processCwd = await fs.realpath(process.cwd()).catch(() => process.cwd());
+									const ownsProcessCwd = processCwd === canonicalFrom;
 									try {
-										await session?.refreshSshTool({ activateIfAvailable: true });
-									} catch {
-										// Non-fatal: the session has moved; the SSH tool refreshes
-										// on its next activation attempt.
-									}
-									try {
-										await rebindCwdCapturingAuthority(sessionManager.getCwd());
-									} catch (error) {
-										logger.warn("Failed to rebind cwd-capturing authority after session rescope", {
-											error: error instanceof Error ? error.message : String(error),
+										await sessionManager.flush();
+										await sessionManager.moveTo(canonicalTarget, {
+											expectedIdentity,
+											targetHandle,
 										});
+										moveConsumed = true;
+										if (ownsProcessCwd) setProjectDir(canonicalTarget);
+										resetCapabilities();
+										const projectRegistry = await resolveActiveProjectRegistryPath(sessionManager.getCwd());
+										clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
+										try {
+											await session?.refreshSshTool({ activateIfAvailable: true });
+										} catch {
+											// Non-fatal: the session has moved; the SSH tool refreshes
+											// on its next activation attempt.
+										}
+										await rebindCwdCapturingAuthority(sessionManager.getCwd());
+										return { from, to: sessionManager.getCwd() };
+									} finally {
+										await targetHandle.close().catch(() => {});
 									}
-									return { from, to: sessionManager.getCwd() };
 								});
 							};
 						})(),

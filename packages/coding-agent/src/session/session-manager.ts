@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 
@@ -21,6 +22,11 @@ import type * as native from "@gajae-code/natives";
 function nativeSessionManager(): typeof import("@gajae-code/natives") {
 	return require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 }
+const cwdTransitionAls = new AsyncLocalStorage<symbol>();
+const CWD_NOFOLLOW_OPEN_FLAGS =
+	fs.constants.O_RDONLY |
+	(typeof fs.constants.O_DIRECTORY === "number" ? fs.constants.O_DIRECTORY : 0) |
+	(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0));
 
 import { getTerminalId } from "@gajae-code/tui";
 import {
@@ -7182,7 +7188,7 @@ export class SessionManager {
 	#closeRetryPending = false;
 	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
-	#cwdTransitionDepth = 0;
+	#cwdTransitionOwner: symbol | undefined;
 	/** Depth of the non-yielding same-session persistence fence (reentrancy counter). */
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
@@ -10452,18 +10458,52 @@ export class SessionManager {
 		}
 	}
 
+	async #assertCwdTargetIdentity(
+		resolvedCwd: string,
+		options: {
+			expectedIdentity?: { dev: bigint; ino: bigint };
+			targetHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
+		},
+	): Promise<void> {
+		let opened: fs.BigIntStats | undefined;
+		if (options.targetHandle) {
+			opened = await options.targetHandle.stat({ bigint: true });
+			if (!opened.isDirectory()) {
+				throw new Error(
+					`Refusing to move through a replaced path: ${resolvedCwd} is no longer the validated directory.`,
+				);
+			}
+		}
+		let observed: fs.BigIntStats;
+		try {
+			observed = await fs.promises.lstat(resolvedCwd, { bigint: true });
+		} catch {
+			throw new Error(`Directory identity unavailable at state-changing boundary: ${resolvedCwd}`);
+		}
+		if (observed.isSymbolicLink() || !observed.isDirectory()) {
+			throw new Error(
+				`Refusing to move through a replaced path: ${resolvedCwd} is no longer the validated directory.`,
+			);
+		}
+		if (opened && (observed.dev !== opened.dev || observed.ino !== opened.ino)) {
+			throw new Error(`Refusing to move: target identity changed at ${resolvedCwd}.`);
+		}
+		const expected = options.expectedIdentity;
+		const pinned = opened ?? observed;
+		if (expected && (pinned.dev !== expected.dev || pinned.ino !== expected.ino)) {
+			throw new Error(`Refusing to move: target identity changed at ${resolvedCwd}.`);
+		}
+	}
+
 	/**
-	 * Serialize every cwd transition (model, TUI, SDK/ACP) and keep the
-	 * committed work non-abortable: later callers queue, dispose joins the tail.
+	 * Serialize every cwd transition (model, TUI, SDK/ACP). Re-entry is allowed
+	 * only for the async context that already owns the lock — unrelated callers
+	 * queue on the tail instead of skipping it.
 	 */
 	async runExclusiveCwdTransition<T>(fn: () => Promise<T>): Promise<T> {
-		if (this.#cwdTransitionDepth > 0) {
-			this.#cwdTransitionDepth += 1;
-			try {
-				return await fn();
-			} finally {
-				this.#cwdTransitionDepth -= 1;
-			}
+		const owner = this.#cwdTransitionOwner;
+		if (owner !== undefined && cwdTransitionAls.getStore() === owner) {
+			return fn();
 		}
 		const previous = this.#cwdTransitionTail;
 		const { promise, resolve } = Promise.withResolvers<void>();
@@ -10472,11 +10512,12 @@ export class SessionManager {
 			() => promise,
 		);
 		await previous.catch(() => {});
-		this.#cwdTransitionDepth = 1;
+		const token = Symbol("cwd-transition");
+		this.#cwdTransitionOwner = token;
 		try {
-			return await fn();
+			return await cwdTransitionAls.run(token, fn);
 		} finally {
-			this.#cwdTransitionDepth = 0;
+			if (this.#cwdTransitionOwner === token) this.#cwdTransitionOwner = undefined;
 			resolve();
 		}
 	}
@@ -10484,6 +10525,14 @@ export class SessionManager {
 	/** Wait for any in-flight exclusive cwd transition to settle. */
 	async joinCwdTransition(): Promise<void> {
 		await this.#cwdTransitionTail;
+	}
+
+	#ownsCwdTransition(): boolean {
+		const owner = this.#cwdTransitionOwner;
+		return owner !== undefined && cwdTransitionAls.getStore() === owner;
+	}
+	static async openNoFollowDirectory(dir: string): Promise<fs.promises.FileHandle> {
+		return fs.promises.open(dir, CWD_NOFOLLOW_OPEN_FLAGS);
 	}
 
 	/**
@@ -10496,27 +10545,17 @@ export class SessionManager {
 	 */
 	async moveTo(
 		newCwd: string,
-		options?: { alreadyExclusive?: boolean; expectedIdentity?: { dev: bigint; ino: bigint } },
+		options?: {
+			expectedIdentity?: { dev: bigint; ino: bigint };
+			targetHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
+		},
 	): Promise<void> {
-		if (!options?.alreadyExclusive) {
-			return this.runExclusiveCwdTransition(() => this.moveTo(newCwd, { ...options, alreadyExclusive: true }));
+		if (!this.#ownsCwdTransition()) {
+			return this.runExclusiveCwdTransition(() => this.moveTo(newCwd, options));
 		}
 		const resolvedCwd = path.resolve(newCwd);
-		if (options?.expectedIdentity) {
-			let observed: fs.BigIntStats;
-			try {
-				observed = await fs.promises.lstat(resolvedCwd, { bigint: true });
-			} catch {
-				throw new Error(`Directory identity unavailable at state-changing boundary: ${resolvedCwd}`);
-			}
-			if (observed.isSymbolicLink() || !observed.isDirectory()) {
-				throw new Error(
-					`Refusing to move through a replaced path: ${resolvedCwd} is no longer the validated directory.`,
-				);
-			}
-			if (observed.dev !== options.expectedIdentity.dev || observed.ino !== options.expectedIdentity.ino) {
-				throw new Error(`Refusing to move: target identity changed at ${resolvedCwd}.`);
-			}
+		if (options?.expectedIdentity || options?.targetHandle) {
+			await this.#assertCwdTargetIdentity(resolvedCwd, options);
 		}
 		if (resolvedCwd === this.cwd) return;
 		const previousCwd = this.cwd;
@@ -10762,6 +10801,9 @@ export class SessionManager {
 
 		// Update cwd and sessionDir after physical publication succeeds. Metadata failures restore the source
 		// authority but deliberately retain any destination publication evidence rather than deleting it.
+		if (options?.expectedIdentity || options?.targetHandle) {
+			await this.#assertCwdTargetIdentity(resolvedCwd, options);
+		}
 		this.cwd = resolvedCwd;
 		this.sessionDir = newSessionDir;
 		this.destination = nextDestination;

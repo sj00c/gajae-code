@@ -423,6 +423,31 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	});
 
+	it("queues an unrelated cwd transition instead of skipping the lock", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		fs.mkdirSync(cwdA, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const hold = Promise.withResolvers<void>();
+		const firstEntered = Promise.withResolvers<void>();
+		let secondEntered = false;
+		const first = sessionManager.runExclusiveCwdTransition(async () => {
+			firstEntered.resolve();
+			await hold.promise;
+		});
+		await firstEntered.promise;
+		const second = sessionManager.runExclusiveCwdTransition(async () => {
+			secondEntered = true;
+		});
+		await Bun.sleep(40);
+		expect(secondEntered).toBe(false);
+		hold.resolve();
+		await Promise.all([first, second]);
+		expect(secondEntered).toBe(true);
+		await sessionManager.close();
+	});
+
 	it("serializes overlapping model and SessionManager moves", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
@@ -434,23 +459,24 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
 		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
 		try {
-			const moveTool = session.getToolByName("move_session")!;
-			const started = Promise.withResolvers<void>();
-			const release = Promise.withResolvers<void>();
-			const original = sessionManager.runExclusiveCwdTransition.bind(sessionManager);
-			sessionManager.runExclusiveCwdTransition = async <T>(fn: () => Promise<T>): Promise<T> => {
-				started.resolve();
-				await release.promise;
-				return original(fn);
-			};
-			const modelMove = moveTool.execute("move-overlap", { path: "repo-b" });
-			await started.promise;
-			const acpMove = sessionManager.moveTo(repoC);
-			release.resolve();
-			await modelMove;
-			await acpMove;
-			const final = sessionManager.getCwd();
-			expect([fs.realpathSync(repoB), fs.realpathSync(repoC)]).toContain(final);
+			const hold = Promise.withResolvers<void>();
+			const firstEntered = Promise.withResolvers<void>();
+			const first = sessionManager.runExclusiveCwdTransition(async () => {
+				firstEntered.resolve();
+				await hold.promise;
+				await sessionManager.moveTo(repoB);
+			});
+			await firstEntered.promise;
+			let acpDone = false;
+			const acp = sessionManager.moveTo(repoC).then(() => {
+				acpDone = true;
+			});
+			await Bun.sleep(40);
+			expect(acpDone).toBe(false);
+			hold.resolve();
+			await first;
+			await acp;
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoC));
 		} finally {
 			await session.dispose();
 		}
@@ -494,18 +520,32 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	});
 
-	it("refuses a move when the no-follow target identity changed", async () => {
+	it("refuses a move when the no-follow target is replaced after the handle is opened", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const cwdA = path.join(tempDir, "root");
 		const repoB = path.join(cwdA, "repo-b");
+		const outside = path.join(tempDir, "outside");
 		fs.mkdirSync(cwdA, { recursive: true });
 		fs.mkdirSync(repoB, { recursive: true });
+		fs.mkdirSync(outside, { recursive: true });
 		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
-		await expect(sessionManager.moveTo(repoB, { expectedIdentity: { dev: 0n, ino: 0n } })).rejects.toThrow(
-			/identity changed/,
-		);
-		expect(sessionManager.getCwd()).toBe(cwdA);
+		const handle = await SessionManager.openNoFollowDirectory(repoB);
+		try {
+			const opened = await handle.stat({ bigint: true });
+			fs.rmdirSync(repoB);
+			fs.symlinkSync(outside, repoB);
+			await expect(
+				sessionManager.moveTo(repoB, {
+					expectedIdentity: { dev: opened.dev, ino: opened.ino },
+					targetHandle: handle,
+				}),
+			).rejects.toThrow(/replaced path|identity changed/);
+			expect(sessionManager.getCwd()).toBe(cwdA);
+		} finally {
+			await handle.close().catch(() => {});
+			await sessionManager.close();
+		}
 	});
 
 	it("sanitizes control characters in the renderer preview and error output", () => {

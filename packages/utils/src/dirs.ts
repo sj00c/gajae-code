@@ -145,8 +145,9 @@ export function getProjectDir(): string {
 
 /** Set the project directory. */
 export function setProjectDir(dir: string): void {
-	projectDir = standardizeMacOSPath(path.resolve(dir));
-	process.chdir(projectDir);
+	const resolved = standardizeMacOSPath(path.resolve(dir));
+	process.chdir(resolved);
+	projectDir = standardizeMacOSPath(process.cwd());
 }
 
 /**
