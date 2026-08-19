@@ -2085,7 +2085,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// or an arbitrary absolute path.
 			...(!isCanonicalSubSession &&
 			!options.bashRestrictionProfile &&
-			(options.bashAllowedPrefixes ?? []).length === 0
+			(options.bashAllowedPrefixes ?? []).length === 0 &&
+			!options.mcpManager &&
+			options.workspaceTree === undefined
 				? {
 						rescopeSessionCwd: (() => {
 							let moveConsumed = false;

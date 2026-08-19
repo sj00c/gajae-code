@@ -1153,13 +1153,15 @@ export class CommandController {
 		}
 
 		try {
-			await this.ctx.sessionManager.flush();
-			await this.ctx.sessionManager.moveTo(resolvedPath);
-			setProjectDir(resolvedPath);
-			clearClaudePluginRootsCache(); // re-warms preloadedPluginRoots with new project dir (async)
-			resetCapabilities();
-			await this.ctx.refreshSlashCommandState(resolvedPath);
-			await this.ctx.session.refreshSshTool({ activateIfAvailable: true });
+			await this.ctx.sessionManager.runExclusiveCwdTransition(async () => {
+				await this.ctx.sessionManager.flush();
+				await this.ctx.sessionManager.moveTo(resolvedPath);
+				setProjectDir(resolvedPath);
+				clearClaudePluginRootsCache();
+				resetCapabilities();
+				await this.ctx.refreshSlashCommandState(resolvedPath);
+				await this.ctx.session.refreshSshTool({ activateIfAvailable: true });
+			});
 
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();

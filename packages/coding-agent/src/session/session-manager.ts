@@ -7189,6 +7189,7 @@ export class SessionManager {
 	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
 	#cwdTransitionOwner: symbol | undefined;
+	#cwdGeneration = 0;
 	/** Depth of the non-yielding same-session persistence fence (reentrancy counter). */
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
@@ -10526,6 +10527,9 @@ export class SessionManager {
 	async joinCwdTransition(): Promise<void> {
 		await this.#cwdTransitionTail;
 	}
+	getCwdGeneration(): number {
+		return this.#cwdGeneration;
+	}
 
 	#ownsCwdTransition(): boolean {
 		const owner = this.#cwdTransitionOwner;
@@ -10804,6 +10808,7 @@ export class SessionManager {
 		if (options?.expectedIdentity || options?.targetHandle) {
 			await this.#assertCwdTargetIdentity(resolvedCwd, options);
 		}
+		this.#cwdGeneration += 1;
 		this.cwd = resolvedCwd;
 		this.sessionDir = newSessionDir;
 		this.destination = nextDestination;

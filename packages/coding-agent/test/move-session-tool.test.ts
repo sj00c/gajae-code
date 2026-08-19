@@ -244,6 +244,33 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await session.dispose();
 		}
 	});
+	it("does not expose move_session when caller-owned MCP or a frozen workspace tree is bound", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		fs.mkdirSync(cwdA, { recursive: true });
+		const frozenTree = { cwd: cwdA, entries: [], agentsMdFiles: [] };
+		const withTree = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const treeSession = await makeSession(cwdA, withTree, {
+			toolNames: ["move_session"],
+			workspaceTree: frozenTree,
+		});
+		try {
+			expect(treeSession.session.getToolByName("move_session")).toBeUndefined();
+		} finally {
+			await treeSession.session.dispose();
+		}
+		const withMcp = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const mcpSession = await makeSession(cwdA, withMcp, {
+			toolNames: ["move_session"],
+			mcpManager: { connectServers() {} },
+		});
+		try {
+			expect(mcpSession.session.getToolByName("move_session")).toBeUndefined();
+		} finally {
+			await mcpSession.session.dispose();
+		}
+	});
 
 	it("refuses to rescope outside the current session directory", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
@@ -477,6 +504,52 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await first;
 			await acp;
 			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoC));
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("does not steal process cwd when this session does not own it", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const processBefore = process.cwd();
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			await moveTool.execute("move-no-steal", { path: "repo-b" });
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+			expect(process.cwd()).toBe(processBefore);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("rejects a relative tool admitted before a concurrent cwd generation change", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session", "bash"] });
+		try {
+			const hold = Promise.withResolvers<void>();
+			const firstEntered = Promise.withResolvers<void>();
+			const first = sessionManager.runExclusiveCwdTransition(async () => {
+				firstEntered.resolve();
+				await hold.promise;
+				await sessionManager.moveTo(repoB);
+			});
+			await firstEntered.promise;
+			const bashTool = session.getToolForExecution("bash")!;
+			const bashRun = bashTool.execute("pwd-during-move", { command: "pwd" });
+			await Bun.sleep(20);
+			hold.resolve();
+			await first;
+			await expect(bashRun).rejects.toThrow(/working directory changed/);
 		} finally {
 			await session.dispose();
 		}

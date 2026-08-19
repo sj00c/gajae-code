@@ -8258,6 +8258,30 @@ export class AgentSession {
 			},
 		}) as T;
 	}
+	#wrapToolForCwdTransitionFence<T extends AgentTool>(tool: T): T {
+		if (tool.name === "move_session") return tool;
+		return new Proxy(tool, {
+			get: (target, prop) => {
+				if (prop !== "execute") return Reflect.get(target, prop, target);
+				return async (
+					toolCallId: string,
+					args: unknown,
+					signal: AbortSignal | undefined,
+					onUpdate: never,
+					ctx: never,
+				) => {
+					const admittedGeneration = this.sessionManager.getCwdGeneration();
+					await this.sessionManager.joinCwdTransition();
+					if (this.sessionManager.getCwdGeneration() !== admittedGeneration) {
+						throw new Error(
+							"Session working directory changed before this tool executed; retry against the new cwd.",
+						);
+					}
+					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+				};
+			},
+		}) as T;
+	}
 
 	/**
 	/** Wrap a tool with the workflow mutation guard before permissions or execution. */
@@ -8305,16 +8329,18 @@ export class AgentSession {
 		let wrappersByVersion = this.#guardedToolWrapperCache.get(tool);
 		const cached = wrappersByVersion?.get(cacheKey);
 		if (cached) return cached as T;
-		const wrapped = this.#wrapToolForWorkflowMutationGuard(
-			this.#wrapToolForAcpPermission(
-				guardToolForUltragoalAsk(
-					tool,
-					() => this.sessionManager.getCwd(),
-					() => ({
-						activeSkillState: this.getActiveSkillState(),
-						sessionId: this.sessionManager.getSessionId(),
-					}),
-					() => this.getSessionAgentDir(),
+		const wrapped = this.#wrapToolForCwdTransitionFence(
+			this.#wrapToolForWorkflowMutationGuard(
+				this.#wrapToolForAcpPermission(
+					guardToolForUltragoalAsk(
+						tool,
+						() => this.sessionManager.getCwd(),
+						() => ({
+							activeSkillState: this.getActiveSkillState(),
+							sessionId: this.sessionManager.getSessionId(),
+						}),
+						() => this.getSessionAgentDir(),
+					),
 				),
 			),
 		);
