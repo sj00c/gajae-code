@@ -95,6 +95,13 @@ describe("fresh-process test harness contracts", () => {
 		]);
 		expect(spec.cwd).toBe("/repo root");
 		expect(spec.argv).not.toContain("--isolate");
+		const serialSpec = buildTestProcessSpec(
+			"packages/coding-agent/test/chat-daemon-session-reconnect.test.ts",
+			"/tmp/sandbox",
+			30_000,
+			"/repo root",
+		);
+		expect(serialSpec.argv).toContain("--max-concurrency=1");
 		expect(spec.env.HOME).toBe("/tmp/sandbox with spaces/home");
 		expect(spec.env.GJC_HOME).toBe("/tmp/sandbox with spaces/gjc-home");
 		expect(spec.env.XDG_STATE_HOME).toBe("/tmp/sandbox with spaces/xdg/state");

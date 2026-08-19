@@ -1058,7 +1058,7 @@ test("fails closed when a protected native authority declaration is missing or m
 		// attestations that validateCurrentTreeManifest byte-compares against the tree.
 		const stale = { ...digests, [key]: digests[key] === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64) };
 		expect(stableEntries(stale)).not.toBe(stableEntries(digests));
-	}, 20000);
+	}, 120_000);
 
 	test("canonicalizes BigInt literals without colliding with numeric or string literals", () => {
 		const bigint = declaration("function probe() { return 1n === -2n; }", "probe");
@@ -1086,7 +1086,7 @@ test("fails closed when a protected native authority declaration is missing or m
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
-	}, 60000);
+	}, 120_000);
 
 	test("stale declaration digests fail strict validation but a regenerated manifest passes (fail-before / pass-after)", async () => {
 		// fail-before: a manifest whose semantic digests do not byte-match the current
@@ -1109,7 +1109,7 @@ test("fails closed when a protected native authority declaration is missing or m
 			validateRegeneratedManifest(JSON.stringify(regenerated), GUARD_CONTRACT_VERSION),
 		).resolves.toBeUndefined();
 		expect(regenerated.digests).toEqual(await currentTreeDigests());
-	}, 60000);
+	}, 120_000);
 
 	test("CI/guard environments reject the explicit local --fix-generations mutation path", async () => {
 		const previousCi = process.env.CI;

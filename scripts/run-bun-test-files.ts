@@ -9,6 +9,7 @@ export const DEFAULT_TEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_FILE_TIMEOUT_MS = 5 * 60_000;
 export const DEFAULT_CONCURRENCY = 1;
 export const TEST_PRELOAD = "./scripts/test-preload.ts";
+const SERIAL_TEST_FILES = new Set(["packages/coding-agent/test/chat-daemon-session-reconnect.test.ts"]);
 
 export interface HarnessOptions {
 	root: string;
@@ -162,7 +163,15 @@ export function buildTestProcessSpec(
 	}
 	for (const name of INHERITED_GJC_STATE_ENV) env[name] = undefined;
 	return {
-		argv: ["bun", "test", `--timeout=${testTimeoutMs}`, "--preload", TEST_PRELOAD, `./${file}`],
+		argv: [
+			"bun",
+			"test",
+			`--timeout=${testTimeoutMs}`,
+			...(SERIAL_TEST_FILES.has(file) ? ["--max-concurrency=1"] : []),
+			"--preload",
+			TEST_PRELOAD,
+			`./${file}`,
+		],
 		cwd: base,
 		file,
 		sandbox,
