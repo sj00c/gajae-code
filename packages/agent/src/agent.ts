@@ -1499,8 +1499,13 @@ export class Agent {
 				// the in-loop getFollowUpMessages path uses: denied owned-completion
 				// envelopes are filtered before they reach the loop, and delivered
 				// envelopes settle their registrations — the direct path otherwise
-				// bypasses onFollowUpConsumed entirely (review threads P1/P2).
-				await this.onFollowUpConsumed?.(queuedFollowUp, { startsOwnRun: true });
+				// bypasses onFollowUpConsumed entirely (review threads P1/P2). A
+				// maintenanceContinuation resumes the existing logical run (no new
+				// agent_start), so its batch is in-run consumption, not an own-run
+				// promotion (#4668 review P1).
+				await this.onFollowUpConsumed?.(queuedFollowUp, {
+					startsOwnRun: options?.maintenanceContinuation !== true,
+				});
 				// The hook can filter the WHOLE batch (every entry denied by a
 				// scope:"owned" abort): starting an empty provider run would
 				// violate the zero-final-call guarantee, so return without
@@ -1546,8 +1551,12 @@ export class Agent {
 			// authorized owned-completion follow-up reaches this branch, so
 			// bypassing the hook would leak every such job's ownership tuple and
 			// eventually exhaust the bounded ownership registries (review thread
-			// P2).
-			await this.onFollowUpConsumed?.(queuedFollowUp, { startsOwnRun: true });
+			// P2). A maintenanceContinuation resumes the existing logical run (no
+			// new agent_start), so its batch is in-run consumption, not an own-run
+			// promotion (#4668 review P1).
+			await this.onFollowUpConsumed?.(queuedFollowUp, {
+				startsOwnRun: options?.maintenanceContinuation !== true,
+			});
 			// The hook can filter the WHOLE batch (every entry denied by a
 			// scope:"owned" abort): starting an empty provider run would violate
 			// the zero-final-call guarantee, so return without running the loop

@@ -139,15 +139,19 @@ export function expectSemanticResult(operation: Operation, result: unknown): voi
 	const code = expectedDomainErrors[operation.sdkId];
 	if (code) expect(result).toMatchObject({ ok: false, error: { code } });
 	else if (operation.sdkId === "goal.list/get") {
-		expect(result).toMatchObject({ ok: true });
+		// Envelope shapes differ per adapter: daemon/MCP return { ok, result|data },
+		// ACP unwraps to the bare payload. When an ok flag is present it must be true.
+		const envelope = result as { ok?: unknown } | null;
+		if (envelope !== null && typeof envelope === "object" && "ok" in envelope)
+			expect(result).toMatchObject({ ok: true });
 		const page =
 			(result as { page?: { items?: unknown[] } } | null)?.page ??
 			(result as { result?: { page?: { items?: unknown[] } } } | null)?.result?.page ??
 			(result as { data?: { page?: { items?: unknown[] } } } | null)?.data?.page;
-		// ACP currently returns {ok:true} without a page (MCP/daemonCli return the full diagnostic).
-		// Keep the check non-vacuous when a page is present but do not fail ACP on missing page yet;
-		// when present it must be the expected no_active_goal diagnostic.
-		if (page == null) return;
+		// ACP's translated contract for goal.list/get is the same no_active_goal
+		// diagnostic page the daemon/MCP surfaces return (#4668 review P2): a
+		// missing page is a contract violation, not a pass.
+		if (page == null) throw new Error("goal.list/get diagnostic page must be present");
 		expect(
 			Array.isArray(page.items) && page.items.length > 0,
 			"goal.list/get diagnostic must contain at least one item",
@@ -347,7 +351,29 @@ export async function fixture(): Promise<AdapterFixture> {
 			if (typeof operation !== "string")
 				return { ok: false, error: { code: "invalid_input", message: "invalid frame" } };
 			const code = expectedDomainErrors[operation];
-			return code ? { ok: false, error: { code, message: code } } : { ok: true, result: { ok: true } };
+			if (code) return { ok: false, error: { code, message: code } };
+			// ACP translated contract for goal.list/get (#4668 review P2): a
+			// goal-less session succeeds with the explicit no_active_goal
+			// diagnostic page, never a bare {ok:true} with no payload.
+			if (operation === "goal.list/get")
+				return {
+					ok: true,
+					result: {
+						page: {
+							items: [
+								{
+									enabled: false,
+									goal: null,
+									reason: "no_active_goal",
+									message:
+										"No goal is active in this session: goal mode has not created or resumed a goal, so no goal snapshot exists yet.",
+								},
+							],
+							complete: true,
+						},
+					},
+				};
+			return { ok: true, result: { ok: true } };
 		},
 	};
 	return {

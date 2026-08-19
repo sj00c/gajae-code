@@ -8,7 +8,11 @@ import {
 	recordAttributableProgress,
 } from "./prompt-deadline-lease";
 
+const MAX_EXPIRY_RETRIES = 5;
+const EXPIRY_RETRY_DELAY_MS = 1_000;
+
 type DeadlineReconciliation = InvocationReconciliation | KindAwareReconciliation;
+
 export type PromptDeadlineOutcome = {
 	kind: "failed";
 	code: "prompt_deadline_exceeded";
@@ -25,6 +29,7 @@ export class PromptDeadlineManager {
 	readonly #correlations = new Map<string, InvocationCorrelation>();
 	readonly #timers = new Map<string, ReturnType<typeof setTimeout>>();
 	readonly #reconciliation: DeadlineReconciliation;
+	readonly #expiryRetries = new Map<string, number>();
 	readonly #getLeaseMs: () => number;
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
@@ -86,6 +91,7 @@ export class PromptDeadlineManager {
 			message: "Prompt deadline exceeded.",
 			provenance: "deadline",
 		};
+		let terminallyConfirmed = false;
 		try {
 			await this.#reconciliation.claimPendingOutcome("prompt", correlation, outcome);
 		} catch {
@@ -93,14 +99,42 @@ export class PromptDeadlineManager {
 		}
 		try {
 			await this.#reconciliation.finalizeOutcome("prompt", correlation, outcome);
+			terminallyConfirmed = true;
 		} catch {
-			// finalize may race with normal terminalization; ignore.
-		} finally {
+			// finalize may race with normal terminalization; confirm the durable
+			// record actually reached a terminal state before believing it.
+			const after = this.#reconciliation.lookup("prompt", correlation) as { status: string };
+			terminallyConfirmed = after.status === "terminal_ok" || after.status === "failed";
+		}
+		if (terminallyConfirmed) {
+			// Retire pending ownership ONLY after durable terminal confirmation
+			// (#4668 review P1): retiring earlier strands an accepted/in-flight
+			// invocation without an owner, retry, or deadline recovery path.
 			try {
 				this.#onExpired?.(correlation);
 			} catch {}
+			this.#expiryRetries.delete(key);
 			this.clear(correlation);
+			return;
 		}
+		// Durable terminal work did not land: retain the lease and pending
+		// ownership and retry the reconciliation boundedly (#4668 review P1).
+		// Once the retry budget is exhausted the explicit uncertain-outcome path
+		// keeps ownership in place (the next lifecycle boundary can still adopt
+		// and terminalize it) and parks the lease without a timer; any later
+		// attributable progress reschedules the deadline check via onProgress.
+		const attempts = (this.#expiryRetries.get(key) ?? 0) + 1;
+		this.#expiryRetries.set(key, attempts);
+		if (attempts > MAX_EXPIRY_RETRIES) {
+			this.#clearTimer(key);
+			return;
+		}
+		this.#clearTimer(key);
+		const timer = setTimeout(() => {
+			void this.#onDeadline(key);
+		}, EXPIRY_RETRY_DELAY_MS);
+		(timer as unknown as { unref?: () => void }).unref?.();
+		this.#timers.set(key, timer);
 	}
 
 	onAccepted(correlation: InvocationCorrelation): void {
@@ -133,12 +167,14 @@ export class PromptDeadlineManager {
 		this.#clearTimer(key);
 		this.#leases.delete(key);
 		this.#correlations.delete(key);
+		this.#expiryRetries.delete(key);
 	}
 
 	clearAll(): void {
 		for (const key of [...this.#timers.keys()]) this.#clearTimer(key);
 		this.#leases.clear();
 		this.#correlations.clear();
+		this.#expiryRetries.clear();
 	}
 
 	/** For tests: current deadline or undefined if no lease. */

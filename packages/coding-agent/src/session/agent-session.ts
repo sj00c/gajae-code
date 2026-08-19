@@ -11729,6 +11729,16 @@ export class AgentSession {
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
 				});
+				// Dispatch-race disposition (#4668 review P1): the SDK snapshot-decided
+				// this submission starts its own turn (idle at dispatch), but the
+				// session began streaming before sendUserMessage ran, so the message
+				// was actually diverted into the in-flight run's steering queue. The
+				// submission promise resolves NOW, before any consumption or promotion
+				// hook fires; without a synchronous disposition the SDK settlement
+				// would terminalize the accepted request as an own-run completion
+				// before it is consumed. Report the actual in-run disposition so the
+				// runtime attaches the correlation to the in-flight run instead.
+				options?.onQueuedPromoted?.({ startsOwnRun: false });
 				options?.onPreflightAccepted?.();
 				return;
 			}

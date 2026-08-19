@@ -2635,6 +2635,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const emitLifecycle = async (
 		type: "agent_start" | "agent_end" | "agent_failed",
 		ctx: ExtensionContext,
+		failureCause?: unknown,
 	): Promise<void> => {
 		const current = active;
 		if (!current) return;
@@ -2703,7 +2704,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		let observed = true;
 		try {
 			for (const invocation of transitions) {
-				await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, { type } as never);
+				// agent_failed is a terminal lifecycle boundary (#4668 review P1):
+				// thread the observed failure cause into the transition so
+				// reconciliation keeps the real reason instead of a bare failure.
+				const frame =
+					type === "agent_failed"
+						? {
+								type,
+								error: failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
+							}
+						: { type };
+				await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, frame as never);
 				if ((type as string) === "agent_end" || (type as string) === "agent_failed") {
 					if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
 				}
@@ -2732,7 +2743,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		api as unknown as {
 			on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void>) => void;
 		}
-	).on("agent_failed", async (_event, ctx) => await emitLifecycle("agent_failed", ctx));
+	).on("agent_failed", async (event, ctx) =>
+		emitLifecycle("agent_failed", ctx, (event as { error?: unknown } | null | undefined)?.error),
+	);
 	api.on("turn_start", async (_event, ctx) => {
 		const current = active;
 		if (!current) return;
@@ -2913,10 +2926,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					);
 					if (pendingIdx >= 0) pending.splice(pendingIdx, 1);
 					// In-run consumed steering tracks deadline but must NOT gain
-					// root turn.abort authority (review P1).
+					// root turn.abort authority (review P1). The same correlation can
+					// be reported twice — once by the synchronous dispatch-race
+					// disposition at queue time and again when the steering batch is
+					// actually consumed — so attach idempotently (#4668 review P1).
 					if (current.drainedInvocations === undefined)
 						current.drainedInvocations = current.activeInvocation ? [current.activeInvocation] : [];
-					current.drainedInvocations.push({ kind, correlation });
+					const alreadyAttached = current.drainedInvocations.some(
+						entry =>
+							entry.correlation.commandId === correlation.commandId &&
+							entry.correlation.turnId === correlation.turnId,
+					);
+					if (!alreadyAttached) current.drainedInvocations.push({ kind, correlation });
 					return;
 				}
 				// No in-flight run visible and this is an in-run consumption
