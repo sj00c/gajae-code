@@ -585,20 +585,21 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 	for (let attempt = 0; attempt < 200; attempt++) {
 		try {
 			await fs.mkdir(lockPath, { mode: 0o700 });
+		} catch (error) {
+			if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+			if (await staleLock(lockPath)) await fs.rm(lockPath, { recursive: true, force: true });
+			await Bun.sleep(25);
+			continue;
+		}
+		try {
 			await fs.writeFile(
 				path.join(lockPath, "owner.json"),
 				`${JSON.stringify({ pid: process.pid, startedAt: Date.now() })}\n`,
 				{ mode: 0o600, flag: "wx" },
 			);
-			try {
-				return await action();
-			} finally {
-				await fs.rm(lockPath, { recursive: true, force: true });
-			}
-		} catch (error) {
-			if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
-			if (await staleLock(lockPath)) await fs.rm(lockPath, { recursive: true, force: true });
-			await Bun.sleep(25);
+			return await action();
+		} finally {
+			await fs.rm(lockPath, { recursive: true, force: true });
 		}
 	}
 	throw new Error("timed out waiting for the crash issue creation lock");
