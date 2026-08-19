@@ -30,6 +30,7 @@ export class PromptDeadlineManager {
 	readonly #timers = new Map<string, ReturnType<typeof setTimeout>>();
 	readonly #reconciliation: DeadlineReconciliation;
 	readonly #expiryRetries = new Map<string, number>();
+	readonly #expiring = new Set<string>();
 	readonly #getLeaseMs: () => number;
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
@@ -80,11 +81,21 @@ export class PromptDeadlineManager {
 			this.#schedule(key);
 			return;
 		}
-		const lookup = this.#reconciliation.lookup("prompt", correlation) as { status: string };
+		// Fence ownership synchronously before the first await. A late agent_start
+		// must not drain this correlation while durable expiry is in flight.
+		this.#expiring.add(key);
+		let lookup: { status: string };
+		try {
+			lookup = this.#reconciliation.lookup("prompt", correlation) as { status: string };
+		} catch {
+			this.#retry(key);
+			return;
+		}
 		if (lookup.status === "terminal_ok" || lookup.status === "failed") {
 			this.clear(correlation);
 			return;
 		}
+		const generation = lease.generation;
 		const outcome: PromptDeadlineOutcome = {
 			kind: "failed",
 			code: "prompt_deadline_exceeded",
@@ -97,14 +108,24 @@ export class PromptDeadlineManager {
 		} catch {
 			// claim may fail if already claimed (e.g., cancellation won); ignore.
 		}
+		const currentAfterClaim = this.#leases.get(key);
+		if (
+			currentAfterClaim !== lease ||
+			currentAfterClaim.generation !== generation ||
+			this.#now() < promptDeadlineAt(currentAfterClaim)
+		) {
+			this.#expiring.delete(key);
+			this.#expiryRetries.delete(key);
+			if (currentAfterClaim) this.#schedule(key);
+			return;
+		}
 		try {
 			await this.#reconciliation.finalizeOutcome("prompt", correlation, outcome);
 			terminallyConfirmed = true;
 		} catch {
-			// finalize may race with normal terminalization; confirm the durable
-			// record actually reached a terminal state before believing it.
-			const after = this.#reconciliation.lookup("prompt", correlation) as { status: string };
-			terminallyConfirmed = after.status === "terminal_ok" || after.status === "failed";
+			// Do not infer durable confirmation from an in-memory lookup after a
+			// failed write. The accepted lease and ownership stay recoverable until
+			// a later retry observes a successful finalization.
 		}
 		if (terminallyConfirmed) {
 			// Retire pending ownership ONLY after durable terminal confirmation
@@ -123,16 +144,15 @@ export class PromptDeadlineManager {
 		// keeps ownership in place (the next lifecycle boundary can still adopt
 		// and terminalize it) and parks the lease without a timer; any later
 		// attributable progress reschedules the deadline check via onProgress.
+		this.#retry(key);
+	}
+
+	#retry(key: string): void {
 		const attempts = (this.#expiryRetries.get(key) ?? 0) + 1;
 		this.#expiryRetries.set(key, attempts);
-		if (attempts > MAX_EXPIRY_RETRIES) {
-			this.#clearTimer(key);
-			return;
-		}
 		this.#clearTimer(key);
-		const timer = setTimeout(() => {
-			void this.#onDeadline(key);
-		}, EXPIRY_RETRY_DELAY_MS);
+		if (attempts > MAX_EXPIRY_RETRIES) return;
+		const timer = setTimeout(() => void this.#onDeadline(key), EXPIRY_RETRY_DELAY_MS);
 		(timer as unknown as { unref?: () => void }).unref?.();
 		this.#timers.set(key, timer);
 	}
@@ -154,7 +174,8 @@ export class PromptDeadlineManager {
 		const beforeDeadline = promptDeadlineAt(lease);
 		recordAttributableProgress(lease, now);
 		const afterDeadline = promptDeadlineAt(lease);
-		if (afterDeadline !== beforeDeadline) this.#schedule(key);
+		if (this.#expiring.delete(key)) this.#expiryRetries.delete(key);
+		if (afterDeadline !== beforeDeadline || !this.#expiring.has(key)) this.#schedule(key);
 	}
 
 	onAttributableEvent(correlation: InvocationCorrelation, eventType: string, now = this.#now()): void {
@@ -168,6 +189,7 @@ export class PromptDeadlineManager {
 		this.#leases.delete(key);
 		this.#correlations.delete(key);
 		this.#expiryRetries.delete(key);
+		this.#expiring.delete(key);
 	}
 
 	clearAll(): void {
@@ -175,6 +197,7 @@ export class PromptDeadlineManager {
 		this.#leases.clear();
 		this.#correlations.clear();
 		this.#expiryRetries.clear();
+		this.#expiring.clear();
 	}
 
 	/** For tests: current deadline or undefined if no lease. */
@@ -186,5 +209,10 @@ export class PromptDeadlineManager {
 	/** For tests: whether a lease exists. */
 	has(correlation: InvocationCorrelation): boolean {
 		return this.#leases.has(leaseKey(correlation));
+	}
+
+	/** Whether expiry has fenced this correlation from late run adoption. */
+	isExpiring(correlation: InvocationCorrelation): boolean {
+		return this.#expiring.has(leaseKey(correlation));
 	}
 }

@@ -3254,7 +3254,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		try {
 			let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
 			const harness = await invocationHarness("agent-failed", cwd, {
-				sendUserMessage: async (content, options) => {
+				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
 					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
 						promoted = (

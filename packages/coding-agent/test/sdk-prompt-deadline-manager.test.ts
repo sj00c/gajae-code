@@ -12,6 +12,8 @@ interface FakeReconciliation {
 	status: string;
 	finalizeFailures: number;
 	finalizeCalls: number;
+	claimStarted?: () => void;
+	claimRelease?: Promise<void>;
 	/** When set, a failing finalize still leaves the durable record terminal (lost race). */
 	terminalOnFailure?: boolean;
 }
@@ -29,7 +31,10 @@ function fakeReconciliation(): {
 		state,
 		reconciliation: {
 			lookup: () => ({ status: state.status }),
-			claimPendingOutcome: async () => {},
+			claimPendingOutcome: async () => {
+				state.claimStarted?.();
+				if (state.claimRelease) await state.claimRelease;
+			},
 			finalizeOutcome: async () => {
 				state.finalizeCalls += 1;
 				if (state.finalizeCalls <= state.finalizeFailures) {
@@ -67,17 +72,17 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		expect(manager.has(correlation)).toBe(true);
 		// The bounded retry lands the durable terminal outcome: only then is
 		// pending ownership retired and the lease cleared.
-		await Bun.sleep(1_300);
+		await Bun.sleep(2_300);
 		expect(state.finalizeCalls).toBeGreaterThanOrEqual(2);
 		expect(expired).toBe(1);
 		expect(manager.has(correlation)).toBe(false);
 		manager.clearAll();
 	});
 
-	test("a finalize race with a normal terminal transition still retires cleanly", async () => {
+	test("a failed finalize never infers durable terminality from an in-memory lookup", async () => {
 		const { reconciliation, state } = fakeReconciliation();
 		state.finalizeFailures = Number.MAX_SAFE_INTEGER; // finalize always throws...
-		state.terminalOnFailure = true; // ...but the record turns terminal in the race
+		state.terminalOnFailure = true; // the in-memory map reports a terminal race
 		let expired = 0;
 		const manager = new PromptDeadlineManager({
 			reconciliation: reconciliation as never,
@@ -90,10 +95,30 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		const correlation = { commandId: "cmd-2", turnId: "turn-2" };
 		manager.onAccepted(correlation);
 		await Bun.sleep(120);
-		// Terminal confirmation came from the lookup, so retirement proceeded
-		// without entering the retry path.
-		expect(expired).toBe(1);
-		expect(manager.has(correlation)).toBe(false);
+		// A failed persistence call is not durable confirmation, even if a
+		// concurrent in-memory transition appears terminal.
+		expect(expired).toBe(0);
+		expect(manager.has(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
+	test("fences late adoption while expiry persistence is suspended", async () => {
+		const gate = Promise.withResolvers<void>();
+		const { reconciliation, state } = fakeReconciliation();
+		state.claimRelease = gate.promise;
+		const started = Promise.withResolvers<void>();
+		state.claimStarted = () => started.resolve();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-fence", turnId: "turn-fence" };
+		manager.onAccepted(correlation);
+		await started.promise;
+		expect(manager.isExpiring(correlation)).toBe(true);
+		gate.resolve();
+		await Bun.sleep(30);
 		manager.clearAll();
 	});
 

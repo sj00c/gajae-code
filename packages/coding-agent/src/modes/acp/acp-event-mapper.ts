@@ -266,6 +266,13 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "turn_end":
 		case "message_start":
 			return [];
+		case "agent_failed":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: { gjcPhase: "error", gjcRunning: false, gjcAgentFailed: true },
+				}),
+			];
 		case "auto_compaction_start":
 			return [
 				toSessionNotification(sessionId, {

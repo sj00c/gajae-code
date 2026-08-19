@@ -349,12 +349,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * attach per-turn state (e.g. a fresh owned-completion lineage) at actual
 	 * resume admission rather than when the message was merely queued.
 	 */
+	/**
+	 * Invoked when follow-up messages are consumed. `startsOwnRun` is true only
+	 * when the batch owns a new agent run; maintenance and in-run consumption
+	 * report false so callers attach to the existing lifecycle.
+	 */
 	onFollowUpConsumed?: (messages: AgentMessage[], promotion: { startsOwnRun: boolean }) => void;
 	/**
 	 * Invoked with the steering messages the loop dequeues mid-run for the
 	 * CURRENT turn (right after getSteeringMessages). `promotion.startsOwnRun`
 	 * is false for in-run consumption and true when the batch starts a new run.
 	 */
+	/** Invoked when steering is consumed; see `startsOwnRun` on the promotion disposition. */
 	onSteeringConsumed?: (messages: AgentMessage[], promotion: { startsOwnRun: boolean }) => void;
 	/**
 	 * Supplies one bounded synthetic recovery instruction before the loop would
@@ -757,6 +763,7 @@ export interface AgentContext {
 export type AgentEvent =
 	// Agent lifecycle
 	| { type: "agent_start"; scope?: AttemptScope }
+	| { type: "agent_failed"; error: unknown; scope?: AttemptScope }
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];

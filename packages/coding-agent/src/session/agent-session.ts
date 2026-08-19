@@ -7178,6 +7178,15 @@ export class AgentSession {
 					undefined,
 					deliveryScope,
 				);
+			} else if (event.type === "agent_failed") {
+				await this.#extensionRunner.emit(
+					{
+						type: "agent_failed",
+						error: event.error,
+					},
+					undefined,
+					deliveryScope,
+				);
 			} else if (event.type === "agent_end") {
 				await this.#extensionRunner.emit(
 					{

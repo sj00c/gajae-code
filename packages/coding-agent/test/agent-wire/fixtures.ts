@@ -22,6 +22,7 @@ const message = (id: string) => ({
 
 export const EVENT_FIXTURES: Record<AgentWireEventType, AgentSessionEvent> = {
 	agent_start: ev({ type: "agent_start" }),
+	agent_failed: ev({ type: "agent_failed", error: new Error("provider unavailable") }),
 	agent_end: ev({ type: "agent_end", messages: [], stopReason: "completed" }),
 	turn_start: ev({ type: "turn_start" }),
 	turn_end: ev({ type: "turn_end", message: message("m-turn"), toolResults: [] }),

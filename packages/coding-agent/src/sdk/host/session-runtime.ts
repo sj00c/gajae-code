@@ -2675,8 +2675,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// turn (queued-while-streaming submissions never push), so a mid-prompt
 			// continuation agent_start with an empty queue leaves the current owner
 			// untouched (review thread P1).
-			const drained = current.pending.splice(0);
-
+			const drained = current.pending
+				.splice(0)
+				.filter(entry => entry.kind !== "prompt" || !current.deadlineManager.isExpiring(entry.correlation));
 			if (drained.length > 0) {
 				current.openLifecycleBatches.push({ invocations: drained });
 				adoptLifecycleBatch(drained);
@@ -2704,22 +2705,34 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		let observed = true;
 		try {
 			for (const invocation of transitions) {
-				// agent_failed is a terminal lifecycle boundary (#4668 review P1):
-				// thread the observed failure cause into the transition so
-				// reconciliation keeps the real reason instead of a bare failure.
-				const frame =
-					type === "agent_failed"
-						? {
-								type,
-								error: failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
-							}
-						: { type };
-				await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, frame as never);
-				if ((type as string) === "agent_end" || (type as string) === "agent_failed") {
-					if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
+				try {
+					// agent_failed is a terminal lifecycle boundary (#4668 review P1):
+					// thread the observed failure cause into the transition so
+					// reconciliation keeps the real reason instead of a bare failure.
+					const frame =
+						type === "agent_failed"
+							? {
+									type,
+									error:
+										failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
+								}
+							: { type };
+					await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, frame as never);
+					if ((type as string) === "agent_end" || (type as string) === "agent_failed") {
+						if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
+					}
+				} catch {
+					// One broken durable transition must not strand the rest of a
+					// shared-run batch. The failed record remains leased/repairable
+					// and the publication is marked unobserved for terminal callers.
+					observed = false;
 				}
 			}
-			current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
+			try {
+				current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
+			} catch {
+				observed = false;
+			}
 		} catch {
 			observed = false;
 		}

@@ -1422,7 +1422,12 @@ export type SendUserMessageHandler = (
 		deliverAs?: "steer" | "followUp";
 		onPreflightAccepted?: () => void;
 		onPreflightAcceptCommit?: () => void | Promise<void>;
-		/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
+		/**
+		 * Fired when a queued submission is consumed. `startsOwnRun: true` means
+		 * the batch starts a new run; false means it joins an active run or
+		 * maintenance continuation. Consumers must not assume every promotion
+		 * grants root abort ownership.
+		 */
 		onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
 		preflightSignal?: AbortSignal;
 		/** Internal SDK correlation owner for an exact queued follow-up. */
