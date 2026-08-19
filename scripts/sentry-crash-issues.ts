@@ -615,22 +615,28 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 	await ensureApprovalStoreDirectory();
 	const lockPath = `${approvalStorePath()}.create.lock`;
 	for (let attempt = 0; attempt < 200; attempt++) {
+		const ownerToken = randomUUID();
+		const candidatePath = `${lockPath}.${process.pid}.${ownerToken}.tmp`;
 		try {
-			await fs.mkdir(lockPath, { mode: 0o700 });
+			await fs.mkdir(candidatePath, { mode: 0o700 });
+			await fs.writeFile(
+				path.join(candidatePath, "owner.json"),
+				`${JSON.stringify({ token: ownerToken, pid: process.pid, startedAt: Date.now(), processStart: await processStartIdentity(process.pid) })}\n`,
+				{ mode: 0o600, flag: "wx" },
+			);
+			await fs.rename(candidatePath, lockPath);
 		} catch (error) {
-			if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+			const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
+			await fs.rm(candidatePath, { recursive: true, force: true }).catch(() => undefined);
+			if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
 			const stale = await staleLock(lockPath);
 			if (stale.stale) await removeLockIfOwner(lockPath, stale.token);
 			await Bun.sleep(25);
 			continue;
+		} finally {
+			await fs.rm(candidatePath, { recursive: true, force: true }).catch(() => undefined);
 		}
-		const ownerToken = randomUUID();
 		try {
-			await fs.writeFile(
-				path.join(lockPath, "owner.json"),
-				`${JSON.stringify({ token: ownerToken, pid: process.pid, startedAt: Date.now(), processStart: await processStartIdentity(process.pid) })}\n`,
-				{ mode: 0o600, flag: "wx" },
-			);
 			return await action();
 		} finally {
 			await removeLockIfOwner(lockPath, ownerToken);
@@ -672,9 +678,28 @@ async function staleLock(lockPath: string): Promise<{ stale: boolean; token?: st
 async function removeLockIfOwner(lockPath: string, token: string | undefined): Promise<void> {
 	try {
 		const ownerPath = path.join(lockPath, "owner.json");
-		const owner = JSON.parse(await Bun.file(ownerPath).text()) as { token?: unknown };
-		if (token !== undefined && owner.token !== token) return;
-		if (token === undefined && owner.token !== undefined) return;
+		let owner: { token?: unknown } | undefined;
+		try {
+			owner = JSON.parse(await Bun.file(ownerPath).text()) as { token?: unknown };
+		} catch (error) {
+			const code = error instanceof Error && "code" in error ? error.code : undefined;
+			if (code !== "ENOENT") throw error;
+			// A process can die after mkdir and before owner.json. Re-check the
+			// directory once so a successor that has already published its owner
+			// token is never removed by the stale-takeover path.
+			await Bun.sleep(0);
+			try {
+				owner = JSON.parse(await Bun.file(ownerPath).text()) as { token?: unknown };
+			} catch (secondError) {
+				const secondCode = secondError instanceof Error && "code" in secondError ? secondError.code : undefined;
+				if (secondCode === "ENOENT" && token === undefined) {
+					await fs.rm(lockPath, { recursive: true, force: true });
+				}
+				return;
+			}
+		}
+		if (token !== undefined && owner?.token !== token) return;
+		if (token === undefined && owner?.token !== undefined) return;
 		await fs.rm(lockPath, { recursive: true, force: true });
 	} catch {
 		// Teardown is best effort; never mask the action's result.
