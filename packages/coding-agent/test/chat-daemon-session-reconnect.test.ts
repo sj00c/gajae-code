@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { test as bunTest, expect, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,6 +12,30 @@ import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import type { SlackProviderClient } from "../src/sdk/bus/slack-provider";
 import { ACP_SESSION_RECONNECT } from "../src/sdk/session-reconnect";
 import { drainReconnects, expectedBackoffs, FakeWebSocket, withFakeTransport } from "./helpers/fake-sdk-transport";
+
+type ReconnectTestBody = () => void | Promise<void>;
+
+// Every test swaps process-global WebSocket/timer/Date implementations. Bun's
+// async test scheduler can overlap bodies, so queue the bodies explicitly rather
+// than letting one test restore another test's transport globals.
+let reconnectTestTail = Promise.resolve();
+function test(name: string, body: ReconnectTestBody, timeout?: number): void {
+	bunTest(
+		name,
+		async () => {
+			const previous = reconnectTestTail;
+			const turn = Promise.withResolvers<void>();
+			reconnectTestTail = previous.then(() => turn.promise);
+			await previous;
+			try {
+				await body();
+			} finally {
+				turn.resolve();
+			}
+		},
+		timeout,
+	);
+}
 
 const SESSION_ID = "chat-reconnect-session";
 const GENERATION = 4;
@@ -631,7 +655,9 @@ async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): 
 		await Bun.sleep(1);
 	expect(provider.posts).toHaveLength(count);
 	expect(provider.completedClientMsgIds.size).toBeGreaterThanOrEqual(count);
-	await Bun.sleep(100);
+	// Provider acknowledgement precedes the router's final frame-tail cursor update;
+	// allow the durable notification publication to settle before forcing a drop.
+	await Bun.sleep(500);
 }
 
 async function awaitDiscordPosts(provider: FakeDiscordProvider, count: number): Promise<void> {
@@ -784,6 +810,38 @@ test("an established chat attachment that loses its open socket resumes from its
 			]);
 			// The frame the outage swallowed is delivered exactly once, and the frame that
 			// was already acknowledged before the drop is not delivered twice.
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\nbefore the drop",
+				"GJC notice\nduring the outage",
+			]);
+		});
+	});
+}, 20_000);
+
+test("a reconnect waits for an in-flight publication before choosing its resume cursor", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			provider.stallPosts();
+			host.emit("before the drop");
+			await awaitPosts(provider, 1);
+			host.drop();
+			host.emit("during the outage");
+			provider.releasePosts();
+			await awaitCompletedPosts(provider, 1);
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitPosts(provider, 2);
+
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
 			expect(provider.posts.map(post => post.text)).toEqual([
 				"GJC notice\nbefore the drop",
 				"GJC notice\nduring the outage",
