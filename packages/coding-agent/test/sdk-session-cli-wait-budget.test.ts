@@ -14,6 +14,7 @@ function statusRouter(): { router: SessionRouter; budgets: (number | undefined)[
 		generation: 1,
 		isCurrent: () => true,
 		send: async () => {},
+		sendMaintenance: () => {},
 	};
 	const router = {
 		attachment: () => attachment,
@@ -64,6 +65,7 @@ test("a wait window that ends on a stalled poll reports the wait outcome, not a 
 		generation: 1,
 		isCurrent: () => true,
 		send: async () => {},
+		sendMaintenance: () => {},
 	};
 	const router = {
 		attachment: () => attachment,
@@ -103,6 +105,7 @@ test("a transport failure inside the wait window still surfaces to the caller", 
 		generation: 1,
 		isCurrent: () => true,
 		send: async () => {},
+		sendMaintenance: () => {},
 	};
 	const router = {
 		attachment: () => attachment,

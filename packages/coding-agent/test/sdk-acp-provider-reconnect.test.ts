@@ -40,6 +40,7 @@ test("ACP provider activation retries the current Router attachment after rotati
 		generation,
 		isCurrent: () => currentGeneration === generation,
 		send: async () => {},
+		sendMaintenance: () => {},
 	});
 	const firstAttachment = attachment(1);
 	const secondAttachment = attachment(2);
@@ -76,6 +77,7 @@ test("ACP provider readiness renews leases on the same attachment after transpor
 		generation: 1,
 		isCurrent: () => true,
 		send: async () => {},
+		sendMaintenance: () => {},
 	};
 	const adapter = new AcpSdkAdapter({
 		router: {

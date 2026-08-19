@@ -146,6 +146,48 @@ const dirFor = (agentDir: string) => path.join(agentDir, "sdk", "sessions");
 const logFor = (agentDir: string) => path.join(dirFor(agentDir), "index.jsonl");
 const snapshotFor = (agentDir: string) => path.join(dirFor(agentDir), "index.snapshot.json");
 const auditFor = (agentDir: string) => path.join(dirFor(agentDir), "index-audit.jsonl");
+/**
+ * Idle-poll change stamp over the two index files (#4689). A polling reader
+ * that has already replayed the index must be able to prove "nothing changed"
+ * with two stats instead of re-acquiring the machine-global lock and
+ * re-parsing the whole log every cycle. `ctimeMs` is included so a same-size
+ * in-place rewrite or a rename replacement (rotation) still reads as a change.
+ */
+interface SessionIndexFileStamp {
+	readonly exists: boolean;
+	readonly size: number;
+	readonly mtimeMs: number;
+	readonly ctimeMs: number;
+}
+interface SessionIndexChangeStamp {
+	readonly log: SessionIndexFileStamp;
+	readonly snapshot: SessionIndexFileStamp;
+}
+async function statIndexFile(file: string): Promise<SessionIndexFileStamp> {
+	try {
+		const stat = await fs.stat(file);
+		return { exists: true, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { exists: false, size: 0, mtimeMs: 0, ctimeMs: 0 };
+		throw error;
+	}
+}
+async function readIndexChangeStamp(agentDir: string): Promise<SessionIndexChangeStamp> {
+	const [log, snapshot] = await Promise.all([statIndexFile(logFor(agentDir)), statIndexFile(snapshotFor(agentDir))]);
+	return { log, snapshot };
+}
+function sameIndexChangeStamp(a: SessionIndexChangeStamp, b: SessionIndexChangeStamp): boolean {
+	return (
+		a.log.exists === b.log.exists &&
+		a.log.size === b.log.size &&
+		a.log.mtimeMs === b.log.mtimeMs &&
+		a.log.ctimeMs === b.log.ctimeMs &&
+		a.snapshot.exists === b.snapshot.exists &&
+		a.snapshot.size === b.snapshot.size &&
+		a.snapshot.mtimeMs === b.snapshot.mtimeMs &&
+		a.snapshot.ctimeMs === b.snapshot.ctimeMs
+	);
+}
 const ROTATE_BYTES = 4 * 1024 * 1024;
 /** Coalesced heartbeat checkpoint rate cap (C2): at most one per session per minute. */
 export const SESSION_HEARTBEAT_INTERVAL_MS = 60_000;
@@ -813,6 +855,11 @@ export class SessionIndex {
 	#warnings: string[] = [];
 	#logOffset = 0;
 	#corruptSuffix = false;
+	/**
+	 * Last change stamp observed by a completed locked pass (#4689); lets the
+	 * polling refresh path prove "index unchanged" with two stats.
+	 */
+	#changeStamp: SessionIndexChangeStamp | undefined;
 	/** indexSeqs already recorded in the durable audit; null until lazily seeded. */
 	#auditedSeq: Set<number> | null = null;
 	constructor(agentDir: string, policy: RetentionPolicy = {}) {
@@ -861,6 +908,69 @@ export class SessionIndex {
 			withSessionIndexLock("replay", this.#agentDir, () => this.#replayUnderLock()),
 		);
 	}
+	/**
+	 * Polling-path refresh (#4689): when both index files carry the exact change
+	 * stamp of the last completed locked pass, the in-memory projection is
+	 * already current and the locked rescan is skipped entirely — this is what
+	 * keeps an idle SessionRouter reconcile (2s cadence) from re-parsing and
+	 * re-checksumming the whole index forever. An append committed before the
+	 * stat always changes the stamp, so a miss is impossible; a change landing
+	 * after the stat is seen on the next poll, the same TOCTOU envelope a
+	 * locked read has. A corrupt suffix never takes the fast path: re-scanning
+	 * preserves the existing re-diagnosis behavior. Returns true when state was
+	 * reloaded. Authority revalidation that needs the strongest available
+	 * snapshot inside an already-locked write (append, unregister) keeps using
+	 * the exact locked paths.
+	 */
+	async refreshIfChanged(): Promise<boolean> {
+		if (this.#changeStamp !== undefined && !this.#corruptSuffix) {
+			const stamp = await readIndexChangeStamp(this.#agentDir);
+			if (sameIndexChangeStamp(this.#changeStamp, stamp)) return false;
+			// A possible change is re-classified UNDER the lock (#4689 review):
+			// writers mutate these files only while holding it, so the locked
+			// observation is atomic with the tail/replay it selects. The
+			// unlocked stamp above is only the cheap "definitely unchanged" cut.
+			const indexPath = path.resolve(logFor(this.#agentDir));
+			await SessionIndex.#enqueue(indexPath, () =>
+				withSessionIndexLock("poll-refresh", this.#agentDir, () => this.#refreshOrReplayUnderLock()),
+			);
+			return true;
+		}
+		await this.open();
+		await this.refresh();
+		return true;
+	}
+	/**
+	 * Locked change classification (#4689). Append-only log growth with an
+	 * untouched snapshot tails from the last offset; anything else — in-place
+	 * rewrite, truncation, rotation, snapshot replacement, existence
+	 * transitions, or an append/compact interleaving that outran the unlocked
+	 * pre-check — takes the full replay. Metadata cannot prove prefix identity
+	 * against a writer that rewrites history in place while growing the file;
+	 * that boundary is the cooperative locked-writer protocol, which never
+	 * does that (appendSync, or rename-replace with a fresh snapshot).
+	 */
+	async #refreshOrReplayUnderLock(): Promise<void> {
+		const stamp = await readIndexChangeStamp(this.#agentDir);
+		const prior = this.#changeStamp;
+		// Append-only growth with an untouched snapshot tails from the last
+		// offset; anything else replays in full.
+		if (
+			prior &&
+			prior.log.exists &&
+			stamp.log.exists &&
+			stamp.log.size > prior.log.size &&
+			stamp.snapshot.exists === prior.snapshot.exists &&
+			stamp.snapshot.size === prior.snapshot.size &&
+			stamp.snapshot.mtimeMs === prior.snapshot.mtimeMs &&
+			stamp.snapshot.ctimeMs === prior.snapshot.ctimeMs
+		)
+			await this.#tailUnderLock();
+		else await this.#replayUnderLock();
+		// #replayUnderLock recaptures the stamp itself; the tail path needs it
+		// captured here (refresh() does this via #refreshUnderLock).
+		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
+	}
 	async #replayUnderLock(): Promise<void> {
 		const scan = await this.#scan();
 		if (scan.diagnosis.status === "unsupported") throw scan.unsupportedError!;
@@ -871,6 +981,7 @@ export class SessionIndex {
 		if (scan.diagnosis.reason === "invalid snapshot") this.#warnings.push("Invalid session index snapshot");
 		if (this.#corruptSuffix) this.#warnings.push("Corrupt session index entry; replay truncated");
 		await this.#writeAuditUnderLock();
+		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
 	/** Seed the audit dedupe set once, then append records for newly-rejected events. */
 	async #writeAuditUnderLock(): Promise<void> {
@@ -1156,6 +1267,9 @@ export class SessionIndex {
 	async #refreshUnderLock(): Promise<void> {
 		await this.#tailUnderLock();
 		await this.#writeAuditUnderLock();
+		// #tailUnderLock may delegate to #replayUnderLock (which re-captures);
+		// capturing here covers the tail-only and missing-log paths.
+		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
 	get indexSeq(): number {
 		return this.#events.at(-1)?.indexSeq ?? 0;
@@ -1352,6 +1466,11 @@ export class SessionIndex {
 		const file = logFor(this.#agentDir);
 		await replaceAtomically(file, "");
 		this.#logOffset = 0;
+		// Sync in-memory state with the compacted snapshot while the lock is
+		// held: without this the instance keeps pre-compaction events and a
+		// fresh change stamp, so later refreshIfChanged() polls would never
+		// observe the compaction (#4689 review).
+		await this.#replayUnderLock();
 	}
 
 	listSessions(): SessionList {

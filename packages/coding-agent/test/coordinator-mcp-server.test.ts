@@ -250,6 +250,7 @@ async function createSdkControlServer(
 	const routerIndex = {
 		open: async () => {},
 		refresh: async () => {},
+		refreshIfChanged: async () => true,
 		listSessions: () => ({
 			indexSeq: 1,
 			sessions: brokerSessions.map(session => {

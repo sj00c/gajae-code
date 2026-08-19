@@ -60,6 +60,8 @@ export interface SessionAttachment {
 	readonly generation: number;
 	isCurrent(): boolean;
 	send(frame: Record<string, unknown>): unknown;
+	/** Idempotent provider-lease heartbeat send that skips the pre-send authority reconcile (#4689). */
+	sendMaintenance(leaseId: string): unknown;
 	/** Revoke this exact capability after provider admission or replay fails closed. */
 	retire?(): Promise<void>;
 }
@@ -149,6 +151,8 @@ export interface SessionRouterDeps {
 	clearInterval?: typeof clearInterval;
 	setTimeout?: typeof setTimeout;
 	clearTimeout?: typeof clearTimeout;
+	/** Test seam for the idle liveness-sweep cadence (#4689). */
+	idleSweepMs?: number;
 }
 
 export type SessionRouterProviderDeps = Pick<
@@ -220,6 +224,15 @@ const DELIVERY_ATTEMPT_LIMIT = 3;
 const ATTACH_CONCURRENCY = 4;
 const ATTACH_CONNECT_TIMEOUT_MS = 10_000;
 const NOTIFICATION_WORK_TIMEOUT_MS = 5_000;
+/**
+ * Idle liveness-sweep cadence (#4689). When the session index is unchanged and
+ * no adoption is pending, the 2s reconcile tick is only a change-stamp check;
+ * the full attach/retire body runs on index changes and on this sweep, which
+ * bounds time-driven transitions (dead host pid, aged heartbeat, dropped
+ * transport revival) without re-projecting the whole index every tick. 30s
+ * stays well inside the index's own 2×60s heartbeat-freshness window.
+ */
+const SESSION_ROUTER_IDLE_SWEEP_MS = 30_000;
 const NOTIFICATION_WORK_TIMEOUT = Symbol("notification_work_timeout");
 /**
  * Client-message types the native session server authorizes with the
@@ -359,7 +372,16 @@ export class SessionRouter {
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
-	#reconcilePending: { readonly runEpoch: number } | undefined;
+	#reconcilePending: { readonly runEpoch: number; force: boolean } | undefined;
+	/**
+	 * Set when a live indexed session failed to attach; keeps the idle gate
+	 * from parking retries until the 30s sweep (#4689 review).
+	 */
+	#retryPending = false;
+	/** Monotonic time of the last completed full reconcile body (#4689). */
+	#lastReconcileSweepAt = 0;
+	/** Index sequence the last completed full reconcile body processed (#4689). */
+	#lastReconciledIndexSeq = -1;
 	#ready = false;
 	#started = false;
 	#stopController = new AbortController();
@@ -391,9 +413,13 @@ export class SessionRouter {
 			this.#reconcileTail = Promise.resolve();
 			this.#reconcilePending = undefined;
 			this.#frameTails.clear();
+			// A restart must re-run the full body on the first tick: reset the
+			// idle-gate markers so stale state cannot carry across run epochs.
+			this.#lastReconcileSweepAt = 0;
+			this.#lastReconciledIndexSeq = -1;
 		}
 		try {
-			await this.#serialReconcile(runEpoch);
+			await this.#serialReconcile(runEpoch, false, true);
 			if (!this.#running(runEpoch)) return;
 			const timer = (this.#deps.setInterval ?? setInterval)(
 				() => this.#schedule(this.#serialReconcile(runEpoch, true)),
@@ -409,9 +435,11 @@ export class SessionRouter {
 	/** Exposed for deterministic callers and reconciliation tests. */
 	async reconcile(options: { waitForReplay?: boolean } = {}): Promise<void> {
 		const waitForReplay = options.waitForReplay ?? true;
-		await this.#serialReconcile(this.#runEpoch, !waitForReplay);
+		// Explicit callers always force the full body (#4689): the idle gate must
+		// never make an explicit reconcile a no-op.
+		await this.#serialReconcile(this.#runEpoch, !waitForReplay, true);
 		if (!waitForReplay) return;
-		// Periodic reconciliation may have published an attachment while its initial replay
+		// Periodic reconciliation may have published an attachment while its
 		// initial replay continues on that attachment's isolated ready tail.
 		// Explicit callers retain the historical synchronous contract without
 		// putting any ready tail back onto the fleet-wide reconcile tail.
@@ -481,7 +509,7 @@ export class SessionRouter {
 		const indexedCurrent =
 			listing.warnings.length === 0 ? listing.sessions.find(item => item.sessionId === sessionId) : undefined;
 		if (indexedCurrent && sameIndexedAuthority(indexed, indexedCurrent))
-			await this.#serialReconcile(this.#runEpoch, true);
+			await this.#serialReconcile(this.#runEpoch, true, true);
 		return capability;
 	}
 
@@ -557,7 +585,7 @@ export class SessionRouter {
 	): Promise<Record<string, unknown>> {
 		const publishing = this.#sessions.get(sessionId);
 		if (!expectedAttachment || publishing?.capability !== expectedAttachment || !publishing.initializingPublication)
-			await this.#serialReconcile(this.#runEpoch, true);
+			await this.#serialReconcile(this.#runEpoch, true, true);
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentPublished(attached))
 			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not published.");
@@ -721,18 +749,25 @@ export class SessionRouter {
 		}
 	}
 
-	#serialReconcile(runEpoch: number, deferReplay = false): Promise<void> {
+	#serialReconcile(runEpoch: number, deferReplay = false, force = false): Promise<void> {
 		if (!this.#running(runEpoch)) return Promise.resolve();
 		const pending = this.#reconcilePending;
-		if (pending?.runEpoch === runEpoch) return this.#reconcileTail;
-		const queued = { runEpoch };
+		if (pending?.runEpoch === runEpoch) {
+			// A dispatch that needs the exact authority body must not inherit an
+			// already-queued idle-timer pass: escalate the queued pass (#4689
+			// review). If the pass already started, this call queues a forced
+			// follow-up on the tail instead.
+			if (force) pending.force = true;
+			return this.#reconcileTail;
+		}
+		const queued = { runEpoch, force };
 		this.#reconcilePending = queued;
 		const task = this.#reconcileTail
 			.catch(() => undefined)
 			.then(async () => {
 				if (this.#reconcilePending === queued) this.#reconcilePending = undefined;
 				try {
-					await this.#reconcile(runEpoch, deferReplay);
+					await this.#reconcile(runEpoch, deferReplay, queued.force);
 					if (!this.#running(runEpoch)) return;
 					this.#ready = true;
 					this.#deps.onReconciled?.();
@@ -745,12 +780,36 @@ export class SessionRouter {
 		return task;
 	}
 
-	async #reconcile(runEpoch: number, deferReplay = false): Promise<void> {
+	async #reconcile(runEpoch: number, deferReplay = false, force = false): Promise<void> {
 		if (!this.#running(runEpoch)) return;
-		await this.#index.open();
+		// Idle-poll fast path (#4689): an unchanged index is proven with two
+		// stats instead of a locked full re-parse on every 2s tick; any committed
+		// append changes the stamp and forces the exact reload below.
+		const changed = await this.#index.refreshIfChanged();
 		if (!this.#running(runEpoch)) return;
-		await this.#index.refresh();
-		if (!this.#running(runEpoch)) return;
+		// Idle gate (#4689), timer ticks ONLY: dispatch, adoption, explicit
+		// reconcile, and start pass force=true and keep the exact locked
+		// authority body. A gated tick must also never park local recovery: a
+		// failed replay barrier, a retired-but-listed attachment, or an
+		// unpublished attachment all force the body. `changed` covers durable
+		// index updates; a corrupt suffix never takes the stamp fast path.
+		const sweepDue =
+			performance.now() - this.#lastReconcileSweepAt >= (this.#deps.idleSweepMs ?? SESSION_ROUTER_IDLE_SWEEP_MS);
+		if (
+			!force &&
+			!changed &&
+			!sweepDue &&
+			this.#adopted.size === 0 &&
+			!this.#retryPending &&
+			!this.#hasUnhealthyAttachment() &&
+			this.#index.indexSeq === this.#lastReconciledIndexSeq
+		) {
+			// The 2s tick is also the session-transport revival mechanism:
+			// connect() is a cheap no-op on a healthy socket, so skipped ticks
+			// keep the reconnect latency without re-projecting the index.
+			for (const attached of this.#sessions.values()) this.#reviveTransport(attached);
+			return;
+		}
 		const indexed = this.#index.listSessions();
 		const live =
 			indexed.warnings.length === 0
@@ -799,6 +858,7 @@ export class SessionRouter {
 			}
 		}
 		let nextAttachment = 0;
+		let attachThrew = false;
 		const attachWorkers = Array.from({ length: Math.min(ATTACH_CONCURRENCY, live.length) }, async () => {
 			for (;;) {
 				if (!this.#running(runEpoch)) return;
@@ -808,6 +868,11 @@ export class SessionRouter {
 					if (await this.#attach(session, runEpoch, undefined, false, false, deferReplay))
 						attachedIds.add(session.sessionId);
 				} catch {
+					// A live row that failed to attach is local recovery state the
+					// durable index cannot see: keep ticks retrying it (#4689).
+					// A definitive no-endpoint #attach miss (returned false) does
+					// not latch — that row can never attach.
+					attachThrew = true;
 					const failed = this.#sessions.get(session.sessionId);
 					if (failed?.runEpoch === runEpoch)
 						await this.#retireAttachment(failed, liveIds.has(session.sessionId) ? "replaced" : "removed");
@@ -835,6 +900,14 @@ export class SessionRouter {
 			}
 		}
 		if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "SessionRouter stale cleanup failed.");
+		this.#lastReconcileSweepAt = performance.now();
+		// Record the snapshot the body actually enumerated: a nested exact
+		// refresh during endpoint validation may have already advanced the
+		// index past it, and those newer events were NOT processed here.
+		this.#lastReconciledIndexSeq = indexed.indexSeq;
+		// The retry latch is set only where a live row's attach throws (see the
+		// attach worker); a definitive no-endpoint miss can never attach.
+		this.#retryPending = attachThrew && live.some(session => !attachedIds.has(session.sessionId));
 	}
 
 	async #readEndpoint(indexed: IndexedSession): Promise<SdkSessionEndpoint | null> {
@@ -1045,10 +1118,23 @@ export class SessionRouter {
 						await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
 						throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 					}
-				} else await this.#serialReconcile(runEpoch, true);
+				} else await this.#serialReconcile(runEpoch, true, true);
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(this.#prepareFrame(attached, frame));
+			},
+			/**
+			 * Provider-lease heartbeats skip the pre-send authority reconcile
+			 * (#4689): the frame is idempotent and advisory, the native server
+			 * drops wrong-token/stale-connection frames, and the 2s tick plus
+			 * 30s sweep revalidate authority on their own cadence. The frame
+			 * shape is fixed here so no command traffic can take this path;
+			 * dispatch keeps using send().
+			 */
+			sendMaintenance: (leaseId: string) => {
+				if (!attached || !this.#attachmentPublished(attached))
+					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+				attached.client.send(this.#prepareFrame(attached, { type: "provider_heartbeat", leaseId }));
 			},
 			retire: async () => {
 				if (attached) await this.#retireAttachment(attached);
@@ -1275,6 +1361,17 @@ export class SessionRouter {
 		return this.#started && runEpoch === this.#runEpoch;
 	}
 
+	/**
+	 * Idle-gate guard (#4689): local recovery state the durable index cannot
+	 * see. A failed/detached replay barrier or an unpublished attachment must
+	 * force the next full body instead of waiting for the sweep.
+	 */
+	#hasUnhealthyAttachment(): boolean {
+		for (const attached of this.#sessions.values()) {
+			if (attached.barrier.failed || attached.barrier.detached || !attached.published) return true;
+		}
+		return false;
+	}
 	#attachmentLive(attached: AttachedSession): boolean {
 		return (
 			this.#running(attached.runEpoch) &&

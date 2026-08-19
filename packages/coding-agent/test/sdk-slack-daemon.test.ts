@@ -144,6 +144,7 @@ function endpoint(sessionId: string, generation = 1): SessionAttachment {
 		generation,
 		isCurrent: () => true,
 		send: () => undefined,
+		sendMaintenance: () => {},
 	};
 }
 
@@ -210,6 +211,7 @@ async function withDaemon(
 						if (attachment) return attachment.send(frame);
 						injected.push(frame);
 					},
+					sendMaintenance: () => {},
 				};
 			},
 			now: options.now,
@@ -1084,6 +1086,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				resolveAttachment: async sessionId => ({
 					...endpoint(sessionId),
 					send: (frame: Record<string, unknown>) => injected.push(frame),
+					sendMaintenance: () => {},
 				}),
 			});
 			await restarted.start();
@@ -1677,6 +1680,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				resolveAttachment: async sessionId => ({
 					...endpoint(sessionId),
 					send: (frame: Record<string, unknown>) => injected.push(frame),
+					sendMaintenance: () => {},
 				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
@@ -1810,6 +1814,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					send: () => {
 						throw new SdkClientError("connection_closed", "before send");
 					},
+					sendMaintenance: () => {},
 				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
@@ -1830,6 +1835,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				resolveAttachment: async sessionId => ({
 					...endpoint(sessionId),
 					send: (frame: Record<string, unknown>) => replayed.push(frame),
+					sendMaintenance: () => {},
 				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
@@ -1890,6 +1896,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				resolveAttachment: async sessionId => ({
 					...endpoint(sessionId),
 					send: (frame: Record<string, unknown>) => replayed.push(frame),
+					sendMaintenance: () => {},
 				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
@@ -2064,6 +2071,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					send: () => {
 						throw new SdkClientError("unavailable", "accepted then disconnected");
 					},
+					sendMaintenance: () => {},
 				}),
 
 				authorizeActor: actorId => actorId === "U1",
@@ -2092,6 +2100,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				resolveAttachment: async sessionId => ({
 					...endpoint(sessionId),
 					send: (frame: Record<string, unknown>) => replayed.push(frame),
+					sendMaintenance: () => {},
 				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
@@ -2152,6 +2161,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				resolveAttachment: async sessionId => ({
 					...endpoint(sessionId),
 					send: (frame: Record<string, unknown>) => injected.push(frame),
+					sendMaintenance: () => {},
 				}),
 			});
 			const replacement = await restarted.resume("session", "replacement root");

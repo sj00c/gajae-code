@@ -4629,6 +4629,7 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		generation: 1,
 		isCurrent: () => true,
 		send: async frame => client.send(routedFrame(frame)),
+		sendMaintenance: () => {},
 		retire: async () => {},
 	};
 	const adapter = new AcpSdkAdapter({

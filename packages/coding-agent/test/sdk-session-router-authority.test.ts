@@ -96,6 +96,10 @@ async function routerFixture(
 		refresh: async () => {
 			await options.onIndexRefresh?.();
 		},
+		refreshIfChanged: async () => {
+			await options.onIndexRefresh?.();
+			return true;
+		},
 		listSessions: () => ({
 			indexSeq: authority.generation,
 			sessions: authority.indexed
@@ -255,6 +259,7 @@ function hungRouterFixture(): HungRouterFixture {
 	const index = {
 		open: async () => {},
 		refresh: async () => {},
+		refreshIfChanged: async () => true,
 		listSessions: () => ({
 			indexSeq: 1,
 			sessions: indexed.map(session => ({
@@ -522,6 +527,7 @@ describe("SessionRouter dispatch authority", () => {
 		const index = {
 			open: async () => {},
 			refresh: async () => {},
+			refreshIfChanged: async () => true,
 			listSessions: () => ({
 				indexSeq: 1,
 				sessions: indexed.map(session => ({
@@ -554,6 +560,7 @@ describe("SessionRouter dispatch authority", () => {
 						request: async () => ({ events: [] }),
 						close: async () => {},
 						send: () => {},
+						sendMaintenance: () => {},
 					};
 				},
 				onAttachment: attachment => {
@@ -752,6 +759,7 @@ describe("SessionRouter dispatch authority", () => {
 			generation: 1,
 			isCurrent: () => true,
 			send: async () => {},
+			sendMaintenance: () => {},
 		});
 		try {
 			await expect(
@@ -1334,6 +1342,7 @@ describe("SessionRouter dispatch authority", () => {
 					throw new Error("close handshake failed");
 				},
 				send: () => {},
+				sendMaintenance: () => {},
 			}),
 		});
 		const incarnation = brokerProcessIncarnation(process.pid);
@@ -1602,6 +1611,7 @@ describe("SessionRouter dispatch authority", () => {
 		const index = {
 			open: async () => {},
 			refresh: async () => {},
+			refreshIfChanged: async () => true,
 			listSessions: () => ({
 				indexSeq: generation,
 				sessions: [
@@ -1633,6 +1643,7 @@ describe("SessionRouter dispatch authority", () => {
 					},
 					close: async () => {},
 					send: () => {},
+					sendMaintenance: () => {},
 				}),
 				onReconciled: () => {
 					reconcileCount++;
@@ -1694,6 +1705,425 @@ describe("SessionRouter dispatch authority", () => {
 			expect(explicitSettled).toBe(true);
 		} finally {
 			wedgedGate.resolve();
+			await router.stop();
+		}
+	});
+	test("periodic reconcile polls an unchanged index without re-opening it (#4689)", async () => {
+		// Idle-spin regression: before the fix, every 2s reconcile tick ran
+		// index.open() — a locked full re-parse of the session index — forever,
+		// burning CPU proportional to total index history per live session. The
+		// polling path now goes through refreshIfChanged and must leave open()
+		// untouched across ticks, while prompts keep working.
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const sessionId = "idle-poll";
+		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+		await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://idle.test", token: "v1", pid: 42 }));
+		let reconcileCount = 0;
+		let tick: (() => void) | undefined;
+		const calls = { open: 0, refresh: 0, refreshIfChanged: 0, listSessions: 0 };
+		const index = {
+			open: async () => {
+				calls.open++;
+			},
+			refresh: async () => {
+				calls.refresh++;
+			},
+			refreshIfChanged: async () => {
+				calls.refreshIfChanged++;
+				return calls.refreshIfChanged === 1;
+			},
+			get indexSeq() {
+				return 1;
+			},
+			listSessions: () => {
+				calls.listSessions++;
+				return {
+					indexSeq: 1,
+					sessions: [
+						{
+							sessionId,
+							locator: { repo, stateRoot },
+							endpointGeneration: 1,
+							pid: 42,
+							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
+							live: true,
+							indexSeq: 1,
+							ambiguous: false,
+							terminal: false,
+						},
+					],
+					warnings: [],
+				};
+			},
+		} as unknown as SessionIndex;
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => ({
+					onFrame: () => () => {},
+					request: async () => ({ events: [] }),
+					close: async () => {},
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+				onReconciled: () => {
+					reconcileCount++;
+				},
+				setInterval: ((callback: () => void) => {
+					tick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+		try {
+			await router.start();
+			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
+			const baseline = { ...calls };
+			const baselineReconciles = reconcileCount;
+			for (let i = 0; i < 3; i++) {
+				const before = reconcileCount;
+				tick!();
+				for (let spins = 0; spins < 500 && reconcileCount <= before; spins++) await Bun.sleep(1);
+				expect(reconcileCount).toBeGreaterThan(before);
+			}
+			expect(reconcileCount).toBe(baselineReconciles + 3);
+			// The polling path must never drive the locked full re-parse, and
+			// the idle gate skips the projection body on unchanged ticks.
+			expect(calls.open).toBe(baseline.open);
+			expect(calls.listSessions).toBe(baseline.listSessions);
+			expect(calls.refreshIfChanged).toBe(baseline.refreshIfChanged + 3);
+			// Prompt dispatch forces the exact body even on an unchanged index
+			// (authority revalidation is never gated), and still settles fast.
+			const beforeRequest = { ...calls };
+			const requestSettled = await Promise.race([
+				Bun.sleep(500).then(() => false),
+				router.request(sessionId, { type: "test" }).then(() => true),
+			]);
+			expect(requestSettled).toBe(true);
+			expect(calls.listSessions).toBeGreaterThan(beforeRequest.listSessions);
+		} finally {
+			await router.stop();
+		}
+	});
+	test("idle sweep reruns the reconcile body without an index change (#4689)", async () => {
+		// The gate must not park time-driven work forever: with the sweep due,
+		// a tick runs the full body again even though the index is unchanged.
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-sweep-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const sessionId = "sweep";
+		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+		await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://sweep.test", token: "v1", pid: 42 }));
+		let tick: (() => void) | undefined;
+		let reconcileCount = 0;
+		let listSessionsCalls = 0;
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			refreshIfChanged: async () => false,
+			get indexSeq() {
+				return 1;
+			},
+			listSessions: () => {
+				listSessionsCalls++;
+				return {
+					indexSeq: 1,
+					sessions: [
+						{
+							sessionId,
+							locator: { repo, stateRoot },
+							endpointGeneration: 1,
+							pid: 42,
+							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
+							live: true,
+							indexSeq: 1,
+							ambiguous: false,
+							terminal: false,
+						},
+					],
+					warnings: [],
+				};
+			},
+		} as unknown as SessionIndex;
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => ({
+					onFrame: () => () => {},
+					request: async () => ({ events: [] }),
+					close: async () => {},
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+				onReconciled: () => {
+					reconcileCount++;
+				},
+				setInterval: ((callback: () => void) => {
+					tick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+				idleSweepMs: 0,
+			},
+		});
+		try {
+			await router.start();
+			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
+			const baseline = listSessionsCalls;
+			for (let i = 0; i < 2; i++) {
+				const before = reconcileCount;
+				tick!();
+				for (let spins = 0; spins < 500 && reconcileCount <= before; spins++) await Bun.sleep(1);
+				expect(reconcileCount).toBeGreaterThan(before);
+			}
+			expect(listSessionsCalls).toBeGreaterThan(baseline);
+		} finally {
+			await router.stop();
+		}
+	});
+	test("a dispatch queued behind an idle tick escalates it to the exact body (#4689 review)", async () => {
+		// tick() queues an unforced timer pass; a request arriving before it
+		// starts must escalate that pass instead of dispatching behind an
+		// idle-gated one.
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-force-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const sessionId = "force-escalation";
+		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+		await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://force.test", token: "v1", pid: 42 }));
+		let tick: (() => void) | undefined;
+		let listSessionsCalls = 0;
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			refreshIfChanged: async () => false,
+			get indexSeq() {
+				return 1;
+			},
+			listSessions: () => {
+				listSessionsCalls++;
+				return {
+					indexSeq: 1,
+					sessions: [
+						{
+							sessionId,
+							locator: { repo, stateRoot },
+							endpointGeneration: 1,
+							pid: 42,
+							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
+							live: true,
+							indexSeq: 1,
+							ambiguous: false,
+							terminal: false,
+						},
+					],
+					warnings: [],
+				};
+			},
+		} as unknown as SessionIndex;
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => ({
+					onFrame: () => () => {},
+					request: async () => ({ events: [] }),
+					close: async () => {},
+					send: () => {},
+				}),
+				setInterval: ((callback: () => void) => {
+					tick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+		try {
+			await router.start();
+			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
+			const baseline = listSessionsCalls;
+			// Queue the timer pass and the forced dispatch synchronously: the
+			// queued pass must run the body (escalated), not the idle gate.
+			tick!();
+			const requestSettled = await Promise.race([
+				Bun.sleep(500).then(() => false),
+				router.request(sessionId, { type: "test" }).then(() => true),
+			]);
+			expect(requestSettled).toBe(true);
+			expect(listSessionsCalls).toBeGreaterThan(baseline);
+		} finally {
+			await router.stop();
+		}
+	});
+	test("a live session whose attach failed is retried on the next tick, not the sweep (#4689 review)", async () => {
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-retry-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const sessionId = "retry-latch";
+		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+		await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://retry.test", token: "v1", pid: 42 }));
+		let tick: (() => void) | undefined;
+		let refreshIfChangedCalls = 0;
+		let listSessionsCalls = 0;
+		let connectAttempts = 0;
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			refreshIfChanged: async () => {
+				refreshIfChangedCalls++;
+				return refreshIfChangedCalls === 1;
+			},
+			get indexSeq() {
+				return 1;
+			},
+			listSessions: () => {
+				listSessionsCalls++;
+				return {
+					indexSeq: 1,
+					sessions: [
+						{
+							sessionId,
+							locator: { repo, stateRoot },
+							endpointGeneration: 1,
+							pid: 42,
+							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
+							live: true,
+							indexSeq: 1,
+							ambiguous: false,
+							terminal: false,
+						},
+					],
+					warnings: [],
+				};
+			},
+		} as unknown as SessionIndex;
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => {
+					connectAttempts++;
+					if (connectAttempts === 1) throw new Error("endpoint not reachable yet");
+					return {
+						onFrame: () => () => {},
+						request: async () => ({ events: [] }),
+						close: async () => {},
+						send: () => {},
+					};
+				},
+				setInterval: ((callback: () => void) => {
+					tick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+		try {
+			await router.start();
+			expect(router.attachment(sessionId)).toBeNull();
+			expect(connectAttempts).toBe(1);
+			const baselineListings = listSessionsCalls;
+			// The index never changed, but the retry latch must bypass the idle
+			// gate: the very next tick reruns the body and attaches.
+			tick!();
+			for (let spins = 0; spins < 500 && router.attachment(sessionId)?.isCurrent() !== true; spins++)
+				await Bun.sleep(1);
+			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
+			expect(connectAttempts).toBe(2);
+			expect(listSessionsCalls).toBeGreaterThan(baselineListings);
+		} finally {
+			await router.stop();
+		}
+	});
+	test("sendMaintenance emits exactly a provider heartbeat without reconciling (#4689 review)", async () => {
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-hb-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const sessionId = "heartbeat-shape";
+		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+		await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://hb.test", token: "v1", pid: 42 }));
+		let refreshIfChangedCalls = 0;
+		const sent: Record<string, unknown>[] = [];
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			refreshIfChanged: async () => {
+				refreshIfChangedCalls++;
+				return true;
+			},
+			get indexSeq() {
+				return 1;
+			},
+			listSessions: () => ({
+				indexSeq: 1,
+				sessions: [
+					{
+						sessionId,
+						locator: { repo, stateRoot },
+						endpointGeneration: 1,
+						pid: 42,
+						endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
+						live: true,
+						indexSeq: 1,
+						ambiguous: false,
+						terminal: false,
+					},
+				],
+				warnings: [],
+			}),
+		} as unknown as SessionIndex;
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => ({
+					onFrame: () => () => {},
+					request: async () => ({ events: [] }),
+					close: async () => {},
+					send: (frame: Record<string, unknown>) => {
+						sent.push(frame);
+					},
+				}),
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+		try {
+			await router.start();
+			const attachment = router.attachment(sessionId);
+			expect(attachment?.isCurrent()).toBe(true);
+			const baseline = refreshIfChangedCalls;
+			attachment!.sendMaintenance("lease-9");
+			// Exactly the heartbeat frame shape — no command traffic can take this
+			// path — and no reconcile was triggered.
+			expect(sent).toEqual([
+				{
+					type: "provider_heartbeat",
+					leaseId: "lease-9",
+				},
+			]);
+			expect(refreshIfChangedCalls).toBe(baseline);
+		} finally {
 			await router.stop();
 		}
 	});

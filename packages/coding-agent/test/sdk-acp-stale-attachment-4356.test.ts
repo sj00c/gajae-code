@@ -17,6 +17,7 @@ function createRouterHarness(): RouterHarness {
 		generation: 1,
 		isCurrent: () => current,
 		send: async () => {},
+		sendMaintenance: () => {},
 	};
 	const router = {
 		request: async (_sid: string, frame: Record<string, unknown>) => {

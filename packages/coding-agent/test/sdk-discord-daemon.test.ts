@@ -182,6 +182,7 @@ async function withDaemon(
 				generation: expectedGeneration,
 				isCurrent: () => true,
 				send: () => {},
+				sendMaintenance: () => {},
 			}),
 			...overrides,
 		});
@@ -238,7 +239,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 			});
 			const first = daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "first" });
 			await entered.promise;
@@ -299,6 +306,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						generation: expectedGeneration,
 						isCurrent: () => true,
 						send: () => {},
+						sendMaintenance: () => {},
 					};
 				},
 			},
@@ -312,7 +320,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 2, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 2,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 			});
 			const restored = await restarted.notify({
 				sessionId: "session",
@@ -360,6 +374,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					generation: expectedGeneration,
 					isCurrent: () => true,
 					send: () => {},
+					sendMaintenance: () => {},
 				}),
 			},
 		);
@@ -439,6 +454,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						generation: 4,
 						isCurrent: () => true,
 						send: () => {},
+						sendMaintenance: () => {},
 					}),
 				});
 				await restarted.resolveAction("session", "ask");
@@ -449,7 +465,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 			},
 			{
-				resolveAttachment: async sessionId => ({ sessionId, generation: 4, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 4,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 			},
 		);
 	});
@@ -468,7 +490,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				expect(selected.threadId).not.toBe(original.threadId);
 			},
 			{
-				resolveAttachment: async sessionId => ({ sessionId, generation, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 			},
 		);
 	});
@@ -546,6 +574,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			send: (frame: Record<string, unknown>) => {
 				frames.push(frame);
 			},
+			sendMaintenance: () => {},
 		};
 		await withDaemon(
 			async daemon => {
@@ -568,6 +597,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					generation: 4,
 					isCurrent: () => true,
 					send: frame => client.send(frame),
+					sendMaintenance: () => {},
 				}),
 			},
 		);
@@ -610,6 +640,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						send: frame => {
 							frames.push(frame);
 						},
+						sendMaintenance: () => {},
 					};
 				},
 			},
@@ -673,6 +704,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 							send: frame => {
 								frames.push(frame);
 							},
+							sendMaintenance: () => {},
 						}),
 					});
 					await recovery.start();
@@ -708,6 +740,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						send: frame => {
 							frames.push(frame);
 						},
+						sendMaintenance: () => {},
 					}),
 				},
 			);
@@ -796,6 +829,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						generation: 1,
 						isCurrent: () => true,
 						send: () => {},
+						sendMaintenance: () => {},
 					}),
 				});
 				await restarted.start();
@@ -890,6 +924,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						generation: 1,
 						isCurrent: () => true,
 						send: () => {},
+						sendMaintenance: () => {},
 					}),
 				});
 				await restarted.start();
@@ -970,6 +1005,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						generation: 2,
 						isCurrent: () => true,
 						send: () => {},
+						sendMaintenance: () => {},
 					}),
 				});
 				await restarted.start();
@@ -1047,7 +1083,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 2, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 2,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 			});
 			await restarted.start();
 			expect(await store.read(`app:guild:parent:${stale.id}`)).toBeUndefined();
@@ -1097,6 +1139,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 									send: frame => {
 										frames.push(frame);
 									},
+									sendMaintenance: () => {},
 								}
 							: unavailable === "removed"
 								? null
@@ -1107,6 +1150,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 										send: frame => {
 											frames.push(frame);
 										},
+										sendMaintenance: () => {},
 									},
 				},
 			);
@@ -1135,7 +1179,9 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					parentChannelId: "parent",
 					provider,
 					resolveAttachment: async sessionId =>
-						staleBinding ? null : { sessionId, generation: 1, isCurrent: () => true, send: () => {} },
+						staleBinding
+							? null
+							: { sessionId, generation: 1, isCurrent: () => true, send: () => {}, sendMaintenance: () => {} },
 				});
 				await restarted.start();
 				const effects = await new ChatEffectJournal({ agentDir, transport: "discord" }).list();
@@ -1209,6 +1255,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						frames.push(frame);
 						current = false;
 					},
+					sendMaintenance: () => {},
 				}),
 			},
 		);
@@ -1262,6 +1309,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					generation,
 					isCurrent: () => generation === 1,
 					send: () => {},
+					sendMaintenance: () => {},
 				}),
 			},
 		);
@@ -1374,6 +1422,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						frames.push(frame);
 						if (ambiguous) throw new SdkClientError("unavailable", "SDK disconnected after send");
 					},
+					sendMaintenance: () => {},
 				}),
 			},
 		);
@@ -1393,6 +1442,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					send: frame => {
 						frames.push(frame);
 					},
+					sendMaintenance: () => {},
 				});
 				const first = new DiscordNotificationDaemon({
 					agentDir,
@@ -1474,6 +1524,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						originalSend(frame);
 						throw new Error("accepted then disconnected");
 					},
+					sendMaintenance: () => {},
 				});
 				const sender = new DiscordNotificationDaemon({
 					agentDir,
@@ -1504,6 +1555,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					send: frame => {
 						frames.push(frame);
 					},
+					sendMaintenance: () => {},
 				}),
 			},
 		);
@@ -1528,7 +1580,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 			},
 			{
-				resolveAttachment: async sessionId => ({ sessionId, generation, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 				onCommand: async (_sessionId, content) => {
 					commands.push(content);
 					return true;
@@ -1639,6 +1697,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 								send: frame => {
 									frames.push(frame);
 								},
+								sendMaintenance: () => {},
 							}),
 						});
 						await recovery.start();
@@ -1701,6 +1760,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						send: frame => {
 							frames.push(frame);
 						},
+						sendMaintenance: () => {},
 					}),
 				});
 				await recovered.start();
@@ -1719,6 +1779,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					send: () => {
 						throw new DiscordAttachmentBindingError();
 					},
+					sendMaintenance: () => {},
 				}),
 			},
 		);
@@ -1737,7 +1798,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 			});
 			await restarted.start();
 			expect(provider.messages).toHaveLength(1);
@@ -1772,6 +1839,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					send: frame => {
 						frames.push(frame);
 					},
+					sendMaintenance: () => {},
 				}),
 			});
 			await restarted.start();
@@ -1832,6 +1900,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					send: frame => {
 						frames.push(frame);
 					},
+					sendMaintenance: () => {},
 				}),
 			});
 			await restarted.start();
@@ -1890,7 +1959,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 				onCommand: async (_sessionId, command) => {
 					commands.push(command);
 					return true;
@@ -1935,7 +2010,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 				onCommand: async (_sessionId, content) => {
 					commands.push(content);
 					return true;
@@ -1992,6 +2073,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					send: frame => {
 						frames.push(frame);
 					},
+					sendMaintenance: () => {},
 				}),
 			});
 			await restarted.start();
@@ -2047,6 +2129,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					send: frame => {
 						frames.push(frame);
 					},
+					sendMaintenance: () => {},
 				}),
 			});
 			await restarted.start();
@@ -2100,6 +2183,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					generation,
 					isCurrent: () => generation === 1,
 					send: () => {},
+					sendMaintenance: () => {},
 				}),
 			},
 		);
@@ -2185,7 +2269,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 			});
 			await expect(restarted.start()).rejects.toThrow("Discord interaction callback failed");
 			const effectId = `discord:app:guild:parent:${conversation.threadId}:callback-health`;
@@ -2207,7 +2297,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					failedScheduledDrains++;
 					throw new Error("transient attachment lookup failure");
 				}
-				return { sessionId, generation: 1, isCurrent: () => true, send: () => {} };
+				return { sessionId, generation: 1, isCurrent: () => true, send: () => {}, sendMaintenance: () => {} };
 			};
 			const first = new DiscordNotificationDaemon({
 				agentDir,
@@ -2365,6 +2455,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						send: frame => {
 							frames.push(frame);
 						},
+						sendMaintenance: () => {},
 					}),
 				});
 				await recovery.start();
@@ -2375,7 +2466,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				await recovery.stop();
 			},
 			{
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 			},
 		);
 	});
@@ -2569,7 +2666,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
 			});
 			await restarted.start();
 			expect((await store.read(key))?.inboundDispatches ?? []).toEqual([]);

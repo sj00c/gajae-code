@@ -69,6 +69,7 @@ function endpoint(sessionId: string, generation: number): SessionAttachment {
 		generation,
 		isCurrent: () => true,
 		send: () => undefined,
+		sendMaintenance: () => {},
 	};
 }
 

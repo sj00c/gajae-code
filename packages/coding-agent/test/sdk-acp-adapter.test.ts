@@ -93,6 +93,7 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 			sent.push(frame);
 			return await options.send?.(frame);
 		},
+		sendMaintenance: () => {},
 	};
 	const router = {
 		request: async (

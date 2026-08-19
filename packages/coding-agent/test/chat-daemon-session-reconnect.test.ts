@@ -714,6 +714,7 @@ test("chat daemon startup isolates an unreachable indexed endpoint from a health
 							request: async () => ({ events: [] }),
 							close: async () => {},
 							send: () => {},
+							sendMaintenance: () => {},
 						};
 					},
 					setInterval: (() => 0) as unknown as typeof setInterval,

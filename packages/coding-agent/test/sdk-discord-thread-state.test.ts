@@ -28,6 +28,7 @@ function attachment(sessionId = "session", generation = 4, current = true): Sess
 		generation,
 		isCurrent: () => current,
 		send: () => {},
+		sendMaintenance: () => {},
 	};
 }
 

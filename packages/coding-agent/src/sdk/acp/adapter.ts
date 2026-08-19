@@ -576,13 +576,24 @@ export class AcpSdkAdapter {
 		if (!attachment?.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 		await Promise.resolve(attachment.send(frame));
 	}
+	/** Lease heartbeats are idempotent maintenance: they skip the authority reconcile (#4689). */
+	async #sendLeaseHeartbeat(leaseId: string): Promise<void> {
+		if (!this.#router)
+			throw new AcpSdkAdapterError(
+				"operation_prohibited",
+				"Live session sends require the current Router attachment.",
+			);
+		const attachment = this.#attachment;
+		if (!attachment?.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+		await Promise.resolve(attachment.sendMaintenance(leaseId));
+	}
 
 	async #heartbeatLeases(): Promise<void> {
 		if (this.#closed) return;
 		try {
 			if (!this.#router) return;
 			if (!this.#attachment?.isCurrent()) return;
-			for (const leaseId of this.#leases.values()) await this.#sendSession({ type: "provider_heartbeat", leaseId });
+			for (const leaseId of this.#leases.values()) await this.#sendLeaseHeartbeat(leaseId);
 		} catch (error) {
 			if (error instanceof SessionRouterError && error.phase === "pre_send") return;
 			this.#reportReconnectFailure(error);
