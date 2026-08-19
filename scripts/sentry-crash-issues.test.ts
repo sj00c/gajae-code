@@ -95,6 +95,12 @@ describe("parseArgs", () => {
 	test("supports a normal help path", () => {
 		expect(parseArgs(["--help"])).toMatchObject({ help: true });
 	});
+
+	test("bounds Sentry org and project slugs before building authenticated paths", () => {
+		expect(parseArgs(["--org", "probe%2F..%2Forganizations%2Fsecret"])).toMatchObject({ error: expect.stringContaining("--org") });
+		expect(parseArgs(["--project", "gajae-code\n# forged"])).toMatchObject({ error: expect.stringContaining("--project") });
+	expect(parseArgs(["--org", "probe", "--project", "gajae-code"])).toMatchObject({ org: "probe", project: "gajae-code" });
+	});
 });
 
 describe("fingerprintFromTagPayload", () => {
@@ -116,6 +122,7 @@ describe("fingerprintFromTagPayload", () => {
 	test("handles a missing or empty topValues without throwing", () => {
 		expect(fingerprintFromTagPayload({ key: "gjc.fingerprint" })).toBeUndefined();
 		expect(fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [] })).toBeUndefined();
+		expect(fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [null] })).toBeUndefined();
 		expect(fingerprintFromTagPayload(null)).toBeUndefined();
 	});
 
@@ -321,6 +328,7 @@ describe("main orchestration", () => {
 			? [approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options())]
 			: [];
 		const filed: { manifest: ApprovalManifest; url: string }[] = [];
+		const pending: ApprovalManifest[] = [];
 		return {
 			stdout,
 			stderr,
@@ -347,6 +355,14 @@ describe("main orchestration", () => {
 						filed.some(candidate => candidate.url === url && JSON.stringify(candidate.manifest) === JSON.stringify(manifest)),
 					recordFiled: async (manifest, url) => {
 						filed.push({ manifest, url });
+					},
+					hasPending: async manifest => pending.some(candidate => JSON.stringify(candidate) === JSON.stringify(manifest)),
+					recordPending: async manifest => {
+						if (!pending.some(candidate => JSON.stringify(candidate) === JSON.stringify(manifest))) pending.push(manifest);
+					},
+					clearPending: async manifest => {
+						const index = pending.findIndex(candidate => JSON.stringify(candidate) === JSON.stringify(manifest));
+						if (index >= 0) pending.splice(index, 1);
 					},
 				},
 				withCreationLock: async action => action(),
@@ -461,6 +477,9 @@ describe("main orchestration", () => {
 				consume: async () => {},
 				hasFiled: async () => false,
 				recordFiled: async () => {},
+				hasPending: async () => false,
+				recordPending: async () => {},
+				clearPending: async () => {},
 			},
 		});
 		await expect(main(["--approve", digestMatch![1]!], approving.dependencies)).resolves.toBe(1);

@@ -39,6 +39,7 @@
  * `--apply`. The repository is pinned to the interactive report repository.
  */
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -54,9 +55,11 @@ const FINGERPRINT = /^[0-9a-f]{32}$/;
 const CRASH_MARKER_PATTERN = /gjc-crash-fp\.v1:(?:[0-9a-f]{32}|<hex>)(?![a-z0-9_])/gi;
 /** Sentry paginates at 100; a triage batch larger than this wants a saved search, not a bigger flag. */
 const MAX_LIMIT = 100;
+const MAX_RETRIES = 2;
 const MAX_PERMALINK_PATH_LENGTH = 2048;
 const MAX_ISSUE_BODY_BYTES = 48 * 1024;
 const SENTRY_LEVELS = new Set(["fatal", "error", "warning", "info", "debug"]);
+const SENTRY_SLUG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 interface Options {
 	apply: boolean;
@@ -123,8 +126,14 @@ export function parseArgs(argv: readonly string[]): Options | { error: string } 
 		}
 		if (arg === "--approve") options.approve = value;
 		else if (arg === "--acknowledge") options.acknowledge = value;
-		else if (arg === "--org") options.org = value;
-		else if (arg === "--project") options.project = value;
+		else if (arg === "--org") {
+			if (!SENTRY_SLUG.test(value)) return { error: "--org must be a bounded Sentry slug." };
+			options.org = value;
+		}
+		else if (arg === "--project") {
+			if (!SENTRY_SLUG.test(value)) return { error: "--project must be a bounded Sentry slug." };
+			options.project = value;
+		}
 		else if (arg === "--repo") {
 			// The cross-surface dedup contract only holds against one repository:
 			// `checkForDuplicateIssue` in report.ts searches CRASH_REPORT_REPO and
@@ -155,12 +164,21 @@ class SentryHttpError extends Error {
 }
 
 async function sentryGet(pathname: string, token: string): Promise<unknown> {
-	const response = await fetch(`${SENTRY_API}${pathname}`, {
-		headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-		signal: AbortSignal.timeout(GH_TIMEOUT_MS),
-	});
-	if (!response.ok) throw new SentryHttpError(pathname, response.status);
-	return response.json();
+	for (let attempt = 0; ; attempt++) {
+		try {
+			const response = await fetch(`${SENTRY_API}${pathname}`, {
+				headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+				signal: AbortSignal.timeout(GH_TIMEOUT_MS),
+			});
+			if (response.ok) return response.json();
+			const error = new SentryHttpError(pathname, response.status);
+			if ((response.status !== 429 && response.status < 500) || attempt >= MAX_RETRIES) throw error;
+		} catch (error) {
+			if (error instanceof SentryHttpError && (error.status !== 429 && error.status < 500 || attempt >= MAX_RETRIES)) throw error;
+			if (attempt >= MAX_RETRIES) throw error;
+		}
+		await Bun.sleep(250 * 2 ** attempt);
+	}
 }
 
 function asString(value: unknown): string {
@@ -253,7 +271,9 @@ export function fingerprintFromTagPayload(raw: unknown): string | undefined {
 	if (asString(record.key) !== "gjc.fingerprint") return undefined;
 	const top = record.topValues;
 	if (!Array.isArray(top) || top.length !== 1) return undefined;
-	const value = asString((top[0] as { value?: unknown }).value);
+	const first = top[0];
+	if (typeof first !== "object" || first === null) return undefined;
+	const value = asString((first as { value?: unknown }).value);
 	return FINGERPRINT.test(value) ? value : undefined;
 }
 
@@ -297,6 +317,8 @@ async function gh(args: readonly string[]): Promise<{ ok: boolean; stdout: strin
 interface ExistingIssueSearch {
 	kind: "none" | "untrusted";
 	url?: string;
+	title?: string;
+	body?: string;
 }
 
 async function findExistingIssue(repo: string, fingerprint: string): Promise<ExistingIssueSearch> {
@@ -313,20 +335,23 @@ async function findExistingIssue(repo: string, fingerprint: string): Promise<Exi
 		"--limit",
 		"5",
 		"--json",
-		"url",
+		"url,title,body",
 	]);
 	if (!result.ok) throw new Error(`gh issue list failed: ${result.stderr.trim() || "unknown error"}`);
 	const parsed: unknown = JSON.parse(result.stdout);
 	if (!Array.isArray(parsed)) throw new Error("gh issue list returned a non-array JSON payload");
 	if (parsed.length === 0) return { kind: "none" };
 	if (parsed.length !== 1) throw new Error("gh issue list returned multiple marker candidates");
-	const url = (parsed[0] as { url?: unknown }).url;
+	const candidate = parsed[0] as { url?: unknown; title?: unknown; body?: unknown };
+	const url = candidate.url;
 	const expectedUrl = new RegExp(`^https://github\\.com/${repo.replace("/", "\\/")}/issues/[0-9]+$`);
 	if (typeof url !== "string" || !expectedUrl.test(url))
 		throw new Error("gh issue list returned a malformed or non-canonical issue URL");
+	if (typeof candidate.title !== "string" || typeof candidate.body !== "string")
+		throw new Error("gh issue list returned incomplete issue content");
 	// A marker in an arbitrary issue body is not provenance and cannot suppress
 	// a crash class without an explicit operator decision.
-	return { kind: "untrusted", url };
+	return { kind: "untrusted", url, title: candidate.title, body: candidate.body };
 }
 
 function issueTitle(row: TriageRow): string {
@@ -413,6 +438,9 @@ export interface ApprovalStore {
 	consume(manifest: ApprovalManifest): Promise<void>;
 	hasFiled(manifest: ApprovalManifest, url: string): Promise<boolean>;
 	recordFiled(manifest: ApprovalManifest, url: string): Promise<void>;
+	hasPending(manifest: ApprovalManifest): Promise<boolean>;
+	recordPending(manifest: ApprovalManifest): Promise<void>;
+	clearPending(manifest: ApprovalManifest): Promise<void>;
 }
 
 export interface ApprovalManifest {
@@ -427,6 +455,7 @@ export interface ApprovalManifest {
 interface StoredApprovals {
 	approvals: ApprovalManifest[];
 	filed: { manifest: ApprovalManifest; url: string }[];
+	pending: ApprovalManifest[];
 }
 
 function digest(parts: readonly string[]): string {
@@ -482,10 +511,19 @@ function isManifest(value: unknown): value is ApprovalManifest {
 }
 
 async function loadStoredApprovals(): Promise<StoredApprovals> {
+	const target = approvalStorePath();
+	const directory = path.dirname(target);
 	try {
-		const parsed: unknown = await Bun.file(approvalStorePath()).json();
-		if (typeof parsed !== "object" || parsed === null) return { approvals: [], filed: [] };
-		const record = parsed as { approvals?: unknown; filed?: unknown };
+		const directoryStat = await fs.lstat(directory);
+		const uid = process.getuid?.();
+		if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0 || (uid !== undefined && directoryStat.uid !== uid))
+			return { approvals: [], filed: [], pending: [] };
+		const fileStat = await fs.lstat(target);
+		if (!fileStat.isFile() || fileStat.isSymbolicLink() || (fileStat.mode & 0o077) !== 0 || (uid !== undefined && fileStat.uid !== uid))
+			return { approvals: [], filed: [], pending: [] };
+		const parsed: unknown = await Bun.file(target).json();
+		if (typeof parsed !== "object" || parsed === null) return { approvals: [], filed: [], pending: [] };
+		const record = parsed as { approvals?: unknown; filed?: unknown; pending?: unknown };
 		return {
 			approvals: Array.isArray(record.approvals) ? record.approvals.filter(isManifest) : [],
 			filed: Array.isArray(record.filed)
@@ -497,20 +535,33 @@ async function loadStoredApprovals(): Promise<StoredApprovals> {
 							typeof (value as { url?: unknown }).url === "string",
 					)
 				: [],
+			pending: Array.isArray(record.pending) ? record.pending.filter(isManifest) : [],
 		};
 	} catch {
-		return { approvals: [], filed: [] };
+		return { approvals: [], filed: [], pending: [] };
 	}
 }
 
 async function writeStoredApprovals(stored: StoredApprovals): Promise<void> {
 	const target = approvalStorePath();
-	await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-	await Bun.write(target, `${JSON.stringify(stored, null, "\t")}\n`);
-	await fs.chmod(target, 0o600);
+	const directory = path.dirname(target);
+	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	const directoryStat = await fs.lstat(directory);
+	const uid = process.getuid?.();
+	if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0 || (uid !== undefined && directoryStat.uid !== uid))
+		throw new Error("approval store directory is not a private directory owned by the current user");
+	const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		await fs.writeFile(temporary, `${JSON.stringify(stored, null, "\t")}\n`, { mode: 0o600, flag: "wx" });
+		await fs.rename(temporary, target);
+	} finally {
+		await fs.rm(temporary, { force: true }).catch(() => undefined);
+	}
 }
 
-async function withCreationLock<T>(action: () => Promise<T>): Promise<T> {
+let approvalStoreLockDepth = 0;
+
+async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 	const lockPath = `${approvalStorePath()}.create.lock`;
 	for (let attempt = 0; attempt < 200; attempt++) {
 		try {
@@ -526,6 +577,21 @@ async function withCreationLock<T>(action: () => Promise<T>): Promise<T> {
 		}
 	}
 	throw new Error("timed out waiting for the crash issue creation lock");
+}
+
+async function withCreationLock<T>(action: () => Promise<T>): Promise<T> {
+	return withApprovalStoreLock(async () => {
+		approvalStoreLockDepth++;
+		try {
+			return await action();
+		} finally {
+			approvalStoreLockDepth--;
+		}
+	});
+}
+
+async function withStoreMutation<T>(action: () => Promise<T>): Promise<T> {
+	return approvalStoreLockDepth > 0 ? action() : withApprovalStoreLock(action);
 }
 
 function issueUrlFromCreateOutput(output: string): string | undefined {
@@ -552,23 +618,47 @@ const fileApprovalStore: ApprovalStore = {
 		return (await loadStoredApprovals()).approvals;
 	},
 	async recordApprovals(manifests: readonly ApprovalManifest[]): Promise<void> {
-		const stored = await loadStoredApprovals();
-		stored.approvals = [...stored.approvals, ...manifests.filter(manifest => !stored.approvals.some(saved => sameManifest(saved, manifest)))];
-		await writeStoredApprovals(stored);
+		await withStoreMutation(async () => {
+			const stored = await loadStoredApprovals();
+			stored.approvals = [...stored.approvals, ...manifests.filter(manifest => !stored.approvals.some(saved => sameManifest(saved, manifest)))];
+			await writeStoredApprovals(stored);
+		});
 	},
 	async consume(manifest: ApprovalManifest): Promise<void> {
-		const stored = await loadStoredApprovals();
-		stored.approvals = stored.approvals.filter(saved => !sameManifest(saved, manifest));
-		await writeStoredApprovals(stored);
+		await withStoreMutation(async () => {
+			const stored = await loadStoredApprovals();
+			stored.approvals = stored.approvals.filter(saved => !sameManifest(saved, manifest));
+			await writeStoredApprovals(stored);
+		});
 	},
 	async hasFiled(manifest: ApprovalManifest, url: string): Promise<boolean> {
 		return (await loadStoredApprovals()).filed.some(entry => entry.url === url && sameManifest(entry.manifest, manifest));
 	},
 	async recordFiled(manifest: ApprovalManifest, url: string): Promise<void> {
-		const stored = await loadStoredApprovals();
-		if (!stored.filed.some(entry => entry.url === url && sameManifest(entry.manifest, manifest)))
-			stored.filed.push({ manifest, url });
-		await writeStoredApprovals(stored);
+		await withStoreMutation(async () => {
+			const stored = await loadStoredApprovals();
+			if (!stored.filed.some(entry => entry.url === url && sameManifest(entry.manifest, manifest)))
+				stored.filed.push({ manifest, url });
+			stored.pending = stored.pending.filter(saved => !sameManifest(saved, manifest));
+			await writeStoredApprovals(stored);
+		});
+	},
+	async hasPending(manifest: ApprovalManifest): Promise<boolean> {
+		return (await loadStoredApprovals()).pending.some(saved => sameManifest(saved, manifest));
+	},
+	async recordPending(manifest: ApprovalManifest): Promise<void> {
+		await withStoreMutation(async () => {
+			const stored = await loadStoredApprovals();
+			if (!stored.pending.some(saved => sameManifest(saved, manifest))) stored.pending.push(manifest);
+			await writeStoredApprovals(stored);
+		});
+	},
+	async clearPending(manifest: ApprovalManifest): Promise<void> {
+		await withStoreMutation(async () => {
+			const stored = await loadStoredApprovals();
+			stored.pending = stored.pending.filter(saved => !sameManifest(saved, manifest));
+			await writeStoredApprovals(stored);
+		});
 	},
 };
 
@@ -627,6 +717,12 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		dependencies.writeStderr("Sentry returned an unexpected issue list shape.\n");
 		return 1;
 	}
+	if (raw.length === options.limit && options.limit === MAX_LIMIT) {
+		dependencies.writeStderr(
+			`Sentry returned the maximum ${MAX_LIMIT} rows; refusing to continue because the unresolved issue set may be truncated. Narrow the upstream query before approving a batch.\n`,
+		);
+		return 1;
+	}
 
 	const candidates: TriageRow[] = [];
 	let skippedNoFingerprint = 0;
@@ -670,6 +766,7 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 	const approvals = await dependencies.approvals.loadApprovals();
 	const manifests = new Map(rows.map(row => [row, approvalManifest(row, options)]));
 	const untrustedBodyMarkers: TriageRow[] = [];
+	const recoverableExisting = new Set<TriageRow>();
 	let already = 0;
 	for (const row of rows) {
 		let existing: ExistingIssueSearch;
@@ -685,6 +782,14 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 			row.existingIssueUrl = existing.url;
 			const manifest = manifests.get(row);
 			if (manifest && existing.url && (await dependencies.approvals.hasFiled(manifest, existing.url))) already++;
+			else if (
+				manifest &&
+				existing.url &&
+				(await dependencies.approvals.hasPending(manifest)) &&
+				existing.title === issueTitle(row) &&
+				existing.body === issueBody(row, options)
+			)
+				recoverableExisting.add(row);
 			else untrustedBodyMarkers.push(row);
 		}
 	}
@@ -768,12 +873,15 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 	}
 
 	if (!options.apply) {
-		for (const row of pending)
+		for (const row of pending) {
+			const body = issueBody(row, options);
 			dependencies.writeStdout(
 				`would file  ${row.fingerprint}  ${row.sentry.count}x  ${issueTitle(row)}\n` +
 					`    culprit: ${previewCulprit(row.sentry.culprit)}\n` +
-					`    ${row.sentry.permalink}\n`,
+					`    ${row.sentry.permalink}\n` +
+					`    exact rendered issue body:\n${body}\n`,
 			);
+		}
 		dependencies.writeStdout(
 			`\nDry run. Review the ${pending.length} issue(s) above, then record them with ` +
 				`--approve ${batchDigest(pending.map(row => manifests.get(row)).filter((manifest): manifest is ApprovalManifest => manifest !== undefined))} and file with --apply.\n`,
@@ -782,9 +890,13 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 	}
 
 	// --apply files only the approved subset; unapproved rows stay withheld.
-	const fileable = pending.filter(row => {
+	const fileable = rows.filter(row => {
 		const manifest = manifests.get(row);
-		return manifest && approvals.some(approval => sameManifest(approval, manifest));
+		return (
+			manifest &&
+			approvals.some(approval => sameManifest(approval, manifest)) &&
+			(row.existingIssueUrl === undefined || recoverableExisting.has(row))
+		);
 	});
 	if (fileable.length === 0) {
 		dependencies.writeStdout(
@@ -804,7 +916,19 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 				const existing = await dependencies.findExistingIssue(options.repo, row.fingerprint);
 				if (existing.kind === "untrusted" && existing.url && (await dependencies.approvals.hasFiled(manifest, existing.url)))
 					return undefined;
-				if (existing.kind === "untrusted") throw new Error(`untrusted marker at ${existing.url ?? "unknown URL"}`);
+				if (existing.kind === "untrusted") {
+					if (
+						recoverableExisting.has(row) &&
+						existing.url &&
+						existing.title === issueTitle(row) &&
+						existing.body === issueBody(row, options)
+					) {
+						await dependencies.approvals.recordFiled(manifest, existing.url);
+						return undefined;
+					}
+					throw new Error(`untrusted marker at ${existing.url ?? "unknown URL"}`);
+				}
+				await dependencies.approvals.recordPending(manifest);
 				const created = await dependencies.gh([
 					"issue",
 					"create",
@@ -824,7 +948,6 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 			});
 		} catch (error) {
 			failed++;
-			await dependencies.approvals.consume(manifest);
 			dependencies.writeStderr(`failed ${row.fingerprint}: ${error instanceof Error ? error.message : String(error)}\n`);
 			continue;
 		}
@@ -840,7 +963,7 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 			continue;
 		}
 		failed++;
-		await dependencies.approvals.consume(manifest);
+		await dependencies.approvals.clearPending(manifest);
 		dependencies.writeStderr(`failed ${row.fingerprint}: ${result.stderr.trim() || "unknown error"}\n`);
 	}
 	dependencies.writeStdout(`\ncreated ${created}, failed ${failed}\n`);
