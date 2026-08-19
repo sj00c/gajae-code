@@ -193,12 +193,18 @@ function setupNodeStepViolations(relativePath: string, job: WorkflowJob): Baseli
 		}
 
 		const nodeVersion = setupNodeVersion(stepLines, stepIndent);
-		if (nodeVersion === "24") continue;
+		// Repository policy: release-capable jobs pin the Node 24 line. The bare
+		// "24" pin satisfies the baseline; an intentionally pinned exact
+		// 24.<minor>.<patch> is also accepted for credential-bearing release
+		// jobs (e.g. the OIDC publish job), where a floating bootstrap runtime
+		// inside the id-token boundary is a security regression, not hygiene.
+		// Ranges, other majors, and omitted versions stay violations.
+		if (nodeVersion === "24" || /^24\.\d+\.\d+$/u.test(nodeVersion ?? "")) continue;
 
 		violations.push({
 			path: relativePath,
 			line: job.startLine + index,
-			message: `Release-capable job '${job.name}' uses actions/setup-node but does not pin node-version: "24".`,
+			message: `Release-capable job '${job.name}' uses actions/setup-node but does not pin node-version: "24" (or an exact 24.x.y patch for credential-bearing jobs).`,
 			snippet: line.trim(),
 		});
 	}

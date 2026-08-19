@@ -208,6 +208,44 @@ jobs:
 		expect(violations).toEqual([]);
 	});
 
+	test("accepts an intentionally pinned exact Node 24 patch for credential-bearing release jobs", async () => {
+		const root = await createRepo({
+			".github/workflows/ci.yml": `name: CI
+jobs:
+  publish:
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.19.0"
+      - run: bun run ci:release:publish
+`,
+		});
+
+		const violations = await checkNode20Baseline(root);
+
+		expect(violations).toEqual([]);
+	});
+
+	test("still rejects floating ranges and non-exact Node pins on release jobs", async () => {
+		for (const version of ["24.x", "24.19", "^24.19.0", "~24.19.0", "25.0.0", "20"]) {
+			const root = await createRepo({
+				".github/workflows/ci.yml": `name: CI
+jobs:
+  publish:
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "${version}"
+      - run: bun run ci:release:publish
+`,
+			});
+
+			const violations = await checkNode20Baseline(root);
+
+			expect(violations, `node-version "${version}" must stay a violation`).not.toEqual([]);
+		}
+	});
+
 	test("allows released changelog history and historical fixtures", async () => {
 		const root = await createRepo({
 			"packages/ai/CHANGELOG.md": `# Changelog

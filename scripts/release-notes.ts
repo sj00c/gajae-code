@@ -45,6 +45,8 @@ export interface ReleaseCommit {
 	author: string;
 	/** Resolved GitHub login for the author, when the API provides one. */
 	githubLogin?: string;
+	/** Cherry-pick origin OID when this commit was cherry-picked; else undefined. */
+	originSha?: string;
 }
 
 export interface CandidatePullRequest {
@@ -53,6 +55,8 @@ export interface CandidatePullRequest {
 	author: string;
 	/** Subjects of every commit the pull request contains. */
 	commitSubjects: readonly string[];
+	/** OIDs of every commit the pull request contains (coverage is by identity). */
+	commitOids: readonly string[];
 }
 
 export type Attribution =
@@ -82,14 +86,19 @@ export function parseSubjectPullRequestRef(subject: string): number | undefined 
 	return match ? Number(match[1]) : undefined;
 }
 
-/** Share of `pullRequest`'s commits present in `shippedSubjects`. */
-export function shippedCoverage(pullRequest: CandidatePullRequest, shippedSubjects: ReadonlySet<string>): number {
-	if (pullRequest.commitSubjects.length === 0) return 0;
+/**
+ * Share of `pullRequest`'s commits this release ships, compared by commit
+ * OID (cherry-pick origins included). Subject text cannot be used here:
+ * duplicate subjects would count one shipped commit multiple times and push
+ * a partially shipped candidate over the credit threshold.
+ */
+export function shippedCoverage(pullRequest: CandidatePullRequest, shippedOids: ReadonlySet<string>): number {
+	if (pullRequest.commitOids.length === 0) return 0;
 	let shipped = 0;
-	for (const subject of pullRequest.commitSubjects) {
-		if (shippedSubjects.has(normalizeSubject(subject))) shipped++;
+	for (const oid of pullRequest.commitOids) {
+		if (shippedOids.has(oid)) shipped++;
 	}
-	return shipped / pullRequest.commitSubjects.length;
+	return shipped / pullRequest.commitOids.length;
 }
 
 /**
@@ -101,6 +110,7 @@ export function attributeCommit(
 	commit: ReleaseCommit,
 	input: Pick<ReleaseNotesInput, "candidatesBySha" | "pullRequestsByNumber">,
 	shippedSubjects: ReadonlySet<string>,
+	shippedOids: ReadonlySet<string>,
 ): Attribution {
 	const referenced = parseSubjectPullRequestRef(commit.subject);
 	if (referenced !== undefined) {
@@ -111,7 +121,7 @@ export function attributeCommit(
 	const normalized = normalizeSubject(commit.subject);
 	const accepted = (input.candidatesBySha.get(commit.sha) ?? [])
 		.filter(candidate => candidate.commitSubjects.some(subject => normalizeSubject(subject) === normalized))
-		.filter(candidate => shippedCoverage(candidate, shippedSubjects) >= SHIPPED_COVERAGE_THRESHOLD)
+		.filter(candidate => shippedCoverage(candidate, shippedOids) >= SHIPPED_COVERAGE_THRESHOLD)
 		.sort((left, right) => left.commitSubjects.length - right.commitSubjects.length || left.number - right.number);
 
 	const smallest = accepted[0];
@@ -121,11 +131,12 @@ export function attributeCommit(
 export function buildReleaseNotes(input: ReleaseNotesInput): string {
 	const repoUrl = `https://github.com/${input.repo}`;
 	const shippedSubjects = new Set(input.commits.map(commit => normalizeSubject(commit.subject)));
+	const shippedOids = new Set(input.commits.map(commit => commit.originSha ?? commit.sha));
 
 	const lines: string[] = [];
 	const credited = new Set<number>();
 	for (const commit of input.commits) {
-		const attribution = attributeCommit(commit, input, shippedSubjects);
+		const attribution = attributeCommit(commit, input, shippedSubjects, shippedOids);
 		if (attribution.kind === "pull-request") {
 			const { number, title, author } = attribution.pullRequest;
 			if (credited.has(number)) continue;
@@ -209,7 +220,8 @@ async function collectCommits(baseTag: string, head: string): Promise<ReleaseCom
 		if (sha === undefined || subject === undefined || author === undefined) continue;
 		// The release script's own version bump is machinery, not a change.
 		if (BUMP_SUBJECT.test(subject)) continue;
-		commits.push({ sha, subject, author });
+		const originSha = await cherryPickOrigin(sha);
+		commits.push({ sha, subject, author, ...(originSha === sha ? {} : { originSha }) });
 	}
 	return commits;
 }
@@ -226,13 +238,14 @@ async function loadPullRequest(repo: string, number: number): Promise<CandidateP
 		number: number;
 		title: string;
 		author: { login: string };
-		commits: { messageHeadline: string }[];
+		commits: { messageHeadline: string; oid: string }[];
 	};
 	return {
 		number: parsed.number,
 		title: parsed.title,
 		author: parsed.author.login,
 		commitSubjects: parsed.commits.map(commit => commit.messageHeadline),
+		commitOids: parsed.commits.map(commit => commit.oid),
 	};
 }
 
@@ -278,9 +291,10 @@ export async function deriveReleaseNotes(repo: string, baseTag: string, head: st
 
 	for (const commit of commits) {
 		const referenced = parseSubjectPullRequestRef(commit.subject);
+
 		if (referenced !== undefined && (await ensure(referenced))) continue;
 		const candidates: CandidatePullRequest[] = [];
-		for (const number of await candidateNumbers(repo, await cherryPickOrigin(commit.sha))) {
+		for (const number of await candidateNumbers(repo, commit.originSha ?? commit.sha)) {
 			const loaded = await ensure(number);
 			if (loaded) candidates.push(loaded);
 		}
@@ -288,13 +302,14 @@ export async function deriveReleaseNotes(repo: string, baseTag: string, head: st
 	}
 
 	const shippedSubjects = new Set(commits.map(commit => normalizeSubject(commit.subject)));
+	const shippedOids = new Set(commits.map(commit => commit.originSha ?? commit.sha));
 	const firstMergedPullRequestByAuthor = new Map<string, number>();
 	for (const commit of commits) {
-		const attribution = attributeCommit(commit, { candidatesBySha, pullRequestsByNumber }, shippedSubjects);
+		const attribution = attributeCommit(commit, { candidatesBySha, pullRequestsByNumber }, shippedSubjects, shippedOids);
 		if (attribution.kind !== "pull-request") {
 			// Fallback commits credit by login only when one is resolved;
 			// otherwise the Git display name is rendered without `@`.
-			commit.githubLogin = await resolveCommitLogin(repo, await cherryPickOrigin(commit.sha));
+			commit.githubLogin = await resolveCommitLogin(repo, commit.originSha ?? commit.sha);
 			continue;
 		}
 		const { author } = attribution.pullRequest;

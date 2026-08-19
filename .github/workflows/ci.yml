@@ -611,10 +611,25 @@ jobs:
 
    publish:
       # Minimal credential boundary: the only job holding contents: write and
-      # the OIDC identity token. All preparation (dependency installs behind
-      # native builds, repository scripts, GitHub API reads, notes derivation)
-      # happened in release_prepare; this job consumes its integrity-checked
-      # artifacts and performs only the irreversible steps.
+      # the OIDC identity token. All untrusted work (dependency installs,
+      # native builds, GitHub API reads, notes derivation) happened in
+      # release_prepare; this job consumes integrity-checked artifacts and
+      # performs only the irreversible steps. It deliberately runs NO
+      # repository-controlled installation, dependency cache, or package
+      # lifecycle scripts. The publish script and its
+      # release-evidence helper import only node/bun builtins, so a bare
+      # checkout of the tagged (trusted, main-ancestry-gated) revision
+      # suffices.
+      #
+      # The OIDC subject stays ref-scoped (repo:...:ref:refs/tags/v*) — the
+      # identity the npm trusted-publisher registrations and the shipped
+      # v0.14.1 exchange already prove. Owner-controlled release
+      # prerequisites that cannot be set from this repository (documented
+      # blocker, verified absent at review time): a ruleset protecting
+      # `main`, and a tag ruleset for `refs/tags/v*` restricting creation to
+      #      maintainers. Do NOT scope this job to a GitHub environment
+      #      without first re-registering every published package's trusted
+      #      publisher for the environment-scoped OIDC subject.
       if: ${{ needs.release_prepare.result == 'success' }}
       needs: [release_prepare, release_metadata]
       timeout-minutes: 45
@@ -625,19 +640,11 @@ jobs:
          # GitHub OIDC token for a short-lived registry credential, so no
          # long-lived NPM_TOKEN is involved and nothing expires under us.
          id-token: write
-      # Owner-controlled trust boundary (workflow half): this job only runs
-      # under the npm-release environment, whose protection rules live in the
-      # repository settings and are NOT evaluated from the tagged revision.
-      # To close the tag-creation bypass the owner must configure:
-      #   1. a ruleset protecting `main` (require pull request + checks),
-      #   2. a tag ruleset for `refs/tags/v*` restricting creation to
-      #      maintainers,
-      #   3. environment `npm-release` with required reviewers and deployment
-      #      refs restricted to protected branches plus the v* tag pattern.
-      # Until those exist this environment reference is only a gate hook.
-      environment: npm-release
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+           with:
+              # The publish boundary never persists the workflow token.
+              persist-credentials: false
          - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
               # Exact patch pin: this job holds the OIDC identity token, so the
@@ -664,12 +671,6 @@ jobs:
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3.14"
-         - name: Cache bun dependencies
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
-           with:
-              path: ~/.bun/install/cache
-              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - run: bun install --frozen-lockfile
          - name: Download pre-publication package evidence
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:

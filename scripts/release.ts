@@ -457,9 +457,10 @@ export type AtomicPushFailureDisposition =
 	// The remote accepted the atomic transaction even though the push command
 	// reported failure; the run must continue as a success, never roll back.
 	| { kind: "committed"; note: string }
-	// Both remote refs provably still hold their pre-push values: local rollback is safe.
-	| { kind: "rollback"; note: string }
-	// Partial move or unreachable remote: preserve all local state for the operator.
+	// Anything else — baseline-equal snapshots included — is ambiguous: refs
+	// could have moved and been restored before the re-query, and a transient
+	// tag may already have started the release workflow. Local state is always
+	// preserved; an operator reconciles with durable server evidence.
 	| { kind: "preserve"; note: string };
 
 export interface AtomicPushReconciliation {
@@ -475,7 +476,7 @@ export function reconcileAtomicPushFailure(tag: string, input: AtomicPushReconci
 	if (!input.remoteReachable) {
 		return {
 			kind: "preserve",
-			note: `The push failed AND the remote could not be re-queried, so whether the transaction committed is unknown. Local tag ${tag} and the release commit ${input.sourceCommit} are preserved untouched. Once origin is reachable, run \`git ls-remote origin refs/heads/main refs/tags/${tag} 'refs/tags/${tag}^{}'\`: if both refs resolve to ${input.sourceCommit} the release committed (rerun the script's verification, do NOT roll back); if main is still ${input.prePushMain} and no ${tag} exists, nothing shipped and the local state may be rolled back with the guarded commands from a rerun.`,
+			note: `The push failed AND the remote could not be re-queried, so whether the transaction committed is unknown. Local tag ${tag} and the release commit ${input.sourceCommit} are preserved untouched. Once origin is reachable, run \`git ls-remote origin refs/heads/main refs/tags/${tag} 'refs/tags/${tag}^{}'\`: if both refs resolve to ${input.sourceCommit} the release committed (rerun the script's verification, do NOT roll back); otherwise reconcile by hand with the guarded commands below.`,
 		};
 	}
 	if (input.postPushMain === input.sourceCommit && input.postPushTag === input.sourceCommit) {
@@ -486,8 +487,8 @@ export function reconcileAtomicPushFailure(tag: string, input: AtomicPushReconci
 	}
 	if (input.postPushMain === input.prePushMain && input.postPushTag === input.prePushTag) {
 		return {
-			kind: "rollback",
-			note: `Neither remote ref moved (main is still ${input.prePushMain}, ${tag} still ${input.prePushTag === "" ? "absent" : input.prePushTag}), so the transaction published nothing and local rollback is safe.`,
+			kind: "preserve",
+			note: `The remote currently reads as the pre-push baseline (main ${input.prePushMain}, ${tag} ${input.prePushTag === "" ? "absent" : input.prePushTag}), but a client-observed failed push does not PROVE rejection: GitHub may have committed the transaction and the refs could have been restored before this re-query, with the tag event already running. Local tag ${tag} and release commit ${input.sourceCommit} are preserved untouched. Before any rollback or retry, verify durably: no tag workflow run exists for ${tag}, and origin never carried ${input.sourceCommit}. Only then run the guarded rollback commands below; they are idempotent and safe to re-run.`,
 		};
 	}
 	return {
@@ -544,26 +545,17 @@ export async function pushReleaseRefsAtomically(version: string): Promise<void> 
 			// Fall through to the normal verification below, which re-proves the
 			// remote state strictly.
 			console.log(disposition.note);
-		} else if (disposition.kind === "rollback") {
-			// Proven nothing shipped: undo the complete local release state so a
-			// same-version retry re-runs the original transaction from a clean
-			// tree (the release flow asserts a clean tree before preparing, so
-			// resetting loses nothing outside this attempt).
-			const tagRollback = await git(["tag", "--delete", tag]).quiet().nothrow();
-			const commitRollback = await git(["reset", "--hard", rollbackPlan.preReleaseCommit]).quiet().nothrow();
-			const residual = localRollbackCommands(tag, sourceCommit, rollbackPlan.preReleaseCommit, {
-				tagPresent: tagRollback.exitCode !== 0,
-				onReleaseCommit: commitRollback.exitCode !== 0,
-			});
-			const rollbackNote = residual.length === 0
-				? `Local tag ${tag} and the release commit were rolled back to ${rollbackPlan.preReleaseCommit}; this version can be retried once the push cause is resolved.`
-				: `Local rollback is partially applied; finish it with these idempotent commands (safe to re-run): ${residual.join(" ; ")}`;
-			throw new Error(
-				`Atomic push of main and ${tag} was rejected; neither ref may be retried independently: ${outputOf(push) || `exit ${push.exitCode ?? "unknown"}`}. ${disposition.note} ${rollbackNote}`,
-			);
 		} else {
+			// Preserve the complete local release state on every ambiguous
+			// outcome. The guarded commands describe the rollback an operator
+			// may run only after durably proving nothing shipped; each is
+			// idempotent and safe to re-run in any order.
+			const guarded = localRollbackCommands(tag, sourceCommit, rollbackPlan.preReleaseCommit, {
+				tagPresent: true,
+				onReleaseCommit: true,
+			});
 			throw new Error(
-				`Atomic push of main and ${tag} failed with an ambiguous remote outcome: ${outputOf(push) || `exit ${push.exitCode ?? "unknown"}`}. ${disposition.note}`,
+				`Atomic push of main and ${tag} failed with an ambiguous remote outcome: ${outputOf(push) || `exit ${push.exitCode ?? "unknown"}`}. ${disposition.note} Guarded local rollback commands (only after durable proof nothing shipped): ${guarded.join(" ; ")}`,
 			);
 		}
 	}

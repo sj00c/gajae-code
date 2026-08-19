@@ -151,7 +151,7 @@ describe("stable release policy", () => {
 		expect(notes).toContain(': > "$notes"');
 	});
 
-	test("gates stable tag releases on protected-main provenance and the approval environment", async () => {
+	test("gates stable tag releases on protected-main provenance with a ref-scoped OIDC subject", async () => {
 		const ci = await workflow();
 		const metadata = jobSection(ci, "release_metadata");
 		const publish = jobSection(ci, "publish");
@@ -163,9 +163,26 @@ describe("stable release policy", () => {
 		expect(metadata).toContain('git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main');
 		expect(publish).toContain("needs: [release_prepare, release_metadata]");
 
-		// The publish job is wired to the owner-protected approval environment;
-		// its protection rules are repository settings, not tag-resolved YAML.
-		expect(publish).toContain("environment: npm-release");
+		// The OIDC subject must stay ref-scoped: an `environment:` would change
+		// the token subject away from the identity the npm trusted-publisher
+		// registrations (and the shipped v0.14.1 exchange) already prove. Owner
+		// prerequisites (main ruleset, v* tag-creation ruleset) are documented
+		// on the job instead.
+		expect(publish).not.toContain("environment:");
+	});
+
+	test("runs no repository-controlled installation inside the credential-bearing publish job", async () => {
+		const ci = await workflow();
+		const publish = jobSection(ci, "publish");
+
+		// No dependency installation, cache, or package lifecycle scripts may
+		// execute where contents: write and id-token: write are both live; the
+		// checkout must not persist the workflow token either.
+		expect(publish).toContain("persist-credentials: false");
+		expect(publish).not.toContain("bun install");
+		expect(publish).not.toContain("actions/cache@");
+		expect(publish).not.toContain("npm ci");
+		expect(publish).not.toContain("node_modules");
 	});
 
 	test("pins the OIDC-capable Node bootstrap to an exact patch", async () => {

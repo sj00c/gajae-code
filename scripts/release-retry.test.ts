@@ -65,7 +65,7 @@ describe("atomic push rollback plan", () => {
 });
 
 describe("rejected atomic push recovery", () => {
-	test("rolls back the complete local release state so the same version can be retried", async () => {
+	test("preserves the complete local release state with idempotent guidance on rejection", async () => {
 		const { origin, work, preReleaseCommit } = await releaseFixture();
 
 		// A concurrent main update makes the atomic push reject.
@@ -77,14 +77,21 @@ describe("rejected atomic push recovery", () => {
 		await git(other, ["push", "origin", "HEAD:refs/heads/main"]);
 
 		process.chdir(work);
-		await expect(pushReleaseRefsAtomically("9.9.9")).rejects.toThrow(/rolled back/u);
+		const failure = await pushReleaseRefsAtomically("9.9.9").then(
+			() => { throw new Error("expected the ambiguous push to throw"); },
+			(error: unknown) => String(error),
+		);
+		// Guidance carries the guarded, per-artifact rollback commands.
+		expect(failure).toContain("ambiguous remote outcome");
+		expect(failure).toContain("git show-ref --verify --quiet refs/tags/v9.9.9 && git tag --delete v9.9.9");
+		expect(failure).toContain(`git reset --hard ${preReleaseCommit}`);
 
-		// Full rollback: the tag is gone and HEAD plus the tree are exactly the
-		// pre-release state, so retrying re-runs the original transaction.
+		// Nothing was rolled back: the tag and the release commit are intact,
+		// and the tree is clean, so the operator can reconcile by hand.
 		const head = (await git(work, ["rev-parse", "HEAD"])).trim();
-		expect(head).toBe(preReleaseCommit);
+		expect(head).not.toBe(preReleaseCommit);
 		const tagCheck = await $`git show-ref --verify --quiet refs/tags/v9.9.9`.cwd(work).quiet().nothrow();
-		expect(tagCheck.exitCode).not.toBe(0);
+		expect(tagCheck.exitCode).toBe(0);
 		const status = (await git(work, ["status", "--porcelain"])).trim();
 		expect(status).toBe("");
 		// Nothing reached origin.
@@ -124,7 +131,10 @@ describe("ambiguous atomic push failure reconciliation", () => {
 		expect(disposition.note).toContain("no local state was rolled back");
 	});
 
-	test("rollback is allowed only after proving neither remote ref moved", () => {
+	test("baseline-equal snapshots are ambiguous and preserve local state (accepted-then-restored regression)", () => {
+		// The refs may have committed and been restored before the re-query; a
+		// snapshot match is not durable proof of rejection, so nothing is rolled
+		// back automatically.
 		const disposition = reconcileAtomicPushFailure("v9.9.9", {
 			sourceCommit,
 			prePushMain: preMain,
@@ -133,7 +143,9 @@ describe("ambiguous atomic push failure reconciliation", () => {
 			postPushMain: preMain,
 			postPushTag: "",
 		});
-		expect(disposition.kind).toBe("rollback");
+		expect(disposition.kind).toBe("preserve");
+		expect(disposition.note).toContain("does not PROVE rejection");
+		expect(disposition.note).toContain("preserved untouched");
 	});
 
 	test("a partially moved remote preserves all local state", () => {

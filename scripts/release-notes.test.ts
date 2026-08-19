@@ -23,8 +23,15 @@ function pullRequest(
 	title: string,
 	commitSubjects: readonly string[],
 	author = "Yeachan-Heo",
+	commitOids?: readonly string[],
 ): CandidatePullRequest {
-	return { number, title, author, commitSubjects };
+	return {
+		number,
+		title,
+		author,
+		commitSubjects,
+		commitOids: commitOids ?? commitSubjects.map((_, index) => `${number}-oid-${index}`),
+	};
 }
 
 function notes(input: {
@@ -65,9 +72,9 @@ describe("subject parsing", () => {
 describe("shipped coverage", () => {
 	test("measures the share of a pull request the release carries", () => {
 		const pr = pullRequest(4607, "feat(provider): add oMLX profiles", ["a", "b", "c", "d"]);
-		expect(shippedCoverage(pr, new Set(["a", "b", "c", "d"]))).toBe(1);
-		expect(shippedCoverage(pr, new Set(["a", "b"]))).toBe(0.5);
-		expect(shippedCoverage(pr, new Set(["a"]))).toBe(0.25);
+		expect(shippedCoverage(pr, new Set(["4607-oid-0", "4607-oid-1", "4607-oid-2", "4607-oid-3"]))).toBe(1);
+		expect(shippedCoverage(pr, new Set(["4607-oid-0", "4607-oid-1"]))).toBe(0.5);
+		expect(shippedCoverage(pr, new Set(["4607-oid-0"]))).toBe(0.25);
 	});
 
 	test("treats a pull request with no commits as unshipped instead of dividing by zero", () => {
@@ -85,6 +92,7 @@ describe("attribution", () => {
 			commit("aaa", subject),
 			{ candidatesBySha: new Map([["aaa", [contained]]]), pullRequestsByNumber: new Map([[4666, referenced]]) },
 			new Set([normalizeSubject(subject)]),
+			new Set(["aaa"]),
 		);
 
 		expect(attribution).toEqual({ kind: "pull-request", pullRequest: referenced });
@@ -104,6 +112,7 @@ describe("attribution", () => {
 			shipped,
 			{ candidatesBySha: new Map([["bbb", [swap]]]), pullRequestsByNumber: new Map() },
 			new Set([shipped.subject]),
+			new Set(["bbb"]),
 		);
 
 		expect(attribution).toEqual({ kind: "commit", commit: shipped });
@@ -118,6 +127,7 @@ describe("attribution", () => {
 			commit("ccc", subject),
 			{ candidatesBySha: new Map([["ccc", [promotion, owner]]]), pullRequestsByNumber: new Map() },
 			new Set([subject, "second"]),
+			new Set(["4676-oid-0", "4676-oid-1", "4607-oid-0"]),
 		);
 
 		expect(attribution).toEqual({ kind: "pull-request", pullRequest: owner });
@@ -132,6 +142,7 @@ describe("attribution", () => {
 				orphan,
 				{ candidatesBySha: new Map([["ddd", [unrelated]]]), pullRequestsByNumber: new Map() },
 				new Set([orphan.subject, "something else"]),
+				new Set(["ddd", "4000-oid-0"]),
 			),
 		).toEqual({ kind: "commit", commit: orphan });
 	});
@@ -139,14 +150,30 @@ describe("attribution", () => {
 	test("coverage exactly at the threshold is accepted", () => {
 		const subject = "fix(a): half";
 		const half = pullRequest(10, "half shipped", [subject, "unshipped"]);
-		expect(shippedCoverage(half, new Set([subject]))).toBe(SHIPPED_COVERAGE_THRESHOLD);
+		expect(shippedCoverage(half, new Set(["10-oid-0"]))).toBe(SHIPPED_COVERAGE_THRESHOLD);
 		expect(
 			attributeCommit(
 				commit("eee", subject),
 				{ candidatesBySha: new Map([["eee", [half]]]), pullRequestsByNumber: new Map() },
 				new Set([subject]),
+				new Set(["eee", "10-oid-0"]),
 			),
 		).toEqual({ kind: "pull-request", pullRequest: half });
+	});
+
+	test("duplicate subjects cannot inflate coverage: only the actually shipped OID counts", () => {
+		// Regression: subject-based coverage counted the duplicated subject
+		// twice (2/4 = 0.5) although only one of the four commits shipped.
+		const partial = pullRequest(11, "partially shipped", ["dup", "dup", "c", "d"], "Yeachan-Heo", ["o1", "o2", "o3", "o4"]);
+		const shipped = commit("fff111", "dup");
+		expect(shippedCoverage(partial, new Set(["fff111", "o1"]))).toBe(0.25);
+		const attribution = attributeCommit(
+			shipped,
+			{ candidatesBySha: new Map([["fff111", [partial]]]), pullRequestsByNumber: new Map() },
+			new Set(["dup"]),
+			new Set(["fff111", "o1"]),
+		);
+		expect(attribution).toEqual({ kind: "commit", commit: shipped });
 	});
 });
 
