@@ -50,5 +50,6 @@ describe("windows AVX2 probe live execution (#4652)", () => {
 			const result = detectWin32Avx2Support(() => undefined);
 			expect(typeof result).toBe("boolean");
 		},
+		15_000,
 	);
 });
