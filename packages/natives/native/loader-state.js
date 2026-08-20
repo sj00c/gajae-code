@@ -534,7 +534,10 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 		const source = safeFileSnapshot(sourcePath);
 		try {
 			const existing = safeFileSnapshot(refreshPath);
-			if (existing.hash === source.hash) return refreshPath;
+			if (existing.hash === source.hash) {
+				recordStagedSnapshot(ctx, refreshPath, existing);
+				return refreshPath;
+			}
 			throw new Error("refresh destination contains different bytes");
 		} catch (error) {
 			if (error?.code !== "ENOENT" && error?.message !== "ENOENT") throw error;

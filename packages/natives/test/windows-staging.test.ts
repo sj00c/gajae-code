@@ -21,6 +21,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -291,6 +292,57 @@ describe("windows native addon staging", () => {
 			expect(second.attempted[0]).not.toBe(first.attempted[0]);
 			expect(second.attempted[0]).not.toBe(sourcePath);
 			expect(await fs.readFile(second.attempted[0], "utf8")).toBe("newer-addon");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a warm refresh replaced after staging and before require", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-warm-race-"));
+		const nativeDir = path.join(root, "native");
+		const versionedDir = path.join(root, "versioned");
+		const filename = "pi_natives.win32-x64.node";
+		const sourcePath = path.join(nativeDir, filename);
+		const stagedPath = path.join(versionedDir, filename);
+		const refreshPath = path.join(
+			versionedDir,
+			`.refresh-${createHash("sha256").update("new-addon").digest("hex").slice(0, 24)}-${filename}`,
+		);
+		await fs.mkdir(nativeDir, { recursive: true });
+		await fs.mkdir(versionedDir, { recursive: true });
+		await fs.writeFile(sourcePath, "new-addon");
+		await fs.writeFile(stagedPath, "old-addon");
+		await fs.writeFile(refreshPath, "new-addon");
+		try {
+			const attempted: string[] = [];
+			expect(() =>
+				loadNative({
+					context: {
+						isCompiledBinary: false,
+						stageFromNodeModules: true,
+						platformTag: "win32-x64",
+						packageVersion: "test",
+						selectedVariant: "baseline",
+						versionedDir,
+						nativeDir,
+						optionalPackageNativeDirs: [],
+						addonFilenames: [filename],
+						candidates: [refreshPath, stagedPath, sourcePath],
+					},
+					extractEmbeddedAddons: () => [],
+					stageNodeModulesAddon: (ctx, stageErrors) => {
+						const selected = maybeStageNodeModulesAddon(ctx, stageErrors);
+						if (selected) fsSync.writeFileSync(selected, "tampered-addon");
+						return selected;
+					},
+					requireCandidate: candidate => {
+						attempted.push(candidate);
+						return { selected: candidate };
+					},
+					validateCandidate: () => undefined,
+				}),
+			).toThrow("staged addon changed before load");
+			expect(attempted).toEqual([]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

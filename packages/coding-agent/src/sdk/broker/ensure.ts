@@ -464,8 +464,8 @@ async function retireStaleBroker(
 function matchesExpectedPackageGeneration(
 	discovery: BrokerDiscovery,
 	expectedPackageGeneration: string | undefined,
-	expectedPackageVersion?: string,
-	expectedInstallationIdentity?: string,
+	expectedPackageVersion: string | undefined,
+	expectedInstallationIdentity: string | undefined,
 ): boolean {
 	return (
 		expectedPackageGeneration === undefined ||
