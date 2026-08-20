@@ -130,6 +130,45 @@ test("a late agent failure never overwrites the reason an already terminal recor
 	expect(reconciliation.lookup("prompt", { clientRef: "first-reason-ref" })).toEqual(claimed);
 });
 
+test("durable reload keeps agent_end terminal across a paused successor transition", async () => {
+	let records: unknown[] = [];
+	let pauseWrites = 0;
+	const writeStarted = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+	const releaseWrite = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+	const store = {
+		path: null,
+		load: async () => records,
+		transact: async (mutator: (current: never[]) => never[]) => {
+			const candidate = mutator(records as never);
+			if (pauseWrites > 0) {
+				const index = 2 - pauseWrites;
+				pauseWrites -= 1;
+				writeStarted[index]?.resolve();
+				await releaseWrite[index]?.promise;
+			}
+			records = candidate;
+		},
+	} as never;
+	const reconciliation = createInvocationReconciliation({ store });
+	const correlation = { commandId: "durable-race-command", turnId: "durable-race-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "durable-race-ref");
+	pauseWrites = 2;
+	const terminal = reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+	await writeStarted[0]!.promise;
+	// A successor lifecycle event arrives while the terminal write is held. It
+	// must observe the staged terminal record and never resurrect in_flight state.
+	await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
+	releaseWrite[0]!.resolve();
+	releaseWrite[1]!.resolve();
+	await terminal;
+	const reloaded = createInvocationReconciliation({ store });
+	await reloaded.hydrate();
+	expect(reloaded.lookup("prompt", { clientRef: "durable-race-ref" })).toMatchObject({
+		status: "terminal_ok",
+		terminalAt: expect.any(Number),
+	});
+});
+
 test("a reason attached after a prompt settled is never replaced by a later failure", async () => {
 	const reconciliation = createInvocationReconciliation();
 	const correlation = { commandId: "late-reason-command", turnId: "late-reason-turn" };

@@ -475,14 +475,18 @@ export function createInvocationReconciliation(
 			: undefined;
 	let persistenceChain: Promise<void> = Promise.resolve();
 	let mutationRevision = 0;
-	const revisionOf = (record: InvocationRecord): number => record.revision ?? 0;
-	const persist = async (snapshot: readonly InvocationRecord[] = [...records.values()]): Promise<void> => {
-		if (store) {
-			await store.transact(() => [...snapshot]);
-			return;
-		}
-		if (!reconciliationFile) return;
+	const persist = async (): Promise<void> => {
 		const run = async (): Promise<void> => {
+			// Construct the candidate only when this serialized write starts. A
+			// pre-await full snapshot lets a later agent_start/agent_end transition
+			// be overwritten on disk by an older queued write even though the live
+			// map has already converged.
+			const snapshot = [...records.values()].map(record => ({ ...record }));
+			if (store) {
+				await store.transact(() => snapshot.map(record => ({ ...record })));
+				return;
+			}
+			if (!reconciliationFile) return;
 			const directory = path.dirname(reconciliationFile);
 			const temporary = `${reconciliationFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
 			await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -643,10 +647,13 @@ export function createInvocationReconciliation(
 						error: formatPromptFailureForLocalLog(frame.error),
 					});
 					next.error = sanitizePromptFailure(frame.error);
-					await persist([...records.values()].map(candidate => (candidate === record ? next : candidate)));
-					const current = records.get(key(kind, correlation));
-					if (current === record || (current !== undefined && revisionOf(current) < next.revision))
-						records.set(key(kind, correlation), next);
+					records.set(key(kind, correlation), next);
+					try {
+						await persist();
+					} catch (error) {
+						if (records.get(key(kind, correlation)) === next) records.set(key(kind, correlation), record);
+						throw error;
+					}
 				}
 				return;
 			}
@@ -667,10 +674,13 @@ export function createInvocationReconciliation(
 				next.status = next.error === undefined ? "terminal_ok" : "failed";
 				next.terminalAt = Date.now();
 			}
-			await persist([...records.values()].map(candidate => (candidate === record ? next : candidate)));
-			const current = records.get(key(kind, correlation));
-			if (current === record || (current !== undefined && revisionOf(current) < next.revision))
-				records.set(key(kind, correlation), next);
+			records.set(key(kind, correlation), next);
+			try {
+				await persist();
+			} catch (error) {
+				if (records.get(key(kind, correlation)) === next) records.set(key(kind, correlation), record);
+				throw error;
+			}
 		},
 		lookup(kind, selector) {
 			const record = find(kind, selector);
@@ -703,10 +713,13 @@ export function createInvocationReconciliation(
 			if (pending !== undefined) return pending;
 			const next = { ...record, revision: ++mutationRevision } as InvocationRecord & { pendingOutcome?: unknown };
 			next.pendingOutcome = outcome;
-			await persist([...records.values()].map(candidate => (candidate === record ? next : candidate)));
-			const current = records.get(key(kind, correlation));
-			if (current === record || (current !== undefined && revisionOf(current) < next.revision))
-				records.set(key(kind, correlation), next);
+			records.set(key(kind, correlation), next);
+			try {
+				await persist();
+			} catch (error) {
+				if (records.get(key(kind, correlation)) === next) records.set(key(kind, correlation), record);
+				throw error;
+			}
 			return outcome;
 		},
 		async finalizeOutcome(kind, correlation, outcome, isCurrent) {
@@ -716,7 +729,6 @@ export function createInvocationReconciliation(
 				(record as unknown as { pendingOutcome?: { kind: string; code: string; message: string } })
 					.pendingOutcome) as { kind: string; code: string; message: string } | undefined;
 			const previousRecord = { ...record };
-			const baseRevision = revisionOf(record);
 			const finalizedRecord: InvocationRecord = { ...record, revision: ++mutationRevision, terminalAt: Date.now() };
 			if (finalOutcome?.kind === "failed") {
 				finalizedRecord.status = "failed";
@@ -726,24 +738,22 @@ export function createInvocationReconciliation(
 			}
 			(finalizedRecord as unknown as Record<string, unknown>).pendingOutcome = undefined;
 			if (isCurrent !== undefined && !isCurrent()) return;
-			const snapshot = [...records.values()].map(candidate => (candidate === record ? finalizedRecord : candidate));
+			records.set(key(kind, correlation), finalizedRecord);
 			try {
-				await persist(snapshot);
+				await persist();
 			} catch (error) {
 				const current = records.get(key(kind, correlation));
-				if (current === record || (current !== undefined && revisionOf(current) <= baseRevision))
-					records.set(key(kind, correlation), previousRecord);
+				if (current === finalizedRecord) records.set(key(kind, correlation), previousRecord);
 				throw error;
 			}
 			if (isCurrent !== undefined && !isCurrent()) {
 				const current = records.get(key(kind, correlation));
-				if (current === record || (current !== undefined && revisionOf(current) <= baseRevision))
-					await persist([...records.values()]);
+				if (current === finalizedRecord) {
+					records.set(key(kind, correlation), previousRecord);
+					await persist();
+				}
 				return;
 			}
-			const current = records.get(key(kind, correlation));
-			if (current === record || (current !== undefined && revisionOf(current) < finalizedRecord.revision))
-				records.set(key(kind, correlation), finalizedRecord);
 		},
 	};
 }
