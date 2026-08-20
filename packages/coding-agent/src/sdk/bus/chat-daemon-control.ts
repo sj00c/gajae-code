@@ -124,6 +124,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 65 / Slack generation 68 fence the off-reconcile-tail
  * initial attachment replay introduced by #4542 so pre-upgrade daemon owners
  * cannot retain the earlier SessionRouter attachment contract.
+ * Discord generation 66 / Slack generation 69 fence the SessionRouter
+ * idle-poll/change-stamp rollout (#4689). Both daemons construct a
+ * SessionRouter whose idle tick no longer re-acquires the machine-global
+ * session-index lock every 2s; staleness retirement moved to a 30s sweep and
+ * lease heartbeats no longer force an authority reconcile. A pre-upgrade owner
+ * would retain the old hot polling loop, so replacement is required.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
 	discord: 66,

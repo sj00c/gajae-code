@@ -60,7 +60,17 @@ export interface SessionAttachment {
 	readonly generation: number;
 	isCurrent(): boolean;
 	send(frame: Record<string, unknown>): unknown;
-	/** Idempotent provider-lease heartbeat send that skips the pre-send authority reconcile (#4689). */
+	/**
+	 * Idempotent provider-lease heartbeat send that skips the pre-send authority
+	 * reconcile (#4689).
+	 *
+	 * This is a required member, not an optional capability: an implementation
+	 * that silently fell back to `send()` would restore the 5s heartbeat-forced
+	 * locked rescan this fix exists to remove, so the contract fails closed at
+	 * the type level instead. Implementors are versioned by the Telegram serving
+	 * epoch (88) and the Discord/Slack daemon generations (66/69), which force
+	 * replacement of any pre-#4689 owner rather than letting it keep serving.
+	 */
 	sendMaintenance(leaseId: string): unknown;
 	/** Revoke this exact capability after provider admission or replay fails closed. */
 	retire?(): Promise<void>;

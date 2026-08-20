@@ -756,7 +756,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 171 at serving epoch 87", () => {
+test("publishes exact durable authority generation 172 at serving epoch 88", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -787,8 +787,12 @@ test("publishes exact durable authority generation 171 at serving epoch 87", () 
 	// monotonic reaction settlement for Telegram notification delivery (#4528).
 	// Generation 169: delivers every ring-positioned session event live through
 	// the bounded, capability-gated directed subscriber leg used by replay.
-	expect(DAEMON_GENERATION).toBe(171);
-	expect(SERVING_EPOCH).toBe(87);
+	// Generation 172 / epoch 88: fences the SessionRouter idle-poll rollout
+	// (#4689). The daemon builds a SessionRouter, so a pre-upgrade owner would
+	// retain the old per-tick locked index rescan. Generation alone does not
+	// force replacement, so the serving epoch advances with it.
+	expect(DAEMON_GENERATION).toBe(172);
+	expect(SERVING_EPOCH).toBe(88);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

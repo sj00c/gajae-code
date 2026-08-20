@@ -273,8 +273,15 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * reaction settlement for Telegram notification delivery (#4528).
  * Generation 169 delivers every ring-positioned session event live through the
  * bounded, capability-gated directed subscriber leg used by replay.
+ * Generation 172 fences the SessionRouter idle-poll/change-stamp rollout (#4689).
+ * The daemon constructs a SessionRouter, and the router's idle tick no longer
+ * re-acquires the machine-global session-index lock on every 2s pass: unchanged
+ * polls are stat-only and staleness retirement moved to a 30s sweep. A daemon
+ * still running the pre-#4689 router keeps the old hot polling loop and its
+ * lock contention, so an already-running owner must be replaced rather than
+ * retained across this upgrade.
  */
-export const DAEMON_GENERATION = 171;
+export const DAEMON_GENERATION = 172;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -360,5 +367,8 @@ export const DAEMON_GENERATION = 171;
  * Epoch 85 removes direct relay attachment and prohibits lifecycle controls on every adapter.
  * Epoch 86 removes public discovery/client exports and retires cross-process raw transports.
  * Epoch 87 preserves accepted Telegram delivery ambiguity and advances poisoned poll cursors.
+ * Epoch 88 requires the #4689 SessionRouter idle-poll contract: generation alone
+ * does not force replacement, so the serving boundary advances to guarantee a
+ * pre-#4689 daemon cannot keep serving with the old per-tick locked rescan.
  */
-export const SERVING_EPOCH = 87;
+export const SERVING_EPOCH = 88;

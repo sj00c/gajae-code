@@ -1310,12 +1310,48 @@ describe("SDK session index", () => {
 			if (path.resolve(String(file)) === logPath) logReads++;
 			return await readFile(file as Parameters<typeof fs.readFile>[0], options as BufferEncoding);
 		}) as typeof fs.readFile);
+		// Reads alone are not the regression that matters: the idle cost this fix
+		// removes is contention on the machine-global session-index lock. A change
+		// that put the unchanged path back under `withFileLock()` without reading
+		// would satisfy `logReads === 0` while restoring the exact starvation.
+		let lockAttempts = 0;
+		FileLockTestHooks.afterParentMkdir = () => {
+			lockAttempts++;
+		};
 		try {
 			for (let i = 0; i < 5; i++) expect(await index.refreshIfChanged()).toBe(false);
 			expect(logReads).toBe(0);
+			expect(lockAttempts).toBe(0);
 			expect(index.listSessions().sessions).toEqual([expect.objectContaining({ sessionId: "polled" })]);
 		} finally {
+			FileLockTestHooks.afterParentMkdir = undefined;
 			spy.mockRestore();
+		}
+	});
+	it("a changed index still takes the session-index lock, so the no-lock assertion discriminates (#4689)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-lock-"));
+		const writer = new SessionIndex(dir);
+		await writer.append(event("locked"));
+		const index = new SessionIndex(dir);
+		expect(await index.refreshIfChanged()).toBe(true);
+
+		let lockAttempts = 0;
+		FileLockTestHooks.afterParentMkdir = () => {
+			lockAttempts++;
+		};
+		try {
+			// Control: an unchanged poll is lock-free.
+			expect(await index.refreshIfChanged()).toBe(false);
+			expect(lockAttempts).toBe(0);
+			// A durable append must still reclassify under the index lock, proving the
+			// zero-lock assertion above is a real behavioral fence and not vacuous.
+			await writer.append(event("locked-2"));
+			lockAttempts = 0;
+			expect(await index.refreshIfChanged()).toBe(true);
+			expect(lockAttempts).toBeGreaterThan(0);
+			expect(index.indexSeq).toBe(writer.indexSeq);
+		} finally {
+			FileLockTestHooks.afterParentMkdir = undefined;
 		}
 	});
 	it("refreshIfChanged reloads after an external append and after log removal (#4689)", async () => {
