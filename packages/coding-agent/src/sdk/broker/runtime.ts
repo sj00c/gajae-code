@@ -213,6 +213,7 @@ function workspaceDependencyFiles(packageDirectory: string): string[] {
 }
 
 function trustedProjectLockfile(packageDirectory: string): string | undefined {
+	const canonicalPackageDirectory = fs.realpathSync(packageDirectory);
 	let current = packageDirectory;
 	for (let depth = 0; depth < 8; depth++) {
 		const lockfile = path.join(current, "bun.lock");
@@ -223,7 +224,23 @@ function trustedProjectLockfile(packageDirectory: string): string | undefined {
 					name?: unknown;
 					workspaces?: unknown;
 				};
-				if (manifest.name === "gajae-code" || manifest.workspaces !== undefined) return lockfile;
+				if (manifest.name === "gajae-code") {
+					const canonicalLockfile = fs.realpathSync(lockfile);
+					if (!containedPath(current, canonicalLockfile))
+						throw new Error("SDK internal launch refused: project lockfile escapes its trusted root.");
+					return canonicalLockfile;
+				}
+				const relativePackage = path.relative(current, canonicalPackageDirectory).replaceAll(path.sep, "/");
+				const belongsToKnownWorkspaceLayout =
+					relativePackage === "packages/coding-agent" ||
+					relativePackage.startsWith("packages/coding-agent/") ||
+					relativePackage.startsWith("node_modules/@gajae-code/");
+				if (manifest.workspaces !== undefined && belongsToKnownWorkspaceLayout) {
+					const canonicalLockfile = fs.realpathSync(lockfile);
+					if (!containedPath(current, canonicalLockfile))
+						throw new Error("SDK internal launch refused: project lockfile escapes its trusted root.");
+					return canonicalLockfile;
+				}
 			} catch {
 				throw new Error("SDK internal launch refused: project lockfile metadata is unreadable.");
 			}
