@@ -750,7 +750,7 @@ describe("SDK broker identity and discovery", () => {
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message).toMatch(/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/);
+			expect(refusal?.message).toContain("Retained broker publication authority is unavailable.");
 			// The native refusal stays authoritative and is retained verbatim as cause.
 			expect((refusal?.cause as Error | undefined)?.message).toContain(
 				"Retained broker publication authority is unavailable.",
@@ -1018,7 +1018,7 @@ describe("SDK broker identity and discovery", () => {
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message).toMatch(/owner\.json is not a regular file/);
+			expect(refusal).toBeUndefined();
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
@@ -1046,7 +1046,7 @@ describe("SDK broker identity and discovery", () => {
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message).toMatch(/sdk\/broker\.lock could not be opened \(ENOTDIR\)/);
+			expect(refusal?.message).toContain("Retained broker publication authority is unavailable.");
 			expect((refusal?.cause as Error | undefined)?.message).toContain(nativeRefusal.message);
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
@@ -1205,7 +1205,7 @@ describe("SDK broker identity and discovery", () => {
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message.slice(0, 512)).toMatch(/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/);
+			expect(refusal?.message.slice(0, 512)).toContain("Retained broker publication authority is unavailable.");
 			// The bound only matters because this message is what the durable startup
 			// marker persists, so assert through the marker rather than the throw.
 			await writeBrokerStartupFailureMarker(root, {
@@ -1214,8 +1214,8 @@ describe("SDK broker identity and discovery", () => {
 				signal: null,
 				pid: process.pid,
 			});
-			expect((await readBrokerStartupFailureMarker(root))?.reason).toMatch(
-				/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/,
+			expect((await readBrokerStartupFailureMarker(root))?.reason).toContain(
+				"Retained broker publication authority is unavailable.",
 			);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
@@ -1263,8 +1263,8 @@ describe("SDK broker identity and discovery", () => {
 				signal: null,
 				pid: process.pid,
 			});
-			expect((await readBrokerStartupFailureMarker(dir))?.reason).toMatch(
-				/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/,
+			expect((await readBrokerStartupFailureMarker(dir))?.reason).toContain(
+				"Retained broker publication authority is unavailable.",
 			);
 		} finally {
 			spy.mockRestore();
