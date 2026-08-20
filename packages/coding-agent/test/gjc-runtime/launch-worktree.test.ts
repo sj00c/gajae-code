@@ -524,6 +524,45 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		expect(await fs.realpath(worktreeModules)).toBe(await fs.realpath(originModules));
 	});
 
+	it("shares node_modules for a plain repo whose .bin shims resolve inside the tree", async () => {
+		// `node_modules/.bin/<tool> -> ../<pkg>/bin/<tool>.js` realpaths under the
+		// source root, but stays inside node_modules: it describes the install
+		// graph, not the repository's sources. Treating it as a workspace self-link
+		// refused the share for ordinary non-workspace repos, leaving the worktree
+		// with no node_modules at all.
+		const repo = await createRepo("gjc-launch-worktree-bin-shim-");
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(path.join(originModules, "leftpad", "bin"), { recursive: true });
+		await Bun.write(path.join(originModules, "leftpad", "bin", "leftpad.js"), "module.exports = 1;\n");
+		await fs.mkdir(path.join(originModules, ".bin"), { recursive: true });
+		await fs.symlink(path.join("..", "leftpad", "bin", "leftpad.js"), path.join(originModules, ".bin", "leftpad"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(true);
+		expect(await fs.realpath(worktreeModules)).toBe(await fs.realpath(originModules));
+		// The shared tree actually resolves the dependency from the worktree.
+		expect(await fs.realpath(path.join(worktreeModules, "leftpad", "bin", "leftpad.js"))).toBe(
+			await fs.realpath(path.join(originModules, "leftpad", "bin", "leftpad.js")),
+		);
+	});
+
+	it("does not share when a link nested deep inside node_modules escapes to source packages", async () => {
+		// The .bin exclusion is scoped to targets that stay inside node_modules.
+		// An isolated-layout link buried several levels down that still reaches
+		// `packages/<pkg>` couples the checkouts and must refuse the share.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-deep-escape-");
+		const originModules = path.join(repo, "node_modules");
+		const nested = path.join(originModules, ".bun", "install", "cache");
+		await fs.mkdir(nested, { recursive: true });
+		await fs.symlink(path.join(repo, "packages", "app"), path.join(nested, "app"));
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree"]);
+		const worktreeModules = path.join(launched.cwd, "node_modules");
+		expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(false);
+		expect(await fs.realpath(worktreeModules)).toBe(worktreeModules);
+	});
+
 	it("remediates an already-contaminated worktree node_modules symlink", async () => {
 		const repo = await createRepo("gjc-launch-worktree-remediate-");
 		const originModules = path.join(repo, "node_modules");

@@ -483,12 +483,26 @@ const BROKEN_LINK_CODES = new Set(["ENOENT", "ENOTDIR", "ELOOP", "EDEADLK"]);
  * inside the tree, and chasing arbitrary external targets would make the scan
  * unbounded.
  *
+ * Links that resolve *within the `node_modules` tree itself* are not workspace
+ * self-links: `node_modules/.bin/tool -> ../pkg/bin/tool.js`, and the intra-tree
+ * links isolated layouts use for nested dependencies, describe the install
+ * graph rather than the repository's own sources. They exist in essentially
+ * every install, and treating them as self-links would refuse a shared tree for
+ * ordinary non-workspace repositories — leaving the worktree with no
+ * `node_modules` at all (#4626 review). Only targets that escape the tree and
+ * land on repository sources (`node_modules/@scope/pkg -> ../../packages/pkg`)
+ * couple the two checkouts.
+ *
  * Fails closed: a link whose target cannot be resolved for any reason other
  * than the link being broken is treated as self-linked, because an unreadable
  * link can never be proven safe to share.
  */
 export function nodeModulesLinksInto(nodeModulesPath: string, sourceRoot: string): boolean {
 	const sourceReal = fs.realpathSync(sourceRoot);
+	// Real location of the tree being scanned. Targets landing inside it are
+	// install-graph internals, not repository sources; a root that cannot be
+	// resolved yields null, which excludes nothing and keeps the scan strict.
+	const modulesReal = tryRealpath(nodeModulesPath);
 	// The node_modules root itself may be a symlink: a root that resolves
 	// OUTSIDE the source repo belongs to another checkout's install graph
 	// (nested repo in a parent workspace, external store) and must never be
@@ -502,7 +516,7 @@ export function nodeModulesLinksInto(nodeModulesPath: string, sourceRoot: string
 		if (rootReal === null) return true;
 		if (!isInsideOrEqualReal(sourceReal, rootReal)) return true;
 	}
-	if (resolvesInside(rootStat, nodeModulesPath, sourceReal)) return true;
+	if (resolvesInside(rootStat, nodeModulesPath, sourceReal, modulesReal)) return true;
 	const stack: Array<{ dir: string; depth: number }> = [{ dir: nodeModulesPath, depth: 0 }];
 	let depthCapped = false;
 	while (stack.length > 0) {
@@ -519,7 +533,7 @@ export function nodeModulesLinksInto(nodeModulesPath: string, sourceRoot: string
 		}
 		for (const entry of entries) {
 			const entryPath = path.join(dir, entry.name);
-			if (resolvesInside(entry, entryPath, sourceReal)) return true;
+			if (resolvesInside(entry, entryPath, sourceReal, modulesReal)) return true;
 			if (entry.isDirectory() && depth + 1 < NODE_MODULES_SCAN_DEPTH) {
 				stack.push({ dir: entryPath, depth: depth + 1 });
 			} else if (entry.isDirectory()) {
@@ -541,11 +555,22 @@ function isInsideOrEqualReal(dirReal: string, candidateReal: string): boolean {
 
 /**
  * Returns true when `entry` is a symlink whose target provably resolves inside
- * `sourceReal`, or whose resolution fails in a way that cannot rule that out.
- * A symlink whose target resolves to nowhere (broken or looping) resolves
- * nowhere and cannot pull origin sources in.
+ * `sourceReal` *and outside* `modulesReal`, or whose resolution fails in a way
+ * that cannot rule that out. A symlink whose target resolves to nowhere (broken
+ * or looping) resolves nowhere and cannot pull origin sources in.
+ *
+ * `modulesReal` is the real path of the `node_modules` tree being scanned, or
+ * null when it could not be resolved. Targets inside it are install-graph
+ * internals (`.bin` shims, nested dependency links) and never couple the
+ * worktree to the origin's sources; targets reaching repository sources outside
+ * it do, and are still reported.
  */
-function resolvesInside(entry: fs.Stats | fs.Dirent, entryPath: string, sourceReal: string): boolean {
+function resolvesInside(
+	entry: fs.Stats | fs.Dirent,
+	entryPath: string,
+	sourceReal: string,
+	modulesReal: string | null,
+): boolean {
 	if (!entry.isSymbolicLink()) return false;
 	let target: string;
 	try {
@@ -553,12 +578,24 @@ function resolvesInside(entry: fs.Stats | fs.Dirent, entryPath: string, sourceRe
 	} catch (error) {
 		return !BROKEN_LINK_CODES.has((error as NodeJS.ErrnoException).code ?? "");
 	}
-	return (
+	const insideSource =
 		sameFileSystemPath(target, sourceReal, sourceReal) ||
 		(volumeMatchesCaseInsensitively(sourceReal) &&
 			target.toLowerCase().startsWith(`${sourceReal.toLowerCase()}${path.sep}`)) ||
-		target.startsWith(`${sourceReal}${path.sep}`)
-	);
+		target.startsWith(`${sourceReal}${path.sep}`);
+	if (!insideSource) return false;
+	return modulesReal === null || !isInsideOrEqualRealCaseAware(modulesReal, target, sourceReal);
+}
+
+/**
+ * {@link isInsideOrEqualReal} that also accepts a case-folded match when the
+ * probed volume is case-insensitive, so a `.bin` target recorded with different
+ * casing than its tree is still recognized as living inside it.
+ */
+function isInsideOrEqualRealCaseAware(dirReal: string, candidateReal: string, probeRoot: string): boolean {
+	if (isInsideOrEqualReal(dirReal, candidateReal)) return true;
+	if (!volumeMatchesCaseInsensitively(probeRoot)) return false;
+	return isInsideOrEqualReal(dirReal.toLowerCase(), candidateReal.toLowerCase());
 }
 
 /**
