@@ -6889,7 +6889,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						ok: false,
 						error: {
 							code: "runtime_authority_unavailable",
-							message: "The running session has no established sidecar authority. Start a new coordinator session.",
+							message:
+								"The running session has no established sidecar authority. Start a new coordinator session.",
 						},
 					};
 				return await withToolIdempotency(

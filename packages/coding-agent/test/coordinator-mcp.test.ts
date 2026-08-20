@@ -23,8 +23,8 @@ import {
 	readSessionTransaction,
 	reconcileCreationRemoteVerifier,
 	rotateClaimedCreationVerifier,
-	transactionPath,
 	startCreationRemote,
+	transactionPath,
 	withNamespaceRegistry,
 } from "../src/coordinator-mcp/question-state";
 import { createCoordinatorMcpServer, handleCoordinatorMcpRequest } from "../src/coordinator-mcp/server";
@@ -447,7 +447,9 @@ describe("coordinator question-state direct contracts", () => {
 			const migrated = await readSessionTransaction(paths, session.session_id);
 			expect(migrated).toMatchObject({
 				creation_intent_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
-				canonical: { session: { broker: { sidecar_verifier: { key_id: expect.stringMatching(/^[a-f0-9]{64}$/) } } } },
+				canonical: {
+					session: { broker: { sidecar_verifier: { key_id: expect.stringMatching(/^[a-f0-9]{64}$/) } } },
+				},
 			});
 			expect(Object.values(migrated!.outbox).every(event => event.public_delivery.state === "pending")).toBe(true);
 			await withNamespaceRegistry(paths, async registry => {
