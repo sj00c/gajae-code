@@ -139,6 +139,7 @@ function stagedNativeFiles(packageVersion: string): string[] {
  */
 function workspaceDependencyFiles(packageDirectory: string): string[] {
 	const workspaceRoot = path.dirname(packageDirectory);
+	const trustedLocalRoot = path.dirname(workspaceRoot);
 	const files: string[] = [];
 	const visited = new Set<string>();
 	const workspaceDirectories = new Map<string, string>();
@@ -157,13 +158,23 @@ function workspaceDependencyFiles(packageDirectory: string): string[] {
 	const resolveWorkspaceDirectory = (name: string): string | undefined => {
 		const suffix = name.slice("@gajae-code/".length);
 		const candidate = path.resolve(workspaceRoot, suffix);
-		if (!containedPath(workspaceRoot, candidate))
+		if (!containedPath(trustedLocalRoot, candidate))
 			throw new Error("SDK internal launch refused: workspace dependency escapes its trusted root.");
-		return fs.existsSync(candidate) ? candidate : workspaceDirectories.get(name);
+		if (fs.existsSync(candidate)) return candidate;
+		const workspaceCandidate = workspaceDirectories.get(name);
+		if (workspaceCandidate) return workspaceCandidate;
+		let current = packageDirectory;
+		while (true) {
+			const nodeModulesCandidate = path.join(current, "node_modules", name);
+			if (fs.existsSync(nodeModulesCandidate)) return nodeModulesCandidate;
+			const parent = path.dirname(current);
+			if (parent === current) return undefined;
+			current = parent;
+		}
 	};
 	const visit = (dependencyDirectory: string): void => {
 		const canonicalDirectory = fs.realpathSync(dependencyDirectory);
-		if (!containedPath(workspaceRoot, canonicalDirectory))
+		if (!containedPath(trustedLocalRoot, canonicalDirectory))
 			throw new Error("SDK internal launch refused: resolved workspace dependency escapes its trusted root.");
 		if (visited.has(canonicalDirectory)) return;
 		visited.add(canonicalDirectory);

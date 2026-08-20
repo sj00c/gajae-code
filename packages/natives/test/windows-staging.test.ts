@@ -156,6 +156,21 @@ describe("windows native addon staging", () => {
 			);
 			expect(staged).toBeNull();
 			expect(errors).toEqual([expect.stringContaining("staged addon drift")]);
+			await fs.rm(path.join(nativeDir, filename));
+			const orphanErrors: string[] = [];
+			expect(
+				maybeStageNodeModulesAddon(
+					{
+						stageFromNodeModules: true,
+						versionedDir,
+						addonFilenames: [filename],
+						optionalPackageNativeDirs: [],
+						nativeDir,
+					},
+					orphanErrors,
+				),
+			).toBeNull();
+			expect(orphanErrors).toEqual([expect.stringContaining("staged addon orphan")]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

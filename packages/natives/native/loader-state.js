@@ -464,6 +464,10 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 		const sourcePath = sourceDirs.map(sourceDir => path.join(sourceDir, filename)).find(candidate => fs.existsSync(candidate));
 
 		if (fs.existsSync(targetPath)) {
+			if (!sourcePath) {
+				errors.push(`staged addon orphan (${filename}): no current package artifact exists`);
+				continue;
+			}
 			if (sourcePath && !addonBytesMatch(targetPath, sourcePath)) {
 				errors.push(`staged addon drift (${filename}): cached bytes differ from the current package artifact`);
 				continue;
