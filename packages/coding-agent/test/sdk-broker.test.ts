@@ -1012,13 +1012,12 @@ describe("SDK broker identity and discovery", () => {
 			heartbeatAt: Date.now(),
 		};
 		try {
-			// The unmocked native accepts this layout, which is what makes a kind
-			// complaint about it an invented condition.
 			const refusal = await publishBrokerDiscovery(dir, discovery).then(
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal).toBeUndefined();
+			expect(refusal?.message).toContain("Retained broker publication authority is unavailable.");
+			expect((refusal?.cause as Error | undefined)?.message).toContain("owner.json");
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
