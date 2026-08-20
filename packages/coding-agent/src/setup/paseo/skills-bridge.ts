@@ -312,8 +312,17 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 	// empty read here would classify every recorded entry as stale and prune a
 	// healthy bridge. Fail closed and change nothing.
 	try {
-		await fs.stat(sourceDir);
+		const stat = await fs.stat(sourceDir);
+		// An app update can replace the skills directory with a regular file (or
+		// anything non-directory). Treating that as an empty source would prune
+		// every recorded bridge link, so the type change itself is a refusal.
+		if (!stat.isDirectory()) {
+			throw new SkillsBridgeError(
+				`Refusing to converge Paseo skills bridge: the resolved skills directory (${sourceDir}) is not a directory anymore; the existing bridge is left untouched`,
+			);
+		}
 	} catch (error) {
+		if (error instanceof SkillsBridgeError) throw error;
 		const code = (error as NodeJS.ErrnoException).code;
 		throw new SkillsBridgeError(
 			`Refusing to converge Paseo skills bridge: the resolved skills directory (${sourceDir}) became unreadable (${code ?? "unknown"}); the existing bridge is left untouched`,
@@ -627,11 +636,28 @@ function existingCustomDirectories(current: Readonly<RawSettings>): string[] {
 	return [...directories];
 }
 
-/** Append the bridge directory without discarding concurrent user config changes. */
-export async function registerSkillsBridgeDirectory(settings: Settings, bridgeDir: string): Promise<CasReceipt> {
+/**
+ * Register the bridge directory without discarding concurrent user config
+ * changes. A path migration swaps the registration in ONE commit: the old
+ * recorded path leaves `skills.customDirectories` in the same atomic batch
+ * that adds the new one, so a crash can never leave both or neither, and the
+ * CAS receipt restores the exact prior array on undo.
+ */
+export async function registerSkillsBridgeDirectory(
+	settings: Settings,
+	bridgeDir: string,
+	options: { readonly replaces?: string } = {},
+): Promise<CasReceipt> {
 	return settings.commitAtomicBatchWithCurrent(current => {
 		const directories = existingCustomDirectories(current);
-		const next = directories.includes(bridgeDir) ? directories : [...directories, bridgeDir];
+		let next = directories;
+		if (options.replaces !== undefined && options.replaces !== bridgeDir) {
+			next = next.filter(directory => directory !== options.replaces);
+		}
+		next = next.includes(bridgeDir) ? next : [...next, bridgeDir];
+		if (next.length === directories.length && next.every((directory, index) => directories[index] === directory)) {
+			return [];
+		}
 		return [{ path: "skills.customDirectories" as SettingPath, op: "set", value: next }];
 	});
 }

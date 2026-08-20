@@ -1131,6 +1131,143 @@ describe("skills bridge", () => {
 		expect(remove.result.outcome).toBe("removed");
 		await expect(fs.stat(fixture.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
 	});
+	test("a --force overwrite of a scalar provider value is restored on remove (#4644 review r6)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths, { gjc: "user scalar value" });
+
+		const install = await runPaseoSetup({ force: true }, fixture.deps);
+		expect(install.kind).toBe("install");
+		const ledger = await readProvenance(fixture.paths.provenanceLedger);
+		expect(ledger.providerReplacedEntries?.gjc).toBe("user scalar value");
+
+		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		const after = JSON.parse(await fs.readFile(fixture.paths.configJson, "utf8")) as Record<string, unknown>;
+		const providers = (after.agents as { providers: Record<string, unknown> }).providers;
+		expect(providers.gjc).toBe("user scalar value");
+	});
+
+	test("a --force overwrite of a null provider value is restored on remove (#4644 review r6)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		const config = {
+			daemon: { auth: { password: FIXTURE_PASSWORD }, port: 4317 },
+			agents: { providers: { claude: { enabled: true }, gjc: null } },
+		};
+		await fs.writeFile(fixture.paths.configJson, serializeJson(config), { mode: 0o600 });
+
+		const install = await runPaseoSetup({ force: true }, fixture.deps);
+		expect(install.kind).toBe("install");
+
+		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		const after = JSON.parse(await fs.readFile(fixture.paths.configJson, "utf8")) as Record<string, unknown>;
+		const providers = (after.agents as { providers: Record<string, unknown> }).providers;
+		expect(providers.gjc).toBeNull();
+	});
+
+	test("a migration replaces the old custom-directory registration atomically (#4644 review r6)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const oldDir = fixture.paths.bridgeDir;
+
+		// The ledger stays in place; only the bridge path moves (a relocation
+		// inside the same agent directory, where the ledger still records the
+		// old path).
+		const newBridge = path.join(path.dirname(oldDir), "relocated-paseo-skills");
+		const migratedDeps: PaseoSetupDependencies = {
+			...fixture.deps,
+			paths: {
+				...fixture.deps.paths,
+				bridgeDir: newBridge,
+			},
+		};
+		const install = await runPaseoSetup({}, migratedDeps);
+		expect(install.kind).toBe("install");
+		if (install.kind !== "install") throw new Error("expected an install outcome");
+		expect(install.result.outcome).toBe("installed");
+
+		// The new path is registered and the old one is gone in the same swap.
+		const settings = await fs.readFile(path.join(process.env.GJC_CODING_AGENT_DIR ?? "", "config.yml"), "utf8");
+		expect(settings).toContain(newBridge);
+		expect(settings).not.toContain(oldDir);
+		// The old bridge is cleaned after the durable cutover.
+		for (const name of ["paseo", "paseo-advisor"]) {
+			await expect(fs.lstat(path.join(oldDir, name))).rejects.toMatchObject({ code: "ENOENT" });
+		}
+	});
+
+	test("a tampered ledger path refuses removal before any settings mutation (#4644 review r6)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+
+		const victimDir = path.join(fixture.root, "victim");
+		await fs.mkdir(victimDir, { recursive: true });
+		await fs.symlink(path.join(fixture.paths.agentsSkillsDir as string, "paseo"), path.join(victimDir, "paseo"));
+		const ledger = await readProvenance(fixture.paths.provenanceLedger);
+		await writeProvenance(fixture.paths.provenanceLedger, { ...ledger, bridgePath: victimDir });
+
+		const settingsBefore = await snapshotTree(path.dirname(fixture.paths.provenanceLedger));
+		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("partial-removal");
+		// The registration and provider entries were NOT touched: validation
+		// failed before any settings mutation.
+		const config = JSON.parse(await fs.readFile(fixture.paths.configJson, "utf8")) as Record<string, unknown>;
+		const providers = (config.agents as { providers: Record<string, unknown> }).providers;
+		expect(providers.gjc).toBeDefined();
+		expect(await snapshotTree(path.dirname(fixture.paths.provenanceLedger))).toBe(settingsBefore);
+	});
+
+	test("a resolved source replaced by a regular file refuses instead of pruning (#4644 review r6)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const before = await snapshotTree(fixture.paths.bridgeDir);
+
+		// An app update replaces the skills directory with a file.
+		await fs.rm(fixture.paths.agentsSkillsDir as string, { recursive: true, force: true });
+		await fs.writeFile(fixture.paths.agentsSkillsDir as string, "not a directory\n");
+		const deps: PaseoSetupDependencies = {
+			...fixture.deps,
+			skillsSource: async () => ({ dir: fixture.paths.agentsSkillsDir as string, origin: "user" }),
+		};
+
+		await expect(runPaseoSetup({}, deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
+	});
+
+	test("a convergence over an owned empty bridge preserves its provenance and registration (#4644 review r6)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		for (const name of [...SKILL_NAMES]) {
+			await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+		}
+		// First convergence: entries pruned, directory GJC-created and owned.
+		await runPaseoSetup({}, fixture.deps);
+		let ledger = await readProvenance(fixture.paths.provenanceLedger);
+		expect(ledger.bridgeDirCreated).toBe(true);
+
+		// Second convergence over the still-empty source must NOT discard the
+		// ownership record: the directory and its registration stay removable.
+		await runPaseoSetup({}, fixture.deps);
+		ledger = await readProvenance(fixture.paths.provenanceLedger);
+		expect(ledger.bridgeDirCreated).toBe(true);
+		expect(ledger.bridgePath).toBe(fixture.paths.bridgeDir);
+
+		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("removed");
+		await expect(fs.stat(fixture.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+	});
 	test("remove after every entry was pruned still cleans the recorded-created empty bridge (#4644 review r4)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);

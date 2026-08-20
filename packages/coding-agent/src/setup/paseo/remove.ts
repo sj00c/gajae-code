@@ -56,12 +56,16 @@ async function lstatAllowingAbsent(destination: string): Promise<Stats | undefin
  * The ledger-recorded bridge directory, validated before any destructive use.
  *
  * A malformed, tampered, or path-replaced provenance record must never
- * redirect `--remove` at an unrelated directory: the recorded path has to be
- * absolute, stay inside the agent directory the ledger itself lives in (the
- * parent of the ledger's `paseo/` directory -- which is also where a recorded
- * bridge path always lived, including an old path during a migration), and
- * resolve -- without following a final symlink -- to the expected bridge
- * directory shape. Anything else fails the removal closed.
+ * redirect cleanup at an unrelated directory. Two shapes are accepted:
+ *
+ * - the recorded path lives inside the agent directory the ledger itself lives
+ *   in (the parent of the ledger's `paseo/` directory) — the ordinary case; or
+ * - it is a GENUINE migration record: absolute, canonically spelled, carrying
+ *   the exact bridge basename, whose parent directory also holds the `paseo`
+ *   ledger directory (the recorded agent-dir shape GJC itself wrote).
+ *
+ * Both require the path to resolve — without following a final symlink — to a
+ * directory. Anything else fails the removal closed.
  */
 export async function validatedBridgeDir(ledger: ProvenanceLedger, deps: PaseoSetupDependencies): Promise<string> {
 	const recorded = ledger.bridgePath ?? deps.paths.bridgeDir;
@@ -72,7 +76,22 @@ export async function validatedBridgeDir(ledger: ProvenanceLedger, deps: PaseoSe
 			`Refusing to remove Paseo skills bridge: ledger-recorded path is not absolute (${recorded})`,
 		);
 	}
-	if (resolved !== path.resolve(trustedRoot) && !resolved.startsWith(`${path.resolve(trustedRoot)}${path.sep}`)) {
+	const bridgeBasename = path.basename(path.resolve(deps.paths.bridgeDir));
+	const withinTrustedRoot =
+		resolved === path.resolve(trustedRoot) || resolved.startsWith(`${path.resolve(trustedRoot)}${path.sep}`);
+	// A migrated record points at the OLD agent directory, which no longer
+	// contains this ledger. It is still trusted only when it spells the exact
+	// bridge basename inside a parent that also carries GJC's `paseo` ledger
+	// directory — the recorded agent-dir shape install itself wrote, which an
+	// attacker-chosen victim path does not replicate.
+	const oldAgentDir = path.dirname(resolved);
+	const isMigrationShape =
+		path.basename(resolved) === bridgeBasename &&
+		(await fs
+			.stat(path.join(oldAgentDir, "paseo"))
+			.then(s => s.isDirectory())
+			.catch(() => false));
+	if (!withinTrustedRoot && !isMigrationShape) {
 		throw new SkillsBridgeError(
 			`Refusing to remove Paseo skills bridge: ledger-recorded path escapes the agent directory (${recorded})`,
 		);
@@ -132,12 +151,34 @@ export async function removePaseoSetup(
 	const ownsAnything =
 		provenancedProviderKeys(ledger).length > 0 ||
 		Object.keys(ledger.seededOrchestrationKeys).length > 0 ||
-		(ledger.bridgeEntries?.length ?? 0) > 0;
+		(ledger.bridgeEntries?.length ?? 0) > 0 ||
+		// An owned empty bridge is still GJC-owned state: a convergence run that
+		// pruned the final entry leaves `bridgeEntries: []` with
+		// `bridgeDirCreated: true`, and the directory plus its registration must
+		// still be removable.
+		ledger.bridgeDirCreated === true;
 	if (!ownsAnything) return { outcome: "nothing-to-remove" };
 
 	const removed: string[] = [];
 	const remaining: string[] = [];
 	let nextLedger = ledger;
+
+	// The recorded bridge path is validated BEFORE any settings mutation: a
+	// malformed or tampered ledger must never steer `skills.customDirectories`
+	// unregistering (or the symlink cleanup below) at a foreign path.
+	let validatedBridge: string | undefined;
+	if (ledger.bridgePath !== undefined || ledger.bridgeDirCreated === true) {
+		try {
+			validatedBridge = await validatedBridgeDir(ledger, deps);
+		} catch (error) {
+			const detail = error instanceof SkillsBridgeError ? error.message : String(error);
+			return partial([], [ledger.bridgePath ?? deps.paths.bridgeDir], {
+				failedStep: "provenance ledger validation",
+				detail,
+				retained: [deps.paths.provenanceLedger],
+			});
+		}
+	}
 
 	// Step 4 inverse: config.yml registration.
 	if (options.unregisterBridgeDirectory) {
@@ -165,7 +206,10 @@ export async function removePaseoSetup(
 			// recorded when the link was created. A name Paseo no longer ships
 			// is still removed, because the record -- not today's source
 			// contents -- is what proves GJC created it.
-			const bridgeDir = await validatedBridgeDir(ledger, deps);
+			// Validated above, before any settings mutation, so the cleanup paths
+			// and the registration unregistering provably describe the same
+			// ledger-owned directory.
+			const bridgeDir = validatedBridge ?? deps.paths.bridgeDir;
 			// Every present recorded pathname is preserved for inverse
 			// validation: an entry replaced by a regular file or directory is
 			// handed to the inverse, which reports it as a divergence instead of

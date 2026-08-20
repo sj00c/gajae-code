@@ -4,6 +4,7 @@
  * Dispatches to diagnosis, install, or removal, and owns the flag combinations
  * that must be rejected before any target is touched.
  */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Settings } from "../../config/settings";
 import { checkPaseoSetup } from "./check";
@@ -165,12 +166,15 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// pre-existing, never recorded in providerKeys), while a `--force`
 		// overwrite stores the replaced entry so `--remove` restores it rather
 		// than deleting content that was never GJC's to take.
-		const existingProviderEntry = readProviderEntry(config.parsed, providerKey);
+		// The RAW prior value -- including scalars, arrays, and null -- is what a
+		// `--force` overwrite replaces, so that is what must be restorable. An
+		// object-shaped reader alone would lose a scalar/array/null prior and let
+		// compensation delete user configuration instead of restoring it.
+		const rawPriorValue = readRawProviderValue(config.parsed, providerKey);
 		// Same structural equality the conflict check uses, so ownership follows
 		// the exact predicate that decides whether GJC would write anything.
-		const existingMatches =
-			existingProviderEntry !== undefined && JSON.stringify(existingProviderEntry) === JSON.stringify(entry);
-		const replacedEntry = existingProviderEntry !== undefined && !existingMatches ? existingProviderEntry : undefined;
+		const existingMatches = rawPriorValue !== undefined && JSON.stringify(rawPriorValue) === JSON.stringify(entry);
+		const replacedEntry = rawPriorValue !== undefined && !existingMatches ? rawPriorValue : undefined;
 		const step1 = await runJsonStep({
 			label: deps.paths.configJson,
 			step: "provider-config",
@@ -187,11 +191,16 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				providerPreexistingKeys: existingMatches
 					? { ...ledger.providerPreexistingKeys, [providerKey]: true as const }
 					: { ...ledger.providerPreexistingKeys },
-				providerReplacedEntries: replacedEntry
-					? { ...ledger.providerReplacedEntries, [providerKey]: replacedEntry }
-					: { ...ledger.providerReplacedEntries },
+				providerReplacedEntries:
+					replacedEntry !== undefined
+						? { ...ledger.providerReplacedEntries, [providerKey]: replacedEntry }
+						: { ...ledger.providerReplacedEntries },
 			}),
-			revert: draft => removeProviderKey(draft, providerKey),
+			// Compensation restores what this run actually replaced: a key GJC
+			// created is removed, a key that carried ANY prior value (including a
+			// scalar, array, or null) gets that exact value back, and an
+			// identical pre-existing entry was never written and keeps its value.
+			revert: draft => restoreProviderKey(draft, providerKey, replacedEntry),
 			revertLedger: ledger => {
 				const providerKeys = { ...ledger.providerKeys };
 				delete providerKeys[providerKey];
@@ -256,30 +265,19 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		const isMigration =
 			recordedBridgePath !== undefined && path.resolve(recordedBridgePath) !== path.resolve(deps.paths.bridgeDir);
 		let migratedOldEntries: readonly string[] = [];
+		let migratedOldBridgeDir: string | undefined;
 		if (isMigration && (bridgeLedger.bridgeEntries?.length ?? 0) > 0) {
-			const oldSourceDir = bridgeLedger.bridgeSourceDir ?? legacyRecordedSourceDir(deps.home ?? "");
 			// The migration branch composes destructive cleanup paths from the
 			// ledger's own bytes, so it must fail closed exactly like `--remove`
 			// does: a tampered or malformed record (a `..` entry, a relative or
 			// escaping bridge path) is refused, never fed to the unlinker.
+			// The old bridge's links are removed only AFTER the new ledger and
+			// settings cutover below is durable, as a compensable step, so a
+			// later failure restores the old bridge instead of leaving the ledger
+			// pointing at missing links.
 			const oldBridgeDir = await validatedBridgeDir(bridgeLedger, deps);
 			migratedOldEntries = safeBridgeEntryNames(bridgeLedger.bridgeEntries ?? []);
-			await inverseSkillsBridge(
-				deps,
-				{
-					createdEntries: [...migratedOldEntries],
-					prunedEntries: [],
-					adoptedEntries: [],
-					bridgeDirCreated: bridgeLedger.bridgeDirCreated ?? false,
-					sourceDir: oldSourceDir,
-				},
-				{ bridgeDir: oldBridgeDir },
-			).catch(error => {
-				throw new SagaStepError(
-					"install",
-					`bridge path migrated from ${recordedBridgePath} but the old bridge could not be cleaned: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			});
+			migratedOldBridgeDir = oldBridgeDir;
 		}
 		const previouslyRecorded = isMigration ? new Set<string>() : new Set(bridgeLedger.bridgeEntries ?? []);
 		const ownedAfterRun = [
@@ -305,7 +303,13 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			ownedAfterRun.length === 0 &&
 			Object.keys(bridgePreflight.entries).length === 0 &&
 			bridgePreflight.adopts.length === 0 &&
-			bridgePreflight.prunes.length === 0;
+			bridgePreflight.prunes.length === 0 &&
+			// A bridge directory GJC created and still owns (an earlier run pruned
+			// the final entry) keeps its provenance: clearing the record would
+			// strand an owned directory and its registration. The no-bridge state
+			// applies only when the ledger owns no bridge at all.
+			bridgeLedger.bridgeDirCreated !== true &&
+			bridgeLedger.bridgePath === undefined;
 		if (intentionalNoBridge) {
 			await writeProvenance(deps.paths.provenanceLedger, {
 				...bridgeLedger,
@@ -370,7 +374,9 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// Step 4: register the bridge with GJC skill discovery -- only when the
 		// bridge was validated against a real source this run. Registering an
 		// existing directory that no source validates and no ledger owns would
-		// globally load whatever a stale or foreign bridge contains.
+		// globally load whatever a stale or foreign bridge contains. A migration
+		// REPLACES the old recorded registration in the same atomic commit, so
+		// the stale path cannot survive the cutover.
 		if (bridgePreflight.sourceDir === undefined && !ledgerOwnsBridge(bridgeLedger)) {
 			throw new SagaStepError(
 				"install",
@@ -378,9 +384,58 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			);
 		}
 		const settings = await Settings.init();
-		const receipt = await registerSkillsBridgeDirectory(settings, deps.paths.bridgeDir);
+		const receipt = await registerSkillsBridgeDirectory(settings, deps.paths.bridgeDir, {
+			...(migratedOldBridgeDir !== undefined ? { replaces: migratedOldBridgeDir } : {}),
+		});
 		completed.push(receiptStep("config.yml skills.customDirectories", receipt));
 		changed.push("config.yml skills.customDirectories");
+
+		// The new ledger and settings cutover is now durable, so the old bridge
+		// can be retired as its own compensable step: on a later failure the old
+		// links are restored to the old directory (the registration receipt above
+		// already reverts the swap), instead of stranding a ledger that points at
+		// links that no longer exist.
+		if (migratedOldBridgeDir !== undefined && migratedOldEntries.length > 0) {
+			const oldSourceDir = bridgeLedger.bridgeSourceDir ?? legacyRecordedSourceDir(deps.home ?? "");
+			try {
+				await inverseSkillsBridge(
+					deps,
+					{
+						createdEntries: [...migratedOldEntries],
+						prunedEntries: [],
+						adoptedEntries: [],
+						bridgeDirCreated: bridgeLedger.bridgeDirCreated ?? false,
+						sourceDir: oldSourceDir,
+					},
+					{ bridgeDir: migratedOldBridgeDir },
+				);
+			} catch (error) {
+				throw new SagaStepError(
+					"install",
+					`bridge path migrated from ${recordedBridgePath} but the old bridge could not be cleaned: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+			completed.push({
+				label: migratedOldBridgeDir,
+				undo: async () => {
+					// Restore the old bridge exactly as it was recorded: the same
+					// links at the same recorded targets in the old directory.
+					try {
+						for (const name of migratedOldEntries) {
+							await fs.symlink(path.resolve(oldSourceDir, name), path.join(migratedOldBridgeDir ?? "", name));
+						}
+						return { status: "reverted" as const };
+					} catch (error) {
+						return {
+							status: "conflict" as const,
+							detail: error instanceof Error ? error.message : String(error),
+							retained: [migratedOldBridgeDir ?? deps.paths.bridgeDir],
+						};
+					}
+				},
+			});
+			changed.push(migratedOldBridgeDir);
+		}
 	} catch (error) {
 		const failure =
 			error instanceof SagaStepError
@@ -400,23 +455,27 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 function ledgerOwnsBridge(ledger: ProvenanceLedger): boolean {
 	return (ledger.bridgeEntries?.length ?? 0) > 0 && ledger.bridgePath !== undefined;
 }
-/** The provider entry a Paseo config carries at `key`, if any. */
-function readProviderEntry(config: Record<string, unknown>, providerKey: string): Record<string, unknown> | undefined {
+/** The RAW value a Paseo config carries at `agents.providers.<key>`, of any shape. */
+function readRawProviderValue(config: Record<string, unknown>, providerKey: string): unknown {
 	const agents = config.agents;
 	if (!agents || typeof agents !== "object" || Array.isArray(agents)) return undefined;
 	const providers = (agents as Record<string, unknown>).providers;
 	if (!providers || typeof providers !== "object" || Array.isArray(providers)) return undefined;
-	const entry = (providers as Record<string, unknown>)[providerKey];
-	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
-	return entry as Record<string, unknown>;
+	return (providers as Record<string, unknown>)[providerKey];
 }
 
-function removeProviderKey(draft: Record<string, unknown>, providerKey: string): void {
+/**
+ * Undo a provider write exactly: a key this run created is removed, and a key
+ * that carried ANY prior value (object, scalar, array, or null) gets that
+ * value back instead of being deleted.
+ */
+function restoreProviderKey(draft: Record<string, unknown>, providerKey: string, replacedEntry: unknown): void {
 	const agents = draft.agents;
 	if (!agents || typeof agents !== "object" || Array.isArray(agents)) return;
 	const providers = (agents as Record<string, unknown>).providers;
 	if (!providers || typeof providers !== "object" || Array.isArray(providers)) return;
-	delete (providers as Record<string, unknown>)[providerKey];
+	if (replacedEntry === undefined) delete (providers as Record<string, unknown>)[providerKey];
+	else (providers as Record<string, unknown>)[providerKey] = replacedEntry;
 }
 
 async function unregisterBridgeDirectory(settings: Settings, bridgeDir: string): Promise<void> {
