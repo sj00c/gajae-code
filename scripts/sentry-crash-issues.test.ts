@@ -12,6 +12,7 @@ import {
 	issueTitle,
 	main,
 	type ApprovalManifest,
+	type ApprovalStore,
 	type MainDependencies,
 	type Options,
 	parseArgs,
@@ -19,6 +20,7 @@ import {
 	previewCulprit,
 	type SentryIssue,
 	toSentryIssue,
+	withCreationLock,
 } from "./sentry-crash-issues";
 
 const FINGERPRINT = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
@@ -387,6 +389,10 @@ describe("main orchestration", () => {
 					recordPending: async manifest => {
 						if (!pending.some(candidate => JSON.stringify(candidate) === JSON.stringify(manifest))) pending.push(manifest);
 					},
+					clearPending: async manifest => {
+						const index = pending.findIndex(candidate => JSON.stringify(candidate) === JSON.stringify(manifest));
+						if (index >= 0) pending.splice(index, 1);
+					},
 				},
 				withCreationLock: async action => action(),
 				writeStdout: message => stdout.push(message),
@@ -512,6 +518,7 @@ describe("main orchestration", () => {
 				recordFiled: async () => {},
 				hasPending: async () => false,
 				recordPending: async () => {},
+				clearPending: async () => {},
 			},
 		});
 		await expect(main(["--approve", digestMatch![1]!], approving.dependencies)).resolves.toBe(0);
@@ -524,13 +531,36 @@ describe("main orchestration", () => {
 		expect(postApproval.ghCalls.length).toBeGreaterThan(0);
 	});
 
-	test("rejects an approval when the same fingerprint is replaced with a different reviewed row", async () => {
-		const changed = mainDependencies(true, {
-			sentryGet: async () => [sentryIssue({ id: "999", title: "replacement group" })],
-		});
-		await expect(main(["--apply"], changed.dependencies)).resolves.toBe(1);
-		expect(changed.ghCalls).toHaveLength(0);
-		expect(changed.stderr.join("")).toContain("unverified");
+	test("an approval binds to every manifest field, so drift in any one of them alone withholds the row", async () => {
+		// Each case perturbs exactly one binding field relative to the approved
+		// row. A design that bound only a subset would file at least one of these,
+		// which is precisely the inheritance defect that pulled filing out of #4659.
+		const approved = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
+		const drifted: { field: string; overrides: Partial<MainDependencies>; argv: string[] }[] = [
+			// Immutable Sentry group id, with identical rendered content otherwise.
+			{ field: "groupId", overrides: { sentryGet: async () => [sentryIssue({ id: "999" })] }, argv: ["--apply"] },
+			// Rendered content digest only: same group, same fingerprint, new title.
+			{ field: "contentDigest", overrides: { sentryGet: async () => [sentryIssue({ title: "replacement group" })] }, argv: ["--apply"] },
+			// Fingerprint only: same group id, same title, different crash class.
+			{ field: "fingerprint", overrides: { fingerprintOf: async () => ({ fingerprint: FORGED_FINGERPRINT }) }, argv: ["--apply"] },
+			// Sentry org and project are part of the manifest, not just the query.
+			{ field: "org", overrides: {}, argv: ["--apply", "--org", "other-org"] },
+			{ field: "project", overrides: {}, argv: ["--apply", "--project", "other-project"] },
+		];
+		for (const { field, overrides, argv } of drifted) {
+			const changed = mainDependencies(true, overrides);
+			expect(await main(argv, changed.dependencies)).toBe(1);
+			expect(changed.ghCalls, `${field} drift must not file`).toHaveLength(0);
+			expect(changed.stderr.join(""), `${field} drift must be reported as unverified`).toContain("unverified");
+		}
+		// Control: the unperturbed row carrying the same approval does file, so the
+		// cases above fail for drift rather than for an unrelated reason.
+		const unchanged = mainDependencies(true);
+		expect(await main(["--apply"], unchanged.dependencies)).toBe(0);
+		expect(unchanged.ghCalls).toHaveLength(1);
+		// The repo field is pinned by parseArgs, so it can only ever equal the
+		// approved value; assert the binding carries it rather than leaving it implied.
+		expect(approved.repo).toBe("Yeachan-Heo/gajae-code");
 	});
 
 	test("requires URL-bound acknowledgement before a planted marker becomes locally filed", async () => {
@@ -544,40 +574,51 @@ describe("main orchestration", () => {
 		expect(setup.stdout.join("")).toContain("1 already filed");
 	});
 
-	test("serializes the final duplicate check and create across concurrent applies", async () => {
-		let locked = false;
-		const waiters: { resolve: () => void }[] = [];
-		let created = false;
-		let creates = 0;
-		const shared = mainDependencies(true, {
-			findExistingIssue: async () =>
-				created
-					? { kind: "untrusted", url: "https://github.com/Yeachan-Heo/gajae-code/issues/1" }
-					: { kind: "none" },
-			gh: async args => {
-				expect(args).toContain("create");
-				creates++;
-				created = true;
-				return { ok: true, stdout: "https://github.com/Yeachan-Heo/gajae-code/issues/1\n", stderr: "" };
-			},
-			withCreationLock: async action => {
-				while (locked) {
-					const waiter = Promise.withResolvers<void>();
-					waiters.push(waiter);
-					await waiter.promise;
-				}
-				locked = true;
-				try {
-					return await action();
-				} finally {
-					locked = false;
-					waiters.shift()?.resolve();
-				}
-			},
-		});
-		const results = await Promise.all([main(["--apply"], shared.dependencies), main(["--apply"], shared.dependencies)]);
-		expect(results).toEqual([0, 0]);
-		expect(creates).toBe(1);
+	test("the production creation lock serializes the final duplicate check and create", async () => {
+		// Deliberately exercises the real on-disk lock and the real approval store
+		// rather than an injected mutex: the whole point of the critical section is
+		// that it holds across processes, which an in-test mutex cannot demonstrate.
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-lock-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		process.env.GJC_SENTRY_APPROVAL_STORE = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		try {
+			const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
+			await fileApprovalStore.recordApprovals([manifest]);
+
+			let created = false;
+			let creates = 0;
+			let concurrentCriticalSections = 0;
+			let maxConcurrentCriticalSections = 0;
+			const invocation = () =>
+				mainDependencies(true, {
+					approvals: fileApprovalStore,
+					withCreationLock,
+					findExistingIssue: async () =>
+						created ? { kind: "untrusted", url: "https://github.com/Yeachan-Heo/gajae-code/issues/1" } : { kind: "none" },
+					gh: async args => {
+						expect(args).toContain("create");
+						concurrentCriticalSections++;
+						maxConcurrentCriticalSections = Math.max(maxConcurrentCriticalSections, concurrentCriticalSections);
+						// Yield inside the section so an unserialized second contender
+						// would be observed rather than accidentally ordered.
+						await Bun.sleep(40);
+						creates++;
+						created = true;
+						concurrentCriticalSections--;
+						return { ok: true, stdout: "https://github.com/Yeachan-Heo/gajae-code/issues/1\n", stderr: "" };
+					},
+				}).dependencies;
+			const results = await Promise.all([main(["--apply"], invocation()), main(["--apply"], invocation())]);
+			expect(results).toEqual([0, 0]);
+			expect(creates).toBe(1);
+			expect(maxConcurrentCriticalSections).toBe(1);
+			expect(await fileApprovalStore.hasAnyFiled(manifest)).toBe(true);
+			expect(await fileApprovalStore.hasPending(manifest)).toBe(false);
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
 	});
 
 	test("requires acknowledgement for an exact pending public issue match", async () => {
@@ -601,11 +642,138 @@ describe("main orchestration", () => {
 				},
 				hasPending: async candidate => JSON.stringify(candidate) === JSON.stringify(manifest),
 				recordPending: async () => {},
+				clearPending: async () => {},
 			},
 		});
 		await expect(main(["--apply"], recovered.dependencies)).resolves.toBe(1);
 		expect(recorded).toBe(0);
 		expect(recovered.ghCalls).toHaveLength(0);
+	});
+
+	test("a create that committed remotely without a confirmed URL is never retried automatically", async () => {
+		// The defect this closes: a create reaches GitHub, the client loses the
+		// response, and the eventually-consistent marker search then reports no
+		// issue. Retrying on that evidence files the same crash class twice.
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-replay-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		process.env.GJC_SENTRY_APPROVAL_STORE = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		try {
+			const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
+			let creates = 0;
+			let pendingReads = 0;
+			const store: ApprovalStore = {
+				...fileApprovalStore,
+				hasPending: async candidate => {
+					pendingReads++;
+					return fileApprovalStore.hasPending(candidate);
+				},
+			};
+			await fileApprovalStore.recordApprovals([manifest]);
+
+			// Attempt 1: the issue is committed upstream, then the client fails.
+			const lost = mainDependencies(true, {
+				approvals: store,
+				withCreationLock,
+				findExistingIssue: async () => ({ kind: "none" }),
+				gh: async () => {
+					creates++;
+					throw new Error("gh issue create timed out after the request was sent");
+				},
+			});
+			expect(await main(["--apply"], lost.dependencies)).toBe(1);
+			expect(creates).toBe(1);
+			expect(await fileApprovalStore.hasPending(manifest)).toBe(true);
+			expect(await fileApprovalStore.hasAnyFiled(manifest)).toBe(false);
+
+			// Attempt 2: replay while the search still cannot see the new issue.
+			const pendingReadsBeforeReplay = pendingReads;
+			const replay = mainDependencies(true, {
+				approvals: store,
+				withCreationLock,
+				findExistingIssue: async () => ({ kind: "none" }),
+				gh: async () => {
+					creates++;
+					return { ok: true, stdout: "https://github.com/Yeachan-Heo/gajae-code/issues/2\n", stderr: "" };
+				},
+			});
+			expect(await main(["--apply"], replay.dependencies)).toBe(1);
+			// The in-flight record was actually consulted, and no second issue exists.
+			expect(pendingReads).toBeGreaterThan(pendingReadsBeforeReplay);
+			expect(creates).toBe(1);
+			expect(replay.stderr.join("")).toContain(`--retry-pending ${FINGERPRINT}`);
+
+			// Same outcome when the create returns a malformed URL rather than throwing:
+			// the row stays withheld instead of becoming a second write.
+			const malformed = mainDependencies(true, {
+				approvals: store,
+				withCreationLock,
+				findExistingIssue: async () => ({ kind: "none" }),
+				gh: async () => {
+					creates++;
+					return { ok: true, stdout: "not-a-url\n", stderr: "" };
+				},
+			});
+			expect(await main(["--apply"], malformed.dependencies)).toBe(1);
+			expect(creates).toBe(1);
+
+			// Reconciliation path: the operator confirms upstream has no such issue,
+			// clears the record, and only then does a retry file exactly once.
+			const cleared = mainDependencies(true, { approvals: store, withCreationLock });
+			expect(await main(["--retry-pending", FINGERPRINT], cleared.dependencies)).toBe(0);
+			expect(cleared.ghCalls).toHaveLength(0);
+			expect(await fileApprovalStore.hasPending(manifest)).toBe(false);
+
+			const retried = mainDependencies(true, {
+				approvals: store,
+				withCreationLock,
+				findExistingIssue: async () => ({ kind: "none" }),
+				gh: async () => {
+					creates++;
+					return { ok: true, stdout: "https://github.com/Yeachan-Heo/gajae-code/issues/3\n", stderr: "" };
+				},
+			});
+			expect(await main(["--apply"], retried.dependencies)).toBe(0);
+			expect(creates).toBe(2);
+			expect(await fileApprovalStore.hasAnyFiled(manifest)).toBe(true);
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("--retry-pending refuses a fingerprint with no in-flight record and refuses drifted content", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-retry-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		process.env.GJC_SENTRY_APPROVAL_STORE = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		try {
+			const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
+			await fileApprovalStore.recordApprovals([manifest]);
+
+			// Nothing in flight yet: clearing must not be a no-op success that the
+			// operator could read as "reconciled".
+			const none = mainDependencies(true, { approvals: fileApprovalStore, withCreationLock });
+			expect(await main(["--retry-pending", FINGERPRINT], none.dependencies)).toBe(2);
+			expect(none.stderr.join("")).toContain("no in-flight create record");
+
+			// A fingerprint absent from the batch cannot be reconciled blind.
+			expect(await main(["--retry-pending", FORGED_FINGERPRINT], none.dependencies)).toBe(2);
+
+			await fileApprovalStore.recordPending(manifest);
+			// Same fingerprint, drifted rendered content: a different write, so the
+			// in-flight record for the reviewed row must survive.
+			const drifted = mainDependencies(true, {
+				approvals: fileApprovalStore,
+				withCreationLock,
+				sentryGet: async () => [sentryIssue({ title: "drifted title" })],
+			});
+			expect(await main(["--retry-pending", FINGERPRINT], drifted.dependencies)).toBe(2);
+			expect(await fileApprovalStore.hasPending(manifest)).toBe(true);
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
 	});
 
 	test("reports malformed rows distinctly from no-fingerprint skips and fails the run", async () => {

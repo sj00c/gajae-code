@@ -26,6 +26,14 @@
  *   bun scripts/sentry-crash-issues.ts --approve DIGEST [--limit N] [--org SLUG] [--project SLUG]
  *   bun scripts/sentry-crash-issues.ts --apply [--limit N] [--org SLUG] [--project SLUG]
  *   bun scripts/sentry-crash-issues.ts --acknowledge ISSUE_URL [--limit N] [--org SLUG] [--project SLUG]
+ *   bun scripts/sentry-crash-issues.ts --retry-pending FINGERPRINT [--limit N] [--org SLUG] [--project SLUG]
+ *
+ * An `--apply` attempt that reaches `gh issue create` and never confirms a
+ * canonical issue URL leaves an in-flight record for that exact manifest.
+ * Because the marker search is eventually consistent, no later run can prove
+ * the issue was not created, so the row is withheld rather than retried: either
+ * `--acknowledge <url>` the issue that did land, or `--retry-pending <fp>`
+ * after confirming none did.
  *
  * `--repo` exists only to make the target explicit; it is pinned to the same
  * repository `gjc crash report` searches, because the shared marker is the
@@ -87,6 +95,8 @@ interface Options {
 	/** Record the reviewed pending set into the local approval store instead of writing. */
 	approve: string | undefined;
 	acknowledge?: string | undefined;
+	/** Clear one unresolved in-flight create record after the operator proved no issue exists. */
+	retryPending?: string | undefined;
 	help?: boolean;
 	limit: number;
 	org: string;
@@ -117,6 +127,7 @@ export function parseArgs(argv: readonly string[]): Options | { error: string } 
 		apply: false,
 		approve: undefined,
 		acknowledge: undefined,
+		retryPending: undefined,
 		help: false,
 		limit: 25,
 		org: DEFAULT_ORG,
@@ -147,6 +158,10 @@ export function parseArgs(argv: readonly string[]): Options | { error: string } 
 		}
 		if (arg === "--approve") options.approve = value;
 		else if (arg === "--acknowledge") options.acknowledge = value;
+		else if (arg === "--retry-pending") {
+			if (!FINGERPRINT.test(value)) return { error: "--retry-pending must be a v1 fingerprint." };
+			options.retryPending = value;
+		}
 		else if (arg === "--org") {
 			if (!SENTRY_SLUG.test(value)) return { error: "--org must be a bounded Sentry slug." };
 			options.org = value;
@@ -469,6 +484,7 @@ export interface ApprovalStore {
 	recordFiled(manifest: ApprovalManifest, url: string): Promise<void>;
 	hasPending(manifest: ApprovalManifest): Promise<boolean>;
 	recordPending(manifest: ApprovalManifest): Promise<void>;
+	clearPending(manifest: ApprovalManifest): Promise<void>;
 }
 
 export interface ApprovalManifest {
@@ -600,6 +616,13 @@ async function writeStoredApprovals(stored: StoredApprovals): Promise<void> {
 	}
 }
 
+/**
+ * Returned when a manifest already has an in-flight create record: the previous
+ * attempt reached GitHub and never confirmed a URL, so neither "filed" nor "not
+ * filed" is known and no automatic retry is safe.
+ */
+const UNRESOLVED_CREATE = Symbol("unresolved-create");
+
 const approvalStoreLockContext = new AsyncLocalStorage<boolean>();
 
 async function ensureApprovalStoreDirectory(): Promise<void> {
@@ -719,7 +742,7 @@ async function processStartIdentity(pid: number): Promise<string | undefined> {
 	}
 }
 
-async function withCreationLock<T>(action: () => Promise<T>): Promise<T> {
+export async function withCreationLock<T>(action: () => Promise<T>): Promise<T> {
 	return withApprovalStoreLock(() => approvalStoreLockContext.run(true, action));
 }
 
@@ -736,9 +759,10 @@ function issueUrlFromCreateOutput(output: string): string | undefined {
 function usage(): string {
 	return (
 		"Usage: bun scripts/sentry-crash-issues.ts [--apply] [--approve DIGEST] [--acknowledge ISSUE_URL] " +
-		"[--limit N] [--org SLUG] [--project SLUG]\n" +
+		"[--retry-pending FINGERPRINT] [--limit N] [--org SLUG] [--project SLUG]\n" +
 		"  default: dry run (no writes). Review the printed batch digest,\n" +
-		"  then --approve DIGEST to record the reviewed rows, then --apply to file them.\n"
+		"  then --approve DIGEST to record the reviewed rows, then --apply to file them.\n" +
+		"  --retry-pending clears one in-flight create record after you confirmed upstream has no such issue.\n"
 	);
 }
 
@@ -786,6 +810,13 @@ export const fileApprovalStore: ApprovalStore = {
 		await withStoreMutation(async () => {
 			const stored = await loadStoredApprovals();
 			if (!stored.pending.some(saved => sameManifest(saved, manifest))) stored.pending.push(manifest);
+			await writeStoredApprovals(stored);
+		});
+	},
+	async clearPending(manifest: ApprovalManifest): Promise<void> {
+		await withStoreMutation(async () => {
+			const stored = await loadStoredApprovals();
+			stored.pending = stored.pending.filter(saved => !sameManifest(saved, manifest));
 			await writeStoredApprovals(stored);
 		});
 	},
@@ -956,6 +987,27 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 				.join("\n")}\n`,
 		);
 
+	if (options.retryPending !== undefined) {
+		// The operator asserts they checked the repository and no issue exists for
+		// this manifest, so the in-flight record may be discarded. It is cleared
+		// only for the exact currently-rendered manifest: a row whose content,
+		// group or project moved since the abandoned attempt is a different write
+		// and must not inherit the reconciliation.
+		const match = rows.find(row => row.fingerprint === options.retryPending);
+		const manifest = match ? manifests.get(match) : undefined;
+		if (!match || !manifest) {
+			dependencies.writeStderr("--retry-pending must name a fingerprint present in this batch.\n");
+			return 2;
+		}
+		if (!(await dependencies.approvals.hasPending(manifest))) {
+			dependencies.writeStderr("--retry-pending names no in-flight create record for the currently rendered row.\n");
+			return 2;
+		}
+		await dependencies.approvals.clearPending(manifest);
+		dependencies.writeStdout(`cleared the in-flight create record for ${options.retryPending}; --apply may retry it.\n`);
+		return incomplete ? 1 : 0;
+	}
+
 	if (options.acknowledge !== undefined) {
 		const match = untrustedBodyMarkers.find(row => row.existingIssueUrl === options.acknowledge);
 		if (!match) {
@@ -1029,10 +1081,11 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 
 	let created = 0;
 	let failed = 0;
+	let unresolved = 0;
 	for (const row of fileable) {
 		const manifest = manifests.get(row);
 		if (!manifest) continue;
-		let result: { ok: boolean; stdout: string; stderr: string } | undefined;
+		let result: { ok: boolean; stdout: string; stderr: string } | undefined | typeof UNRESOLVED_CREATE;
 		try {
 			result = await dependencies.withCreationLock(async () => {
 				const existing = await dependencies.findExistingIssue(options.repo, row.fingerprint);
@@ -1042,6 +1095,15 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 				if (existing.kind === "untrusted") {
 					throw new Error(`untrusted marker at ${existing.url ?? "unknown URL"}`);
 				}
+				// A prior invocation reached `gh issue create` for this exact manifest
+				// and never observed a canonical URL back. GitHub may or may not have
+				// committed that issue, and the body search above is eventually
+				// consistent, so it cannot rule the creation out. Retrying here is
+				// exactly how the same crash class gets filed twice, so the row is
+				// withheld until an operator reconciles it explicitly. This read is
+				// inside the creation lock so a concurrent invocation cannot slip a
+				// second create between the check and the write below.
+				if (await dependencies.approvals.hasPending(manifest)) return UNRESOLVED_CREATE;
 				await dependencies.approvals.recordPending(manifest);
 				const created = await dependencies.gh([
 					"issue",
@@ -1065,6 +1127,16 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 			dependencies.writeStderr(`failed ${row.fingerprint}: ${error instanceof Error ? error.message : String(error)}\n`);
 			continue;
 		}
+		if (result === UNRESOLVED_CREATE) {
+			unresolved++;
+			dependencies.writeStderr(
+				`withheld ${row.fingerprint}: a previous --apply reached GitHub without confirming an issue URL. ` +
+					`Check ${options.repo} for an issue carrying ${CRASH_ISSUE_MARKER_PREFIX}${row.fingerprint}; ` +
+					`record it with --acknowledge <url> if it exists, or clear the in-flight record with ` +
+					`--retry-pending ${row.fingerprint} once you have confirmed it does not.\n`,
+			);
+			continue;
+		}
 		if (result === undefined) {
 			already++;
 			await dependencies.approvals.consume(manifest);
@@ -1078,11 +1150,15 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		}
 		failed++;
 		dependencies.writeStderr(
-			`failed ${row.fingerprint}: ${result.stderr.trim() || "unknown error"}; approval and pending-create record retained for a safe retry\n`,
+			`failed ${row.fingerprint}: ${result.stderr.trim() || "unknown error"}; the create may still have committed upstream, ` +
+				`so this fingerprint is withheld from further --apply runs until it is reconciled with ` +
+				`--acknowledge <url> or --retry-pending ${row.fingerprint}\n`,
 		);
 	}
-	dependencies.writeStdout(`\ncreated ${created}, failed ${failed}\n`);
-	return failed > 0 || collisions.length > 0 || skippedMalformed > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
+	dependencies.writeStdout(`\ncreated ${created}, failed ${failed}, unresolved ${unresolved}\n`);
+	return failed > 0 || unresolved > 0 || collisions.length > 0 || skippedMalformed > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0
+		? 1
+		: 0;
 }
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));
