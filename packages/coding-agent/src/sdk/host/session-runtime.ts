@@ -2886,6 +2886,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			];
 		}
 		const eventLifecycleEpoch = current.lifecycleEpoch;
+		const retireEndedLifecycleBatch = (): void => {
+			const ended = current.openLifecycleBatches[0];
+			if (!ended) return;
+			const transitionKeys = new Set(
+				transitions.map(({ correlation }) => `${correlation.commandId}:${correlation.turnId}`),
+			);
+			if (
+				ended.invocations.some(({ correlation }) =>
+					transitionKeys.has(`${correlation.commandId}:${correlation.turnId}`),
+				)
+			)
+				current.openLifecycleBatches.shift();
+		};
 		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") {
 			try {
 				current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
@@ -2943,8 +2956,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		if (type === "agent_end") {
 			if (current.lifecycleEpoch !== eventLifecycleEpoch) {
 				// A successor agent_start won the lifecycle race while this event's
-				// durable transitions were awaiting persistence. Never clear or
-				// overwrite the successor's owner/batch.
+				// durable transitions were awaiting persistence. Retire the ended
+				// batch before returning; otherwise it remains ahead of the successor
+				// and the next agent_end is paired with stale ownership.
+				retireEndedLifecycleBatch();
 				const resolvers = terminalPublicationCapture.resolvers;
 				terminalPublicationCapture.resolvers = undefined;
 				for (const resolve of resolvers ?? []) resolve(observed);
@@ -2954,6 +2969,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// Durable terminalization failed. Keep the recovery-owned batch and
 				// its deadline leases alive so the deadline manager can replay a real
 				// agent_end instead of clearing into a stale synthetic failure.
+				retireEndedLifecycleBatch();
 				current.lifecycleActive = false;
 				current.activeInvocation = failedTransitions[0];
 				current.drainedInvocations = failedTransitions;

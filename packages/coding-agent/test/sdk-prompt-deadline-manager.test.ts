@@ -19,6 +19,8 @@ interface FakeReconciliation {
 	noteTransitionCalls: number;
 	noteTransitionFailures: number;
 	uncertainCalls: number;
+	noteTransitionFrames: string[];
+	finalizeCodes: string[];
 
 	/** When set, a failing finalize still leaves the durable record terminal (lost race). */
 	terminalOnFailure?: boolean;
@@ -28,7 +30,7 @@ function fakeReconciliation(): {
 	reconciliation: {
 		lookup: () => { status: string };
 		claimPendingOutcome: () => Promise<void>;
-		noteTransition: () => Promise<void>;
+		noteTransition: (_kind: string, _correlation: unknown, frame?: { type?: string }) => Promise<void>;
 		markUncertain: () => Promise<void>;
 		finalizeOutcome: (
 			_kind: string,
@@ -46,13 +48,16 @@ function fakeReconciliation(): {
 		noteTransitionCalls: 0,
 		noteTransitionFailures: 0,
 		uncertainCalls: 0,
+		noteTransitionFrames: [],
+		finalizeCodes: [],
 	};
 	return {
 		state,
 		reconciliation: {
 			lookup: () => ({ status: state.status }),
-			noteTransition: async () => {
+			noteTransition: async (_kind: string, _correlation: unknown, frame?: { type?: string }) => {
 				state.noteTransitionCalls += 1;
+				state.noteTransitionFrames.push(frame?.type ?? "unknown");
 				if (state.noteTransitionCalls <= state.noteTransitionFailures) throw new Error("terminal replay failed");
 				state.status = "terminal_ok";
 			},
@@ -64,8 +69,9 @@ function fakeReconciliation(): {
 				state.claimStarted?.();
 				if (state.claimRelease) await state.claimRelease;
 			},
-			finalizeOutcome: async (_kind, _correlation, _outcome, isCurrent?: () => boolean) => {
+			finalizeOutcome: async (_kind, _correlation, outcome, isCurrent?: () => boolean) => {
 				state.finalizeCalls += 1;
+				state.finalizeCodes.push((outcome as { code?: string } | undefined)?.code ?? "none");
 				state.finalizeStarted?.();
 				const previousStatus = state.status;
 				state.status = "failed";
@@ -316,6 +322,8 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		finalizeRelease.resolve();
 		await Bun.sleep(2_300);
 		expect(state.noteTransitionCalls).toBeGreaterThanOrEqual(2);
+		expect(state.noteTransitionFrames).toContain("agent_end");
+		expect(state.finalizeCodes).toEqual(["prompt_deadline_exceeded"]);
 		expect(state.status).toBe("terminal_ok");
 		expect(expired).toBe(1);
 		expect(manager.has(correlation)).toBe(false);
