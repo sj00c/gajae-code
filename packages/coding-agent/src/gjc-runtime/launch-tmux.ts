@@ -1047,7 +1047,6 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 			extraEnv: {
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
-				...coordinatorSidecarSigningEnv(env),
 				// Carry the GJC-managed session name into the child so tmux-backed
 				// flows can target the correct leader session by name. Under psmux on
 				// Windows the inherited TMUX_PANE can resolve to the wrong/default
@@ -1470,7 +1469,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	const creationSpawn = plan.authority ? spawnSync : rawSpawnSync;
 	const options: TmuxSpawnOptions = {
 		cwd: plan.cwd,
-		env,
+		env: { ...env, ...coordinatorSidecarSigningEnv(env) },
 		stdin: "inherit",
 		stdout: "inherit",
 		stderr: "inherit",

@@ -22,7 +22,12 @@ import {
 	__setExecutableIdentityResolverForTests,
 } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
 import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { persistCoordinatorRuntimeStateFromPostmortem } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+import {
+	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
+	persistCoordinatorRuntimeStateFromPostmortem,
+} from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import {
 	captureOwnerGenerationBaselineSync,
 	isExactScopedBootstrapSuccessReceipt,
@@ -568,6 +573,29 @@ describe("default GJC tmux launch", () => {
 		expect(plan.innerCommand).toContain("tmux-exit.json");
 		expect(plan.innerCommand).toContain("trap __gjc_tmux_write_exit_marker EXIT");
 		expect(plan.innerCommand).not.toStartWith("exec ");
+	});
+
+	it("keeps the sidecar PKCS#8 private key out of tmux argv projections", () => {
+		const privateKey = "private-pkcs8-der-base64";
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {
+				GJC_PSMUX_DETECTION: "off",
+				[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+				[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: privateKey,
+				[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: "a".repeat(64),
+			},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+		});
+		expect(plan?.innerCommand).toBeDefined();
+		expect(plan?.innerCommand).not.toContain(privateKey);
+		expect(plan?.newSessionArgs.join(" ")).not.toContain(privateKey);
 	});
 
 	it("POSIX tmux inner wrapper writes a public-safe exit marker and preserves exit status", () => {
