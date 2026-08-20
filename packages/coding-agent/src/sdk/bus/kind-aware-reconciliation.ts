@@ -75,6 +75,8 @@ export interface KindAwareReconciliation {
 		recordError?: { code: string; message: string },
 		content?: unknown,
 	): Promise<void>;
+	/** Replace an exhausted deadline failure with an active, non-definite record. */
+	markUncertain(kind: ReconciliationKind, correlation: PromptCorrelation): Promise<void>;
 	peekPendingOutcome(kind: ReconciliationKind, correlation: PromptCorrelation): SdkPromptTerminalOutcome | undefined;
 	lookup(
 		kind: ReconciliationKind,
@@ -347,6 +349,7 @@ export function createKindAwareReconciliation(
 			}
 			if (frame.type === "agent_start") {
 				if (record.status !== "accepted") return { value: undefined, changed: false };
+				delete record.deadlineRecoveryPending;
 				record.status = "in_flight";
 				record.startedAt = now();
 				if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
@@ -356,9 +359,11 @@ export function createKindAwareReconciliation(
 				// agent_failed is additive diagnostics; agent_end remains the sole
 				// terminal lifecycle boundary for the correlated invocation.
 				record.error ??= sanitizePromptFailure(frame.error);
+				delete record.deadlineRecoveryPending;
 				return { value: undefined, changed: true };
 			}
 			const pendingOutcome = record.pendingOutcome;
+			delete record.deadlineRecoveryPending;
 			record.terminalAt = now();
 			if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
 			if (pendingOutcome !== undefined) {
@@ -431,6 +436,24 @@ export function createKindAwareReconciliation(
 			record.pendingOutcome = undefined;
 			record.pendingReceiptState = undefined;
 			cleanupRecords(candidate);
+			return { value: undefined, changed: true };
+		});
+	};
+
+	const markUncertain = async (kind: ReconciliationKind, correlation: PromptCorrelation) => {
+		await queueMutation(candidate => {
+			const record = candidate.get(keyOf(kind, correlation));
+			if (!record || record.kind !== kind) return { value: undefined, changed: false };
+			const wasDeadlineFailure = record.status === "failed" && record.error?.code === "prompt_deadline_exceeded";
+			if (!wasDeadlineFailure && record.terminalAt !== undefined) return { value: undefined, changed: false };
+			record.status = record.startedAt === undefined ? "accepted" : "in_flight";
+			delete record.terminalAt;
+			delete record.outcome;
+			delete record.pendingOutcome;
+			delete record.pendingReceiptState;
+			delete record.receiptState;
+			delete record.error;
+			record.deadlineRecoveryPending = true;
 			return { value: undefined, changed: true };
 		});
 	};
@@ -578,6 +601,7 @@ export function createKindAwareReconciliation(
 		noteTransition,
 		claimPendingOutcome,
 		finalizeOutcome,
+		markUncertain,
 		peekPendingOutcome,
 		lookup,
 		lookupResult,

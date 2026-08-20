@@ -446,6 +446,7 @@ export interface InvocationReconciliation {
 		outcome?: { kind: string; code: string; message: string; provenance?: string },
 		isCurrent?: () => boolean,
 	): Promise<void>;
+	markUncertain(kind: InvocationKind, correlation: InvocationCorrelation): Promise<void>;
 }
 
 export function createInvocationReconciliation(
@@ -583,7 +584,11 @@ export function createInvocationReconciliation(
 					record.status === "terminal_ok" ||
 					record.status === "failed")
 			) {
-				if (record.terminalAt === undefined && (record.status === "accepted" || record.status === "in_flight")) {
+				if (
+					record.terminalAt === undefined &&
+					(record.status === "accepted" || record.status === "in_flight") &&
+					!(record as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending
+				) {
 					record.status = "failed";
 					record.terminalAt = Date.now();
 					record.error = { code: "process_restart", message: "Reconciliation incomplete after process restart." };
@@ -723,6 +728,7 @@ export function createInvocationReconciliation(
 				return;
 			}
 			const next = { ...record, revision: ++mutationRevision };
+			delete (next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending;
 			if (frame.type === "agent_start") {
 				next.status = "in_flight";
 				next.startedAt = Date.now();
@@ -833,6 +839,23 @@ export function createInvocationReconciliation(
 			} finally {
 				if (pendingFinalizations.get(recordKey) === pending) pendingFinalizations.delete(recordKey);
 			}
+		},
+		async markUncertain(kind, correlation) {
+			const recordKey = key(kind, correlation);
+			const record = records.get(recordKey);
+			if (!record || record.kind !== kind) return;
+			if (record.terminalAt !== undefined && record.error?.code !== "prompt_deadline_exceeded") return;
+			const next: InvocationRecord = {
+				...record,
+				status: record.startedAt === undefined ? "accepted" : "in_flight",
+				revision: ++mutationRevision,
+			};
+			delete next.terminalAt;
+			delete next.error;
+			delete (next as unknown as { outcome?: unknown }).outcome;
+			(next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending = true;
+			records.set(recordKey, next);
+			await persist();
 		},
 	};
 }

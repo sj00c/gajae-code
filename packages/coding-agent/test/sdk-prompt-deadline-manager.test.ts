@@ -18,6 +18,7 @@ interface FakeReconciliation {
 	finalizeRelease?: Promise<void>;
 	noteTransitionCalls: number;
 	noteTransitionFailures: number;
+	uncertainCalls: number;
 
 	/** When set, a failing finalize still leaves the durable record terminal (lost race). */
 	terminalOnFailure?: boolean;
@@ -28,6 +29,7 @@ function fakeReconciliation(): {
 		lookup: () => { status: string };
 		claimPendingOutcome: () => Promise<void>;
 		noteTransition: () => Promise<void>;
+		markUncertain: () => Promise<void>;
 		finalizeOutcome: (
 			_kind: string,
 			_correlation: unknown,
@@ -43,6 +45,7 @@ function fakeReconciliation(): {
 		finalizeCalls: 0,
 		noteTransitionCalls: 0,
 		noteTransitionFailures: 0,
+		uncertainCalls: 0,
 	};
 	return {
 		state,
@@ -52,6 +55,10 @@ function fakeReconciliation(): {
 				state.noteTransitionCalls += 1;
 				if (state.noteTransitionCalls <= state.noteTransitionFailures) throw new Error("terminal replay failed");
 				state.status = "terminal_ok";
+			},
+			markUncertain: async () => {
+				state.uncertainCalls += 1;
+				state.status = "uncertain";
 			},
 			claimPendingOutcome: async () => {
 				state.claimStarted?.();
@@ -155,7 +162,7 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.clearAll();
 	});
 
-	test("the retry budget is bounded: a persistently failing store parks the lease without dropping ownership", async () => {
+	test("the retry budget is bounded: exhaustion records durable uncertainty instead of false deadline failure", async () => {
 		const { reconciliation, state } = fakeReconciliation();
 		state.finalizeFailures = Number.MAX_SAFE_INTEGER;
 		let expired = 0;
@@ -174,8 +181,11 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		await Bun.sleep(6_800);
 		expect(expired).toBe(0);
 		expect(state.finalizeCalls).toBeLessThanOrEqual(7);
-		// The lease is retained (recovery path), only the timer is parked.
-		expect(manager.has(correlation)).toBe(true);
+		// Exhaustion persists a non-definite recovery marker before releasing the
+		// in-memory lease; a later real agent_end can still repair the durable row.
+		expect(state.uncertainCalls).toBe(1);
+		expect(state.status).toBe("uncertain");
+		expect(manager.has(correlation)).toBe(false);
 		const callsAfterPark = state.finalizeCalls;
 		await Bun.sleep(1_300);
 		expect(state.finalizeCalls).toBe(callsAfterPark);

@@ -176,7 +176,16 @@ export class PromptDeadlineManager {
 		const attempts = (this.#expiryRetries.get(key) ?? 0) + 1;
 		this.#expiryRetries.set(key, attempts);
 		this.#clearTimer(key);
-		if (attempts > MAX_EXPIRY_RETRIES) return;
+		if (attempts > MAX_EXPIRY_RETRIES) {
+			const correlation = this.#correlations.get(key);
+			if (correlation && typeof this.#reconciliation.markUncertain === "function") {
+				void this.#reconciliation
+					.markUncertain("prompt", correlation)
+					.then(() => this.clear(correlation))
+					.catch(() => undefined);
+			}
+			return;
+		}
 		const timer = setTimeout(() => void this.#onDeadline(key), EXPIRY_RETRY_DELAY_MS);
 		(timer as unknown as { unref?: () => void }).unref?.();
 		this.#timers.set(key, timer);

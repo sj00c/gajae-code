@@ -103,6 +103,19 @@ async function accepted(store = new MemoryStore()) {
 }
 
 describe("SDK prompt terminal arbiter", () => {
+	test("exhausted deadline repair persists non-definite ownership across hydrate", async () => {
+		const store = new MemoryStore();
+		const first = await accepted(store);
+		await first.reconciliation.claimPendingOutcome("prompt", correlation, failed("prompt_deadline_exceeded"));
+		await first.reconciliation.finalizeOutcome("prompt", correlation, failed("prompt_deadline_exceeded"));
+		await first.reconciliation.markUncertain("prompt", correlation);
+		const reloaded = createKindAwareReconciliation({ store, now: () => 200 });
+		await reloaded.hydrateFromStore();
+		expect(reloaded.lookup("prompt", correlation)).toMatchObject({ status: "accepted" });
+		await reloaded.noteTransition("prompt", correlation, { type: "agent_end" });
+		expect(reloaded.lookup("prompt", correlation)).toMatchObject({ status: "terminal_ok" });
+	});
+
 	test("claims the first pending outcome without exposing it as terminal", async () => {
 		const { reconciliation, store } = await accepted();
 		const first = stopped("end_turn");
