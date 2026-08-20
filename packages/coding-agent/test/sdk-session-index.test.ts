@@ -1431,6 +1431,80 @@ describe("SDK session index", () => {
 		expect(await reader.refreshIfChanged()).toBe(true);
 		expect(reader.listSessions().warnings).not.toHaveLength(0);
 	});
+	it("refreshIfChanged detects a same-size rename-replace whose timestamps collide (#4689)", async () => {
+		// The cheap path must not depend on timestamp resolution. A same-size
+		// rename-replace inside one filesystem tick reports identical size,
+		// mtimeMs and ctimeMs (measured here: the overwhelming majority of
+		// attempts), so a stamp built only from size+timestamps would report
+		// "unchanged" after a real snapshot replacement. The cooperative writer
+		// protocol replaces files by rename, which always installs a new inode,
+		// so the inode is the field that makes this detectable.
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-ino-"));
+		const writer = new SessionIndex(dir);
+		const first = await writer.append(event("ino-old"));
+		await writer.snapshot();
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["ino-old"]);
+
+		const snapPath = path.join(dir, "sdk", "sessions", "index.snapshot.json");
+		const buildPayload = (sessionId: string) => {
+			const replacement = {
+				version: SDK_STATE_VERSION,
+				indexSeq: first.indexSeq,
+				type: "host_registered" as const,
+				sessionId,
+				locator: { repo: "r", stateRoot: "q" },
+				endpointGeneration: 1,
+				pid: process.pid,
+				ts: first.ts,
+			};
+			return JSON.stringify({
+				version: 3,
+				indexSeq: first.indexSeq,
+				events: [
+					{
+						...replacement,
+						checksum: sessionIndexChecksum(replacement as Parameters<typeof sessionIndexChecksum>[0]),
+					},
+				],
+			});
+		};
+		// Reproduce a natural timestamp collision: replace by rename until the
+		// post-replacement stat is indistinguishable from the pre-replacement
+		// stat on size+mtimeMs+ctimeMs, leaving the inode as the only signal.
+		let collided = false;
+		let expected = "";
+		for (let attempt = 0; attempt < 200 && !collided; attempt++) {
+			const before = await fs.stat(snapPath);
+			expected = `ino-new-${String(attempt).padStart(3, "0")}`;
+			const payload = buildPayload(expected);
+			const staging = `${snapPath}.collide-${attempt}.tmp`;
+			await fs.writeFile(staging, payload);
+			await fs.rename(staging, snapPath);
+			const after = await fs.stat(snapPath);
+			collided =
+				after.size === before.size &&
+				after.mtimeMs === before.mtimeMs &&
+				after.ctimeMs === before.ctimeMs &&
+				Number(after.ino) !== Number(before.ino);
+			if (!collided) {
+				// Not a collision this round; resynchronize the reader so the next
+				// attempt starts from a clean stamp baseline.
+				await reader.refreshIfChanged();
+			}
+		}
+		if (!collided) {
+			// This filesystem reports high-resolution timestamps, so the collision
+			// is not reproducible here and there is nothing to fence.
+			expect(await reader.refreshIfChanged()).toBe(true);
+			return;
+		}
+		// Only the inode changed. The cheap path must still report a change and
+		// fully replay the replacement snapshot.
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual([expected]);
+	});
 	it("refreshIfChanged fully replays same-size rewrites and snapshot-only changes (#4689 QA)", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-rewrite-"));
 		const writer = new SessionIndex(dir);

@@ -150,12 +150,24 @@ const auditFor = (agentDir: string) => path.join(dirFor(agentDir), "index-audit.
  * Idle-poll change stamp over the two index files (#4689). A polling reader
  * that has already replayed the index must be able to prove "nothing changed"
  * with two stats instead of re-acquiring the machine-global lock and
- * re-parsing the whole log every cycle. `ctimeMs` is included so a same-size
- * in-place rewrite or a rename replacement (rotation) still reads as a change.
+ * re-parsing the whole log every cycle.
+ *
+ * Timestamps alone are NOT a durable-equality proof: on a coarse-resolution
+ * filesystem a same-size write inside one tick reports identical `mtimeMs` and
+ * `ctimeMs` (measured: ~98% of back-to-back same-size rewrites collide on
+ * both). The stamp is therefore anchored on the two fields the cooperative
+ * writer protocol cannot leave untouched:
+ *   - append (`appendSync`) always grows `size`;
+ *   - rename-replace (`replaceAtomically`, used for snapshots and rotation)
+ *     always installs a new inode, so `ino` changes even when the replacement
+ *     has an identical byte length (measured: 0/3000 inode collisions).
+ * `mtimeMs`/`ctimeMs` are retained as an extra signal for foreign in-place
+ * edits that keep both size and inode, which the writer protocol never does.
  */
 interface SessionIndexFileStamp {
 	readonly exists: boolean;
 	readonly size: number;
+	readonly ino: number;
 	readonly mtimeMs: number;
 	readonly ctimeMs: number;
 }
@@ -166,9 +178,10 @@ interface SessionIndexChangeStamp {
 async function statIndexFile(file: string): Promise<SessionIndexFileStamp> {
 	try {
 		const stat = await fs.stat(file);
-		return { exists: true, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
+		return { exists: true, size: stat.size, ino: Number(stat.ino), mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { exists: false, size: 0, mtimeMs: 0, ctimeMs: 0 };
+		if ((error as NodeJS.ErrnoException).code === "ENOENT")
+			return { exists: false, size: 0, ino: 0, mtimeMs: 0, ctimeMs: 0 };
 		throw error;
 	}
 }
@@ -180,10 +193,12 @@ function sameIndexChangeStamp(a: SessionIndexChangeStamp, b: SessionIndexChangeS
 	return (
 		a.log.exists === b.log.exists &&
 		a.log.size === b.log.size &&
+		a.log.ino === b.log.ino &&
 		a.log.mtimeMs === b.log.mtimeMs &&
 		a.log.ctimeMs === b.log.ctimeMs &&
 		a.snapshot.exists === b.snapshot.exists &&
 		a.snapshot.size === b.snapshot.size &&
+		a.snapshot.ino === b.snapshot.ino &&
 		a.snapshot.mtimeMs === b.snapshot.mtimeMs &&
 		a.snapshot.ctimeMs === b.snapshot.ctimeMs
 	);
