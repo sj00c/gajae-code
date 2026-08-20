@@ -1,13 +1,15 @@
 import { afterEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
-
+import { generateKeyPairSync, verify } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 import { FileLockTestHooks } from "../src/config/file-lock";
+import { buildDefaultTmuxLaunchPlan } from "../src/gjc-runtime/launch-tmux";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
+	canonicalCoordinatorSidecarPayload,
 	classifyRuntimeToolActivity,
 	eventAffectsCoordinatorRuntimeState,
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
@@ -15,6 +17,9 @@ import {
 	GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV,
 	GJC_COORDINATOR_SESSION_READINESS_FILE_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
@@ -75,6 +80,9 @@ const ORIGINAL_SESSION_ID = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
 const ORIGINAL_BRANCH = process.env[GJC_COORDINATOR_SESSION_BRANCH_ENV];
 const ORIGINAL_LAUNCH_ID = process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV];
 const ORIGINAL_READINESS_FILE = process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV];
+const ORIGINAL_SIDECAR_SIGNING_KEY = process.env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+const ORIGINAL_SIDECAR_KEY_ID = process.env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV];
+const ORIGINAL_SIDECAR_SIGNATURE_REQUIRED = process.env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV];
 const PROMPT_ACCEPTED_ENV = "GJC_SESSION_PROMPT_ACCEPTED_JSON";
 const BASELINE_DIRTY_ENV = "GJC_SESSION_WORKTREE_BASELINE_DIRTY";
 const ORIGINAL_PROMPT_ACCEPTED = process.env[PROMPT_ACCEPTED_ENV];
@@ -104,6 +112,13 @@ afterEach(async () => {
 	else process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = ORIGINAL_LAUNCH_ID;
 	if (ORIGINAL_READINESS_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV];
 	else process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = ORIGINAL_READINESS_FILE;
+	if (ORIGINAL_SIDECAR_SIGNING_KEY === undefined) delete process.env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	else process.env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV] = ORIGINAL_SIDECAR_SIGNING_KEY;
+	if (ORIGINAL_SIDECAR_KEY_ID === undefined) delete process.env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV];
+	else process.env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV] = ORIGINAL_SIDECAR_KEY_ID;
+	if (ORIGINAL_SIDECAR_SIGNATURE_REQUIRED === undefined)
+		delete process.env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV];
+	else process.env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV] = ORIGINAL_SIDECAR_SIGNATURE_REQUIRED;
 	if (ORIGINAL_PROMPT_ACCEPTED === undefined) delete process.env[PROMPT_ACCEPTED_ENV];
 	else process.env[PROMPT_ACCEPTED_ENV] = ORIGINAL_PROMPT_ACCEPTED;
 	if (ORIGINAL_BASELINE_DIRTY === undefined) delete process.env[BASELINE_DIRTY_ENV];
@@ -116,6 +131,49 @@ async function readJson(file: string): Promise<Record<string, unknown>> {
 }
 
 describe("coordinator runtime state sidecar", () => {
+	it("regresses signed subprocess bootstrap, continuation, and tamper refusal", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const fixture = path.join(import.meta.dir, "fixtures", "session-state-sidecar-subprocess.ts");
+		const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+		const privateDer = privateKey.export({ format: "der", type: "pkcs8" }).toString("base64");
+		const publicDer = publicKey.export({ format: "der", type: "spki" });
+		const keyId = "155f1a4c155f1a4c155f1a4c155f1a4c155f1a4c155f1a4c155f1a4c155f1a4c";
+		const env = {
+			...process.env,
+			[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
+			[GJC_COORDINATOR_SESSION_ID_ENV]: "155-FinalA4",
+			[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+			[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: keyId,
+			[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: privateDer,
+		};
+		const run = async () => {
+			const child = Bun.spawn([process.execPath, fixture, stateFile], { env, stdout: "pipe", stderr: "pipe" });
+			return await child.exited;
+		};
+		expect(await run()).toBe(0);
+		const raw = await Bun.file(stateFile).text();
+		const payload = JSON.parse(raw) as Record<string, unknown>;
+		expect(payload.sidecar_key_id).toBe(keyId);
+		expect(typeof payload.sidecar_signature).toBe("string");
+		const { sidecar_signature: signature, ...unsigned } = payload;
+		expect(
+			verify(
+				null,
+				Buffer.from(canonicalCoordinatorSidecarPayload(unsigned)),
+				{ key: publicDer, format: "der", type: "spki" },
+				Buffer.from(String(signature), "base64"),
+			),
+		).toBe(true);
+		expect(unsigned.state).toBe("completed");
+		expect(unsigned.activity).toMatchObject({ active_tool_count: 0 });
+		const tampered = { ...payload, state: "running" };
+		await Bun.write(stateFile, `${JSON.stringify(tampered)}\\n`);
+		const before = await Bun.file(stateFile).bytes();
+		expect(await run()).not.toBe(0);
+		expect(await Bun.file(stateFile).bytes()).toEqual(before);
+	});
+
 	it("ignores a session root removed between postmortem lock parent creation and acquisition", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, ".gjc", "_session-removed", "state", "runtime-state.json");
@@ -182,6 +240,76 @@ describe("coordinator runtime state sidecar", () => {
 			expect(eventAffectsCoordinatorRuntimeState(event as never)).toBe(affects);
 			expect(stateForEvent(event as never) !== null).toBe(lifecycle);
 		}
+	});
+
+	it("persists explicit standalone tmux state with authority env cleared", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "standalone-state.json");
+		delete process.env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+		delete process.env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV];
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "standalone-tmux";
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId: "fallback", cwd: root, sessionFile: null },
+		);
+
+		expect(await readPayload(stateFile)).toMatchObject({ session_id: "standalone-tmux", state: "running" });
+	});
+
+	it("refuses every unpaired or malformed tmux signing launch", async () => {
+		for (const authorityEnv of [
+			{ GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED: "true" },
+			{ GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "private-key" },
+			{
+				GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED: "yes",
+				GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "private-key",
+			},
+		])
+			expect(() =>
+				buildDefaultTmuxLaunchPlan({
+					parsed: { tmux: true, messages: [], fileArgs: [], unknownFlags: new Map() } as never,
+					rawArgs: ["--tmux"],
+					cwd: "/repo",
+					env: { ...authorityEnv, GJC_TMUX_COMMAND: "tmux", GJC_PSMUX_DETECTION: "off" },
+					argv: ["bun", "packages/coding-agent/src/cli.ts"],
+					execPath: "/bin/bun",
+					platform: "darwin",
+					tty: { stdin: true, stdout: true },
+					tmuxAvailable: true,
+					existingBranchSessionName: null,
+				}),
+			).toThrow("Coordinator sidecar signing key is required for this tmux launch.");
+	});
+
+	it("requires Coordinator signing material captured at launch and rejects predecessor launch payloads", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "coordinator-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "coordinator-session";
+		process.env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV] = "true";
+		delete process.env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			),
+		).rejects.toThrow("invalid or unreadable");
+		expect(await Bun.file(stateFile).exists()).toBe(false);
+
+		// The signer is captured and removed before runtime initialization. Supplying
+		// a predecessor-format secret after module bootstrap must not arm a signer.
+		process.env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV] = "a".repeat(64);
+		process.env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV] = "a".repeat(64);
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			),
+		).rejects.toThrow("invalid or unreadable");
+		expect(await Bun.file(stateFile).exists()).toBe(false);
 	});
 
 	it("skips duplicate same-state running writes within the heartbeat", async () => {

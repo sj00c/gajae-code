@@ -16,9 +16,13 @@ import {
 } from "../src/coordinator/contract";
 import {
 	assertCloseAdmission,
+	claimCreationRequest,
 	coordinatorStatePaths,
 	createSessionTransaction,
 	initializeCoordinatorNamespace,
+	reconcileCreationRemoteVerifier,
+	rotateClaimedCreationVerifier,
+	startCreationRemote,
 	withNamespaceRegistry,
 } from "../src/coordinator-mcp/question-state";
 import { createCoordinatorMcpServer, handleCoordinatorMcpRequest } from "../src/coordinator-mcp/server";
@@ -127,14 +131,21 @@ describe("canonical SDK coordinator compatibility handler", () => {
 			expect(
 				await server.callTool("gjc_coordinator_start_session", { cwd: root, idempotency_key: "start-1" }),
 			).toEqual({ ok: false, reason: "coordinator_mutation_call_not_allowed:sessions" });
-			expect(await server.callTool("gjc_coordinator_read_artifact", { path: artifact })).toMatchObject({
-				ok: true,
-				text: "coordinator artifact",
-			});
-			expect(await server.callTool("gjc_coordinator_read_artifact", { path: os.tmpdir() })).toEqual({
-				ok: false,
-				reason: "artifact_outside_allowed_roots",
-			});
+			if (process.platform === "linux") {
+				expect(await server.callTool("gjc_coordinator_read_artifact", { path: artifact })).toMatchObject({
+					ok: true,
+					text: "coordinator artifact",
+				});
+				expect(await server.callTool("gjc_coordinator_read_artifact", { path: os.tmpdir() })).toEqual({
+					ok: false,
+					reason: "artifact_outside_allowed_roots",
+				});
+			} else {
+				await expect(server.callTool("gjc_coordinator_read_artifact", { path: artifact })).resolves.toMatchObject({
+					ok: false,
+					error: { code: "artifact_unavailable" },
+				});
+			}
 		});
 	});
 });
@@ -354,6 +365,39 @@ describe("mcp serve check command compatibility", () => {
 });
 
 describe("coordinator question-state direct contracts", () => {
+	it("rotates only an unspawned claimed creation verifier", async () => {
+		await withTempRoot(async root => {
+			const paths = coordinatorStatePaths(path.join(root, "state"), "namespace-rotate");
+			await initializeCoordinatorNamespace(paths);
+			const oldVerifier = { key_id: "a".repeat(64), public_key: "old-public-key" };
+			const newVerifier = { key_id: "b".repeat(64), public_key: "new-public-key" };
+			const claimed = await claimCreationRequest(paths, {
+				key_digest: "creation-key",
+				request_digest: "request-digest",
+				tool: "gjc_coordinator_start_session",
+				sidecar_verifier: oldVerifier,
+			});
+			expect(claimed.phase).toBe("claimed");
+			const rotated = await rotateClaimedCreationVerifier(paths, "creation-key", oldVerifier.key_id, newVerifier);
+			expect(rotated.sidecar_verifier).toEqual(newVerifier);
+			const started = await startCreationRemote(paths, "creation-key", newVerifier);
+			expect(started.phase).toBe("remote_started");
+			expect(started.sidecar_verifier).toEqual(newVerifier);
+			const replayed = await reconcileCreationRemoteVerifier(paths, "creation-key", oldVerifier, newVerifier.key_id);
+			expect(replayed.sidecar_verifier).toEqual(newVerifier);
+			const rotatedAfterProof = await reconcileCreationRemoteVerifier(
+				paths,
+				"creation-key",
+				oldVerifier,
+				oldVerifier.key_id,
+			);
+			expect(rotatedAfterProof.sidecar_verifier).toEqual(oldVerifier);
+			const preserved = await rotateClaimedCreationVerifier(paths, "creation-key", oldVerifier.key_id, newVerifier);
+			expect(preserved.phase).toBe("remote_started");
+			expect(preserved.sidecar_verifier).toEqual(oldVerifier);
+		});
+	});
+
 	it("persists the creation-session snapshot and rejects post-close admissions", async () => {
 		await withTempRoot(async root => {
 			const paths = coordinatorStatePaths(path.join(root, "state"), "namespace-2550");
@@ -374,6 +418,10 @@ describe("coordinator question-state direct contracts", () => {
 					endpoint_url: "ws://private.example.test",
 					endpoint_generation: 1,
 					endpoint_incarnation: "incarnation-1",
+					sidecar_verifier: {
+						key_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+						public_key: "test-public-key",
+					},
 				},
 				ephemeral: false,
 				visible: true,

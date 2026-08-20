@@ -37,6 +37,7 @@ export interface CanonicalSessionSnapshotV1 {
 		endpoint_url: string;
 		endpoint_generation: number;
 		endpoint_incarnation: string;
+		sidecar_verifier: { key_id: string; public_key: string };
 	};
 	ephemeral: boolean;
 	visible: boolean;
@@ -212,6 +213,8 @@ function isOutboxEntity(value: unknown): value is OutboxEventV1["entity"] {
 }
 export interface CoordinatorSessionTransactionV1 {
 	schema_version: 1;
+	/** Digest of the canonical creation intent that produced this WAL. */
+	creation_intent_digest: string;
 	namespace_id: string;
 	session_id: string;
 	revision: number;
@@ -281,6 +284,7 @@ export interface CreationRequestV1 {
 	remote_create_key: string;
 	session_id: string | null;
 	endpoint_incarnation: string | null;
+	sidecar_verifier: { key_id: string; public_key: string } | null;
 	wal_revision?: number;
 	wal_digest?: string;
 	safe_response?: Record<string, unknown>;
@@ -297,7 +301,16 @@ export interface NamespaceDeletionEntryV1 {
 	close_key: string;
 	phase: "intent" | "broker_closed" | "cleanup_pending" | "completed" | "uncertain";
 	safe_response?: Record<string, unknown>;
-	cleanup: { wal: boolean; turns: boolean; reports: boolean; session: boolean; events: boolean };
+	cleanup: {
+		wal: boolean;
+		turns: boolean;
+		reports: boolean;
+		session: boolean;
+		events: boolean;
+		/** Exact projection targets captured before the canonical WAL is removed. */
+		turn_ids?: string[];
+		report_ids?: string[];
+	};
 	authority_digest: string;
 	created_at: string;
 	updated_at: string;
@@ -330,7 +343,17 @@ const EMERGENCY_BYTES = 128 * 1024;
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const PUBLIC_CLAIM_LEASE_MS = 30_000;
 export const COORDINATOR_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+export const COORDINATOR_REPORT_ID_PATTERN = /^report-[a-f0-9]{64}$/;
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+const canonicalJson = (value: unknown): string => {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+		.join(",")}}`;
+};
 const lockOptions = (signal?: AbortSignal) => (signal ? { signal } : undefined);
 
 function publicDeliveryFor(event: OutboxEventV1): PublicDeliveryV1 {
@@ -419,14 +442,605 @@ async function readJson<T>(file: string): Promise<T | null> {
 		throw new Error("state_corrupt");
 	}
 }
+
+/** Reads an authoritative WAL without conflating an absent file with JSON null or another scalar root. */
+async function readTransactionJson<T>(file: string): Promise<T | null> {
+	let source: string;
+	try {
+		source = await fs.readFile(file, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw new Error("state_corrupt");
+	}
+	try {
+		const value: unknown = JSON.parse(source);
+		if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("invalid_root");
+		return value as T;
+	} catch {
+		throw new Error("state_corrupt");
+	}
+}
 function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespaceId: string, sessionId: string): void {
+	const isRecord = (value: unknown): value is Record<string, unknown> =>
+		typeof value === "object" && value !== null && !Array.isArray(value);
+	const isTime = (value: unknown) => typeof value === "string" && Number.isFinite(Date.parse(value));
+	const safeId = (value: unknown) => typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(value);
+	const turnStatuses = new Set([
+		"queued",
+		"delivering",
+		"active",
+		"waiting_for_answer",
+		"completing",
+		"completed",
+		"failed",
+		"cancelled",
+		"superseded",
+	]);
+	const activeStatuses = new Set(["delivering", "active", "waiting_for_answer", "completing"]);
+	const terminalStatuses = new Set(["completed", "failed", "cancelled", "superseded"]);
+	const promptPhases = new Set([
+		"claimed",
+		"remote_started",
+		"accepted",
+		"linked",
+		"terminal",
+		"completed",
+		"uncertain",
+	]);
+	const validStates = new Set([
+		"booting",
+		"prepared",
+		"ready_for_input",
+		"running",
+		"needs_user_input",
+		"completed",
+		"errored",
+		"stale",
+		"unknown",
+	]);
+	const turns = transaction.canonical?.turns;
+	const prompts = transaction.requests?.prompts;
+	const invalidDelivery = (delivery: unknown) => {
+		if (
+			!isRecord(delivery) ||
+			typeof delivery.delivered !== "boolean" ||
+			typeof delivery.queued !== "boolean" ||
+			(delivery.target !== null && typeof delivery.target !== "string") ||
+			!Array.isArray(delivery.attempts) ||
+			(delivery.prompt_acknowledged !== undefined && typeof delivery.prompt_acknowledged !== "boolean") ||
+			(delivery.state !== undefined &&
+				!["queued", "tmux_keys_sent", "acknowledged", "unavailable", "unacknowledged"].includes(
+					String(delivery.state),
+				))
+		)
+			return true;
+		if (delivery.tmux_keys_sent !== undefined && typeof delivery.tmux_keys_sent !== "boolean") return true;
+		if (delivery.runtime_command_id !== undefined && !safeId(delivery.runtime_command_id)) return true;
+		if (delivery.runtime_turn_id !== undefined && !safeId(delivery.runtime_turn_id)) return true;
+		if (
+			delivery.attempts.some(
+				attempt =>
+					!isRecord(attempt) ||
+					typeof attempt.delivered !== "boolean" ||
+					!isTime(attempt.created_at) ||
+					(attempt.reason !== null && typeof attempt.reason !== "string") ||
+					(attempt.channel !== undefined &&
+						attempt.channel !== "tmux_keys" &&
+						attempt.channel !== "runtime_ack") ||
+					(attempt.tmux_keys_sent !== undefined && typeof attempt.tmux_keys_sent !== "boolean"),
+			)
+		)
+			return true;
+		return (
+			delivery.prompt_acknowledged === true &&
+			(delivery.state !== "acknowledged" ||
+				!safeId(delivery.runtime_command_id) ||
+				!safeId(delivery.runtime_turn_id))
+		);
+	};
+	const invalidProvenance = (value: unknown, turnId: string) =>
+		value != null &&
+		(!isRecord(value) ||
+			value.namespace_id !== namespaceId ||
+			value.session_id !== sessionId ||
+			value.coordinator_turn_id !== turnId ||
+			!safeId(value.endpoint_incarnation) ||
+			!safeId(value.runtime_turn_id) ||
+			!isTime(value.gate_created_at) ||
+			typeof value.schema_hash !== "string" ||
+			value.schema_hash.length === 0 ||
+			typeof value.stage !== "string" ||
+			value.stage.length === 0 ||
+			typeof value.kind !== "string" ||
+			value.kind.length === 0);
+	const invalidAuthorityProvenance = (value: unknown) =>
+		!isRecord(value) ||
+		value.namespace_id !== namespaceId ||
+		value.session_id !== sessionId ||
+		(value.coordinator_turn_id !== "" && !safeId(value.coordinator_turn_id)) ||
+		!safeId(value.endpoint_incarnation) ||
+		!safeId(value.runtime_turn_id) ||
+		!isTime(value.gate_created_at) ||
+		typeof value.schema_hash !== "string" ||
+		value.schema_hash.length === 0 ||
+		typeof value.stage !== "string" ||
+		value.stage.length === 0 ||
+		typeof value.kind !== "string" ||
+		value.kind.length === 0;
+	const invalidTurn = ([turnId, turn]: [string, CanonicalTurnSnapshotV1]) => {
+		if (
+			!isRecord(turn) ||
+			turn.schema_version !== 1 ||
+			turnId !== turn.turn_id ||
+			turn.session_id !== sessionId ||
+			turn.namespace_id !== namespaceId ||
+			!turnStatuses.has(String(turn.status)) ||
+			!isRecord(turn.prompt) ||
+			typeof turn.prompt.text !== "string" ||
+			!isTime(turn.prompt.created_at) ||
+			typeof turn.prompt.source !== "string" ||
+			invalidDelivery(turn.delivery) ||
+			invalidProvenance(turn.runtime_provenance, turnId) ||
+			!Array.isArray(turn.question_ids) ||
+			new Set(turn.question_ids).size !== turn.question_ids.length ||
+			turn.question_ids.some(id => typeof id !== "string" || id.length === 0) ||
+			!isRecord(turn.final_response) ||
+			(turn.final_response.text !== null && typeof turn.final_response.text !== "string") ||
+			turn.final_response.format !== "markdown" ||
+			(turn.final_response.source !== null && typeof turn.final_response.source !== "string") ||
+			(turn.final_response.artifact_path !== null && typeof turn.final_response.artifact_path !== "string") ||
+			typeof turn.final_response.truncated !== "boolean" ||
+			(turn.evidence !== undefined &&
+				(!Array.isArray(turn.evidence) || turn.evidence.some(value => !isRecord(value)))) ||
+			(turn.error !== undefined &&
+				turn.error !== null &&
+				(!isRecord(turn.error) ||
+					typeof turn.error.code !== "string" ||
+					typeof turn.error.message !== "string" ||
+					typeof turn.error.recoverable !== "boolean")) ||
+			(turn.liveness !== undefined &&
+				(!isRecord(turn.liveness) ||
+					(turn.liveness.checked_at !== null &&
+						turn.liveness.checked_at !== undefined &&
+						!isTime(turn.liveness.checked_at)) ||
+					(turn.liveness.live !== null &&
+						turn.liveness.live !== undefined &&
+						typeof turn.liveness.live !== "boolean") ||
+					(turn.liveness.reason !== null &&
+						turn.liveness.reason !== undefined &&
+						typeof turn.liveness.reason !== "string"))) ||
+			!isTime(turn.created_at) ||
+			!isTime(turn.updated_at) ||
+			(turn.started_at !== null && !isTime(turn.started_at)) ||
+			(turn.completed_at !== null && !isTime(turn.completed_at))
+		)
+			return true;
+		if (turn.status === "queued")
+			return turn.started_at !== null || turn.completed_at !== null || turn.terminal_fence !== null;
+		if (terminalStatuses.has(turn.status))
+			return (
+				!isTime(turn.completed_at) ||
+				!isRecord(turn.terminal_fence) ||
+				!Number.isSafeInteger(turn.terminal_fence.epoch) ||
+				turn.terminal_fence.epoch < 1 ||
+				turn.terminal_fence.status !== turn.status ||
+				!isTime(turn.terminal_fence.at) ||
+				(turn.terminal_fence.reason !== null && typeof turn.terminal_fence.reason !== "string")
+			);
+		return !isTime(turn.started_at) || turn.completed_at !== null || turn.terminal_fence !== null;
+	};
+	const receiptFor = (turn: CanonicalTurnSnapshotV1) =>
+		Object.values(prompts).some(
+			request =>
+				request.coordinator_turn_id === turn.turn_id &&
+				["accepted", "linked", "terminal", "completed"].includes(request.phase) &&
+				request.runtime_receipt?.accepted === true &&
+				request.runtime_receipt.command_id === (turn.delivery as Record<string, unknown>).runtime_command_id &&
+				request.runtime_receipt.turn_id === (turn.delivery as Record<string, unknown>).runtime_turn_id,
+		);
+	const invalidPrompt = ([key, request]: [string, PromptRequestV1]) =>
+		!isRecord(request) ||
+		key !== request.key_digest ||
+		!safeId(request.request_id) ||
+		!safeId(request.key_digest) ||
+		!safeId(request.request_digest) ||
+		(request.operation !== "turn.prompt" &&
+			request.operation !== "turn.follow_up" &&
+			request.operation !== "turn.abort_and_prompt") ||
+		!isRecord(request.canonical_prompt) ||
+		typeof request.canonical_prompt.text !== "string" ||
+		!safeId(request.sdk_idempotency_key) ||
+		!promptPhases.has(String(request.phase)) ||
+		!isTime(request.created_at) ||
+		!isTime(request.updated_at) ||
+		(request.coordinator_turn_id !== undefined &&
+			(!safeId(request.coordinator_turn_id) || !turns[request.coordinator_turn_id])) ||
+		(request.runtime_receipt !== undefined &&
+			(!isRecord(request.runtime_receipt) ||
+				request.runtime_receipt.accepted !== true ||
+				!safeId(request.runtime_receipt.command_id) ||
+				!safeId(request.runtime_receipt.turn_id))) ||
+		(["accepted", "linked", "terminal", "completed"].includes(request.phase) &&
+			request.coordinator_turn_id !== undefined &&
+			request.runtime_receipt === undefined) ||
+		(request.safe_response !== undefined && !isRecord(request.safe_response)) ||
+		(request.error_code !== undefined && typeof request.error_code !== "string");
+	const queue = transaction.canonical?.queue;
+	const reports = transaction.canonical?.reports;
+	const authorities = transaction.canonical?.gate_authorities;
+	const questions = transaction.canonical?.questions;
+	const answers = transaction.requests?.answers;
+	const operations = transaction.requests?.operations;
+	const outbox = transaction.outbox;
+	const projection = transaction.projection;
+	const recovery = transaction.recovery;
+	const invalidReport = ([reportId, report]: [string, CanonicalReportSnapshotV1]) =>
+		!isRecord(report) ||
+		!COORDINATOR_REPORT_ID_PATTERN.test(reportId) ||
+		report.report_id !== reportId ||
+		report.schema_version !== 1 ||
+		report.session_id !== sessionId ||
+		!safeId(report.operation_id) ||
+		(report.turn_id !== "" && (!safeId(report.turn_id) || !turns[report.turn_id])) ||
+		typeof report.status !== "string" ||
+		typeof report.summary !== "string" ||
+		(report.blocker !== null && typeof report.blocker !== "string") ||
+		(report.pr_url !== null && typeof report.pr_url !== "string") ||
+		!Array.isArray(report.evidence_paths) ||
+		new Set(report.evidence_paths).size !== report.evidence_paths.length ||
+		report.evidence_paths.some(value => typeof value !== "string") ||
+		!isTime(report.created_at);
+	const invalidAuthority = ([authorityId, authority]: [string, GateAuthorityEntryV1]) => {
+		if (
+			!isRecord(authority) ||
+			!safeId(authorityId) ||
+			!isRecord(authority.authority) ||
+			authority.authority.namespace_id !== namespaceId ||
+			authority.authority.session_id !== sessionId ||
+			typeof authority.authority.endpoint_incarnation !== "string" ||
+			authority.authority.endpoint_incarnation.length === 0 ||
+			!safeId(authority.authority.gate_id) ||
+			!isRecord(authority.observation) ||
+			!isRecord(authority.outcome) ||
+			!isTime(authority.first_seen_at) ||
+			!isTime(authority.updated_at)
+		)
+			return true;
+		const outcome = authority.outcome as Record<string, unknown>;
+		if (authority.observation.kind === "valid") {
+			const provenance = authority.observation.first_provenance;
+			if (outcome.state === "deferred_link") {
+				if (
+					!isRecord(provenance) ||
+					provenance.namespace_id !== namespaceId ||
+					provenance.session_id !== sessionId ||
+					provenance.coordinator_turn_id !== "" ||
+					!safeId(provenance.endpoint_incarnation) ||
+					!safeId(provenance.runtime_turn_id) ||
+					!isTime(provenance.gate_created_at) ||
+					typeof provenance.schema_hash !== "string" ||
+					provenance.schema_hash.length === 0 ||
+					typeof provenance.stage !== "string" ||
+					provenance.stage.length === 0 ||
+					typeof provenance.kind !== "string" ||
+					provenance.kind.length === 0
+				)
+					return true;
+			} else if (
+				(outcome.state === "pending" || outcome.state === "answered") &&
+				invalidProvenance(provenance, String(outcome.turn_id ?? ""))
+			) {
+				return true;
+			} else if (
+				outcome.state !== "pending" &&
+				outcome.state !== "answered" &&
+				invalidAuthorityProvenance(provenance)
+			) {
+				return true;
+			}
+		} else if (
+			authority.observation.kind !== "malformed" ||
+			!/^[a-f0-9]{64}$/.test(String(authority.observation.immutable_observation_digest ?? "")) ||
+			!["missing_runtime_turn", "invalid_runtime_turn", "invalid_gate_row", "wrong_session"].includes(
+				String(authority.observation.malformed),
+			)
+		)
+			return true;
+		if (
+			![
+				"deferred_link",
+				"pending",
+				"answered",
+				"stale",
+				"uncertain",
+				"ownership_unavailable",
+				"ownership_conflict",
+			].includes(String(outcome.state))
+		)
+			return true;
+		if (outcome.state === "pending" || outcome.state === "answered") {
+			const question = questions[String(outcome.question_id)];
+			if (
+				typeof outcome.turn_id !== "string" ||
+				!safeId(outcome.turn_id) ||
+				typeof outcome.question_id !== "string" ||
+				!safeId(outcome.question_id) ||
+				!turns[outcome.turn_id] ||
+				!question ||
+				question.authority_id !== authorityId ||
+				question.turn_id !== outcome.turn_id
+			)
+				return true;
+		}
+		return (
+			(outcome.state === "deferred_link" && !isTime(outcome.first_seen_at)) ||
+			(["stale", "uncertain", "ownership_unavailable", "ownership_conflict"].includes(String(outcome.state)) &&
+				typeof outcome.reason !== "string")
+		);
+	};
+	const invalidQuestion = ([questionId, question]: [string, PrivateQuestionV1]) => {
+		if (
+			!isRecord(question) ||
+			question.question_id !== questionId ||
+			!safeId(questionId) ||
+			!safeId(question.authority_id) ||
+			!authorities[question.authority_id] ||
+			question.session_id !== sessionId ||
+			!safeId(question.turn_id) ||
+			!turns[question.turn_id] ||
+			question.endpoint_incarnation !== transaction.canonical.session.broker.endpoint_incarnation ||
+			typeof question.stage !== "string" ||
+			typeof question.kind !== "string" ||
+			typeof question.prompt !== "string" ||
+			!["pending", "resolving", "answered", "stale", "uncertain"].includes(question.status) ||
+			typeof question.binding_plaintext !== "string" ||
+			!/^[a-f0-9]{64}$/.test(question.binding_sha256) ||
+			!isRecord(question.codec) ||
+			!Array.isArray(question.history) ||
+			!isTime(question.created_at) ||
+			!isTime(question.updated_at) ||
+			(question.answered_at !== null && !isTime(question.answered_at))
+		)
+			return true;
+		if (question.binding_sha256 !== digest(question.binding_plaintext)) return true;
+		if (
+			question.claim_fence_epoch !== null &&
+			(!Number.isSafeInteger(question.claim_fence_epoch) || question.claim_fence_epoch < 1)
+		)
+			return true;
+		if (
+			question.answer_request_id !== null &&
+			(!safeId(question.answer_request_id) ||
+				(question.status === "resolving" &&
+					!Object.values(answers).some(request => request.request_id === question.answer_request_id)))
+		)
+			return true;
+		if (
+			question.history.some(
+				item =>
+					!isRecord(item) ||
+					!isTime(item.at) ||
+					!["pending", "resolving", "answered", "stale", "uncertain"].includes(String(item.status)) ||
+					(item.reason !== null && typeof item.reason !== "string"),
+			)
+		)
+			return true;
+		if (question.status === "pending")
+			return question.claim_fence_epoch !== null || question.answer_request_id !== null;
+		if (question.status === "resolving")
+			return question.claim_fence_epoch === null || question.answer_request_id === null;
+		return question.status === "answered" && question.answered_at === null;
+	};
+	const invalidAnswer = ([answerKey, request]: [string, AnswerRequestV1]) => {
+		if (
+			!isRecord(request) ||
+			request.key_digest !== answerKey ||
+			!safeId(request.request_id) ||
+			!safeId(request.key_digest) ||
+			!safeId(request.request_digest) ||
+			!/^[a-f0-9]{64}$/.test(request.answer_hash) ||
+			!/^[a-f0-9]{64}$/.test(request.answer_binding_sha256) ||
+			!safeId(request.authority_id) ||
+			!safeId(request.question_id) ||
+			!safeId(request.turn_id) ||
+			!safeId(request.endpoint_incarnation) ||
+			!safeId(request.sdk_idempotency_key) ||
+			!Number.isSafeInteger(request.claim_fence_epoch) ||
+			request.claim_fence_epoch < 1 ||
+			!["claimed", "remote_started", "accepted", "rejected", "completed", "uncertain"].includes(request.phase) ||
+			!isTime(request.created_at) ||
+			!isTime(request.updated_at)
+		)
+			return true;
+		const question = questions[request.question_id];
+		if (
+			!question ||
+			question.authority_id !== request.authority_id ||
+			question.turn_id !== request.turn_id ||
+			question.endpoint_incarnation !== request.endpoint_incarnation
+		)
+			return true;
+		// A rejected receipt is immutable evidence of a completed historical attempt.
+		// It must remain replayable after a corrected attempt changes the question's active link.
+		const rejectedHistorical = request.phase === "rejected";
+		if (
+			rejectedHistorical
+				? !request.safe_receipt || request.safe_receipt.status !== "rejected"
+				: question.answer_request_id !== request.request_id ||
+					question.claim_fence_epoch !== request.claim_fence_epoch
+		)
+			return true;
+		if (
+			request.safe_receipt !== undefined &&
+			(!isRecord(request.safe_receipt) ||
+				!["accepted", "rejected"].includes(String(request.safe_receipt.status)) ||
+				request.safe_receipt.answer_hash !== request.answer_hash ||
+				request.safe_receipt.answer_binding_sha256 !== request.answer_binding_sha256 ||
+				request.safe_receipt.authority_id !== request.authority_id ||
+				request.safe_receipt.turn_id !== request.turn_id ||
+				request.safe_receipt.endpoint_incarnation !== request.endpoint_incarnation ||
+				request.safe_receipt.claim_fence_epoch !== request.claim_fence_epoch ||
+				!isTime(request.safe_receipt.resolved_at))
+		)
+			return true;
+		if (
+			(request.phase === "rejected" && request.safe_receipt?.status !== "rejected") ||
+			(request.phase === "completed" && request.safe_receipt?.status !== "accepted") ||
+			(!["rejected", "completed"].includes(request.phase) && request.safe_receipt !== undefined)
+		)
+			return true;
+		return request.error_code !== undefined && typeof request.error_code !== "string";
+	};
+	const invalidOperation = ([operationId, operation]: [string, OperationRequestV1]) =>
+		!isRecord(operation) ||
+		operation.operation_id !== operationId ||
+		!safeId(operationId) ||
+		typeof operation.tool !== "string" ||
+		!safeId(operation.key_digest) ||
+		!safeId(operation.request_digest) ||
+		!safeId(operation.local_id) ||
+		(operation.remote_id !== undefined && !safeId(operation.remote_id)) ||
+		!["claimed", "remote_started", "completed", "uncertain"].includes(operation.phase) ||
+		!isRecord(operation.intent) ||
+		!isTime(operation.created_at) ||
+		!isTime(operation.updated_at) ||
+		(operation.safe_response !== undefined && !isRecord(operation.safe_response)) ||
+		(operation.error_code !== undefined && typeof operation.error_code !== "string");
+	const invalidOutbox = ([eventId, event]: [string, OutboxEventV1]) => {
+		if (
+			!isRecord(event) ||
+			event.id !== eventId ||
+			typeof eventId !== "string" ||
+			eventId.length === 0 ||
+			!Number.isSafeInteger(event.transaction_revision) ||
+			event.transaction_revision < 1 ||
+			event.transaction_revision > transaction.revision ||
+			typeof event.kind !== "string" ||
+			event.kind.length === 0 ||
+			!["turn", "question", "report", "session", "deletion"].includes(event.entity) ||
+			typeof event.entity_id !== "string" ||
+			event.entity_id.length === 0 ||
+			!isRecord(event.payload) ||
+			Object.values(event.payload).some(
+				value => value !== null && !["string", "number", "boolean"].includes(typeof value),
+			) ||
+			typeof event.emitted !== "boolean" ||
+			!safeId(event.public_event_id) ||
+			!isRecord(event.public_delivery)
+		)
+			return true;
+		const delivery = event.public_delivery;
+		if (
+			delivery.public_event_id !== event.public_event_id ||
+			!["pending", "claimed", "acknowledged"].includes(delivery.state) ||
+			(delivery.claim_fence !== null && (!Number.isSafeInteger(delivery.claim_fence) || delivery.claim_fence < 1)) ||
+			(delivery.claim_expires_at !== null && !isTime(delivery.claim_expires_at)) ||
+			(delivery.journal_seq !== null && (!Number.isSafeInteger(delivery.journal_seq) || delivery.journal_seq < 1)) ||
+			(delivery.acknowledged_at !== null && !isTime(delivery.acknowledged_at))
+		)
+			return true;
+		return (
+			(delivery.state === "pending" &&
+				(delivery.claim_fence !== null ||
+					delivery.claim_expires_at !== null ||
+					delivery.journal_seq !== null ||
+					delivery.acknowledged_at !== null)) ||
+			(delivery.state === "claimed" &&
+				(delivery.claim_fence === null ||
+					delivery.claim_expires_at === null ||
+					delivery.journal_seq !== null ||
+					delivery.acknowledged_at !== null)) ||
+			(delivery.state === "acknowledged" && (delivery.claim_expires_at !== null || delivery.journal_seq === null))
+		);
+	};
 	if (
+		!isRecord(transaction) ||
 		transaction.schema_version !== 1 ||
+		typeof transaction.creation_intent_digest !== "string" ||
+		!/^[a-f0-9]{64}$/.test(transaction.creation_intent_digest) ||
 		transaction.namespace_id !== namespaceId ||
 		transaction.session_id !== sessionId ||
+		!isRecord(transaction.canonical) ||
+		!isRecord(transaction.requests) ||
+		!isRecord(turns) ||
+		!isRecord(prompts) ||
+		!isRecord(answers) ||
+		!isRecord(operations) ||
+		!isRecord(reports) ||
+		!isRecord(authorities) ||
+		!isRecord(questions) ||
+		!isRecord(outbox) ||
+		!isRecord(projection) ||
+		!isRecord(recovery) ||
+		!isRecord(queue) ||
+		!isRecord(transaction.canonical.session) ||
 		transaction.canonical.session.namespace_id !== namespaceId ||
 		transaction.canonical.session.session_id !== sessionId ||
-		transaction.canonical.session.cwd !== path.resolve(transaction.canonical.session.cwd)
+		typeof transaction.canonical.session.cwd !== "string" ||
+		transaction.canonical.session.cwd.length === 0 ||
+		!isTime(transaction.canonical.session.created_at) ||
+		!isTime(transaction.canonical.session.updated_at) ||
+		!isRecord(transaction.canonical.session.broker) ||
+		!isRecord(transaction.canonical.session.broker.sidecar_verifier) ||
+		!/^[a-f0-9]{64}$/.test(String(transaction.canonical.session.broker.sidecar_verifier.key_id ?? "")) ||
+		typeof transaction.canonical.session.broker.sidecar_verifier.public_key !== "string" ||
+		!validStates.has(String(transaction.canonical.desired_session_state)) ||
+		Object.entries(turns).some(invalidTurn) ||
+		Object.entries(prompts).some(invalidPrompt) ||
+		new Set(Object.values(prompts).map(request => request.request_id)).size !== Object.keys(prompts).length ||
+		Object.entries(authorities).some(invalidAuthority) ||
+		Object.entries(questions).some(invalidQuestion) ||
+		Object.entries(answers).some(invalidAnswer) ||
+		new Set(Object.values(answers).map(request => request.request_id)).size !== Object.keys(answers).length ||
+		Object.entries(operations).some(invalidOperation) ||
+		new Set(Object.values(operations).map(request => request.operation_id)).size !== Object.keys(operations).length ||
+		Object.entries(outbox).some(invalidOutbox) ||
+		new Set(Object.values(outbox).map(event => event.public_event_id)).size !== Object.keys(outbox).length ||
+		Object.entries(reports).some(invalidReport) ||
+		new Set(Object.values(reports).map(report => report.operation_id)).size !== Object.keys(reports).length ||
+		!Array.isArray(queue.ordered_turn_ids) ||
+		new Set(queue.ordered_turn_ids).size !== queue.ordered_turn_ids.length ||
+		queue.ordered_turn_ids.some(
+			turnId => typeof turnId !== "string" || !turns[turnId] || turns[turnId].status !== "queued",
+		) ||
+		(queue.active_turn_id !== null &&
+			(!safeId(queue.active_turn_id) ||
+				!turns[queue.active_turn_id] ||
+				!activeStatuses.has(turns[queue.active_turn_id].status))) ||
+		!Number.isSafeInteger(transaction.revision) ||
+		transaction.revision < 1 ||
+		(transaction.endpoint !== null &&
+			(!isRecord(transaction.endpoint) ||
+				!safeId(transaction.endpoint.incarnation) ||
+				!isTime(transaction.endpoint.observed_at))) ||
+		[
+			projection.applied_turns_revision,
+			projection.applied_reports_revision,
+			projection.applied_session_revision,
+			projection.applied_active_revision,
+			projection.applied_events_revision,
+			projection.scheduler_pending_revision,
+			projection.scheduler_applied_revision,
+		].some(
+			value => value !== undefined && (!Number.isSafeInteger(value) || value < 0 || value > transaction.revision),
+		) ||
+		(projection.scheduler_digest !== undefined &&
+			(typeof projection.scheduler_digest !== "string" || projection.scheduler_digest.length === 0)) ||
+		(recovery.prompt_watermark_at !== null && !isTime(recovery.prompt_watermark_at)) ||
+		(recovery.last_repaired_at !== null && !isTime(recovery.last_repaired_at)) ||
+		(queue.selected_promotion !== null &&
+			(!isRecord(queue.selected_promotion) ||
+				!safeId(queue.selected_promotion.from_turn_id) ||
+				!safeId(queue.selected_promotion.to_turn_id) ||
+				!Number.isSafeInteger(queue.selected_promotion.revision) ||
+				!turns[queue.selected_promotion.from_turn_id] ||
+				!turns[queue.selected_promotion.to_turn_id])) ||
+		Object.values(turns).some(
+			turn =>
+				activeStatuses.has(turn.status) &&
+				(turn.delivery as Record<string, unknown>).prompt_acknowledged === true &&
+				!receiptFor(turn),
+		)
 	)
 		throw new Error("state_corrupt");
 }
@@ -481,7 +1095,7 @@ export async function ensureSchedulerRoster(
 	sessionId: string,
 	options: { signal?: AbortSignal } = {},
 ): Promise<void> {
-	const transaction = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+	const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
 	if (!transaction) return;
 	await withNamespaceRegistry(
 		paths,
@@ -528,7 +1142,7 @@ export async function listCanonicalActiveSessions(
 	const active: string[] = [];
 	for (const sessionId of sessionIds) {
 		if (options.signal?.aborted) throw options.signal.reason ?? new Error("aborted");
-		const transaction = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+		const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
 		if (!transaction) continue;
 		assertTransaction(transaction, path.basename(paths.root), sessionId);
 		const hasActiveTurn = Object.values(transaction.canonical.turns).some(turn =>
@@ -625,7 +1239,7 @@ export async function readSessionTransaction(
 	paths: CoordinatorStatePaths,
 	sessionId: string,
 ): Promise<CoordinatorSessionTransactionV1 | null> {
-	const transaction = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+	const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
 	if (!transaction) return null;
 	assertTransaction(transaction, path.basename(paths.root), sessionId);
 	normalizeOutbox(transaction);
@@ -643,7 +1257,7 @@ export async function withSessionTransaction<T>(
 	return await withFileLock(
 		transactionLockPath(paths, sessionId),
 		async () => {
-			const transaction = await readJson<CoordinatorSessionTransactionV1>(file);
+			const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
 			if (!transaction) throw new Error("resource_gone");
 			assertTransaction(transaction, path.basename(paths.root), sessionId);
 			const beforeDigest = digest(JSON.stringify(transaction));
@@ -662,6 +1276,10 @@ export async function withSessionTransaction<T>(
 				}),
 			);
 			transaction.revision++;
+			// Callers mutate this authoritative object in place. Validate the complete
+			// post-image after compaction and revision/projection updates so malformed
+			// ingress can never poison the WAL.
+			assertTransaction(transaction, path.basename(paths.root), sessionId);
 			await writeAtomic(file, transaction);
 			return result;
 		},
@@ -681,7 +1299,9 @@ async function pruneRetainedSessionIfEmpty(
 			await withFileLock(
 				transactionLockPath(paths, sessionId),
 				async () => {
-					const transaction = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+					const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(
+						transactionPath(paths, sessionId),
+					);
 					if (transaction) normalizeOutbox(transaction);
 					if (
 						!transaction ||
@@ -707,7 +1327,7 @@ export async function admitSessionClose(
 			await withFileLock(
 				transactionLockPath(paths, entry.session_id),
 				async () => {
-					const transaction = await readJson<CoordinatorSessionTransactionV1>(
+					const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(
 						transactionPath(paths, entry.session_id),
 					);
 					if (!transaction) throw new Error("resource_gone");
@@ -792,15 +1412,24 @@ export async function withAdmittedSessionTransaction<T>(
 /** Claims a caller-visible creation request before any remote work or projection. */
 export async function claimCreationRequest(
 	paths: CoordinatorStatePaths,
-	input: { key_digest: string; request_digest: string; tool: string },
+	input: {
+		key_digest: string;
+		request_digest: string;
+		tool: string;
+		sidecar_verifier: { key_id: string; public_key: string };
+	},
 ): Promise<CreationRequestV1> {
 	return await withNamespaceRegistry(paths, async registry => {
 		const existing = registry.creations[input.key_digest];
 		if (existing) {
 			if (existing.request_digest !== input.request_digest || existing.tool !== input.tool)
 				throw new Error("idempotency_conflict");
+			if (!existing.sidecar_verifier || !/^[a-f0-9]{64}$/.test(existing.sidecar_verifier.key_id))
+				throw new Error("state_corrupt");
 			return existing;
 		}
+		if (!/^[a-f0-9]{64}$/.test(input.sidecar_verifier.key_id) || !input.sidecar_verifier.public_key)
+			throw new Error("state_corrupt");
 		const now = new Date().toISOString();
 		const request: CreationRequestV1 = {
 			key_digest: input.key_digest,
@@ -811,10 +1440,84 @@ export async function claimCreationRequest(
 			remote_create_key: `remote_${input.key_digest}`,
 			session_id: null,
 			endpoint_incarnation: null,
+			sidecar_verifier: input.sidecar_verifier,
 			created_at: now,
 			updated_at: now,
 		};
 		registry.creations[input.key_digest] = request;
+		return request;
+	});
+}
+
+/**
+ * Replaces a claimed creation's verifier before any remote effect.  A server
+ * restart intentionally loses the private half, so only this pre-effect phase
+ * may acquire a new authority.
+ */
+export async function rotateClaimedCreationVerifier(
+	paths: CoordinatorStatePaths,
+	keyDigest: string,
+	expectedKeyId: string,
+	sidecarVerifier: { key_id: string; public_key: string },
+): Promise<CreationRequestV1> {
+	return await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[keyDigest];
+		if (!request) throw new Error("state_corrupt");
+		if (request.phase === "claimed" && request.sidecar_verifier?.key_id === expectedKeyId) {
+			if (!/^[a-f0-9]{64}$/.test(sidecarVerifier.key_id) || !sidecarVerifier.public_key)
+				throw new Error("state_corrupt");
+			request.sidecar_verifier = sidecarVerifier;
+			request.updated_at = new Date().toISOString();
+		}
+		return request;
+	});
+}
+
+/**
+ * Fences a creation before a broker-visible effect. The durable verifier is the
+ * only signing authority a recovery may retain until the broker proves a
+ * different candidate actually launched.
+ */
+export async function startCreationRemote(
+	paths: CoordinatorStatePaths,
+	keyDigest: string,
+	expectedVerifier: { key_id: string; public_key: string },
+): Promise<CreationRequestV1> {
+	return await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[keyDigest];
+		if (!request || !request.sidecar_verifier) throw new Error("state_corrupt");
+		if (
+			request.phase === "claimed" &&
+			(request.sidecar_verifier.key_id !== expectedVerifier.key_id ||
+				request.sidecar_verifier.public_key !== expectedVerifier.public_key)
+		)
+			throw new Error("state_corrupt");
+		if (request.phase === "claimed") request.phase = "remote_started";
+		if (request.phase !== "remote_started") throw new Error("terminal_uncertain");
+		request.updated_at = new Date().toISOString();
+		return request;
+	});
+}
+
+/**
+ * Reconciles an attempted launch against broker-persisted public evidence. A
+ * replay retains its original verifier; only proof that the candidate key was
+ * used may rotate the durable verifier.
+ */
+export async function reconcileCreationRemoteVerifier(
+	paths: CoordinatorStatePaths,
+	keyDigest: string,
+	candidate: { key_id: string; public_key: string },
+	usedKeyId: string,
+): Promise<CreationRequestV1> {
+	return await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[keyDigest];
+		if (!request || !request.sidecar_verifier || request.phase !== "remote_started")
+			throw new Error("terminal_uncertain");
+		if (!/^[a-f0-9]{64}$/.test(usedKeyId)) throw new Error("terminal_uncertain");
+		if (usedKeyId === candidate.key_id) request.sidecar_verifier = candidate;
+		else if (usedKeyId !== request.sidecar_verifier.key_id) throw new Error("terminal_uncertain");
+		request.updated_at = new Date().toISOString();
 		return request;
 	});
 }
@@ -832,9 +1535,21 @@ export async function bindCreationRequest(
 		if (
 			request.session_id &&
 			(request.session_id !== session.session_id ||
-				request.endpoint_incarnation !== session.broker.endpoint_incarnation)
+				request.endpoint_incarnation !== session.broker.endpoint_incarnation ||
+				request.sidecar_verifier?.key_id !== session.broker.sidecar_verifier.key_id)
 		)
 			throw new Error("state_corrupt");
+		// A broker-created session is reconciled before binding. Binding must never
+		// infer signer authority from a remotely claimed phase or snapshot. Local
+		// registration has no remote create effect and retains its existing binding.
+		if (
+			!request.session_id &&
+			request.phase !== "claimed" &&
+			request.sidecar_verifier?.key_id !== session.broker.sidecar_verifier.key_id
+		)
+			throw new Error("terminal_uncertain");
+		if (!request.session_id && request.phase === "claimed")
+			request.sidecar_verifier = session.broker.sidecar_verifier;
 		if (
 			Object.values(registry.deletions).some(
 				entry =>
@@ -843,7 +1558,9 @@ export async function bindCreationRequest(
 			)
 		)
 			throw new Error("session_closing");
-		request.canonical_create_intent = intent;
+		if (request.canonical_create_intent && canonicalJson(request.canonical_create_intent) !== canonicalJson(intent))
+			throw new Error("idempotency_conflict");
+		request.canonical_create_intent ??= intent;
 		request.session_id = session.session_id;
 		request.endpoint_incarnation = session.broker.endpoint_incarnation;
 		if (request.phase === "claimed") request.phase = "remote_started";
@@ -852,19 +1569,45 @@ export async function bindCreationRequest(
 	});
 }
 
+/**
+ * Creation provenance must bind all semantic launch inputs while allowing idempotent
+ * recovery to regenerate observation timestamps.
+ */
+function creationIntentDigest(intent: CanonicalCreateIntentV1): string {
+	const { created_at: _createdAt, updated_at: _updatedAt, ...session } = intent.session;
+	const initial_events = intent.initial_events.map(({ created_at: _eventCreatedAt, ...event }) => event);
+	return digest(canonicalJson({ ...intent, session, initial_events }));
+}
+
 /** Creates the durable session WAL for an already claimed creation request. */
 export async function commitCreationWal(
 	paths: CoordinatorStatePaths,
 	keyDigest: string,
 	intent: CanonicalCreateIntentV1,
 ): Promise<CoordinatorSessionTransactionV1> {
+	const intentDigest = creationIntentDigest(intent);
+	// Validate an existing WAL before binding, so a creation-intent mismatch cannot
+	// update the registry receipt or any other durable state.
+	const preexisting = await readTransactionJson<CoordinatorSessionTransactionV1>(
+		transactionPath(paths, intent.session.session_id),
+	);
+	if (preexisting) {
+		assertTransaction(preexisting, intent.session.namespace_id, intent.session.session_id);
+		if (
+			preexisting.canonical.session.broker.endpoint_incarnation === intent.session.broker.endpoint_incarnation &&
+			preexisting.creation_intent_digest !== intentDigest
+		)
+			throw new Error("idempotency_conflict");
+	}
 	await bindCreationRequest(paths, keyDigest, intent);
 	return await withNamespaceRegistry(paths, async registry => {
 		const session = intent.session;
 		return await withFileLock(transactionLockPath(paths, session.session_id), async () => {
 			const request = registry.creations[keyDigest];
 			if (!request || request.canonical_create_intent === null) throw new Error("state_corrupt");
-			let existing = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, session.session_id));
+			let existing = await readTransactionJson<CoordinatorSessionTransactionV1>(
+				transactionPath(paths, session.session_id),
+			);
 			if (existing) {
 				assertTransaction(existing, session.namespace_id, session.session_id);
 				if (existing.canonical.session.broker.endpoint_incarnation !== session.broker.endpoint_incarnation) {
@@ -880,6 +1623,8 @@ export async function commitCreationWal(
 					// in that gap would expose a missing session and permit a successor to
 					// race the replacement.
 					existing = null;
+				} else if (existing.creation_intent_digest !== intentDigest) {
+					throw new Error("idempotency_conflict");
 				}
 				if (existing) {
 					request.phase = "wal_committed";
@@ -892,6 +1637,7 @@ export async function commitCreationWal(
 			const now = new Date().toISOString();
 			const transaction: CoordinatorSessionTransactionV1 = {
 				schema_version: 1,
+				creation_intent_digest: intentDigest,
 				namespace_id: session.namespace_id,
 				session_id: session.session_id,
 				revision: 1,
@@ -906,7 +1652,7 @@ export async function commitCreationWal(
 					questions: {},
 				},
 				requests: { prompts: {}, answers: {}, operations: {} },
-				outbox: {},
+				outbox: initialCreationOutbox(intent, 1),
 				projection: {
 					applied_turns_revision: 0,
 					applied_reports_revision: 0,
@@ -919,6 +1665,7 @@ export async function commitCreationWal(
 				},
 				recovery: { prompt_watermark_at: null, last_repaired_at: null },
 			};
+			assertTransaction(transaction, session.namespace_id, session.session_id);
 			await writeAtomic(transactionPath(paths, session.session_id), transaction);
 			request.phase = "wal_committed";
 			request.wal_revision = transaction.revision;
@@ -938,14 +1685,28 @@ export async function commitCreationWal(
 		});
 	});
 }
+/** A validated pre-WAL projection imported in the same registry/transaction commit as its first canonical WAL. */
+export interface LegacyProjectionImportV1 {
+	turns: Record<string, CanonicalTurnSnapshotV1>;
+	queue: CoordinatorSessionTransactionV1["canonical"]["queue"];
+	desired_session_state: CoordinatorSessionState;
+	reports: Record<string, CanonicalReportSnapshotV1>;
+	gate_authorities: Record<string, GateAuthorityEntryV1>;
+	questions: Record<string, PrivateQuestionV1>;
+	/** A legacy projection has no durable answer request claim; start with an explicit empty ledger. */
+	requests: CoordinatorSessionTransactionV1["requests"];
+}
+
 export async function createSessionTransaction(
 	paths: CoordinatorStatePaths,
 	intent: CanonicalCreateIntentV1,
+	legacyProjection?: LegacyProjectionImportV1,
 ): Promise<CoordinatorSessionTransactionV1> {
 	const session = intent.session;
 	return await withNamespaceRegistry(paths, async registry => {
 		return await withFileLock(transactionLockPath(paths, session.session_id), async () => {
 			const key = digest(`${intent.kind}\0${session.session_id}\0${session.broker.endpoint_incarnation}`);
+			const intentDigest = creationIntentDigest(intent);
 			if (
 				Object.values(registry.deletions).some(
 					entry =>
@@ -955,7 +1716,9 @@ export async function createSessionTransaction(
 			)
 				throw new Error("session_closing");
 			const prior = registry.creations[key];
-			const existing = await readJson<CoordinatorSessionTransactionV1>(transactionPath(paths, session.session_id));
+			const existing = await readTransactionJson<CoordinatorSessionTransactionV1>(
+				transactionPath(paths, session.session_id),
+			);
 			if (existing) {
 				assertTransaction(existing, session.namespace_id, session.session_id);
 				if (existing.canonical.session.broker.endpoint_incarnation !== session.broker.endpoint_incarnation) {
@@ -966,6 +1729,8 @@ export async function createSessionTransaction(
 							entry.phase === "completed",
 					);
 					if (!priorDeleted) throw new Error("session_closing");
+				} else if (existing.creation_intent_digest !== intentDigest) {
+					throw new Error("idempotency_conflict");
 				} else if (
 					prior?.phase === "completed" ||
 					prior?.phase === "projected" ||
@@ -984,26 +1749,32 @@ export async function createSessionTransaction(
 				remote_create_key: `remote_${key}`,
 				session_id: session.session_id,
 				endpoint_incarnation: session.broker.endpoint_incarnation,
+				sidecar_verifier: session.broker.sidecar_verifier,
 				created_at: now,
 				updated_at: now,
 			};
 			const transaction: CoordinatorSessionTransactionV1 = {
 				schema_version: 1,
+				creation_intent_digest: intentDigest,
 				namespace_id: session.namespace_id,
 				session_id: session.session_id,
 				revision: 1,
 				endpoint: { incarnation: session.broker.endpoint_incarnation, observed_at: now },
 				canonical: {
 					session,
-					turns: {},
-					queue: { ordered_turn_ids: [], active_turn_id: null, selected_promotion: null },
-					desired_session_state: intent.initial_state,
-					reports: {},
-					gate_authorities: {},
-					questions: {},
+					turns: legacyProjection?.turns ?? {},
+					queue: legacyProjection?.queue ?? {
+						ordered_turn_ids: [],
+						active_turn_id: null,
+						selected_promotion: null,
+					},
+					desired_session_state: legacyProjection?.desired_session_state ?? intent.initial_state,
+					reports: legacyProjection?.reports ?? {},
+					gate_authorities: legacyProjection?.gate_authorities ?? {},
+					questions: legacyProjection?.questions ?? {},
 				},
-				requests: { prompts: {}, answers: {}, operations: {} },
-				outbox: {},
+				requests: legacyProjection?.requests ?? { prompts: {}, answers: {}, operations: {} },
+				outbox: initialCreationOutbox(intent, 1),
 				projection: {
 					applied_turns_revision: 0,
 					applied_reports_revision: 0,
@@ -1016,6 +1787,9 @@ export async function createSessionTransaction(
 				},
 				recovery: { prompt_watermark_at: null, last_repaired_at: null },
 			};
+			// Legacy projections become authority only after the same deep validation
+			// required for an existing canonical WAL.
+			assertTransaction(transaction, session.namespace_id, session.session_id);
 			await writeAtomic(transactionPath(paths, session.session_id), transaction);
 			registry.creations[key]!.phase = "wal_committed";
 			registry.creations[key]!.wal_revision = transaction.revision;
@@ -1061,6 +1835,53 @@ export function deterministicOutboxId(
 ): string {
 	return `txn:${sessionId}:${revision}:${kind}:${entity}:${entityId}`;
 }
+
+function initialCreationOutbox(
+	intent: CanonicalCreateIntentV1,
+	transactionRevision: number,
+): Record<string, OutboxEventV1> {
+	const outbox: Record<string, OutboxEventV1> = {};
+	for (const initial of intent.initial_events) {
+		const kind = typeof initial.kind === "string" && initial.kind.length > 0 ? initial.kind : null;
+		if (!kind) continue;
+		const entityCandidate = initial.entity;
+		const entity: OutboxEventV1["entity"] =
+			entityCandidate === "turn" ||
+			entityCandidate === "question" ||
+			entityCandidate === "report" ||
+			entityCandidate === "deletion"
+				? entityCandidate
+				: "session";
+		const entityId =
+			typeof initial.entity_id === "string" && initial.entity_id.length > 0
+				? initial.entity_id
+				: intent.session.session_id;
+		const id = deterministicOutboxId(intent.session.session_id, transactionRevision, kind, entity, entityId);
+		const payload = Object.fromEntries(
+			Object.entries(initial).filter(([key]) => key !== "kind" && key !== "entity" && key !== "entity_id"),
+		) as OutboxEventV1["payload"];
+		outbox[id] = {
+			id,
+			transaction_revision: transactionRevision,
+			kind,
+			entity,
+			entity_id: entityId,
+			payload: { session_id: intent.session.session_id, ...payload },
+			emitted: false,
+			public_event_id: id,
+			public_delivery: {
+				public_event_id: id,
+				state: "pending",
+				claim_fence: null,
+				claim_expires_at: null,
+				journal_seq: null,
+				acknowledged_at: null,
+			},
+		};
+	}
+	return outbox;
+}
+
 export async function appendOutboxEvents(
 	paths: CoordinatorStatePaths,
 	transaction: CoordinatorSessionTransactionV1,
@@ -1243,10 +2064,12 @@ export async function enumeratePublicDeliveries(
 		if (cursorSession && sessionId < cursorSession) continue;
 		const afterOrderKey = sessionId === cursorSession ? cursorOrderKey : undefined;
 		let batch: PublicDeliveryClaimV1[] = [];
+		const remaining = boundedLimit - claims.length;
+		if (remaining <= 0) break;
 		try {
 			batch = await claimPublicDelivery(paths, sessionId, {
 				...options,
-				limit: boundedLimit,
+				limit: remaining,
 				after_order_key: afterOrderKey,
 			});
 		} catch (error) {
@@ -1408,10 +2231,25 @@ export async function removeSessionTransaction(
 		async registry =>
 			await withFileLock(transactionLockPath(paths, sessionId), async () => {
 				const file = transactionPath(paths, sessionId);
-				const transaction = await readJson<CoordinatorSessionTransactionV1>(file);
-				if (!transaction) return false;
+				const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
+				// A deletion retry may observe the unlink before its registry checkpoint;
+				// clear scheduler hints here as part of the same retry so a completed
+				// deletion cannot leave a missing WAL discoverable forever. False lets
+				// the caller distinguish an already-removed WAL from a still-present
+				// incarnation without recreating it.
+				if (!transaction) {
+					delete registry.roster?.[sessionId];
+					delete registry.retained_sessions?.[sessionId];
+					return false;
+				}
 				assertTransaction(transaction, path.basename(paths.root), sessionId);
+				normalizeOutbox(transaction);
 				if (transaction.endpoint?.incarnation !== endpointIncarnation) throw new Error("endpoint_stale");
+				// The canonical WAL remains the delivery authority until every retained
+				// intent is acknowledged. Reapers must retry cleanup after any competing
+				// exporter lease expires instead of deleting an undelivered event.
+				if (Object.values(transaction.outbox).some(event => event.public_delivery.state !== "acknowledged"))
+					return false;
 				await fs.rm(file, { force: true });
 				await fsyncDirectory(path.dirname(file));
 				delete registry.roster?.[sessionId];

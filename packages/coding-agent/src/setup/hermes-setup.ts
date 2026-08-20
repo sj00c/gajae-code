@@ -81,6 +81,10 @@ export interface HermesSetupResult {
 		requiredTools: string[];
 		missingTools: string[];
 	};
+	check: null | {
+		ok: boolean;
+		mismatches: Array<{ path: string; kind: "missing" | "invalid" | "signature" | "operator_digest" }>;
+	};
 }
 
 class HermesSetupError extends Error {
@@ -181,20 +185,48 @@ function resolveHermesWorktree(flags: HermesSetupFlags): CoordinatorSetupSpec["w
 	return flags.noWorktree ? { enabled: false } : { enabled: true, ...(name ? { name } : {}) };
 }
 
-function resolveHermesSessionCommand(gjcCommand: string, flags: HermesSetupFlags): string {
+function validateHermesSessionCommand(command: string): void {
+	const [executable, ...args] = command.trim().split(/\s+/);
+	if (executable !== DEFAULT_GJC_COMMAND) {
+		throw new HermesSetupError(
+			"GJC_COORDINATOR_MCP_SESSION_COMMAND must be exactly gjc with an optional --worktree [name] selector.",
+			2,
+		);
+	}
+	if (
+		args.length > 0 &&
+		(args[0] !== "--worktree" ||
+			args.length > 2 ||
+			(args[1] !== undefined && (args[1].length === 0 || args[1].startsWith("-"))))
+	) {
+		throw new HermesSetupError(
+			"GJC_COORDINATOR_MCP_SESSION_COMMAND supports only gjc or gjc --worktree [name] under SDK lifecycle control.",
+			2,
+		);
+	}
+}
+
+function resolveHermesSessionCommand(flags: HermesSetupFlags): string {
 	const explicit = optionalTrim(flags.sessionCommand);
-	if (explicit) {
+	if (flags.sessionCommand !== undefined) {
+		if (!explicit) {
+			throw new HermesSetupError(
+				"GJC_COORDINATOR_MCP_SESSION_COMMAND must be exactly gjc with an optional --worktree [name] selector.",
+				2,
+			);
+		}
 		if (flags.noWorktree || flags.worktreeName) {
 			throw new HermesSetupError(
 				"Use either --session-command or Hermes worktree flags; explicit session commands are preserved exactly.",
 				2,
 			);
 		}
+		validateHermesSessionCommand(explicit);
 		return explicit;
 	}
 	const worktree = resolveHermesWorktree(flags);
-	if (!worktree.enabled) return gjcCommand;
-	return worktree.name ? `${gjcCommand} --worktree ${worktree.name}` : `${gjcCommand} --worktree`;
+	if (!worktree.enabled) return DEFAULT_GJC_COMMAND;
+	return worktree.name ? `${DEFAULT_GJC_COMMAND} --worktree ${worktree.name}` : `${DEFAULT_GJC_COMMAND} --worktree`;
 }
 
 function normalizeInstallTarget(flags: HermesSetupFlags): CoordinatorSetupSpec["installTarget"] {
@@ -210,7 +242,7 @@ function normalizeInstallTarget(flags: HermesSetupFlags): CoordinatorSetupSpec["
 export function buildHermesSetupSpec(flags: HermesSetupFlags): CoordinatorSetupSpec {
 	const roots = normalizeRoots(flags.root);
 	const gjcCommand = optionalTrim(flags.gjcCommand) ?? DEFAULT_GJC_COMMAND;
-	const sessionCommand = resolveHermesSessionCommand(gjcCommand, flags);
+	const sessionCommand = resolveHermesSessionCommand(flags);
 	return {
 		schemaVersion: 1,
 		coordinator: "hermes",
@@ -225,7 +257,7 @@ export function buildHermesSetupSpec(flags: HermesSetupFlags): CoordinatorSetupS
 			...(optionalTrim(flags.repo) ? { repo: optionalTrim(flags.repo) } : {}),
 		},
 		worktree: resolveHermesWorktree(flags),
-		sessionCommandSource: optionalTrim(flags.sessionCommand) ? "explicit" : "default",
+		sessionCommandSource: flags.sessionCommand !== undefined ? "explicit" : "default",
 		sessionCommand,
 		...(optionalTrim(flags.stateRoot) ? { stateRoot: path.resolve(flags.stateRoot!) } : {}),
 		mutationPolicy: {
@@ -250,37 +282,28 @@ function canonicalize(value: unknown): unknown {
 	return output;
 }
 
-function signaturePayload(spec: CoordinatorSetupSpec): Record<string, unknown> {
-	return {
-		args: spec.args,
-		artifactByteCap: spec.artifactByteCap,
-		command: spec.gjcCommand,
-		contractDocVersion: spec.contractDocVersion,
-		coordinator: spec.coordinator,
-		mutationClasses: spec.mutationPolicy.classes,
-		worktree: spec.worktree,
-		sessionCommandSource: spec.sessionCommandSource,
-		namespace: spec.namespace,
-		operatorTemplateVersion: spec.operatorTemplateVersion,
-		roots: spec.roots,
-		schemaVersion: spec.schemaVersion,
-		serverKey: spec.serverKey,
-		sessionCommand: spec.sessionCommand,
-		stateRoot: spec.stateRoot,
-	};
+function digest(value: unknown): string {
+	return crypto
+		.createHash("sha256")
+		.update(JSON.stringify(canonicalize(value)))
+		.digest("hex");
+}
+
+function serverBlockDigest(block: Record<string, unknown>): string {
+	const env = isRecord(block.env) ? { ...block.env } : {};
+	delete env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE;
+	return digest({ ...block, env });
 }
 
 export function computeHermesSetupSignature(spec: CoordinatorSetupSpec): string {
-	const canonical = JSON.stringify(canonicalize(signaturePayload(spec)));
-	return crypto.createHash("sha256").update(canonical).digest("hex");
+	return serverBlockDigest(renderHermesServerBlockWithoutSignature(spec));
 }
 
-export function renderHermesServerBlock(spec: CoordinatorSetupSpec): Record<string, unknown> {
+function renderHermesServerBlockWithoutSignature(spec: CoordinatorSetupSpec): Record<string, unknown> {
 	const env: Record<string, string> = {
 		GJC_COORDINATOR_MCP_WORKDIR_ROOTS: spec.roots.join(path.delimiter),
 		GJC_COORDINATOR_MCP_SETUP_MANAGED_BY: MANAGED_BY,
 		GJC_COORDINATOR_MCP_SETUP_SCHEMA_VERSION: SETUP_SCHEMA_VERSION,
-		GJC_COORDINATOR_MCP_SETUP_SIGNATURE: computeHermesSetupSignature(spec),
 	};
 	if (spec.namespace.profile) env.GJC_COORDINATOR_MCP_PROFILE = spec.namespace.profile;
 	if (spec.namespace.repo) env.GJC_COORDINATOR_MCP_REPO = spec.namespace.repo;
@@ -299,25 +322,50 @@ export function renderHermesServerBlock(spec: CoordinatorSetupSpec): Record<stri
 	};
 }
 
+export function renderHermesServerBlock(spec: CoordinatorSetupSpec): Record<string, unknown> {
+	const block = renderHermesServerBlockWithoutSignature(spec);
+	const env = block.env as Record<string, string>;
+	env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE = serverBlockDigest(block);
+	return block;
+}
+
 function renderConfigYaml(spec: CoordinatorSetupSpec): string {
 	return YAML.stringify({ mcp_servers: { [spec.serverKey]: renderHermesServerBlock(spec) } }, null, 2);
 }
 
+const OPERATOR_DIGEST_MARKER = /<!-- GJC Hermes operator instructions digest v(\d+): ([a-f0-9]{64}) -->/;
+const OPERATOR_DIGEST_MARKER_SLOT =
+	/<!-- GJC Hermes operator instructions digest v\d+: (?:[a-f0-9]{64}|\{\{OPERATOR_INSTRUCTIONS_DIGEST\}\}|) -->/;
+
+function operatorInstructionsDigest(content: string): string {
+	return crypto.createHash("sha256").update(content.replace(OPERATOR_DIGEST_MARKER_SLOT, "")).digest("hex");
+}
+
 function renderOperatorTemplate(spec: CoordinatorSetupSpec): string {
-	return operatorInstructionsTemplate
+	const rendered = operatorInstructionsTemplate
 		.replaceAll("{{SERVER_KEY}}", spec.serverKey)
 		.replaceAll("{{TOOL_PREFIX}}", "gjc_coordinator")
 		.replaceAll("{{TEMPLATE_VERSION}}", String(spec.operatorTemplateVersion));
+	return rendered.replaceAll("{{OPERATOR_INSTRUCTIONS_DIGEST}}", operatorInstructionsDigest(rendered));
 }
 
 function serverBlockIsManaged(block: unknown): boolean {
-	if (!isRecord(block)) return false;
+	if (!isRecord(block) || !isRecord(block.env)) return false;
 	const env = block.env;
 	return (
-		isRecord(env) &&
 		env.GJC_COORDINATOR_MCP_SETUP_MANAGED_BY === MANAGED_BY &&
 		env.GJC_COORDINATOR_MCP_SETUP_SCHEMA_VERSION === SETUP_SCHEMA_VERSION &&
-		typeof env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE === "string"
+		typeof env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE === "string" &&
+		env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE === serverBlockDigest(block)
+	);
+}
+
+function operatorInstructionsAreManaged(content: string, spec: CoordinatorSetupSpec): boolean {
+	const marker = content.match(OPERATOR_DIGEST_MARKER);
+	return (
+		marker?.[1] === String(spec.operatorTemplateVersion) &&
+		marker[2] === operatorInstructionsDigest(content) &&
+		content === renderOperatorTemplate(spec)
 	);
 }
 
@@ -371,35 +419,110 @@ function operatorPathForTarget(spec: CoordinatorSetupSpec): string | null {
 	return path.join(spec.installTarget.path, "skills", "autonomous-ai-agents", "gajae-code", "SKILL.md");
 }
 
+type StagedFile = { path: string; stagedPath: string };
+
+async function stageFile(filePath: string, content: string, staged: StagedFile[]): Promise<void> {
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	const stagedPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${crypto.randomUUID()}.tmp`);
+	staged.push({ path: filePath, stagedPath });
+	await fs.writeFile(stagedPath, content, { mode: 0o600 });
+}
+
+type FileSnapshot = { path: string; content: Buffer | null };
+
+async function snapshotFile(filePath: string): Promise<FileSnapshot> {
+	try {
+		return { path: filePath, content: await fs.readFile(filePath) };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path: filePath, content: null };
+		throw error;
+	}
+}
+
+async function restoreFile(snapshot: FileSnapshot): Promise<void> {
+	if (snapshot.content === null) {
+		await fs.rm(snapshot.path, { force: true });
+		return;
+	}
+	await fs.writeFile(snapshot.path, snapshot.content);
+}
+
 async function installConfig(spec: CoordinatorSetupSpec, force: boolean): Promise<string[]> {
 	const configPath = configPathForTarget(spec);
 	if (!configPath) return [];
 	const existing = await readYamlConfig(configPath);
-	const merged = mergeHermesConfig(existing, spec, force);
-	if (force) await backupFile(configPath);
-	await fs.mkdir(path.dirname(configPath), { recursive: true });
-	await Bun.write(configPath, YAML.stringify(merged, null, 2));
-	const written = [configPath];
+	const configContent = YAML.stringify(mergeHermesConfig(existing, spec, force), null, 2);
+	const operatorPath = operatorPathForTarget(spec);
+	const operatorContent = operatorPath ? renderOperatorTemplate(spec) : null;
+
+	// Complete all conflict checks before any backup, directory creation, or output write.
+	if (operatorPath && (await Bun.file(operatorPath).exists()) && !force) {
+		const current = await Bun.file(operatorPath).text();
+		if (!operatorInstructionsAreManaged(current, spec)) {
+			throw new HermesSetupError(
+				`Operator instruction target already exists and is not managed by GJC: ${operatorPath}`,
+				3,
+			);
+		}
+	}
+
+	const staged: StagedFile[] = [];
+	const snapshots: FileSnapshot[] = [];
+	const committed: FileSnapshot[] = [];
+	try {
+		await stageFile(configPath, configContent, staged);
+		if (operatorPath && operatorContent) await stageFile(operatorPath, operatorContent, staged);
+		for (const file of staged) snapshots.push(await snapshotFile(file.path));
+		if (force) {
+			for (const file of staged) await backupFile(file.path);
+		}
+		for (const [index, file] of staged.entries()) {
+			await fs.rename(file.stagedPath, file.path);
+			committed.push(snapshots[index]);
+		}
+	} catch (error) {
+		for (const snapshot of committed.reverse()) await restoreFile(snapshot);
+		throw error;
+	} finally {
+		for (const file of staged) await fs.rm(file.stagedPath, { force: true });
+	}
+	return staged.map(file => file.path);
+}
+
+async function checkInstalledHermesSetup(spec: CoordinatorSetupSpec): Promise<NonNullable<HermesSetupResult["check"]>> {
+	const configPath = configPathForTarget(spec);
+	if (!configPath) {
+		throw new HermesSetupError("Hermes setup --check requires --target or --profile-dir.", 2);
+	}
+	const mismatches: NonNullable<HermesSetupResult["check"]>["mismatches"] = [];
+	if (!(await Bun.file(configPath).exists())) {
+		mismatches.push({ path: configPath, kind: "missing" });
+	} else {
+		try {
+			const config = await readYamlConfig(configPath);
+			const servers = isRecord(config.mcp_servers) ? config.mcp_servers : {};
+			const block = servers[spec.serverKey];
+			if (block === undefined) mismatches.push({ path: configPath, kind: "missing" });
+			else if (!isRecord(block) || !serverBlockIsManaged(block))
+				mismatches.push({ path: configPath, kind: "invalid" });
+			else if (
+				(block.env as Record<string, unknown>).GJC_COORDINATOR_MCP_SETUP_SIGNATURE !==
+				computeHermesSetupSignature(spec)
+			) {
+				mismatches.push({ path: configPath, kind: "signature" });
+			}
+		} catch {
+			mismatches.push({ path: configPath, kind: "invalid" });
+		}
+	}
 	const operatorPath = operatorPathForTarget(spec);
 	if (operatorPath) {
-		if ((await Bun.file(operatorPath).exists()) && !force) {
-			const current = await Bun.file(operatorPath).text();
-			if (
-				!current.includes("GJC Hermes operator instructions") ||
-				!current.includes(`Server key: ${spec.serverKey}`)
-			) {
-				throw new HermesSetupError(
-					`Operator instruction target already exists and is not managed by GJC: ${operatorPath}`,
-					3,
-				);
-			}
+		if (!(await Bun.file(operatorPath).exists())) mismatches.push({ path: operatorPath, kind: "missing" });
+		else if (!operatorInstructionsAreManaged(await Bun.file(operatorPath).text(), spec)) {
+			mismatches.push({ path: operatorPath, kind: "operator_digest" });
 		}
-		if (force) await backupFile(operatorPath);
-		await fs.mkdir(path.dirname(operatorPath), { recursive: true });
-		await Bun.write(operatorPath, renderOperatorTemplate(spec));
-		written.push(operatorPath);
 	}
-	return written;
+	return { ok: mismatches.length === 0, mismatches };
 }
 
 async function runSmoke(spec: CoordinatorSetupSpec): Promise<HermesSetupResult["smoke"]> {
@@ -420,6 +543,10 @@ async function runSmoke(spec: CoordinatorSetupSpec): Promise<HermesSetupResult["
 }
 
 export async function runHermesSetup(flags: HermesSetupFlags): Promise<HermesSetupResult> {
+	const selectedModes = [flags.install, flags.check, flags.smoke].filter(Boolean).length;
+	if (selectedModes > 1) {
+		throw new HermesSetupError("Hermes setup accepts only one of --install, --check, or --smoke.", 2);
+	}
 	const spec = buildHermesSetupSpec(flags);
 	if (flags.install && !spec.installTarget) {
 		throw new HermesSetupError("Hermes setup --install requires --target or --profile-dir.", 2);
@@ -437,28 +564,28 @@ export async function runHermesSetup(flags: HermesSetupFlags): Promise<HermesSet
 		{ path: operatorPathForTarget(spec) ?? "operator-instructions.v1.md", content: renderOperatorTemplate(spec) },
 	];
 	const files_written = flags.install ? await installConfig(spec, Boolean(flags.force)) : [];
+	const check = flags.check ? await checkInstalledHermesSetup(spec) : null;
 	const smoke = flags.smoke ? await runSmoke(spec) : null;
 	if (smoke && !smoke.ok) {
 		throw new HermesSetupError(`Hermes MCP smoke failed; missing tools: ${smoke.missingTools.join(", ")}`, 4);
 	}
 	return {
-		ok: true,
+		ok: check?.ok ?? true,
 		mode,
 		files_written,
 		previews,
 		warnings:
 			spec.sessionCommandSource === "explicit"
-				? [
-						"Using explicit GJC_COORDINATOR_MCP_SESSION_COMMAND exactly as supplied; provider/model/worktree validation is not performed.",
-					]
+				? ["Using explicit GJC_COORDINATOR_MCP_SESSION_COMMAND validated as a supported GJC lifecycle selector."]
 				: spec.worktree.enabled
 					? [
 							`GJC_COORDINATOR_MCP_SESSION_COMMAND defaults to '${spec.sessionCommand}' so GJC owns worktree creation and resume identity.`,
 						]
 					: [
-							"GJC_COORDINATOR_MCP_SESSION_COMMAND defaults to the configured gjc command with worktree isolation disabled by user request.",
+							"GJC_COORDINATOR_MCP_SESSION_COMMAND defaults to 'gjc' with worktree isolation disabled by user request.",
 						],
 		smoke,
+		check,
 	};
 }
 
@@ -473,6 +600,10 @@ export function formatHermesSetupResult(result: HermesSetupResult): string {
 		for (const preview of result.previews) lines.push(`Preview: ${preview.path}`);
 	}
 	for (const warning of result.warnings) lines.push(`Warning: ${warning}`);
+	if (result.check) {
+		lines.push(`Check: ${result.check.ok ? "passed" : "failed"}`);
+		for (const mismatch of result.check.mismatches) lines.push(`Mismatch: ${mismatch.kind} (${mismatch.path})`);
+	}
 	if (result.smoke) {
 		lines.push(`Smoke: ${result.smoke.ok ? "passed" : "failed"} (${result.smoke.requiredTools.length} tools)`);
 	}

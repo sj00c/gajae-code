@@ -160,7 +160,18 @@ function parseFrame(value: unknown): Frame {
 }
 
 function lifecycleFingerprint(operation: string, input: unknown): string {
-	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
+	const identity =
+		input !== null && typeof input === "object" && !Array.isArray(input)
+			? { ...(input as Record<string, unknown>) }
+			: input;
+	if (identity !== null && typeof identity === "object" && !Array.isArray(identity)) {
+		const lifecycleIdentity = identity as Record<string, unknown>;
+		delete lifecycleIdentity.coordinatorSidecarSigningKey;
+		delete lifecycleIdentity.coordinatorSidecarKeyId;
+	}
+	return createHash("sha256")
+		.update(JSON.stringify({ operation, input: identity }))
+		.digest("hex");
 }
 
 function inputFingerprint(input: unknown): string {

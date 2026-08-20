@@ -1,6 +1,8 @@
 import * as crypto from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
+import * as path from "node:path";
 import packageJson from "../../package.json" with { type: "json" };
 import type { CodexHandoffEndpoint, CodexHandoffRegistrationV1, CodexWakeEventV1 } from "./codex-handoff";
 
@@ -17,6 +19,76 @@ export type CodexTransportFactory = (
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+export const CODEX_TOKEN_MAX_BYTES = 4096;
+
+export interface CodexTokenFileIdentity {
+	path: string;
+	device: number;
+	inode: number;
+}
+
+function isWithinRoot(candidate: string, root: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
+}
+
+function sameIdentity(stat: { dev: number; ino: number }, identity: CodexTokenFileIdentity): boolean {
+	return stat.dev === identity.device && stat.ino === identity.inode;
+}
+
+function isSecureTokenStat(stat: { isFile(): boolean; uid: number; mode: number; size: number }): boolean {
+	return (
+		stat.isFile() &&
+		stat.uid === process.getuid?.() &&
+		(stat.mode & 0o077) === 0 &&
+		stat.size > 0 &&
+		stat.size <= CODEX_TOKEN_MAX_BYTES
+	);
+}
+
+/** Resolves and validates a token-file capability before it is persisted in a handoff. */
+export async function authorizeCodexTokenFile(tokenFile: string, tokenRoot: string): Promise<CodexTokenFileIdentity> {
+	if (process.platform === "win32" && process.getuid === undefined)
+		throw new Error("codex_authenticated_handoff_unavailable_windows");
+	try {
+		const root = await fs.realpath(tokenRoot);
+		const initial = await fs.lstat(tokenFile);
+		if (initial.isSymbolicLink()) throw new Error("unsafe");
+		const resolved = await fs.realpath(tokenFile);
+		if (!isWithinRoot(resolved, root)) throw new Error("unsafe");
+		const stat = await fs.lstat(resolved);
+		if (!isSecureTokenStat(stat) || !sameIdentity(stat, { path: resolved, device: initial.dev, inode: initial.ino }))
+			throw new Error("unsafe");
+		return { path: resolved, device: stat.dev, inode: stat.ino };
+	} catch {
+		throw new Error("codex_token_file_not_authorized");
+	}
+}
+
+async function readAuthorizedCodexTokenFile(identity: CodexTokenFileIdentity): Promise<string> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(identity.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+		const before = await handle.stat();
+		if (!isSecureTokenStat(before) || !sameIdentity(before, identity)) throw new Error("unsafe");
+		const token = await handle.readFile({ encoding: "utf8" });
+		const after = await handle.stat();
+		const current = await fs.lstat(identity.path);
+		if (
+			!sameIdentity(after, identity) ||
+			!sameIdentity(current, identity) ||
+			token.length === 0 ||
+			token.length > CODEX_TOKEN_MAX_BYTES ||
+			/[\r\n]/.test(token)
+		)
+			throw new Error("unsafe");
+		return token;
+	} catch {
+		throw new Error("codex_token_file_unreadable");
+	} finally {
+		await handle?.close();
+	}
+}
 
 export function assertSafeCodexEndpoint(endpoint: unknown): CodexHandoffEndpoint {
 	if (endpoint === null || typeof endpoint !== "object") throw new Error("invalid_codex_endpoint");
@@ -41,13 +113,13 @@ export function assertSafeCodexEndpoint(endpoint: unknown): CodexHandoffEndpoint
 	throw new Error("invalid_codex_endpoint");
 }
 
-export async function readCodexTokenFile(tokenFile: string | null): Promise<string | null> {
+export async function readCodexTokenFile(
+	tokenFile: string | null,
+	identity?: CodexTokenFileIdentity | null,
+): Promise<string | null> {
 	if (tokenFile === null) return null;
-	try {
-		return (await fs.readFile(tokenFile, "utf8")).trim();
-	} catch {
-		throw new Error("codex_token_file_unreadable");
-	}
+	if (!identity || identity.path !== tokenFile) throw new Error("codex_token_file_unreadable");
+	return await readAuthorizedCodexTokenFile(identity);
 }
 
 export function buildCodexWakePrompt(event: CodexWakeEventV1): string {
@@ -75,7 +147,7 @@ export async function publishCodexWake(input: {
 	transportFactory: CodexTransportFactory;
 }): Promise<{ published: boolean; reason: string | null }> {
 	const endpoint = assertSafeCodexEndpoint(input.handoff.endpoint);
-	const token = await readCodexTokenFile(input.handoff.token_file);
+	const token = await readCodexTokenFile(input.handoff.token_file, input.handoff.token_file_identity);
 	const transport = await input.transportFactory(endpoint, token);
 	try {
 		await transport.request("initialize", {

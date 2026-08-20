@@ -3,6 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { listCodexWakeEvents, recordCodexWakeEvent, registerCodexHandoff } from "../src/coordinator-mcp/codex-handoff";
+import { buildCoordinatorMcpConfig, coordinatorNamespacePath } from "../src/coordinator-mcp/policy";
+import {
+	coordinatorStatePaths,
+	createSessionTransaction,
+	initializeCoordinatorNamespace,
+} from "../src/coordinator-mcp/question-state";
 import {
 	appendCoordinatorEventForTest,
 	awaitCodexWakePublishesForTest,
@@ -22,7 +28,13 @@ afterEach(async () => {
 });
 
 function namespaceDir(root: string): string {
-	return path.join(root, ".gjc", "coordinator-state", "local", "repo");
+	return coordinatorNamespacePath(
+		buildCoordinatorMcpConfig({
+			GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+			GJC_COORDINATOR_MCP_PROFILE: "local",
+			GJC_COORDINATOR_MCP_REPO: "repo",
+		}),
+	);
 }
 /**
  * Asserts that every file in the idempotency record directory is a complete,
@@ -78,6 +90,7 @@ function createServer(
 		env: {
 			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 			GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+			GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT: path.join(root, ".gjc", "codex-tokens"),
 			GJC_COORDINATOR_MCP_PROFILE: "local",
 			GJC_COORDINATOR_MCP_REPO: "repo",
 			GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
@@ -99,17 +112,57 @@ function createServer(
 	});
 }
 
-async function createSession(root: string): Promise<void> {
-	await fs.mkdir(path.join(namespaceDir(root), "sessions"), { recursive: true });
-	await Bun.write(
-		path.join(namespaceDir(root), "sessions", "session-1.json"),
-		JSON.stringify({ session_id: "session-1" }),
-	);
+async function createSession(
+	root: string,
+	server: ReturnType<typeof createCoordinatorMcpServer>,
+	sessionId = "session-1",
+): Promise<void> {
+	const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+	await initializeCoordinatorNamespace(paths);
+	const now = new Date().toISOString();
+	await createSessionTransaction(paths, {
+		kind: "register",
+		session: {
+			schema_version: 1,
+			namespace_id: server.config.namespace.identity,
+			session_id: sessionId,
+			cwd: root,
+			created_at: now,
+			updated_at: now,
+			mpreset: null,
+			source: "coordinator",
+			model: null,
+			tmux: { session: null, window: null, pane: null },
+			broker: {
+				workspace: root,
+				endpoint_url: "",
+				endpoint_generation: 1,
+				endpoint_incarnation: `test-${sessionId}`,
+				sidecar_verifier: {
+					key_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+					public_key: "test-public-key",
+				},
+			},
+			ephemeral: false,
+			visible: true,
+		},
+		initial_state: "ready_for_input",
+		initial_events: [{ kind: "session.registered", entity: "session", entity_id: sessionId, created_at: now }],
+	});
+}
+
+async function writeManagedToken(root: string, token = "test-token"): Promise<string> {
+	const tokenRoot = path.join(root, ".gjc", "codex-tokens");
+	await fs.mkdir(tokenRoot, { recursive: true, mode: 0o700 });
+	await fs.chmod(tokenRoot, 0o700);
+	const tokenFile = path.join(tokenRoot, "codex-token");
+	await fs.writeFile(tokenFile, token, { mode: 0o600 });
+	await fs.chmod(tokenFile, 0o600);
+	return tokenFile;
 }
 
 async function registerHandoff(server: ReturnType<typeof createCoordinatorMcpServer>, root: string) {
-	const tokenFile = path.join(root, "codex-token");
-	await Bun.write(tokenFile, "test-token");
+	const tokenFile = await writeManagedToken(root);
 	return server.callTool("gjc_coordinator_register_codex_handoff", {
 		session_id: "session-1",
 		thread_id: "thread-1",
@@ -125,22 +178,21 @@ describe("Coordinator Codex resume bridge", () => {
 		const root = await tempRoot();
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 		const server = createServer(root, "idle", requests);
-		await createSession(root);
+		await createSession(root, server);
 
 		await expect(registerHandoff(server, root)).resolves.toMatchObject({
 			ok: true,
 			handoff: {
 				work_unit: "session-1",
 				endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
-				token_file: path.join(root, "codex-token"),
+				token_configured: true,
 			},
 			heartbeat: { supported: false, reason: "automation_update_unavailable" },
 		});
-		await expect(
-			server.callTool("gjc_coordinator_read_codex_handoff", { session_id: "session-1" }),
-		).resolves.toMatchObject({
+		const publicHandoff = await server.callTool("gjc_coordinator_read_codex_handoff", { session_id: "session-1" });
+		expect(publicHandoff).toMatchObject({
 			ok: true,
-			handoff: { thread_id: "thread-1", token_file: path.join(root, "codex-token") },
+			handoff: { thread_id: "thread-1", token_configured: true },
 			heartbeat: { supported: false, reason: "automation_update_unavailable" },
 			lifecycle_schema: {
 				version: 1,
@@ -154,6 +206,8 @@ describe("Coordinator Codex resume bridge", () => {
 			wake_events: [],
 			pending_wake_events: [],
 		});
+		expect(publicHandoff.handoff).not.toHaveProperty("token_file");
+		expect(publicHandoff.handoff).not.toHaveProperty("token_file_identity");
 		await expect(
 			server.callTool("gjc_coordinator_register_codex_handoff", {
 				session_id: "session-1",
@@ -174,11 +228,48 @@ describe("Coordinator Codex resume bridge", () => {
 			}),
 		).resolves.toEqual({ ok: false, error: { code: "token_material_not_allowed" } });
 	});
+	it("denies Codex handoff register, read, and acknowledgement after its root is narrowed", async () => {
+		const root = await tempRoot();
+		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+		const server = createServer(root, "idle", requests);
+		await createSession(root, server);
+		await expect(registerHandoff(server, root)).resolves.toMatchObject({ ok: true });
+		const event = await appendCoordinatorEventForTest(namespaceDir(root), {
+			kind: "turn.completed",
+			sessionId: "session-1",
+			summary: "narrow authorization scope",
+		});
+		const narrowed = path.join(root, "narrowed");
+		await fs.mkdir(narrowed);
+		server.config.allowedRoots = [narrowed];
+
+		await expect(
+			server.callTool("gjc_coordinator_register_codex_handoff", {
+				session_id: "session-1",
+				thread_id: "thread-1",
+				endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
+				idempotency_key: "narrowed-register",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: false });
+		await expect(
+			server.callTool("gjc_coordinator_read_codex_handoff", { session_id: "session-1" }),
+		).resolves.toMatchObject({ ok: false });
+		await expect(
+			server.callTool("gjc_coordinator_ack_codex_handoff", {
+				session_id: "session-1",
+				wake_key: `session-1:${event.seq}`,
+				idempotency_key: "narrowed-ack",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: false });
+	});
+
 	it("bounds Codex handoff idempotency responses to the allowlisted registration shape", async () => {
 		const root = await tempRoot();
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 		const server = createServer(root, "idle", requests);
-		await createSession(root);
+		await createSession(root, server);
 		await expect(
 			server.callTool("gjc_coordinator_register_codex_handoff", {
 				session_id: "session-1",
@@ -190,7 +281,7 @@ describe("Coordinator Codex resume bridge", () => {
 			}),
 		).resolves.toEqual({ ok: false, error: { code: "token_material_not_allowed" } });
 
-		const tokenFile = path.join(root, "codex-token");
+		const tokenFile = await writeManagedToken(root, "bounded-token");
 		const response = await server.callTool("gjc_coordinator_register_codex_handoff", {
 			session_id: "session-1",
 			thread_id: "thread-1",
@@ -200,13 +291,13 @@ describe("Coordinator Codex resume bridge", () => {
 			allow_mutation: true,
 		});
 
-		expect(response).toMatchObject({ ok: true, handoff: { token_file: tokenFile } });
+		expect(response).toMatchObject({ ok: true, handoff: { token_configured: true } });
 		expect(Object.keys((response as { handoff: Record<string, unknown> }).handoff).sort()).toEqual([
 			"endpoint",
 			"registered_at",
 			"schema_version",
 			"thread_id",
-			"token_file",
+			"token_configured",
 			"updated_at",
 			"work_unit",
 		]);
@@ -222,16 +313,16 @@ describe("Coordinator Codex resume bridge", () => {
 			),
 		);
 		const persisted = persistedFiles.find(record => record.response?.ok === true) as {
-			response: { handoff: { token_file: string; endpoint: Record<string, unknown> } };
+			response: { handoff: { token_configured: boolean; endpoint: Record<string, unknown> } };
 		};
-		expect(persisted.response.handoff.token_file).toBe(tokenFile);
+		expect(persisted.response.handoff.token_configured).toBe(true);
 		expect(persisted.response.handoff.endpoint).not.toHaveProperty("ignored");
 	});
 	it("leaves a parseable atomic idempotency state after a rejected nonterminal operation and replays it exactly", async () => {
 		const root = await tempRoot();
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 		const server = createServer(root, "idle", requests);
-		await createSession(root);
+		await createSession(root, server);
 
 		const rejection = await server.callTool("gjc_coordinator_register_codex_handoff", {
 			session_id: "session-1",
@@ -290,22 +381,18 @@ describe("Coordinator Codex resume bridge", () => {
 		const root = await tempRoot();
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 		const server = createServer(root, "idle", requests);
-		await createSession(root);
+		await createSession(root, server);
 		// Additional sessions so distinct-key mutations do not race on the same
 		// handoff record file — that shared-file race is independent of #4473.
-		for (const session of ["session-2", "session-3", "session-4"])
-			await Bun.write(
-				path.join(namespaceDir(root), "sessions", `${session}.json`),
-				JSON.stringify({ session_id: session }),
-			);
-		await Bun.write(path.join(root, "codex-token"), "test-token");
+		for (const session of ["session-2", "session-3", "session-4"]) await createSession(root, server, session);
+		const tokenFile = await writeManagedToken(root);
 
 		const attempt = (sessionId: string, idempotencyKey: string) =>
 			server.callTool("gjc_coordinator_register_codex_handoff", {
 				session_id: sessionId,
 				thread_id: `thread-${sessionId}`,
 				endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
-				token_file: path.join(root, "codex-token"),
+				token_file: tokenFile,
 				idempotency_key: idempotencyKey,
 				allow_mutation: true,
 			});
@@ -334,7 +421,7 @@ describe("Coordinator Codex resume bridge", () => {
 				session_id: "session-1",
 				thread_id: "thread-session-1",
 				endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
-				token_file: path.join(root, "codex-token"),
+				token_file: tokenFile,
 				idempotency_key: "concurrent-shared",
 				allow_mutation: true,
 			}),
@@ -346,7 +433,7 @@ describe("Coordinator Codex resume bridge", () => {
 		const root = await tempRoot();
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 		const server = createServer(root, "idle", requests);
-		await createSession(root);
+		await createSession(root, server);
 		await registerHandoff(server, root);
 
 		const finalResponseSentinel = "FINAL-RESPONSE-SENTINEL-9c41 full GJC answer body";
@@ -410,7 +497,7 @@ describe("Coordinator Codex resume bridge", () => {
 		const root = await tempRoot();
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 		const server = createServer(root, "running", requests);
-		await createSession(root);
+		await createSession(root, server);
 		await registerHandoff(server, root);
 
 		const event = await appendCoordinatorEventForTest(namespaceDir(root), {
@@ -451,7 +538,7 @@ describe("Coordinator Codex resume bridge", () => {
 			factoryError: "a".repeat(500),
 		};
 		const server = createServer(root, control, requests);
-		await createSession(root);
+		await createSession(root, server);
 		await registerHandoff(server, root);
 
 		const event = await appendCoordinatorEventForTest(namespaceDir(root), {
@@ -481,8 +568,8 @@ describe("Coordinator Codex resume bridge", () => {
 	it("logs corrupt handoff state while preserving terminal coordinator events", async () => {
 		const root = await tempRoot();
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
-		createServer(root, "idle", requests);
-		await createSession(root);
+		const server = createServer(root, "idle", requests);
+		await createSession(root, server);
 		await fs.mkdir(path.join(namespaceDir(root), "codex-handoffs"), { recursive: true });
 		await fs.writeFile(path.join(namespaceDir(root), "codex-handoffs", "session-1.json"), "{invalid json");
 
@@ -521,7 +608,7 @@ describe("Coordinator Codex resume bridge", () => {
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 		const control: CodexTransportControl = { status: "running" };
 		const server = createServer(root, control, requests);
-		await createSession(root);
+		await createSession(root, server);
 		await registerHandoff(server, root);
 
 		const pending = await appendCoordinatorEventForTest(namespaceDir(root), {
@@ -554,7 +641,7 @@ describe("Coordinator Codex resume bridge", () => {
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 		const control: CodexTransportControl = { status: "idle", throwOnFactory: true };
 		const server = createServer(root, control, requests);
-		await createSession(root);
+		await createSession(root, server);
 		await registerHandoff(server, root);
 
 		const failed = await appendCoordinatorEventForTest(namespaceDir(root), {
@@ -599,7 +686,7 @@ describe("Coordinator Codex resume bridge", () => {
 		const firstEntered = Promise.withResolvers<void>();
 		const releaseFirst = Promise.withResolvers<void>();
 		const secondStarted = Promise.withResolvers<void>();
-		createCoordinatorMcpServer({
+		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
@@ -621,11 +708,15 @@ describe("Coordinator Codex resume bridge", () => {
 				}),
 			},
 		});
+		await createSession(root, server);
+		await createSession(root, server, "session-2");
 		await registerCodexHandoff(namespace, {
 			work_unit: "session-1",
 			thread_id: "thread-1",
 			endpoint: { kind: "unix", path: "/tmp/one.sock" },
 		});
+		await createSession(root, server);
+		await createSession(root, server, "session-2");
 		await registerCodexHandoff(namespace, {
 			work_unit: "session-2",
 			thread_id: "thread-2",
@@ -655,6 +746,8 @@ describe("Coordinator Codex resume bridge", () => {
 	it("drains persisted failed wakes at server startup", async () => {
 		const root = await tempRoot();
 		const namespace = namespaceDir(root);
+		const preparingServer = createServer(root, "idle", []);
+		await createSession(root, preparingServer);
 		await registerCodexHandoff(namespace, {
 			work_unit: "session-1",
 			thread_id: "thread-1",
@@ -666,9 +759,11 @@ describe("Coordinator Codex resume bridge", () => {
 			event_kind: "turn.failed",
 			summary: "retry",
 		});
-		createServer(root, "idle", []);
+		await preparingServer.close();
+		const restartedServer = createServer(root, "idle", []);
 		await Bun.sleep(20);
 		await awaitCodexWakePublishesForTest(namespace);
+		await restartedServer.close();
 		expect(
 			(await listCodexWakeEvents(namespace, "session-1")).find(event => event.key === wake.event.key),
 		).toMatchObject({
@@ -682,7 +777,7 @@ describe("Coordinator Codex resume bridge", () => {
 		const statusResponses = new Map<number, "idle" | "running">();
 		let threadBusy = false;
 		let startCount = 0;
-		createCoordinatorMcpServer({
+		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
@@ -705,11 +800,15 @@ describe("Coordinator Codex resume bridge", () => {
 				}),
 			},
 		});
+		await createSession(root, server);
+		await createSession(root, server, "session-2");
 		await registerCodexHandoff(namespace, {
 			work_unit: "session-1",
 			thread_id: "thread-shared",
 			endpoint: { kind: "unix", path: "/tmp/shared.sock" },
 		});
+		await createSession(root, server);
+		await createSession(root, server, "session-2");
 		await registerCodexHandoff(namespace, {
 			work_unit: "session-2",
 			thread_id: "thread-shared",
@@ -761,7 +860,7 @@ describe("Coordinator Codex resume bridge", () => {
 		const namespace = namespaceDir(root);
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 		let threadBusy = true;
-		createCoordinatorMcpServer({
+		const server = createCoordinatorMcpServer({
 			env: {
 				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
@@ -780,11 +879,15 @@ describe("Coordinator Codex resume bridge", () => {
 				}),
 			},
 		});
+		await createSession(root, server);
+		await createSession(root, server, "session-2");
 		await registerCodexHandoff(namespace, {
 			work_unit: "session-1",
 			thread_id: "thread-shared",
 			endpoint: { kind: "unix", path: "/tmp/shared.sock" },
 		});
+		await createSession(root, server);
+		await createSession(root, server, "session-2");
 		await registerCodexHandoff(namespace, {
 			work_unit: "session-2",
 			thread_id: "thread-shared",

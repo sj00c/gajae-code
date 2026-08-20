@@ -117,6 +117,7 @@ describe("Codex handoff durable state", () => {
 			thread_id: "thread-3",
 			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
 			token_file: tokenFile,
+			token_root: tokenDir,
 		});
 
 		const state = await persistedText(root);
@@ -233,11 +234,17 @@ console.log(JSON.stringify(await recordCodexWakeEvent(${JSON.stringify(root)}, {
 	});
 	it("round-trips delegate origins and never overwrites an existing delegate binding", async () => {
 		const root = await tempRoot();
+		const tokenRoot = path.join(root, "managed-codex-tokens");
+		await fs.mkdir(tokenRoot, { mode: 0o700 });
+		const tokenFile = path.join(tokenRoot, "codex-token");
+		await fs.writeFile(tokenFile, "test-token", { mode: 0o600 });
+		await fs.chmod(tokenFile, 0o600);
 		const source = await registerCodexHandoff(root, {
 			work_unit: "host-session",
 			thread_id: "thread-source",
 			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
-			token_file: "/tmp/codex-token",
+			token_file: tokenFile,
+			token_root: tokenRoot,
 		});
 		const origin = {
 			gjc_session_id: "delegate-session",
@@ -296,6 +303,7 @@ console.log(JSON.stringify(await recordCodexWakeEvent(${JSON.stringify(root)}, {
 				thread_id: "thread-legacy",
 				endpoint: { kind: "unix", path: "/tmp/codex.sock" },
 				token_file: null,
+				token_file_identity: null,
 				registered_at: "2026-07-19T00:00:00.000Z",
 				updated_at: "2026-07-19T00:00:00.000Z",
 			}),
@@ -309,6 +317,7 @@ console.log(JSON.stringify(await recordCodexWakeEvent(${JSON.stringify(root)}, {
 				thread_id: "thread-corrupt",
 				endpoint: { kind: "unix", path: "/tmp/codex.sock" },
 				token_file: null,
+				token_file_identity: null,
 				registered_at: "2026-07-19T00:00:00.000Z",
 				updated_at: "2026-07-19T00:00:00.000Z",
 				origin: { ...origin, delegation_id: 1 },

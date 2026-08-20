@@ -58,13 +58,23 @@ export interface SessionLifecycleSavedSession {
 	readonly identity: SessionLifecycleSavedSessionIdentity;
 }
 
-export interface SessionLifecycleCoordinatorTarget {
-	readonly coordinatorStateDir?: string;
-	readonly coordinatorSessionId?: string;
-	readonly coordinatorSessionBranch?: string;
-}
+export type SessionLifecycleCoordinatorTarget =
+	| {
+			readonly coordinatorStateDir?: undefined;
+			readonly coordinatorSidecarSigningKey?: undefined;
+			readonly coordinatorSidecarKeyId?: undefined;
+			readonly coordinatorSessionId?: string;
+			readonly coordinatorSessionBranch?: string;
+	  }
+	| {
+			readonly coordinatorStateDir: string;
+			readonly coordinatorSidecarSigningKey: string;
+			readonly coordinatorSidecarKeyId: string;
+			readonly coordinatorSessionId?: string;
+			readonly coordinatorSessionBranch?: string;
+	  };
 
-export interface SessionCreateTarget extends SessionLifecycleCoordinatorTarget {
+export type SessionCreateTarget = SessionLifecycleCoordinatorTarget & {
 	readonly cwd: string;
 	readonly stateRoot?: string;
 	readonly body?: string;
@@ -73,9 +83,9 @@ export interface SessionCreateTarget extends SessionLifecycleCoordinatorTarget {
 	readonly worktree?: SessionLifecycleWorktreeTarget;
 	readonly readiness?: "immediate" | "deferred";
 	readonly readinessTimeoutMs?: number;
-}
+};
 
-export interface SessionForkTarget extends SessionLifecycleCoordinatorTarget {
+export type SessionForkTarget = SessionLifecycleCoordinatorTarget & {
 	readonly cwd: string;
 	readonly stateRoot?: string;
 	readonly sourceSessionId?: string;
@@ -86,9 +96,9 @@ export interface SessionForkTarget extends SessionLifecycleCoordinatorTarget {
 	readonly mcpServers?: readonly Record<string, unknown>[];
 	readonly worktree?: SessionLifecycleWorktreeTarget;
 	readonly readinessTimeoutMs?: number;
-}
+};
 
-export interface SessionResumeTarget extends SessionLifecycleCoordinatorTarget {
+export type SessionResumeTarget = SessionLifecycleCoordinatorTarget & {
 	readonly sessionId: string;
 	readonly cwd?: string;
 	readonly stateRoot?: string;
@@ -99,7 +109,7 @@ export interface SessionResumeTarget extends SessionLifecycleCoordinatorTarget {
 	readonly mcpServers?: readonly Record<string, unknown>[];
 	readonly worktree?: SessionLifecycleWorktreeTarget;
 	readonly readinessTimeoutMs?: number;
-}
+};
 
 export interface SessionCloseTarget {
 	readonly sessionId: string;

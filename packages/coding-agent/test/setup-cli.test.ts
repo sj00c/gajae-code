@@ -3,7 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
-import { parseSetupArgs, runSetupCommand } from "../src/cli/setup-cli";
+import { parseSetupArgs, printSetupHelp, runSetupCommand } from "../src/cli/setup-cli";
+import Setup from "../src/commands/setup";
+import { buildHermesSetupSpec, runHermesSetup } from "../src/setup/hermes-setup";
 import { addApiCompatibleProvider } from "../src/setup/provider-onboarding";
 
 let tempRoot: string | undefined;
@@ -73,11 +75,39 @@ describe("setup CLI parsing", () => {
 		expect({ exitCode, stdout, stderr }).toEqual({ exitCode: 0, stdout: "ok", stderr: "" });
 	});
 
+	it("rejects Hermes-only flags outside the Hermes component in shared dispatch", async () => {
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+			throw new Error("exit");
+		}) as never);
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		await expect(runSetupCommand({ component: "defaults", flags: { profile: "bot" } })).rejects.toThrow("exit");
+		expect(stderr.mock.calls.map(call => String(call[0])).join("")).toContain(
+			"--profile require the explicit `hermes` component",
+		);
+		expect(exit).toHaveBeenCalledWith(1);
+	});
+
 	it("allows provider flags for explicit provider setup", () => {
 		expect(parseSetupArgs(["setup", "provider", "--provider", "proxy", "--compat", "openai"])).toEqual({
 			component: "provider",
 			flags: { provider: "proxy", compat: "openai" },
 		});
+	});
+
+	it("rejects Hermes-only flags outside the Hermes component during argument parsing", async () => {
+		const proc = Bun.spawn({
+			cmd: [
+				process.execPath,
+				"-e",
+				`import { parseSetupArgs } from "./src/cli/setup-cli"; parseSetupArgs(["setup", "python", "--profile", "bot"]);`,
+			],
+			cwd: path.join(import.meta.dir, ".."),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain("--profile require the explicit `hermes` component");
 	});
 
 	it("rejects preset provider setup with arbitrary CLI base URL, model, or API key env", async () => {
@@ -198,22 +228,111 @@ describe("setup CLI parsing", () => {
 			expect(output).toContain("owns worktree creation and resume identity");
 		});
 
-		it("preserves explicit Hermes session commands exactly", async () => {
+		it("rejects explicit Hermes session commands outside supported lifecycle selectors", async () => {
 			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
-			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-			const sessionCommand = "gjc --model anthropic/claude-sonnet-4";
 
-			await runSetupCommand({
-				component: "hermes",
-				flags: {
+			await expect(
+				runHermesSetup({
 					json: true,
 					root: [tempRoot],
-					sessionCommand,
-				},
-			});
+					sessionCommand: "gjc --model anthropic/claude-sonnet-4",
+				}),
+			).rejects.toThrow("GJC_COORDINATOR_MCP_SESSION_COMMAND supports only");
+		});
 
-			const output = stdout.mock.calls.map(call => String(call[0])).join("");
-			expect(output).toContain(sessionCommand);
+		it("accepts compatible explicit Hermes lifecycle selectors", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			for (const sessionCommand of ["gjc", "gjc --worktree", "gjc --worktree hermes-gajae-code"]) {
+				expect(buildHermesSetupSpec({ root: [tempRoot], sessionCommand }).sessionCommand).toBe(sessionCommand);
+			}
+		});
+
+		it("rejects invalid session-command selector boundaries", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const cases: Array<{ name: string; flags: Parameters<typeof buildHermesSetupSpec>[0] }> = [
+				{ name: "blank selector", flags: { root: [tempRoot], sessionCommand: "   " } },
+				{ name: "non-gjc executable", flags: { root: [tempRoot], sessionCommand: "wrapper gjc --worktree" } },
+				{
+					name: "extra selector argument",
+					flags: { root: [tempRoot], sessionCommand: "gjc --worktree hermes extra" },
+				},
+				{
+					name: "option-shaped worktree name",
+					flags: { root: [tempRoot], sessionCommand: "gjc --worktree --named" },
+				},
+				{
+					name: "explicit selector with --no-worktree",
+					flags: { root: [tempRoot], sessionCommand: "gjc", noWorktree: true },
+				},
+				{
+					name: "explicit selector with --worktree-name",
+					flags: { root: [tempRoot], sessionCommand: "gjc --worktree hermes", worktreeName: "other" },
+				},
+				{
+					name: "--no-worktree with --worktree-name",
+					flags: { root: [tempRoot], noWorktree: true, worktreeName: "other" },
+				},
+			];
+
+			for (const { name, flags } of cases) {
+				expect(() => buildHermesSetupSpec(flags), name).toThrow();
+			}
+		});
+
+		it("keeps the Oclif session-command help aligned with typed GJC lifecycle selectors", () => {
+			expect(Setup.flags["session-command"].description).toBe(
+				"Typed GJC lifecycle selector: gjc | gjc --worktree [name]",
+			);
+		});
+
+		it("keeps session-command help aligned with typed GJC lifecycle selectors", () => {
+			const log = vi.spyOn(console, "log").mockImplementation(() => {});
+			printSetupHelp();
+			const output = log.mock.calls.map(call => String(call[0])).join("\n");
+			const commandLines = output
+				.split("\n")
+				.filter(line => line.includes("setup hermes") && line.includes("--session-command"));
+
+			expect(commandLines).toEqual([
+				expect.stringContaining('--session-command "gjc --worktree hermes-custom"'),
+				expect.stringContaining("--session-command gjc"),
+			]);
+			expect(output).toContain("Typed GJC lifecycle selector: gjc | gjc --worktree [name]");
+			expect(commandLines.join("\n")).not.toContain("--model");
+		});
+
+		it("installs an operator template that persists the returned event cursor", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const profileDir = path.join(tempRoot, "profile");
+			const result = await runHermesSetup({
+				install: true,
+				root: [tempRoot],
+				profileDir,
+			});
+			const operatorPath = result.files_written.find(file => file.endsWith(path.join("gajae-code", "SKILL.md")));
+			const renderedTemplate = result.previews.find(preview => preview.path === operatorPath)?.content;
+
+			expect(operatorPath).toBeDefined();
+			if (!operatorPath || !renderedTemplate) throw new Error("missing_operator_template");
+			expect(renderedTemplate).toContain("`next_after_seq`");
+			expect(renderedTemplate).not.toContain("`latest_seq`");
+			expect(await Bun.file(operatorPath).text()).toBe(renderedTemplate);
+		});
+
+		it("keeps generated lifecycle selectors literal when the MCP executable is customized", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const result = await runHermesSetup({
+				json: true,
+				root: [tempRoot],
+				gjcCommand: "/opt/gjc",
+			});
+			const configPreview = result.previews.find(preview => preview.path.endsWith(".yaml"))?.content ?? "";
+			const parsed = YAML.parse(configPreview) as {
+				mcp_servers: Record<string, { command: string; env?: Record<string, string> }>;
+			};
+			const server = parsed.mcp_servers.gjc_coordinator;
+			expect(server.command).toBe("/opt/gjc");
+			expect(server.env?.GJC_COORDINATOR_MCP_SESSION_COMMAND).toBe("gjc --worktree");
 		});
 
 		it("installs Hermes config without overwriting unrelated servers", async () => {
@@ -249,6 +368,131 @@ describe("setup CLI parsing", () => {
 			expect(parsed.mcp_servers.gjc_coordinator?.command).toBe("gjc");
 			expect(parsed.mcp_servers.gjc_coordinator?.env?.GJC_COORDINATOR_MCP_MUTATIONS).toBe("sessions,questions");
 			expect(parsed.mcp_servers.gjc_coordinator?.env?.GJC_COORDINATOR_MCP_SESSION_COMMAND).toBe("gjc --worktree");
+		});
+
+		it("checks installed Hermes setup signatures without writing", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const profileDir = path.join(tempRoot, "profile");
+			const missing = await runHermesSetup({ check: true, root: [tempRoot], profileDir });
+			expect(missing).toMatchObject({ ok: false, mode: "check", files_written: [] });
+			expect(missing.check?.mismatches).toContainEqual({
+				path: path.join(profileDir, "config.yaml"),
+				kind: "missing",
+			});
+
+			await runHermesSetup({ install: true, root: [tempRoot], profileDir });
+			const current = await runHermesSetup({ check: true, root: [tempRoot], profileDir });
+			expect(current).toMatchObject({ ok: true, mode: "check", files_written: [], check: { mismatches: [] } });
+
+			const configPath = path.join(profileDir, "config.yaml");
+			await Bun.write(
+				configPath,
+				(await Bun.file(configPath).text()).replace("command: gjc", "command: tampered-gjc"),
+			);
+			const tampered = await runHermesSetup({ check: true, root: [tempRoot], profileDir });
+			expect(tampered.ok).toBe(false);
+			expect(tampered.check?.mismatches).toContainEqual({ path: configPath, kind: "invalid" });
+		});
+
+		it("rejects conflicting Hermes modes before reading or changing configured targets", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const profileDir = path.join(tempRoot, "profile");
+			const configPath = path.join(profileDir, "config.yaml");
+			const operatorPath = path.join(profileDir, "skills", "autonomous-ai-agents", "gajae-code", "SKILL.md");
+			const configBefore = "preserve-config-bytes\n";
+			const operatorBefore = "preserve-operator-bytes\n";
+			await fs.mkdir(path.dirname(operatorPath), { recursive: true });
+			await Bun.write(configPath, configBefore);
+			await Bun.write(operatorPath, operatorBefore);
+			const readFile = vi.spyOn(fs, "readFile");
+
+			for (const flags of [
+				{ install: true, check: true },
+				{ install: true, smoke: true },
+				{ check: true, smoke: true },
+			]) {
+				await expect(runHermesSetup({ ...flags, root: [tempRoot], profileDir })).rejects.toThrow(
+					"accepts only one of --install, --check, or --smoke",
+				);
+			}
+			expect(readFile).not.toHaveBeenCalled();
+			expect(await Bun.file(configPath).text()).toBe(configBefore);
+			expect(await Bun.file(operatorPath).text()).toBe(operatorBefore);
+		});
+
+		it("rolls back a committed config when the operator rename fails", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const profileDir = path.join(tempRoot, "profile");
+			const configPath = path.join(profileDir, "config.yaml");
+			const operatorPath = path.join(profileDir, "skills", "autonomous-ai-agents", "gajae-code", "SKILL.md");
+			await runHermesSetup({ install: true, root: [tempRoot], profileDir });
+			const configBefore = await fs.readFile(configPath);
+			await fs.rm(operatorPath);
+			const renameFile = fs.rename;
+			vi.spyOn(fs, "rename").mockImplementation(async (oldPath, newPath) => {
+				if (newPath === operatorPath) throw new Error("injected operator rename failure");
+				return renameFile(oldPath, newPath);
+			});
+
+			await expect(runHermesSetup({ install: true, root: [tempRoot], profileDir })).rejects.toThrow(
+				"injected operator rename failure",
+			);
+			expect(await fs.readFile(configPath)).toEqual(configBefore);
+			expect(await Bun.file(operatorPath).exists()).toBe(false);
+		});
+
+		it("cleans staged files when second-stage staging fails before either target exists", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const profileDir = path.join(tempRoot, "profile");
+			const configPath = path.join(profileDir, "config.yaml");
+			const operatorPath = path.join(profileDir, "skills", "autonomous-ai-agents", "gajae-code", "SKILL.md");
+			const writeFile = fs.writeFile;
+			vi.spyOn(fs, "writeFile").mockImplementation(async (file, data, options) => {
+				if (String(file).startsWith(`${path.dirname(operatorPath)}${path.sep}.`)) {
+					throw new Error("injected second-stage failure");
+				}
+				return writeFile(file, data, options);
+			});
+
+			await expect(runHermesSetup({ install: true, root: [tempRoot], profileDir })).rejects.toThrow(
+				"injected second-stage failure",
+			);
+			expect(await Bun.file(configPath).exists()).toBe(false);
+			expect(await Bun.file(operatorPath).exists()).toBe(false);
+			expect((await fs.readdir(tempRoot, { recursive: true })).filter(file => file.endsWith(".tmp"))).toEqual([]);
+		});
+
+		it("cleans staged files when snapshot acquisition fails before commit", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const profileDir = path.join(tempRoot, "profile");
+			const configPath = path.join(profileDir, "config.yaml");
+			const operatorPath = path.join(profileDir, "skills", "autonomous-ai-agents", "gajae-code", "SKILL.md");
+			await runHermesSetup({ install: true, root: [tempRoot], profileDir });
+			const configBefore = await fs.readFile(configPath);
+			const operatorBefore = await fs.readFile(operatorPath);
+			vi.spyOn(fs, "readFile").mockRejectedValueOnce(new Error("injected snapshot failure"));
+
+			await expect(runHermesSetup({ install: true, root: [tempRoot], profileDir })).rejects.toThrow(
+				"injected snapshot failure",
+			);
+			expect(Buffer.from(await Bun.file(configPath).arrayBuffer())).toEqual(configBefore);
+			expect(Buffer.from(await Bun.file(operatorPath).arrayBuffer())).toEqual(operatorBefore);
+			expect((await fs.readdir(tempRoot, { recursive: true })).filter(file => file.endsWith(".tmp"))).toEqual([]);
+		});
+
+		it("returns a nonzero setup status for failed Hermes checks", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+			await runSetupCommand({
+				component: "hermes",
+				flags: { json: true, check: true, root: [tempRoot], profileDir: path.join(tempRoot, "profile") },
+			});
+			expect(JSON.parse(stdout.mock.calls.map(call => String(call[0])).join(""))).toMatchObject({
+				ok: false,
+				check: { mismatches: expect.any(Array) },
+			});
+			expect(exit).toHaveBeenCalledWith(4);
 		});
 
 		it("renders named Hermes worktree commands and allows explicit opt-out", async () => {
@@ -322,6 +566,47 @@ describe("setup CLI parsing", () => {
 
 			expect(exitCode).toBe(0);
 			expect(stdout).toBe("ok");
+		});
+
+		it("leaves every install target byte-identical when an operator conflict is rejected", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const configPath = path.join(tempRoot, "config.yaml");
+			const profileDir = path.join(tempRoot, "profile");
+			const operatorPath = path.join(profileDir, "skills", "autonomous-ai-agents", "gajae-code", "SKILL.md");
+			const configBefore = YAML.stringify({ mcp_servers: { other: { command: "other" } } });
+			const operatorBefore = "unmanaged operator instructions";
+			await Bun.write(configPath, configBefore);
+			await fs.mkdir(path.dirname(operatorPath), { recursive: true });
+			await Bun.write(operatorPath, operatorBefore);
+
+			await expect(runHermesSetup({ install: true, root: [tempRoot], profileDir })).rejects.toThrow(
+				"Operator instruction target already exists and is not managed by GJC",
+			);
+			expect(await Bun.file(configPath).text()).toBe(configBefore);
+			expect(await Bun.file(operatorPath).text()).toBe(operatorBefore);
+		});
+
+		it("requires force for tampered managed Hermes config and operator instructions", async () => {
+			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
+			const profileDir = path.join(tempRoot, "profile");
+			const configPath = path.join(profileDir, "config.yaml");
+			const operatorPath = path.join(profileDir, "skills", "autonomous-ai-agents", "gajae-code", "SKILL.md");
+			await runHermesSetup({ install: true, root: [tempRoot], profileDir });
+			const tamperedConfig = (await Bun.file(configPath).text()).replace("command: gjc", "command: copied-gjc");
+			await Bun.write(configPath, tamperedConfig);
+
+			await expect(runHermesSetup({ install: true, root: [tempRoot], profileDir })).rejects.toThrow(
+				"already exists and is not managed by GJC",
+			);
+			expect(await Bun.file(configPath).text()).toBe(tamperedConfig);
+
+			await runHermesSetup({ install: true, force: true, root: [tempRoot], profileDir });
+			const tamperedOperator = `${await Bun.file(operatorPath).text()}\nTampered.`;
+			await Bun.write(operatorPath, tamperedOperator);
+			await expect(runHermesSetup({ install: true, root: [tempRoot], profileDir })).rejects.toThrow(
+				"Operator instruction target already exists and is not managed by GJC",
+			);
+			expect(await Bun.file(operatorPath).text()).toBe(tamperedOperator);
 		});
 
 		it("smoke checks the current Hermes MCP tool contract without provider credentials", async () => {

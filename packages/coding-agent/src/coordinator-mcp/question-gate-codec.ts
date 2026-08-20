@@ -22,7 +22,8 @@ export type PublicReason =
 	| "session_closing"
 	| "session_unavailable"
 	| "reported_failure"
-	| "validation_rejected";
+	| "validation_rejected"
+	| "dispatch_admission_lost";
 export type CoordinatorQuestionStatusV1 = "pending" | "answered" | "stale" | "uncertain";
 export interface CoordinatorQuestionOptionPublicV1 {
 	id: string;
@@ -337,12 +338,12 @@ export function validateCoordinatorAskAnswer(
 			? { selected: [], other: true, custom: answer.custom }
 			: null;
 	if (
-		answer.other !== undefined ||
+		(answer.other !== undefined && answer.other !== false) ||
 		answer.custom !== undefined ||
 		(!codec.allow_empty && answer.selected.length === 0)
 	)
 		return null;
-	return { selected: [...answer.selected] };
+	return { selected: [...answer.selected], ...(answer.other === false ? { other: false } : {}) };
 }
 export function translateCoordinatorAskAnswer(codec: PrivateAskGateCodecV1, answer: CoordinatorAskAnswerV1): unknown {
 	if ("action" in answer) return answer;

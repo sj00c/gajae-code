@@ -1,5 +1,7 @@
 # GJC Hermes operator instructions v{{TEMPLATE_VERSION}}
 
+<!-- GJC Hermes operator instructions digest v1: {{OPERATOR_INSTRUCTIONS_DIGEST}} -->
+
 Server key: {{SERVER_KEY}}
 
 These instructions teach a Hermes-style coordinator how to operate GJC through the `{{TOOL_PREFIX}}_*` MCP tools. They are setup guidance, not a GJC workflow skill.
@@ -9,7 +11,7 @@ These instructions teach a Hermes-style coordinator how to operate GJC through t
 1. Use `{{TOOL_PREFIX}}_list_sessions` to find an existing session, or `{{TOOL_PREFIX}}_start_session` when a new session is required and mutation is enabled.
 2. Send exactly one bounded task prompt with `{{TOOL_PREFIX}}_send_prompt`.
 3. Store the returned `turn_id`.
-4. Prefer `{{TOOL_PREFIX}}_watch_events` with the stored `latest_seq` for event-driven progress; fall back to `{{TOOL_PREFIX}}_read_turn` or `{{TOOL_PREFIX}}_await_turn` for a specific `turn_id` until terminal.
+4. Prefer `{{TOOL_PREFIX}}_watch_events` with the stored `next_after_seq` for event-driven progress; fall back to `{{TOOL_PREFIX}}_read_turn` or `{{TOOL_PREFIX}}_await_turn` for a specific `turn_id` until terminal.
    If a second task is needed while one turn is active, pass `queue: true`; the next queued turn is promoted after the active turn is reported terminal.
 5. If GJC asks structured questions, call `{{TOOL_PREFIX}}_list_questions` with `session_id`. It reconciles pending `workflow.gates.list` rows and returns bounded public questions, diagnostics, and reconciliation; `pending` is the current filter and `open` is a compatibility alias. Handle every pending row. Submit its `session_id`, `turn_id`, `question_id`, and `answer_binding` to `{{TOOL_PREFIX}}_submit_question_answer` with the advertised `answer`, a unique `idempotency_key`, and `allow_mutation: true`. That tool resolves through `workflow.gate_answer`, never generic `ask.answer`; re-list after restart, incomplete reconciliation is `terminal_uncertain`, stale/terminal rows are not answerable, identical replay is safe, and conflicting idempotency-key reuse fails. Never expect private gate payloads or raw values. This coordinator loop is separate from #2549/#2551 and unattended plain-CLI behavior.
 6. Use `{{TOOL_PREFIX}}_report_status` for coordinator-visible status and final reports.
@@ -26,7 +28,7 @@ Each delegate starts (or reuses) a session, sends one workflow-tagged turn, and 
 
 ## Event watch
 
-`{{TOOL_PREFIX}}_watch_events` is a bounded long-poll read tool. Call it with `after_seq` set to the last stored sequence number, optional `session_id` or `event_types`, `timeout_ms` up to 30000, and `limit` up to 100. Store the returned `latest_seq` before the next wait. A timeout with no events is not failure; call again or use the turn/status read tools for a snapshot.
+`{{TOOL_PREFIX}}_watch_events` is a bounded long-poll read tool. Call it with `after_seq` set to the last stored sequence number, optional `session_id` or `event_types`, `timeout_ms` up to 30000, and `limit` up to 100. Store the returned `next_after_seq` before the next wait. A timeout with no events is not failure; call again or use the turn/status read tools for a snapshot.
 
 Do not report completion to the user until the GJC turn is terminal. Do not infer completion from terminal scrollback alone.
 

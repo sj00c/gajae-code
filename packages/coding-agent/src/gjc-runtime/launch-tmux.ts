@@ -19,8 +19,12 @@ import {
 } from "./managed-owner-supervisor";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
+	coordinatorSidecarSigningBootstrapEnv,
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
@@ -387,6 +391,22 @@ function formatTmuxUnavailableDiagnostic(platform: NodeJS.Platform): string {
 function shellQuote(value: string): string {
 	if (value.length === 0) return "''";
 	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function coordinatorSidecarSigningEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+	const marker = env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]?.trim();
+	const bootstrap = coordinatorSidecarSigningBootstrapEnv();
+	const key =
+		env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]?.trim() ?? bootstrap[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	const keyId = env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]?.trim() ?? bootstrap[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV];
+	if (marker === undefined && key === undefined && keyId === undefined) return {};
+	if (marker !== "true" || !key || !keyId || !/^[a-f0-9]{64}$/.test(keyId))
+		throw new Error("Coordinator sidecar signing key is required for this tmux launch.");
+	return {
+		[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+		[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: key,
+		[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: keyId,
+	};
 }
 
 function buildEnvAssignments(values: Record<string, string> | undefined): string {
@@ -1027,6 +1047,7 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 			extraEnv: {
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
+				...coordinatorSidecarSigningEnv(env),
 				// Carry the GJC-managed session name into the child so tmux-backed
 				// flows can target the correct leader session by name. Under psmux on
 				// Windows the inherited TMUX_PANE can resolve to the wrong/default
@@ -1079,6 +1100,7 @@ function trustedReplacementAuthority(
 
 function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
 	if (plan.ownerGeneration) return;
+	const env = context.env ?? process.env;
 	const sessionId = plan.sessionId ?? plan.sessionName;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
 	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
@@ -1100,6 +1122,7 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 			extraEnv: {
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: plan.sessionStateFile ?? "",
+				...coordinatorSidecarSigningEnv(env),
 				[GJC_TMUX_ACTIVE_SESSION_ENV]: plan.sessionName,
 				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,

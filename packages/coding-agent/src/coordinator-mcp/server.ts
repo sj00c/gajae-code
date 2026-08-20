@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID, sign, verify } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -13,6 +13,7 @@ import {
 } from "../coordinator/contract";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "../gjc-runtime/session-state-lock";
 import {
+	canonicalCoordinatorSidecarPayload,
 	classifyRuntimeToolActivity,
 	publicRuntimeToolActivity,
 	terminallySettledRuntimeToolActivity,
@@ -74,9 +75,12 @@ import {
 } from "./model-preset";
 import {
 	assertCoordinatorArtifactPath,
+	assertCoordinatorSessionLocations,
 	assertCoordinatorWorkdir,
 	buildCoordinatorMcpConfig,
 	type CoordinatorMcpConfig,
+	coordinatorArtifactCapability,
+	coordinatorNamespacePath,
 	requireCoordinatorMutation,
 	safeOpenCoordinatorArtifact,
 } from "./policy";
@@ -104,9 +108,11 @@ import {
 	type CanonicalCreateIntentV1,
 	type CanonicalReportSnapshotV1,
 	type CanonicalSessionSnapshotV1,
+	COORDINATOR_REPORT_ID_PATTERN,
 	COORDINATOR_SESSION_ID_PATTERN,
 	type CoordinatorSessionTransactionV1,
 	claimCreationRequest,
+	claimPublicDelivery,
 	commitCreationWal,
 	coordinatorStatePaths,
 	createSessionTransaction,
@@ -114,14 +120,20 @@ import {
 	ensureSchedulerRoster,
 	enumeratePublicDeliveries,
 	initializeCoordinatorNamespace,
+	type LegacyProjectionImportV1,
 	listCanonicalActiveSessions,
+	type NamespaceDeletionEntryV1,
 	type OperationRequestV1,
 	type RuntimeProvenanceTokenV1,
 	readDeliveryDiscoveryCursor,
 	readSchedulerRoster,
 	readSessionTransaction,
+	reconcileCreationRemoteVerifier,
+	recoverExpiredPublicDelivery,
 	removeSessionTransaction,
 	repairProjections,
+	rotateClaimedCreationVerifier,
+	startCreationRemote,
 	withAdmittedSessionTransaction,
 	withNamespaceRegistry,
 	withSessionTransaction,
@@ -212,6 +224,45 @@ interface RuntimeSessionStatePayload extends CoordinatorSessionState {
 	error?: { code: string; message: string; recoverable: boolean } | null;
 }
 
+function isStrictRuntimeFinalResponse(value: unknown): value is CoordinatorFinalResponse {
+	const response = asRecord(value);
+	return Boolean(
+		response &&
+			(response.text === null || typeof response.text === "string") &&
+			response.format === "markdown" &&
+			(response.source === null || typeof response.source === "string") &&
+			(response.artifact_path === null || typeof response.artifact_path === "string") &&
+			typeof response.truncated === "boolean",
+	);
+}
+
+function hasExactRuntimeWriterIdentity(
+	state: CoordinatorSessionState | null | undefined,
+	broker: { sidecar_verifier: { key_id: string; public_key: string } },
+): boolean {
+	if (!state || state.sidecar_key_id !== broker.sidecar_verifier.key_id || typeof state.sidecar_signature !== "string")
+		return false;
+	const { sidecar_signature: _signature, ...unsigned } = state;
+	try {
+		return verify(
+			null,
+			Buffer.from(canonicalCoordinatorSidecarPayload(unsigned)),
+			{ key: Buffer.from(broker.sidecar_verifier.public_key, "base64"), format: "der", type: "spki" },
+			Buffer.from(state.sidecar_signature, "base64"),
+		);
+	} catch {
+		return false;
+	}
+}
+
+function isStrictTerminalRuntimeState(
+	state: CoordinatorSessionState | null | undefined,
+): state is RuntimeSessionStatePayload {
+	if (!state || (state.state !== "completed" && state.state !== "errored")) return false;
+	const runtime = state as RuntimeSessionStatePayload;
+	return runtime.final_response === undefined || isStrictRuntimeFinalResponse(runtime.final_response);
+}
+
 interface CoordinatorServices {
 	connectBroker?: (url: string, token: string) => Promise<SdkClient>;
 	routerDeps?: SessionRouterDeps;
@@ -222,6 +273,10 @@ interface CoordinatorServices {
 	canonicalizePath?: (value: string) => Promise<string>;
 	codexTransportFactory?: CodexTransportFactory;
 	eventWebhookDelivery?: WebhookDelivery;
+	/** Test barrier invoked after an accepted prompt receipt is durable and before turn finalization. */
+	afterPromptReceiptPersisted?: (sessionId: string) => void | Promise<void>;
+	/** Test barrier invoked after an answer dispatch is claimed and before its final admission check. */
+	afterAnswerRemoteStarted?: (sessionId: string) => void | Promise<void>;
 	/** Test barrier invoked after accepted canonical finalization and before projection. */
 	afterCanonicalTurnCommit?: (sessionId: string) => void | Promise<void>;
 	/** Test barrier invoked after a canonical report commit and before projection repair. */
@@ -275,6 +330,7 @@ interface TurnRecord {
 			tmux_keys_sent?: boolean;
 		}>;
 	};
+	runtime_provenance?: RuntimeProvenanceTokenV1 | null;
 	question_ids: string[];
 	final_response: {
 		text: string | null;
@@ -316,6 +372,9 @@ interface CoordinatorSessionState {
 	source: "coordinator" | "agent_session_event";
 	live: boolean | null;
 	reason: string | null;
+	/** Coordinator verifier id and detached Ed25519 signature over this payload. */
+	sidecar_key_id?: string;
+	sidecar_signature?: string;
 	/**
 	 * Tool-activity snapshot owned by the runtime sidecar; never lifecycle state. It is
 	 * carried opaquely because only the sidecar's validator decides what is publishable.
@@ -378,7 +437,7 @@ interface CoordinatorEvent {
 	report_id?: string;
 	summary: string;
 	payload_ref?: string;
-	metadata?: Record<string, string | number | boolean | null>;
+	metadata?: Record<string, unknown>;
 }
 
 interface CoordinatorEventInput {
@@ -389,7 +448,7 @@ interface CoordinatorEventInput {
 	reportId?: string | null;
 	summary: string;
 	payloadRef?: string | null;
-	metadata?: Record<string, string | number | boolean | null>;
+	metadata?: Record<string, unknown>;
 }
 
 const UNOBSERVED_COMPENSATION_CODE = "broker_compensation_unobserved";
@@ -637,7 +696,9 @@ function toolSchema(name: CoordinatorToolName): {
 	if (name === "gjc_coordinator_read_artifact") {
 		return {
 			name,
-			description: "Read one bounded artifact from configured safe roots.",
+			description: coordinatorArtifactCapability().available
+				? "Read one bounded artifact from configured safe roots."
+				: "Unavailable on this platform: artifact reads require Linux identity-bound handle authorization.",
 			inputSchema: { type: "object", properties: { path: pathField }, required: ["path"] },
 		};
 	}
@@ -715,7 +776,8 @@ function toolSchema(name: CoordinatorToolName): {
 					},
 					token_file: {
 						type: "string",
-						description: "Token FILE PATH reference only; raw tokens are rejected and never persisted.",
+						description:
+							"Token file under the configured Codex token root only; it must be an owner-only regular file of 1–4096 bytes with no CR or LF. Raw tokens are rejected and never persisted.",
 					},
 					allow_mutation: allowMutation,
 					idempotency_key: idempotencyKey,
@@ -873,6 +935,8 @@ function normalizeSession(session: Record<string, unknown>): Record<string, unkn
 		["tmux_target", ["tmux_target", "tmuxTarget"]],
 		["broker_workspace", ["broker_workspace"]],
 		["endpoint_incarnation", ["endpoint_incarnation"]],
+		["sidecar_key_id", ["sidecar_key_id"]],
+		["sidecar_signature", ["sidecar_signature"]],
 	];
 	for (const [output, keys] of strings) {
 		const value = firstString(session, keys);
@@ -887,6 +951,12 @@ function normalizeSession(session: Record<string, unknown>): Record<string, unkn
 		session.endpoint_generation > 0
 	)
 		normalized.endpoint_generation = session.endpoint_generation;
+	const sidecarVerifier = asRecord(session.sidecar_verifier);
+	if (sidecarVerifier && typeof sidecarVerifier.key_id === "string" && typeof sidecarVerifier.public_key === "string")
+		normalized.sidecar_verifier = {
+			key_id: sidecarVerifier.key_id,
+			public_key: sidecarVerifier.public_key,
+		};
 	return normalized;
 }
 
@@ -971,6 +1041,10 @@ const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	connection_closed: "Coordinator connection closed before completion.",
 	uncertain_after_send: "Coordinator request outcome is uncertain.",
 	endpoint_credential_forbidden: "Coordinator endpoint credentials are not public.",
+	codex_token_file_reregistration_required:
+		"Codex token file identity must be re-registered before this handoff can be used.",
+	codex_authenticated_handoff_unavailable_windows:
+		"Authenticated Codex token-file handoff is unavailable on native Windows.",
 	endpoint_stale: "Coordinator session endpoint is stale.",
 	ambiguous: "Coordinator request outcome is ambiguous.",
 	terminal_uncertain: "Coordinator state is uncertain.",
@@ -1124,7 +1198,6 @@ function boundedCodexHandoff(response: unknown): Record<string, unknown> | null 
 	if (!handoff) return null;
 	const workUnit = boundedCodexHandoffString(handoff.work_unit);
 	const threadId = boundedCodexHandoffString(handoff.thread_id);
-	const tokenFile = handoff.token_file === null ? null : boundedCodexHandoffString(handoff.token_file);
 	const registeredAt = boundedCodexHandoffString(handoff.registered_at);
 	const updatedAt = boundedCodexHandoffString(handoff.updated_at);
 	const endpoint = asRecord(handoff.endpoint);
@@ -1132,7 +1205,6 @@ function boundedCodexHandoff(response: unknown): Record<string, unknown> | null 
 		handoff.schema_version !== 1 ||
 		workUnit === null ||
 		threadId === null ||
-		(tokenFile === null && handoff.token_file !== null) ||
 		registeredAt === null ||
 		updatedAt === null ||
 		!endpoint
@@ -1153,7 +1225,7 @@ function boundedCodexHandoff(response: unknown): Record<string, unknown> | null 
 		work_unit: workUnit,
 		thread_id: threadId,
 		endpoint: boundedEndpoint,
-		token_file: tokenFile,
+		token_configured: handoff.token_file !== null,
 		registered_at: registeredAt,
 		updated_at: updatedAt,
 	};
@@ -1476,6 +1548,15 @@ function eventJournalIndexFile(namespaceDir: string): string {
 	return path.join(eventsDir(namespaceDir), "event-journal-index.v1.json");
 }
 
+function eventJournalIndexMigrationFile(namespaceDir: string): string {
+	return path.join(eventsDir(namespaceDir), "event-journal-index.v1.migrated.json");
+}
+
+function eventStableIndexFile(namespaceDir: string, eventId: string): string {
+	const key = createHash("sha256").update(eventId).digest("hex");
+	return path.join(eventsDir(namespaceDir), "event-index", `${key}.json`);
+}
+
 function fixedEventSummary(kind: CoordinatorEventKind): string {
 	if (kind.startsWith("session.")) return "Coordinator session lifecycle changed.";
 	if (kind.startsWith("turn.")) return "Coordinator turn lifecycle changed.";
@@ -1568,6 +1649,7 @@ function publicWatchSuccess(
 }
 
 type EventJournalIndex = { schema_version: 1; by_id: Record<string, { seq: number; offset: number }> };
+type EventJournalIndexMigration = { schema_version: 1; migrated_at: string };
 
 async function fsyncDirectoryForJournal(directory: string): Promise<void> {
 	const handle = await fs.open(directory, "r");
@@ -1634,6 +1716,92 @@ function parseJournalLines(raw: string): { events: CoordinatorEvent[]; offsets: 
 	return { events, offsets, tornTail };
 }
 
+async function migrateLegacyJournalIndexLocked(
+	namespaceDir: string,
+	parsed: { events: CoordinatorEvent[]; offsets: number[] },
+): Promise<void> {
+	const migrationFile = eventJournalIndexMigrationFile(namespaceDir);
+	const migrated = asRecord(await readJsonFile(migrationFile));
+	if (migrated?.schema_version === 1) return;
+
+	const legacy = asRecord(await readJsonFile(eventJournalIndexFile(namespaceDir)));
+	const legacyById =
+		legacy?.schema_version === 1 && legacy.by_id && typeof legacy.by_id === "object"
+			? (legacy.by_id as EventJournalIndex["by_id"])
+			: null;
+	const entries = legacyById
+		? Object.entries(legacyById).filter(
+				([eventId, entry]) =>
+					typeof eventId === "string" &&
+					entry &&
+					typeof entry.seq === "number" &&
+					Number.isSafeInteger(entry.seq) &&
+					typeof entry.offset === "number" &&
+					Number.isSafeInteger(entry.offset) &&
+					entry.offset >= 0,
+			)
+		: parsed.events.flatMap((event, index) => {
+				const offset = parsed.offsets[index];
+				return typeof offset === "number" ? [[event.id, { seq: event.seq, offset }] as const] : [];
+			});
+	for (const [eventId, entry] of entries) {
+		const sidecar = eventStableIndexFile(namespaceDir, eventId);
+		const existing = asRecord(await readJsonFile(sidecar));
+		if (existing?.seq === entry.seq && existing.offset === entry.offset) continue;
+		await writeJournalJsonAtomic(sidecar, { seq: entry.seq, offset: entry.offset });
+	}
+	await writeJournalJsonAtomic(migrationFile, {
+		schema_version: 1,
+		migrated_at: new Date().toISOString(),
+	} satisfies EventJournalIndexMigration);
+}
+
+async function readJournalStableIdFromTail(
+	namespaceDir: string,
+	eventId: string,
+): Promise<{ event: CoordinatorEvent; offset: number } | null> {
+	const file = eventJournalFile(namespaceDir);
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(file, "r");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+	try {
+		const stat = await handle.stat();
+		const start = Math.max(0, stat.size - 256 * 1024);
+		const buffer = Buffer.alloc(stat.size - start);
+		const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+		const bytes = buffer.subarray(0, bytesRead);
+		let offset = start;
+		let text: string;
+		if (start > 0) {
+			const firstNewline = bytes.indexOf(0x0a);
+			if (firstNewline < 0) return null;
+			offset += firstNewline + 1;
+			text = bytes.subarray(firstNewline + 1).toString("utf8");
+		} else text = bytes.toString("utf8");
+		for (const line of text.split("\n")) {
+			const lineBytes = Buffer.byteLength(line) + 1;
+			if (!line.trim()) {
+				offset += lineBytes;
+				continue;
+			}
+			try {
+				const value = asRecord(JSON.parse(line));
+				if (value?.id === eventId) return { event: value as unknown as CoordinatorEvent, offset };
+			} catch {
+				// A torn tail is repaired by the normal journal snapshot path.
+			}
+			offset += lineBytes;
+		}
+		return null;
+	} finally {
+		await handle.close();
+	}
+}
+
 async function readJournalSnapshotLocked(namespaceDir: string, repairTail = true): Promise<EventJournalSnapshot> {
 	const file = eventJournalFile(namespaceDir);
 	let raw = "";
@@ -1659,10 +1827,21 @@ async function readJournalSnapshotLocked(namespaceDir: string, repairTail = true
 		if (byId[event.id]) throw new Error("event_journal_corrupt");
 		byId[event.id] = { seq: event.seq, offset: parsed.offsets[index] ?? 0 };
 	}
-	const index: EventJournalIndex = { schema_version: 1, by_id: byId };
-	const cachedIndex = asRecord(await readJsonFile(eventJournalIndexFile(namespaceDir)));
-	if (cachedIndex?.schema_version !== 1 || canonicalJson(cachedIndex.by_id) !== canonicalJson(index.by_id))
-		await writeJournalJsonAtomic(eventJournalIndexFile(namespaceDir), index);
+	await migrateLegacyJournalIndexLocked(namespaceDir, parsed);
+	// A crash after journal fsync and before the per-id sidecar leaves only the
+	// newest event unindexed. Repair that bounded window without rebuilding the
+	// historical index on every snapshot.
+	const latest = parsed.events.at(-1);
+	const latestOffset = parsed.offsets.at(-1);
+	if (
+		latest &&
+		typeof latestOffset === "number" &&
+		!(await readJsonFile(eventStableIndexFile(namespaceDir, latest.id)))
+	)
+		await writeJournalJsonAtomic(eventStableIndexFile(namespaceDir, latest.id), {
+			seq: latest.seq,
+			offset: latestOffset,
+		});
 	const watermark = parsed.events.at(-1)?.seq ?? 0;
 	if (!Number.isSafeInteger(watermark) || watermark < 0) throw new Error("event_journal_corrupt");
 	const cachedSeq = asRecord(await readJsonFile(eventSequenceFile(namespaceDir)));
@@ -1672,6 +1851,54 @@ async function readJournalSnapshotLocked(namespaceDir: string, repairTail = true
 			updated_at: new Date().toISOString(),
 		});
 	return { events: parsed.events, watermark, offsets: parsed.offsets };
+}
+
+async function readJournalEventAtOffset(namespaceDir: string, offset: number): Promise<CoordinatorEvent | null> {
+	const file = eventJournalFile(namespaceDir);
+	const handle = await fs.open(file, "r");
+	try {
+		const stat = await handle.stat();
+		if (offset < 0 || offset >= stat.size) return null;
+		const length = Math.min(256 * 1024, stat.size - offset);
+		const buffer = Buffer.alloc(length);
+		const { bytesRead } = await handle.read(buffer, 0, length, offset);
+		const newline = buffer.subarray(0, bytesRead).indexOf(0x0a);
+		if (newline < 0) return null;
+		const value = JSON.parse(buffer.subarray(0, newline).toString("utf8"));
+		const event = asRecord(value);
+		return event?.schema_version === 1 && typeof event.seq === "number" && typeof event.id === "string"
+			? (event as unknown as CoordinatorEvent)
+			: null;
+	} catch {
+		return null;
+	} finally {
+		await handle.close();
+	}
+}
+
+async function readJournalTail(namespaceDir: string): Promise<CoordinatorEvent | null> {
+	const file = eventJournalFile(namespaceDir);
+	const handle = await fs.open(file, "r");
+	try {
+		const stat = await handle.stat();
+		if (stat.size === 0) return null;
+		const length = Math.min(256 * 1024, stat.size);
+		const buffer = Buffer.alloc(length);
+		const { bytesRead } = await handle.read(buffer, 0, length, stat.size - length);
+		const raw = buffer.subarray(0, bytesRead).toString("utf8");
+		const lines = raw.split("\n");
+		const last = lines.at(-1) === "" ? lines.at(-2) : lines.at(-1);
+		if (!last) return null;
+		const value = JSON.parse(last);
+		const event = asRecord(value);
+		return event?.schema_version === 1 && typeof event.seq === "number" && typeof event.id === "string"
+			? (event as unknown as CoordinatorEvent)
+			: null;
+	} catch {
+		return null;
+	} finally {
+		await handle.close();
+	}
 }
 
 async function readJournalSnapshot(namespaceDir: string, signal?: AbortSignal): Promise<EventJournalSnapshot> {
@@ -1803,7 +2030,9 @@ async function autoBindDelegateCodexHandoff(
 			await appendCodexWakeDiagnostic(
 				namespaceDir,
 				diagnosticEvent,
-				new Error("codex_handoff_explicit_source_missing"),
+				error instanceof Error && error.message === "codex_token_file_reregistration_required"
+					? error
+					: new Error("codex_handoff_explicit_source_missing"),
 			);
 			throw error;
 		}
@@ -2022,15 +2251,67 @@ async function appendCoordinatorEvent(
 		await withFileLock(
 			path.join(eventsDir(namespaceDir), "event-journal.lock"),
 			async () => {
-				const snapshot = await readJournalSnapshotLocked(namespaceDir);
+				const cachedSeq = asRecord(await readJsonFile(eventSequenceFile(namespaceDir)));
+				let watermark =
+					cachedSeq &&
+					typeof cachedSeq.seq === "number" &&
+					Number.isSafeInteger(cachedSeq.seq) &&
+					cachedSeq.seq >= 0
+						? cachedSeq.seq
+						: null;
+				const stat = await fs.stat(eventJournalFile(namespaceDir)).catch(() => null);
+				if (
+					watermark === null ||
+					(stat &&
+						((stat.size === 0 && watermark > 0) ||
+							(stat.size > 0 && (await readJournalTail(namespaceDir))?.seq !== watermark)))
+				) {
+					const snapshot = await readJournalSnapshotLocked(namespaceDir);
+					watermark = snapshot.watermark;
+				}
+				if (watermark === null) throw new Error("event_journal_corrupt");
 				if (input.stableId) {
-					const prior = snapshot.events.find(candidate => candidate.id === input.stableId);
-					if (prior) {
-						event = prior;
+					let stableIndex = asRecord(await readJsonFile(eventStableIndexFile(namespaceDir, input.stableId)));
+					let priorOffset =
+						stableIndex && typeof stableIndex.offset === "number" && Number.isSafeInteger(stableIndex.offset)
+							? stableIndex.offset
+							: null;
+					if (priorOffset !== null) {
+						const prior = await readJournalEventAtOffset(namespaceDir, priorOffset);
+						if (prior?.id === input.stableId) {
+							event = prior;
+							return;
+						}
+					}
+					// The legacy map is consulted only during its one-time migration. Once
+					// retired, recover only the bounded journal tail left by a write crash.
+					const migration = asRecord(await readJsonFile(eventJournalIndexMigrationFile(namespaceDir)));
+					if (migration?.schema_version !== 1) {
+						await readJournalSnapshotLocked(namespaceDir);
+						stableIndex = asRecord(await readJsonFile(eventStableIndexFile(namespaceDir, input.stableId)));
+						priorOffset =
+							stableIndex && typeof stableIndex.offset === "number" && Number.isSafeInteger(stableIndex.offset)
+								? stableIndex.offset
+								: null;
+						if (priorOffset !== null) {
+							const prior = await readJournalEventAtOffset(namespaceDir, priorOffset);
+							if (prior?.id === input.stableId) {
+								event = prior;
+								return;
+							}
+						}
+					}
+					const recovered = await readJournalStableIdFromTail(namespaceDir, input.stableId);
+					if (recovered) {
+						await writeJournalJsonAtomic(eventStableIndexFile(namespaceDir, input.stableId), {
+							seq: recovered.event.seq,
+							offset: recovered.offset,
+						});
+						event = recovered.event;
 						return;
 					}
 				}
-				const seq = snapshot.watermark + 1;
+				const seq = watermark + 1;
 				const timestamp = new Date().toISOString();
 				event = {
 					schema_version: 1,
@@ -2048,7 +2329,7 @@ async function appendCoordinatorEvent(
 				};
 				const currentSize = await fs
 					.stat(eventJournalFile(namespaceDir))
-					.then(stat => stat.size)
+					.then(value => value.size)
 					.catch(() => 0);
 				const handle = await fs.open(eventJournalFile(namespaceDir), "a", 0o600);
 				try {
@@ -2057,19 +2338,11 @@ async function appendCoordinatorEvent(
 				} finally {
 					await handle.close();
 				}
-				const nextIndex: EventJournalIndex = {
-					schema_version: 1,
-					by_id: {
-						...Object.fromEntries(
-							snapshot.events.map((item, index) => [
-								item.id,
-								{ seq: item.seq, offset: snapshot.offsets[index] ?? 0 },
-							]),
-						),
-						[event.id]: { seq, offset: currentSize },
-					},
-				};
-				await writeJournalJsonAtomic(eventJournalIndexFile(namespaceDir), nextIndex);
+				if (input.stableId)
+					await writeJournalJsonAtomic(eventStableIndexFile(namespaceDir, input.stableId), {
+						seq,
+						offset: currentSize,
+					});
 				await writeJournalJsonAtomic(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
 			},
 			options.signal ? { signal: options.signal } : undefined,
@@ -2278,11 +2551,25 @@ async function writeSessionStateUnlocked(
 	} = {},
 ): Promise<CoordinatorSessionState> {
 	const persisted = await readSessionState(namespaceDir, sessionId);
+	const session = asRecord(
+		await readJsonFile(path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`)),
+	);
 	// An overwrite is a canonical lifecycle repair, not proof that tool activity ended.
 	const previous = options.overwrite ? null : persisted;
 	const hasCurrentTurn = Object.hasOwn(options, "currentTurnId");
 	const hasLastTurn = Object.hasOwn(options, "lastTurnId");
 	const hasLive = Object.hasOwn(options, "live");
+	if (
+		previous?.source === "agent_session_event" &&
+		typeof previous.sidecar_signature === "string" &&
+		options.source === "agent_session_event" &&
+		state === previous.state &&
+		(!hasCurrentTurn || (options.currentTurnId ?? null) === previous.current_turn_id) &&
+		(!hasLastTurn || (options.lastTurnId ?? null) === previous.last_turn_id) &&
+		(!hasLive || (options.live ?? null) === previous.live) &&
+		(options.reason ?? null) === (previous.reason ?? null)
+	)
+		return previous;
 	const updatedAt = new Date().toISOString();
 	// A coordinator write says nothing about tool activity, so every lifecycle path —
 	// including canonical repair — carries the sidecar's snapshot and its sequence
@@ -2300,7 +2587,33 @@ async function writeSessionStateUnlocked(
 		: typeof persisted?.ended_at === "string" && Number.isFinite(Date.parse(persisted.ended_at))
 			? persisted.ended_at
 			: undefined;
-	const payload: CoordinatorSessionState = {
+	// A terminal sidecar carries the runtime's completion receipt alongside the
+	// lifecycle marker. Projection repair rewrites the shared state file through
+	// this coordinator helper, so retain those sidecar-owned fields until the
+	// canonical terminal fence consumes them. Dropping final_response here turns a
+	// valid completed receipt into the indistinguishable "receipt missing" case.
+	const persistedRuntime = persisted as RuntimeSessionStatePayload | null;
+	const persistedRuntimeFields = (persistedRuntime ?? {}) as Record<string, unknown>;
+	const preserveTerminalSidecar = Boolean(
+		persistedRuntime?.source === "agent_session_event" &&
+			(persistedRuntime.state === "completed" || persistedRuntime.state === "errored") &&
+			(state === "completed" || state === "errored"),
+	);
+	const terminalSidecarFields = preserveTerminalSidecar
+		? {
+				...(Object.hasOwn(persistedRuntimeFields, "final_response")
+					? { final_response: persistedRuntimeFields.final_response }
+					: {}),
+				...(Object.hasOwn(persistedRuntimeFields, "error") ? { error: persistedRuntimeFields.error } : {}),
+				...(Object.hasOwn(persistedRuntimeFields, "execution_state")
+					? { execution_state: persistedRuntimeFields.execution_state }
+					: {}),
+				...(Object.hasOwn(persistedRuntimeFields, "receipt_state")
+					? { receipt_state: persistedRuntimeFields.receipt_state }
+					: {}),
+			}
+		: {};
+	const payload = {
 		schema_version: 1,
 		session_id: sessionId,
 		state,
@@ -2315,13 +2628,15 @@ async function writeSessionStateUnlocked(
 		source: options.source ?? "coordinator",
 		live: hasLive ? (options.live ?? null) : (previous?.live ?? null),
 		reason: options.reason ?? null,
+
 		...(endedAt !== undefined ? { ended_at: endedAt } : {}),
 		...(activity.kind === "absent"
 			? {}
 			: { activity: activity.kind === "valid" ? activity.activity : persisted?.activity }),
+		...terminalSidecarFields,
 	};
 	await writeJsonFile(sessionStateFile(namespaceDir, sessionId), payload);
-	return payload;
+	return payload as CoordinatorSessionState;
 }
 
 /**
@@ -2459,6 +2774,20 @@ async function markTurnTerminalFromSessionState(
 	return resolved;
 }
 
+function hasAcceptedRuntimeReceipt(turn: { delivery?: unknown } | null | undefined): boolean {
+	const delivery = asRecord(turn?.delivery);
+	const commandId = delivery?.runtime_command_id;
+	const runtimeTurnId = delivery?.runtime_turn_id;
+	return (
+		delivery?.prompt_acknowledged === true &&
+		delivery.state === "acknowledged" &&
+		typeof commandId === "string" &&
+		SAFE_EXTERNAL_ID_PATTERN.test(commandId) &&
+		typeof runtimeTurnId === "string" &&
+		SAFE_EXTERNAL_ID_PATTERN.test(runtimeTurnId)
+	);
+}
+
 function runtimeStateAcknowledgesTurn(turn: TurnRecord, sessionState: CoordinatorSessionState | null): boolean {
 	return (
 		sessionState?.source === "agent_session_event" &&
@@ -2571,7 +2900,7 @@ async function reconcileRuntimeAcknowledgement(
 		onAcknowledged?: (turn: TurnRecord) => Promise<void>;
 	} = { failOnTimeout: true },
 ): Promise<TurnRecord> {
-	if (sessionState && runtimeStateAcknowledgesTurn(turn, sessionState)) {
+	if (sessionState && hasAcceptedRuntimeReceipt(turn) && runtimeStateAcknowledgesTurn(turn, sessionState)) {
 		const acknowledged = await markTurnAcknowledgedFromRuntimeState(namespaceDir, turn, sessionState);
 		await options.onAcknowledged?.(acknowledged);
 		return acknowledged;
@@ -2735,16 +3064,36 @@ async function waitForCoordinatorEvents(namespaceDir: string, timeoutMs: number)
 }
 
 function decodeUtf8WithinByteCap(bytes: Buffer, byteCap: number): string {
-	const decoder = new TextDecoder("utf-8", { fatal: true });
-	for (let end = Math.min(bytes.length, byteCap); end >= 0; end--) {
-		try {
-			const text = decoder.decode(bytes.subarray(0, end));
-			if (Buffer.byteLength(text) <= byteCap) return text;
-		} catch {
-			// Keep trimming until the byte slice ends on a valid UTF-8 boundary.
+	const limit = Math.min(bytes.length, Math.max(0, byteCap));
+	let index = 0;
+	let validEnd = 0;
+	while (index < limit) {
+		const lead = bytes[index]!;
+		let width = 1;
+		if (lead >= 0xc2 && lead <= 0xdf) width = 2;
+		else if (lead >= 0xe0 && lead <= 0xef) width = 3;
+		else if (lead >= 0xf0 && lead <= 0xf4) width = 4;
+		else if (lead > 0x7f) break;
+		if (index + width > limit) break;
+		if (width > 1) {
+			const second = bytes[index + 1]!;
+			if (
+				second < 0x80 ||
+				second > 0xbf ||
+				(width === 3 && ((lead === 0xe0 && second < 0xa0) || (lead === 0xed && second > 0x9f))) ||
+				(width === 4 && ((lead === 0xf0 && second < 0x90) || (lead === 0xf4 && second > 0x8f)))
+			)
+				break;
+			for (let offset = 2; offset < width; offset++) {
+				const continuation = bytes[index + offset]!;
+				if (continuation < 0x80 || continuation > 0xbf)
+					return new TextDecoder().decode(bytes.subarray(0, validEnd));
+			}
 		}
+		index += width;
+		validEnd = index;
 	}
-	return "";
+	return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, validEnd));
 }
 
 export async function readCoordinatorArtifact(
@@ -2793,7 +3142,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 	const platform = options.platform ?? process.platform;
 	const loadModelProfiles = services.resolveModelProfiles ?? loadCoordinatorModelProfiles;
-	const namespaceDir = path.join(
+	// Every authoritative projection is scoped by the collision-resistant namespace identity.
+	const namespaceDir = coordinatorNamespacePath(config);
+	// The prior human-readable directory is migration input only; it is never authority.
+	const legacyNamespaceDir = path.join(
 		config.stateRoot,
 		config.namespace.profile ?? "unscoped-profile",
 		config.namespace.repo ?? "unscoped-repo",
@@ -2834,7 +3186,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	const startupEventWebhookReplay = (async () => {
 		if (eventWebhookConfig === null) return;
 		try {
-			for (const event of await readCoordinatorEvents(namespaceDir)) enqueueEventWebhook(namespaceDir, event);
+			for (const event of (await readJournalSnapshot(namespaceDir)).events) enqueueEventWebhook(namespaceDir, event);
 			await awaitEventWebhookDeliveriesForTest(namespaceDir);
 		} catch (error) {
 			await appendEventWebhookDiagnostic(namespaceDir, "startup-replay", error);
@@ -2928,17 +3280,55 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
+	const sidecarSigningKeys = new Map<string, string>();
+	function mintSidecarVerifier(): { key_id: string; public_key: string } {
+		const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+		const public_key = publicKey.export({ format: "der", type: "spki" }).toString("base64");
+		const key_id = createHash("sha256").update(public_key).digest("hex");
+		const privateKeyDer = privateKey.export({ format: "der", type: "pkcs8" }).toString("base64");
+		sidecarSigningKeys.set(key_id, privateKeyDer);
+		return { key_id, public_key };
+	}
+
+	/** Test-only: signs a runtime-sidecar payload with this server's session authority. */
+	async function signRuntimeSidecarPayloadForTest(
+		sessionId: string,
+		payload: Record<string, unknown>,
+	): Promise<Record<string, unknown>> {
+		const session = await readJsonFile(
+			path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`),
+		);
+		const verifier = asRecord(asRecord(session)?.sidecar_verifier);
+		const keyId = optionalString(verifier?.key_id);
+		const privateKey = keyId ? sidecarSigningKeys.get(keyId) : undefined;
+		if (!keyId || !privateKey) throw new Error("missing_test_sidecar_signing_authority");
+		const { sidecar_signature: _signature, sidecar_key_id: _keyId, ...unsignedPayload } = payload;
+		const unsigned = { ...unsignedPayload, sidecar_key_id: keyId };
+		return {
+			...unsigned,
+			sidecar_signature: sign(null, Buffer.from(canonicalCoordinatorSidecarPayload(unsigned)), {
+				key: Buffer.from(privateKey, "base64"),
+				format: "der",
+				type: "pkcs8",
+			}).toString("base64"),
+		};
+	}
+
 	function canonicalCreationSnapshot(session: Record<string, unknown>): CanonicalSessionSnapshotV1 {
 		const now = new Date().toISOString();
 		const sessionId = safeExternalId("session", session.session_id ?? session.sessionId);
 		const cwd = optionalString(session.cwd);
+		const brokerWorkspace = optionalString(session.broker_workspace);
 		const incarnation = optionalString(session.endpoint_incarnation);
-		if (!cwd || !incarnation) throw new Error("state_corrupt");
+		if (!cwd || !brokerWorkspace || !incarnation) throw new Error("state_corrupt");
 		return {
 			schema_version: 1,
 			namespace_id: config.namespace.identity,
 			session_id: sessionId,
-			cwd: path.resolve(cwd),
+			// Creation flows already canonicalize cwd and bind it to this exact broker
+			// workspace. Do not pass it through the host path implementation: that
+			// corrupts canonical Windows paths when a cross-platform broker provides them.
+			cwd,
 			created_at: optionalString(session.created_at) ?? now,
 			updated_at: now,
 			mpreset: optionalString(session.mpreset),
@@ -2950,10 +3340,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				pane: optionalString(session.tmux_target),
 			},
 			broker: {
-				workspace: optionalString(session.broker_workspace),
+				workspace: brokerWorkspace,
 				endpoint_url: "",
 				endpoint_generation: typeof session.endpoint_generation === "number" ? session.endpoint_generation : 0,
 				endpoint_incarnation: incarnation,
+				sidecar_verifier:
+					session.sidecar_verifier && typeof session.sidecar_verifier === "object"
+						? (session.sidecar_verifier as { key_id: string; public_key: string })
+						: (() => {
+								throw new Error("state_corrupt");
+							})(),
 			},
 			ephemeral: session.ephemeral === true,
 			visible: session.visible !== false,
@@ -2975,6 +3371,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			broker_workspace: snapshot.broker.workspace,
 			endpoint_generation: snapshot.broker.endpoint_generation,
 			endpoint_incarnation: snapshot.broker.endpoint_incarnation,
+			sidecar_verifier: snapshot.broker.sidecar_verifier,
 		});
 	}
 
@@ -2985,14 +3382,44 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	) {
 		await ensureQuestionStateReady();
 		const { keyDigest, requestDigest } = creationDigests(tool, idempotencyKey, canonicalArgs);
-		return {
-			keyDigest,
-			request: await claimCreationRequest(questionPaths, {
-				key_digest: keyDigest,
-				request_digest: requestDigest,
-				tool,
-			}),
-		};
+		let request = await claimCreationRequest(questionPaths, {
+			key_digest: keyDigest,
+			request_digest: requestDigest,
+			tool,
+			sidecar_verifier: mintSidecarVerifier(),
+		});
+		const claimedKeyId = request.sidecar_verifier?.key_id;
+		if (request.phase === "claimed" && (!claimedKeyId || !sidecarSigningKeys.has(claimedKeyId))) {
+			const verifier = mintSidecarVerifier();
+			request = await rotateClaimedCreationVerifier(questionPaths, keyDigest, claimedKeyId ?? "", verifier);
+		}
+		return { keyDigest, request };
+	}
+
+	/**
+	 * Fence broker creation before admission. Retries deliberately present a new
+	 * candidate key under the same broker idempotency key; the broker's retained
+	 * response decides whether that candidate actually became runtime authority.
+	 */
+	async function prepareCreationBrokerCall(creation: {
+		keyDigest: string;
+		request: { phase: string; sidecar_verifier: { key_id: string; public_key: string } | null };
+	}) {
+		if (!creation.request.sidecar_verifier) throw new Error("state_corrupt");
+		const retry = creation.request.phase === "remote_started";
+		const persisted = await startCreationRemote(questionPaths, creation.keyDigest, creation.request.sidecar_verifier);
+		if (!persisted.sidecar_verifier) throw new Error("state_corrupt");
+		return { request: persisted, candidate: retry ? mintSidecarVerifier() : persisted.sidecar_verifier };
+	}
+
+	async function reconcileCreationBrokerCall(
+		keyDigest: string,
+		candidate: { key_id: string; public_key: string },
+		created: Record<string, unknown>,
+	) {
+		const usedKeyId = optionalString(created.coordinatorSidecarKeyId);
+		if (!usedKeyId) throw new Error("terminal_uncertain");
+		return await reconcileCreationRemoteVerifier(questionPaths, keyDigest, candidate, usedKeyId);
 	}
 
 	async function readCanonicalActiveTurn(sessionId: string): Promise<TurnRecord | null> {
@@ -3007,51 +3434,309 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return fallback ? turnFromCanonical(fallback) : null;
 	}
 
+	function legacyScopeOwned(value: Record<string, unknown>): boolean {
+		const namespace = asRecord(value.namespace);
+		return (
+			namespace?.identity === config.namespace.identity || value.namespace_identity === config.namespace.identity
+		);
+	}
+
+	function reportProjectionFile(directory: string, reportId: string): string {
+		if (!COORDINATOR_REPORT_ID_PATTERN.test(reportId)) throw new Error("state_corrupt");
+		const reportsDir = path.join(directory, "reports");
+		const file = path.resolve(reportsDir, `${reportId}.json`);
+		if (path.dirname(file) !== path.resolve(reportsDir)) throw new Error("state_corrupt");
+		return file;
+	}
+
+	async function readLegacyProjectionImport(sessionId: string): Promise<LegacyProjectionImportV1> {
+		const legacySession = asRecord(
+			await readJsonFile(path.join(legacyNamespaceDir, "sessions", `${sessionId}.json`)),
+		);
+		if (!legacySession || !legacyScopeOwned(legacySession)) throw new Error("legacy_projection_quarantined");
+		const turns = await listJsonFiles(turnsDir(legacyNamespaceDir));
+		const importedTurns: LegacyProjectionImportV1["turns"] = {};
+		for (const value of turns) {
+			const turn = asRecord(value);
+			if (turn?.session_id !== sessionId) continue;
+			if (
+				!legacyScopeOwned(turn) ||
+				turn.schema_version !== 1 ||
+				typeof turn.turn_id !== "string" ||
+				!TURN_ID_PATTERN.test(turn.turn_id) ||
+				(!ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus) &&
+					!TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus)) ||
+				!asRecord(turn.prompt) ||
+				!asRecord(turn.delivery) ||
+				!Array.isArray(turn.question_ids) ||
+				!asRecord(turn.final_response) ||
+				!Array.isArray(turn.evidence) ||
+				!asRecord(turn.liveness) ||
+				typeof turn.created_at !== "string" ||
+				typeof turn.updated_at !== "string"
+			)
+				throw new Error("legacy_projection_quarantined");
+			// A legacy directory can contain multiple projections for the same turn;
+			// never let filename iteration choose an authority implicitly.
+			if (importedTurns[turn.turn_id]) throw new Error("legacy_projection_quarantined");
+			importedTurns[turn.turn_id] = {
+				...(turn as unknown as LegacyProjectionImportV1["turns"][string]),
+				namespace_id: config.namespace.identity,
+				terminal_fence: TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus)
+					? { epoch: 1, status: String(turn.status), reason: null, at: String(turn.updated_at) }
+					: null,
+			};
+		}
+		const active = asRecord(await readJsonFile(activeTurnFile(legacyNamespaceDir, sessionId)));
+		if (active && !legacyScopeOwned(active)) throw new Error("legacy_projection_quarantined");
+		const activeId = active?.turn_id;
+		if (activeId !== undefined && (typeof activeId !== "string" || !importedTurns[activeId]))
+			throw new Error("legacy_projection_quarantined");
+		const activeTurn = typeof activeId === "string" ? importedTurns[activeId] : undefined;
+		if (activeTurn && !ACTIVE_TURN_STATUSES.has(activeTurn.status as TurnStatus))
+			throw new Error("legacy_projection_quarantined");
+		const activeCandidates = Object.values(importedTurns).filter(turn =>
+			ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+		);
+		if (activeCandidates.length > 1 || (activeCandidates.length === 1 && activeCandidates[0] !== activeTurn))
+			throw new Error("legacy_projection_quarantined");
+		const state = await readSessionState(legacyNamespaceDir, sessionId);
+		if (state && (state.session_id !== sessionId || !legacyScopeOwned(state as unknown as Record<string, unknown>)))
+			throw new Error("legacy_projection_quarantined");
+		const provenance = activeTurn ? asRecord(activeTurn.runtime_provenance) : null;
+		const runtimeCommandId = activeTurn?.delivery.runtime_command_id;
+		const runtimeTurnId = activeTurn?.delivery.runtime_turn_id;
+		const validatedWaitingImport =
+			activeTurn?.status === "active" &&
+			state?.schema_version === 1 &&
+			state.source === "agent_session_event" &&
+			state.live === true &&
+			state.state === "needs_user_input" &&
+			state.current_turn_id === activeTurn.turn_id &&
+			Number.isFinite(Date.parse(state.updated_at)) &&
+			hasAcceptedRuntimeReceipt(activeTurn) &&
+			typeof runtimeTurnId === "string" &&
+			activeTurn.question_ids.length > 0 &&
+			activeTurn.question_ids.every(questionId => typeof questionId === "string" && questionId.length > 0) &&
+			provenance?.namespace_id === config.namespace.identity &&
+			provenance.session_id === sessionId &&
+			provenance.coordinator_turn_id === activeTurn.turn_id &&
+			provenance.runtime_turn_id === runtimeTurnId &&
+			typeof provenance.endpoint_incarnation === "string" &&
+			provenance.endpoint_incarnation.length > 0 &&
+			typeof provenance.gate_created_at === "string" &&
+			Number.isFinite(Date.parse(provenance.gate_created_at)) &&
+			typeof provenance.schema_hash === "string" &&
+			provenance.schema_hash.length > 0 &&
+			typeof provenance.stage === "string" &&
+			provenance.stage.length > 0 &&
+			typeof provenance.kind === "string" &&
+			provenance.kind.length > 0;
+		const importedPromptRequests: LegacyProjectionImportV1["requests"]["prompts"] = {};
+		if (validatedWaitingImport) {
+			activeTurn.status = "waiting_for_answer";
+			activeTurn.updated_at = state.updated_at;
+			// Pre-WAL projections did not retain a prompt request ledger. Admit this
+			// legacy active turn only by materializing the receipt that exactly binds
+			// its durable delivery identities; later runtime admission uses the same
+			// correlated receipt requirement as newly-created canonical turns.
+			const receiptKey = createHash("sha256").update(`legacy-prompt\0${activeTurn.turn_id}`).digest("hex");
+			importedPromptRequests[receiptKey] = {
+				request_id: `prompt:${receiptKey}`,
+				key_digest: receiptKey,
+				request_digest: receiptKey,
+				operation: "turn.prompt",
+				canonical_prompt: { text: activeTurn.prompt.text },
+				sdk_idempotency_key: `legacy:${receiptKey}`,
+				phase: "completed",
+				runtime_receipt: {
+					accepted: true,
+					command_id: runtimeCommandId as string,
+					turn_id: runtimeTurnId,
+				},
+				coordinator_turn_id: activeTurn.turn_id,
+				created_at: activeTurn.created_at,
+				updated_at: activeTurn.updated_at,
+			};
+		}
+		const legacyReportsDir = path.join(legacyNamespaceDir, "reports");
+		const reportNames = await fs.readdir(legacyReportsDir).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return [] as string[];
+			throw error;
+		});
+		const importedReports: LegacyProjectionImportV1["reports"] = {};
+		for (const reportName of reportNames) {
+			if (!reportName.endsWith(".json")) continue;
+			const reportId = reportName.slice(0, -".json".length);
+			if (!COORDINATOR_REPORT_ID_PATTERN.test(reportId)) throw new Error("legacy_projection_quarantined");
+			const report = asRecord(await readJsonFile(reportProjectionFile(legacyNamespaceDir, reportId)));
+			if (report?.session_id !== sessionId) continue;
+			if (
+				!legacyScopeOwned(report) ||
+				typeof report.report_id !== "string" ||
+				!COORDINATOR_REPORT_ID_PATTERN.test(report.report_id) ||
+				report.report_id !== reportId ||
+				report.schema_version !== 1 ||
+				typeof report.operation_id !== "string" ||
+				typeof report.turn_id !== "string" ||
+				typeof report.status !== "string" ||
+				typeof report.summary !== "string" ||
+				(report.blocker !== null && typeof report.blocker !== "string") ||
+				(report.pr_url !== null && typeof report.pr_url !== "string") ||
+				!Array.isArray(report.evidence_paths) ||
+				typeof report.created_at !== "string"
+			)
+				throw new Error("legacy_projection_quarantined");
+			importedReports[report.report_id] = report as unknown as LegacyProjectionImportV1["reports"][string];
+		}
+		return {
+			turns: importedTurns,
+			queue: {
+				ordered_turn_ids: Object.values(importedTurns)
+					.filter(turn => turn.status === "queued")
+					.map(turn => turn.turn_id),
+				active_turn_id: activeTurn?.turn_id ?? null,
+				selected_promotion: null,
+			},
+			desired_session_state: validatedWaitingImport
+				? "needs_user_input"
+				: (state?.state ??
+					(activeTurn?.status === "waiting_for_answer"
+						? "needs_user_input"
+						: activeTurn
+							? "running"
+							: "ready_for_input")),
+			reports: importedReports,
+			gate_authorities: {},
+			questions: {},
+			// Legacy projections never persisted an answer claim. A fresh, explicit
+			// ledger lets the first admitted answer create the sole durable claim.
+			requests: { prompts: importedPromptRequests, answers: {}, operations: {} },
+		};
+	}
+
+	async function assertPersistedSessionAuthority(session: CanonicalSessionSnapshotV1): Promise<void> {
+		if (!session.broker.workspace) throw new Error("coordinator_workspace_required");
+		await assertCoordinatorSessionLocations(config, session.cwd, session.broker.workspace, {
+			canonicalizePath: services.canonicalizePath,
+			platform,
+		});
+	}
+
+	/** Every Codex handoff is scoped by the canonical WAL, never a retained projection. */
+	async function assertCanonicalHandoffAuthority(sessionId: string): Promise<void> {
+		const transaction = await readSessionTransaction(questionPaths, sessionId);
+		if (!transaction) throw new Error("resource_gone");
+		await assertPersistedSessionAuthority(transaction.canonical.session);
+	}
+
+	async function authorizedCanonicalSessionIds(
+		sessionIds: Iterable<string>,
+		scopedSessionId: string | null = null,
+	): Promise<Set<string>> {
+		const authorized = new Set<string>();
+		for (const sessionId of new Set(sessionIds)) {
+			const transaction = await readSessionTransaction(questionPaths, sessionId);
+			if (!transaction) {
+				if (scopedSessionId === sessionId) throw new Error("resource_gone");
+				continue;
+			}
+			try {
+				await assertPersistedSessionAuthority(transaction.canonical.session);
+				authorized.add(sessionId);
+			} catch (error) {
+				if (scopedSessionId === sessionId) throw error;
+			}
+		}
+		return authorized;
+	}
+
+	function isSessionAuthorityError(error: unknown): boolean {
+		return (
+			error instanceof Error &&
+			(error.message === "coordinator_workdir_outside_allowed_roots" ||
+				error.message === "coordinator_workdir_roots_required" ||
+				error.message === "coordinator_workspace_required")
+		);
+	}
+
+	async function authorizedCoordinatorEvents(
+		events: CoordinatorEvent[],
+		scopedSessionId: string | null = null,
+	): Promise<CoordinatorEvent[]> {
+		const authorized = await authorizedCanonicalSessionIds(
+			events
+				.map(event => event.session_id)
+				.filter((sessionId): sessionId is string => typeof sessionId === "string"),
+			scopedSessionId,
+		);
+		return events.filter(event => typeof event.session_id === "string" && authorized.has(event.session_id));
+	}
+
 	async function ensureQuestionTransaction(sessionId: string): Promise<void> {
 		await ensureQuestionStateReady();
 		try {
 			const transaction = await readSessionTransaction(questionPaths, sessionId);
 			if (!transaction) throw new Error("resource_gone");
+			await assertPersistedSessionAuthority(transaction.canonical.session);
 			await ensureSchedulerRoster(questionPaths, sessionId);
 			return;
 		} catch (error) {
 			if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
 		}
-		const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+		const session = asRecord(await readJsonFile(path.join(legacyNamespaceDir, "sessions", `${sessionId}.json`)));
 		if (!session) throw new Error("resource_gone");
 		const incarnation = optionalString(session.endpoint_incarnation);
 		const cwd = optionalString(session.cwd);
-		if (!incarnation || !cwd) throw new Error("resource_gone");
-		const now = new Date().toISOString();
-		await createSessionTransaction(questionPaths, {
-			kind: "register",
-			session: {
-				schema_version: 1,
-				namespace_id: config.namespace.identity,
-				session_id: sessionId,
-				cwd: path.resolve(cwd),
-				created_at: optionalString(session.created_at) ?? now,
-				updated_at: now,
-				mpreset: optionalString(session.mpreset),
-				source: optionalString(session.source),
-				model: optionalString(session.model),
-				tmux: {
-					session: optionalString(session.tmux_session),
-					window: null,
-					pane: optionalString(session.tmux_target),
-				},
-				broker: {
-					workspace: optionalString(session.broker_workspace),
-					endpoint_url: "",
-					endpoint_generation: typeof session.endpoint_generation === "number" ? session.endpoint_generation : 0,
-					endpoint_incarnation: incarnation,
-				},
-				ephemeral: session.ephemeral === true,
-				visible: session.visible !== false,
-			},
-			initial_state: "ready_for_input",
-			initial_events: [],
+		const brokerWorkspace = optionalString(session.broker_workspace);
+		if (!incarnation || !cwd || !brokerWorkspace || !legacyScopeOwned(session)) throw new Error("resource_gone");
+		await assertCoordinatorSessionLocations(config, cwd, brokerWorkspace, {
+			canonicalizePath: services.canonicalizePath,
+			platform,
 		});
+		const canonicalCwd = await canonicalBrokerWorkspace(cwd);
+		const canonicalWorkspace = await canonicalBrokerWorkspace(brokerWorkspace);
+		const now = new Date().toISOString();
+		const legacyProjection = await readLegacyProjectionImport(sessionId);
+		const projectedVerifier = asRecord(session.sidecar_verifier);
+		const verifierKeyId = optionalString(projectedVerifier?.key_id);
+		const verifierPublicKey = optionalString(projectedVerifier?.public_key);
+		if (!verifierKeyId || !verifierPublicKey) throw new Error("legacy_projection_quarantined");
+		await createSessionTransaction(
+			questionPaths,
+			{
+				kind: "register",
+				session: {
+					schema_version: 1,
+					namespace_id: config.namespace.identity,
+					session_id: sessionId,
+					cwd: canonicalCwd,
+					created_at: optionalString(session.created_at) ?? now,
+					updated_at: now,
+					mpreset: optionalString(session.mpreset),
+					source: optionalString(session.source),
+					model: optionalString(session.model),
+					tmux: {
+						session: optionalString(session.tmux_session),
+						window: null,
+						pane: optionalString(session.tmux_target),
+					},
+					broker: {
+						workspace: canonicalWorkspace,
+						endpoint_url: "",
+						endpoint_generation:
+							typeof session.endpoint_generation === "number" ? session.endpoint_generation : 0,
+						endpoint_incarnation: incarnation,
+						sidecar_verifier: { key_id: verifierKeyId, public_key: verifierPublicKey },
+					},
+					ephemeral: session.ephemeral === true,
+					visible: session.visible !== false,
+				},
+				initial_state: "ready_for_input",
+				initial_events: [{ kind: "session.registered", entity: "session", entity_id: sessionId, created_at: now }],
+			},
+			legacyProjection,
+		);
 	}
 
 	type RuntimeAdmissionToken = {
@@ -3061,7 +3746,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		transaction_revision: number;
 		sidecar_schema_version: 1;
 		sidecar_session_id: string;
-		sidecar_endpoint_incarnation: string;
 		sidecar_observed_at: string;
 		accepted_delivery: true;
 	};
@@ -3096,7 +3780,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const active = Object.values(transaction.canonical.turns).filter(turn =>
 			ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
 		);
-		const unfencedActive = active.filter(turn => turn.terminal_fence === null);
 		if (
 			_options.signal?.aborted ||
 			(_options.absoluteDeadline !== undefined && Date.now() >= _options.absoluteDeadline)
@@ -3124,16 +3807,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			sessionState.session_id === sessionId &&
 			Number.isFinite(Date.parse(sessionState.updated_at)) &&
 			(sessionState.state === "completed" || sessionState.state === "errored") &&
+			isStrictTerminalRuntimeState(sessionState) &&
+			hasExactRuntimeWriterIdentity(sessionState, transaction.canonical.session.broker) &&
 			candidate &&
 			candidate.terminal_fence === null &&
 			(!current || candidate.turn_id === current) &&
-			(current !== null ||
-				(sessionState.state === "errored" &&
-					unfencedActive.length === 1 &&
-					candidate === unfencedActive[0] &&
-					candidate.turn_id === sessionState.last_turn_id &&
-					candidate.delivery.prompt_acknowledged === true &&
-					typeof candidate.delivery.runtime_turn_id === "string"));
+			hasAcceptedRuntimeReceipt(turnFromCanonical(candidate));
 		if (
 			terminalObservation &&
 			candidate &&
@@ -3157,6 +3836,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			sessionState?.schema_version === 1 &&
 			sessionState.session_id === sessionId &&
 			sessionState.source === "agent_session_event" &&
+			hasExactRuntimeWriterIdentity(sessionState, transaction.canonical.session.broker) &&
 			sessionState.live === true &&
 			Number.isFinite(Date.parse(sessionState.updated_at)) &&
 			sessionState.state === "needs_user_input" &&
@@ -3166,6 +3846,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const waitingTurn = tx.canonical.turns[sessionState!.current_turn_id!];
 				if (
 					!waitingTurn ||
+					!hasAcceptedRuntimeReceipt(waitingTurn) ||
 					waitingTurn.terminal_fence ||
 					!ACTIVE_TURN_STATUSES.has(waitingTurn.status as TurnStatus) ||
 					waitingTurn.status === "waiting_for_answer"
@@ -3227,15 +3908,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			sessionState?.schema_version === 1 &&
 			sessionState.live === true &&
 			sessionState.source === "agent_session_event" &&
+			hasExactRuntimeWriterIdentity(sessionState, refreshed.canonical.session.broker) &&
 			sessionState.state === "needs_user_input" &&
 			sessionState.current_turn_id === waitingTurnId &&
 			typeof sessionState.session_id === "string" &&
 			sessionState.session_id === sessionId &&
 			Number.isFinite(Date.parse(sessionState.updated_at)) &&
 			waitingTurn?.status === "waiting_for_answer" &&
-			waitingTurn.delivery.prompt_acknowledged === true &&
 			typeof runtimeTurnId === "string" &&
-			runtimeTurnId.length > 0
+			runtimeTurnId.length > 0 &&
+			hasAcceptedRuntimeReceipt(waitingTurn)
 				? {
 						session_id: sessionId,
 						coordinator_turn_id: waitingTurn.turn_id,
@@ -3243,7 +3925,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						transaction_revision: refreshed.revision,
 						sidecar_schema_version: 1 as const,
 						sidecar_session_id: sessionState.session_id,
-						sidecar_endpoint_incarnation: refreshed.canonical.session.broker.endpoint_incarnation,
 						sidecar_observed_at: sessionState.updated_at,
 						accepted_delivery: true as const,
 					}
@@ -3517,10 +4198,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							liveState.updated_at !== waitingToken.sidecar_observed_at ||
 							!waitingTurn ||
 							waitingTurn.status !== "waiting_for_answer" ||
-							waitingTurn.delivery.prompt_acknowledged !== true ||
+							!hasAcceptedRuntimeReceipt(waitingTurn) ||
 							waitingTurn.delivery.runtime_turn_id !== waitingToken.runtime_turn_id ||
-							waitingToken.sidecar_endpoint_incarnation !==
-								transaction.canonical.session.broker.endpoint_incarnation ||
+							!hasExactRuntimeWriterIdentity(liveState, transaction.canonical.session.broker) ||
 							transaction.revision < waitingToken.transaction_revision)
 					) {
 						q12Admitted = false;
@@ -3637,6 +4317,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								Number.isFinite(gateCreatedAt) &&
 								Date.now() - gateCreatedAt >= 5 * 60 * 1000;
 							if (owners.length === 0 && !boundedAbsenceProved) {
+								authority.observation = {
+									kind: "valid",
+									first_provenance: runtimeProvenanceToken(sessionId, transaction, null, gate),
+								};
 								authority.outcome = { state: "deferred_link", first_seen_at: authority.first_seen_at };
 								authority.updated_at = observedAt;
 								continue;
@@ -3783,17 +4467,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						reason: "terminal_uncertain",
 					},
 				};
-			for (const [turnId, questionIds] of projectedTurnQuestions) {
-				if (
-					options.signal?.aborted ||
-					(options.absoluteDeadline !== undefined && Date.now() >= options.absoluteDeadline)
-				)
-					break;
-				const legacyTurn = await readTurnRecord(namespaceDir, turnId);
-				if (!legacyTurn) continue;
-				legacyTurn.question_ids = questionIds;
-				await writeTurnRecord(namespaceDir, legacyTurn);
-			}
+			// The Q12 commit is canonical authority. Rebuild every legacy projection
+			// through the same repair lock instead of writing a stale partial turn after
+			// a concurrent terminal reconciliation.
+			await repairCanonicalProjections(sessionId, options.signal ? { signal: options.signal } : undefined);
 			await exportRetainedDeliveries(32, options.signal);
 			for (const opened of openedQuestions) {
 				if (options.signal?.aborted) break;
@@ -4125,6 +4802,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return typeof code === "string" && Object.hasOwn(PUBLIC_ERROR_MESSAGES, code) ? code : "unavailable";
 	}
 	function publicError(error: unknown): Record<string, unknown> {
+		if (error instanceof Error && error.message.startsWith("coordinator_mutation_call_not_allowed:"))
+			return { ok: false, reason: error.message };
 		const directCode = error instanceof SdkClientError ? error.code : sinkErrorCode(error);
 		const messageCode =
 			error instanceof Error && Object.hasOwn(PUBLIC_ERROR_MESSAGES, error.message) ? error.message : undefined;
@@ -4243,10 +4922,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						} as CoordinatorToolIdempotencyRecord);
 						return boundedToolResponse(tool, persistedResponse);
 					}
-					const response = boundedToolResponse(tool, await operation().catch(error => sdkError(error)));
+					const rawResponse = await operation().catch(error => sdkError(error));
+					const response = boundedToolResponse(tool, rawResponse);
 					// The receipt keeps its original key and request digests, so a
 					// reused key still conflicts and a later settled answer still seals.
-					if (isNonterminal(response)) return response;
+					if (isNonterminal(rawResponse)) return response;
 					await writeCoordinatorIdempotencyFile(file, {
 						...existing,
 						state: "completed",
@@ -4272,8 +4952,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				created_at: new Date().toISOString(),
 			};
 			await writeCoordinatorIdempotencyFile(file, started);
-			const response = boundedToolResponse(tool, await operation().catch(error => sdkError(error)));
-			if (isNonterminal(response)) return response;
+			const rawResponse = await operation().catch(error => sdkError(error));
+			const response = boundedToolResponse(tool, rawResponse);
+			if (isNonterminal(rawResponse)) return response;
 			await writeCoordinatorIdempotencyFile(file, {
 				...started,
 				state: "completed",
@@ -4554,11 +5235,99 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		reportIds: readonly string[],
 	): Promise<void> {
 		for (const turnId of turnIds) await fs.rm(turnFile(namespaceDir, turnId), { force: true });
-		for (const reportId of reportIds)
-			await fs.rm(path.join(namespaceDir, "reports", `${reportId}.json`), { force: true });
+		for (const reportId of reportIds) await fs.rm(reportProjectionFile(namespaceDir, reportId), { force: true });
 		await fs.rm(sessionFile(sessionId), { force: true });
 		await fs.rm(sessionStateFile(namespaceDir, sessionId), { force: true });
 		await fs.rm(activeTurnFile(namespaceDir, sessionId), { force: true });
+	}
+	async function drainSessionRetainedDeliveries(sessionId: string): Promise<boolean> {
+		for (;;) {
+			let claims: Awaited<ReturnType<typeof claimPublicDelivery>>;
+			try {
+				claims = await claimPublicDelivery(questionPaths, sessionId, { limit: 128 });
+			} catch (error) {
+				// The WAL unlink and deletion-progress update are separate durable
+				// boundaries. A retry after a crash in that gap has already drained
+				// the retained deliveries by definition.
+				if (error instanceof Error && error.message === "resource_gone") return true;
+				throw error;
+			}
+			if (claims.length === 0) {
+				let recovered = 0;
+				try {
+					recovered = await recoverExpiredPublicDelivery(questionPaths, sessionId);
+				} catch (error) {
+					if (error instanceof Error && error.message === "resource_gone") return true;
+					throw error;
+				}
+				if (recovered > 0) continue;
+				const transaction = await readSessionTransaction(questionPaths, sessionId);
+				return (
+					!transaction ||
+					Object.values(transaction.outbox).every(event => event.public_delivery.state === "acknowledged")
+				);
+			}
+			for (const claim of claims) {
+				const payload = claim.event.payload;
+				const event = await appendCoordinatorEvent(namespaceDir, {
+					stableId: claim.event.public_event_id,
+					kind: claim.event.kind as CoordinatorEventKind,
+					sessionId,
+					turnId: typeof payload.turn_id === "string" ? payload.turn_id : null,
+					questionId: typeof payload.question_id === "string" ? payload.question_id : null,
+					reportId: typeof payload.report_id === "string" ? payload.report_id : null,
+					summary: "Coordinator event recorded.",
+				});
+				await acknowledgePublicDelivery(questionPaths, sessionId, {
+					public_event_id: claim.event.public_event_id,
+					claim_fence: claim.claim_fence,
+					journal_seq: event.seq,
+				});
+			}
+		}
+	}
+	async function completeDeletionCleanup(
+		entry: NamespaceDeletionEntryV1,
+		reason?: string,
+		force = false,
+	): Promise<boolean> {
+		if (!entry.cleanup.wal) {
+			if (!(await drainSessionRetainedDeliveries(entry.session_id))) return false;
+			const removed = await removeSessionTransaction(questionPaths, entry.session_id, entry.endpoint_incarnation);
+			if (!removed && (await readSessionTransaction(questionPaths, entry.session_id))) return false;
+			entry.cleanup.wal = true;
+			await advanceDeletion(questionPaths, entry.deletion_id, "cleanup_pending", { wal: true });
+		}
+		if (!entry.cleanup.turns || !entry.cleanup.reports || !entry.cleanup.session) {
+			await removeReapedProjection(entry.session_id, entry.cleanup.turn_ids ?? [], entry.cleanup.report_ids ?? []);
+			entry.cleanup.turns = true;
+			entry.cleanup.reports = true;
+			entry.cleanup.session = true;
+			await advanceDeletion(questionPaths, entry.deletion_id, "cleanup_pending", {
+				turns: true,
+				reports: true,
+				session: true,
+			});
+		}
+		if (!entry.cleanup.events) {
+			await appendCoordinatorEvent(namespaceDir, {
+				stableId: `reap:${entry.deletion_id}`,
+				kind: "session.reaped",
+				sessionId: entry.session_id,
+				summary: `Session ${entry.session_id} closed and reaped${reason ? ` (${reason})` : ""}`,
+				metadata: { reason: reason ?? null, force, closed: true },
+			});
+			entry.cleanup.events = true;
+			await advanceDeletion(questionPaths, entry.deletion_id, "cleanup_pending", { events: true });
+		}
+		await advanceDeletion(
+			questionPaths,
+			entry.deletion_id,
+			"completed",
+			{ wal: true, turns: true, reports: true, session: true, events: true },
+			{ ok: true, closed: true },
+		);
+		return true;
 	}
 	async function reapSession(
 		rawId: unknown,
@@ -4579,26 +5348,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				if (deletion?.phase === "completed" && deletion.safe_response)
 					return deletion.safe_response as { ok: boolean; closed: boolean };
 				if (deletion?.phase === "broker_closed" || deletion?.phase === "cleanup_pending") {
-					const projectionIds = await withSessionTransaction(questionPaths, id, async transaction => ({
-						turnIds: Object.keys(transaction.canonical.turns),
-						reportIds: Object.keys(transaction.canonical.reports),
-					})).catch(error => {
-						if (error instanceof Error && error.message === "resource_gone")
-							return { turnIds: [] as string[], reportIds: [] as string[] };
-						throw error;
-					});
-					await removeSessionTransaction(questionPaths, id, deletion.endpoint_incarnation).catch(error => {
-						if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
-					});
-					await removeReapedProjection(id, projectionIds.turnIds, projectionIds.reportIds);
-					await advanceDeletion(
-						questionPaths,
-						deletion.deletion_id,
-						"completed",
-						{ wal: true, turns: true, reports: true, session: true, events: true },
-						{ ok: true, closed: true },
-					);
-					return { ok: true, closed: true };
+					const complete = await completeDeletionCleanup(deletion);
+					return complete ? { ok: true, closed: true } : { ok: false, reason: "delivery_pending", closed: false };
 				}
 				if (deletion?.safe_response) {
 					const safeResponse = asRecord(deletion.safe_response);
@@ -4614,9 +5365,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return { ok: false, reason: "unknown_session", closed: false };
 			}
 
-			if (session.ephemeral !== true && opts.force !== true)
-				return { ok: false, reason: "not_ephemeral", closed: false };
 			await ensureQuestionStateReady();
+			// A broker close may precede durable cleanup progress. Resume the admitted
+			// deletion directly from its registry manifest rather than closing again.
+			const pendingDeletion = await withNamespaceRegistry(
+				questionPaths,
+				async registry =>
+					Object.values(registry.deletions)
+						.filter(
+							entry =>
+								entry.session_id === id &&
+								(entry.phase === "broker_closed" || entry.phase === "cleanup_pending"),
+						)
+						.sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0] ?? null,
+			);
+			if (pendingDeletion) {
+				const complete = await completeDeletionCleanup(pendingDeletion, opts.reason, opts.force === true);
+				return complete ? { ok: true, closed: true } : { ok: false, reason: "delivery_pending", closed: false };
+			}
 			await ensureQuestionTransaction(id);
 			// Rebuild legacy projections before reaper eligibility checks. A crash after
 			// canonical terminal commit must not leave a stale active-turn file blocking reap.
@@ -4650,6 +5416,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					return { ok: false, reason: "endpoint_stale", closed: false };
 				throw error;
 			}
+			if (session.ephemeral !== true && opts.force !== true)
+				return { ok: false, reason: "not_ephemeral", closed: false };
 			const canonicalTransaction = await readSessionTransaction(questionPaths, id);
 			const canonicalActiveTurn = (canonicalTransaction
 				? Object.values(canonicalTransaction.canonical.turns).find(turn =>
@@ -4717,6 +5485,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			try {
 				workspace = await canonicalBrokerWorkspace(cwd);
 				let authority: BrokerSessionAuthority | null = null;
+				const closeAlreadyProven = false;
 				if (!closeAlreadyProven) {
 					authority = await exactBrokerSessionAuthority(id, workspace);
 					if (
@@ -4741,20 +5510,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						created_at: now,
 						updated_at: now,
 					};
-				});
-				await recordDeletionIntent(questionPaths, {
-					deletion_id: deletionId,
-					session_id: id,
-					endpoint_incarnation: persistedIncarnation,
-					operation_id: deletionId,
-					key_digest: deletionKey,
-					request_digest: deletionKey,
-					close_key: deletionId,
-					phase: "intent",
-					cleanup: { wal: false, turns: false, reports: false, session: false, events: false },
-					authority_digest: deletionKey,
-					created_at: new Date().toISOString(),
-					updated_at: new Date().toISOString(),
 				});
 				if (!closeAlreadyProven) {
 					if (!authority) throw new Error("state_corrupt");
@@ -4785,6 +5540,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					closed: false,
 				};
 			}
+			await advanceDeletion(questionPaths, deletionId, "broker_closed", {
+				turn_ids: projectionIds.turnIds,
+				report_ids: projectionIds.reportIds,
+			});
 			try {
 				const listing = await paginatedBrokerSessionList(workspace, { cwd: workspace });
 				const rows = jsonRecords(
@@ -4833,29 +5592,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					closed: false,
 				};
 			}
-			await exportRetainedDeliveries();
-			await removeSessionTransaction(questionPaths, id, persistedIncarnation);
-			await removeReapedProjection(id, projectionIds.turnIds, projectionIds.reportIds);
-			await appendCoordinatorEvent(namespaceDir, {
-				kind: "session.reaped",
-				sessionId: id,
-				summary: `Session ${id} closed and reaped${opts.reason ? ` (${opts.reason})` : ""}`,
-				metadata: { reason: opts.reason ?? null, force: opts.force === true, closed: true },
+			await advanceDeletion(questionPaths, deletionId, "cleanup_pending", {
+				turn_ids: projectionIds.turnIds,
+				report_ids: projectionIds.reportIds,
 			});
-			await advanceDeletion(
-				questionPaths,
-				deletionId,
-				"completed",
+			const complete = await completeDeletionCleanup(
 				{
-					wal: true,
-					turns: true,
-					reports: true,
-					session: true,
-					events: true,
+					...deletionEntry,
+					phase: "cleanup_pending",
+					cleanup: {
+						wal: false,
+						turns: false,
+						reports: false,
+						session: false,
+						events: false,
+						turn_ids: projectionIds.turnIds,
+						report_ids: projectionIds.reportIds,
+					},
 				},
-				{ ok: true, closed: true },
+				opts.reason,
+				opts.force === true,
 			);
-			return { ok: true, closed: true };
+			return complete ? { ok: true, closed: true } : { ok: false, reason: "delivery_pending", closed: false };
 		});
 	}
 
@@ -4941,11 +5699,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			});
 			await recoverCanonicalSessionProjection(requestedSession);
 		}
-		const turn = await readTurnRecord(namespaceDir, turnId);
+		let turn = await readTurnRecord(namespaceDir, turnId);
 		if (!turn) return { ok: false, reason: "unknown_turn" };
 		if (!requestedSession) {
 			await reconcileSessionRuntime(turn.session_id, { observeQuestions: true });
 			await recoverCanonicalSessionProjection(turn.session_id);
+			turn = (await readTurnRecord(namespaceDir, turnId)) ?? turn;
 		}
 		if (sessionId != null && turn.session_id !== safeExternalId("session", sessionId)) {
 			return { ok: false, reason: "turn_session_mismatch" };
@@ -4980,23 +5739,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			{ failOnTimeout: false, onAcknowledged: publishAcknowledgedTurnIntent },
 		);
 		if (resolvedTurn !== turn) sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
-		if (
-			sessionState &&
-			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
-			(sessionState.current_turn_id === resolvedTurn.turn_id ||
-				(sessionState.state === "errored" &&
-					sessionState.source === "agent_session_event" &&
-					sessionState.current_turn_id == null)) &&
-			(sessionState.state === "completed" || sessionState.state === "errored")
-		) {
-			resolvedTurn = await markTurnTerminalFromSessionState(resolvedTurn, sessionState);
-			await projectTerminalTransition(resolvedTurn, {
-				desiredState: sessionState.state,
-				reason: sessionState.reason ? "terminal_uncertain" : null,
-				live: sessionState.live,
-			});
-			sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
-		} else if (!session && ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
+		if (!session && ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
 			resolvedTurn = await markTurnFailedForUnavailableSession(resolvedTurn, "session_record_missing");
 			await projectTerminalTransition(resolvedTurn, {
 				desiredState: "stale",
@@ -5166,16 +5909,33 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const request = transaction.requests.prompts[promptKey];
 			if (!request || request.phase === "accepted" || request.phase === "completed") return;
 			const turnId = request.coordinator_turn_id;
+			const restoreActiveTurnId =
+				turnId && transaction.canonical.queue.active_turn_id === turnId
+					? (Object.values(transaction.canonical.turns).find(
+							candidate =>
+								candidate.turn_id !== turnId && ACTIVE_TURN_STATUSES.has(candidate.status as TurnStatus),
+						)?.turn_id ?? null)
+					: transaction.canonical.queue.active_turn_id;
 			if (turnId) {
 				delete transaction.canonical.turns[turnId];
 				transaction.canonical.queue.ordered_turn_ids = transaction.canonical.queue.ordered_turn_ids.filter(
 					candidate => candidate !== turnId,
 				);
 				if (transaction.canonical.queue.active_turn_id === turnId)
-					transaction.canonical.queue.active_turn_id = null;
+					transaction.canonical.queue.active_turn_id = restoreActiveTurnId;
+				if (
+					transaction.canonical.queue.selected_promotion &&
+					(transaction.canonical.queue.selected_promotion.from_turn_id === turnId ||
+						transaction.canonical.queue.selected_promotion.to_turn_id === turnId)
+				)
+					transaction.canonical.queue.selected_promotion = null;
 			}
 			delete transaction.requests.prompts[promptKey];
 		});
+		// The pre-dispatch correlation is a legacy sidecar projection, not
+		// canonical authority. Rebuild it after discarding a decided failure so a
+		// failed prompt cannot leave the session reporting phantom running work.
+		await repairCanonicalProjections(sessionId);
 	}
 
 	async function promptReceipt(sessionId: string, promptKey: string): Promise<RuntimePromptAcknowledgement | null> {
@@ -5233,13 +5993,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	): Promise<RuntimePromptAcknowledgement> {
 		const recovered = await promptReceipt(sessionId, promptKey);
 		if (recovered) return recovered;
+		let coordinatorTurnId: string | null = null;
 		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
 			const request = transaction.requests.prompts[promptKey];
 			if (!request) throw new Error("state_corrupt");
 			if (request.phase === "claimed") request.phase = "remote_started";
 			if (request.phase !== "remote_started") throw new Error("terminal_uncertain");
+			coordinatorTurnId = request.coordinator_turn_id ?? null;
 			request.updated_at = new Date().toISOString();
 		});
+		// Seed a non-authorizing coordinator correlation before the remote request.
+		// Runtime terminal events can then retain this turn identity even when they
+		// arrive before the broker acknowledgement; admission still requires that
+		// durable acknowledgement below.
+		if (coordinatorTurnId && operation !== "turn.follow_up")
+			await writeSessionState(namespaceDir, sessionId, "running", {
+				currentTurnId: coordinatorTurnId,
+				lastTurnId: coordinatorTurnId,
+				live: null,
+				reason: "prompt_reserved",
+				source: "coordinator",
+				emitEvent: false,
+			});
 		let acknowledgement: RuntimePromptAcknowledgement;
 		try {
 			acknowledgement = requirePromptAcknowledgement(
@@ -5256,6 +6031,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		// Persist the receipt before touching projections. A crash after the SDK
 		// accepts the command can then rebuild the turn without dispatching again.
 		await persistPromptReceipt(sessionId, promptKey, acknowledgement);
+		// Test-only barrier for the accepted-receipt/terminal-sidecar interleaving.
+		// The production ordering remains receipt first, then canonical finalization.
+		await services.afterPromptReceiptPersisted?.(sessionId);
 		return acknowledgement;
 	}
 
@@ -5461,6 +6239,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			status: turn.status as TurnStatus,
 			prompt: turn.prompt as TurnRecord["prompt"],
 			delivery: turn.delivery as TurnRecord["delivery"],
+			runtime_provenance: turn.runtime_provenance,
 			question_ids: [...turn.question_ids],
 			final_response: turn.final_response as TurnRecord["final_response"],
 			evidence: [...turn.evidence],
@@ -5483,13 +6262,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				for (const turn of Object.values(canonical.turns))
 					await writeTurnRecord(namespaceDir, turnFromCanonical(turn));
 				for (const report of Object.values(canonical.reports))
-					await writeJsonFile(path.join(namespaceDir, "reports", `${report.report_id}.json`), report);
+					await writeJsonFile(reportProjectionFile(namespaceDir, report.report_id), report);
 				const activeId = canonical.queue.selected_promotion?.to_turn_id ?? canonical.queue.active_turn_id;
 				const active = activeId ? canonical.turns[activeId] : null;
 				if (active) await writeActiveTurn(namespaceDir, turnFromCanonical(active));
 				else {
-					const prior = await readActiveTurn(namespaceDir, sessionId);
-					if (prior) await clearActiveTurn(namespaceDir, prior);
+					// The canonical queue is authoritative under this repair lock. Remove
+					// any stale pointer directly: once the turn projection is rewritten
+					// terminal, readActiveTurn() intentionally rejects it and cannot
+					// discover the legacy active-turn file to clear.
+					await fs.rm(activeTurnFile(namespaceDir, sessionId), { force: true });
 				}
 				// A runtime sidecar can advance a live session while the canonical WAL still
 				// needs projection repair. Preserve that observed lifecycle state (and its
@@ -5498,14 +6280,38 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const runtimeState = await readSessionState(namespaceDir, sessionId);
 				const canonicalTerminal =
 					canonical.desired_session_state === "completed" || canonical.desired_session_state === "errored";
+				const runtimeTurnId = runtimeState?.current_turn_id ?? runtimeState?.last_turn_id;
+				const runtimeTurn = runtimeTurnId ? canonical.turns[runtimeTurnId] : undefined;
+				// A terminal sidecar is authoritative only after the broker receipt is
+				// durable. Preserve that observation across a lagging projection repair so
+				// the next admission pass can install the canonical terminal fence; a
+				// pre-ack terminal observation is intentionally rolled back to canonical
+				// state and cannot become a public terminal event.
+				const terminalRuntimeReceipt = Boolean(
+					runtimeState?.source === "agent_session_event" &&
+						(runtimeState.live === true || runtimeState.live === false) &&
+						(runtimeState.state === "completed" || runtimeState.state === "errored") &&
+						runtimeTurn &&
+						hasAcceptedRuntimeReceipt({ delivery: runtimeTurn.delivery }),
+				);
+				const terminalRuntimeState = Boolean(
+					terminalRuntimeReceipt && ACTIVE_TURN_STATUSES.has(runtimeTurn!.status as TurnStatus),
+				);
+				const terminalRuntimeProjection = Boolean(
+					terminalRuntimeReceipt &&
+						canonicalTerminal &&
+						runtimeTurn!.terminal_fence &&
+						runtimeState!.state === canonical.desired_session_state,
+				);
 				const runtimeStateToPreserve =
 					!canonicalTerminal &&
 					runtimeState &&
 					runtimeState.source === "agent_session_event" &&
-					runtimeState.live === true &&
-					(runtimeState.state === "ready_for_input" ||
-						runtimeState.state === "running" ||
-						runtimeState.state === "needs_user_input")
+					((runtimeState.live === true &&
+						(runtimeState.state === "ready_for_input" ||
+							runtimeState.state === "running" ||
+							runtimeState.state === "needs_user_input")) ||
+						terminalRuntimeState)
 						? runtimeState
 						: null;
 				await writeSessionState(
@@ -5518,10 +6324,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							: (active?.turn_id ?? null),
 						lastTurnId: runtimeStateToPreserve
 							? runtimeStateToPreserve.last_turn_id
-							: (canonical.queue.selected_promotion?.from_turn_id ?? null),
+							: terminalRuntimeProjection
+								? runtimeState?.last_turn_id
+								: (canonical.queue.selected_promotion?.from_turn_id ?? null),
 						live: runtimeStateToPreserve ? runtimeStateToPreserve.live : null,
 						reason: runtimeStateToPreserve ? runtimeStateToPreserve.reason : null,
-						source: runtimeStateToPreserve?.source,
+						source:
+							runtimeStateToPreserve?.source ?? (terminalRuntimeProjection ? runtimeState?.source : undefined),
 						overwrite: runtimeStateToPreserve === null,
 						emitEvent: false,
 					},
@@ -5545,7 +6354,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (applied < transaction.revision) await repairCanonicalProjections(sessionId);
 	}
 
-	async function recoverCanonicalNamespaceProjections(): Promise<void> {
+	async function recoverCanonicalNamespaceProjections(scopedSessionId: string | null = null): Promise<void> {
 		await ensureQuestionStateReady();
 		const roster = await readSchedulerRoster(questionPaths);
 		const persisted = await fs.readdir(questionPaths.sessions).catch(() => []);
@@ -5554,12 +6363,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				...roster.roster.map(entry => entry.session_id),
 				...persisted.filter(entry => COORDINATOR_SESSION_ID_PATTERN.test(entry)),
 			]),
-		];
+		].filter(sessionId => scopedSessionId === null || sessionId === scopedSessionId);
 		for (const sessionId of sessions) {
 			try {
+				const transaction = await readSessionTransaction(questionPaths, sessionId);
+				if (!transaction) continue;
+				await assertPersistedSessionAuthority(transaction.canonical.session);
 				await recoverCanonicalSessionProjection(sessionId);
 			} catch (error) {
-				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+				if (
+					!(error instanceof Error) ||
+					(error.message !== "state_corrupt" && (scopedSessionId !== null || !isSessionAuthorityError(error)))
+				)
+					throw error;
 			}
 		}
 	}
@@ -5878,87 +6694,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				break;
 			processedCursor = entry.session_id;
 			try {
-				await ensureCanonicalWaitingTurn(entry.session_id, options);
 				await reconcileSessionRuntime(entry.session_id, options);
 			} catch (error) {
-				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+				if (
+					!(error instanceof Error) ||
+					(error.message !== "resource_gone" &&
+						(prioritySessionId !== undefined || !isSessionAuthorityError(error)))
+				)
+					throw error;
 			}
 		}
 		if (processedCursor && !options.signal?.aborted)
 			await advanceSchedulerCursor(questionPaths, processedCursor, { signal: options.signal });
-	}
-
-	async function ensureCanonicalWaitingTurn(
-		sessionId: string,
-		options: { absoluteDeadline?: number; signal?: AbortSignal } = {},
-	): Promise<void> {
-		const state = await readSessionState(namespaceDir, sessionId);
-		if (
-			state?.schema_version !== 1 ||
-			state.session_id !== sessionId ||
-			state.source !== "agent_session_event" ||
-			state.live !== true ||
-			!Number.isFinite(Date.parse(state.updated_at)) ||
-			state.state !== "needs_user_input" ||
-			!state.current_turn_id ||
-			options.signal?.aborted
-		)
-			return;
-		let transitioned = false;
-		await withAdmittedSessionTransaction(
-			questionPaths,
-			sessionId,
-			async transaction => {
-				const turn = transaction.canonical.turns[state.current_turn_id!];
-				if (
-					!turn ||
-					turn.terminal_fence ||
-					!ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus) ||
-					turn.status === "waiting_for_answer"
-				)
-					return;
-				turn.status = "waiting_for_answer";
-				turn.updated_at = state.updated_at;
-				transaction.canonical.desired_session_state = "needs_user_input";
-				const eventId = deterministicOutboxId(
-					sessionId,
-					transaction.revision + 1,
-					"turn.waiting_for_answer",
-					"turn",
-					turn.turn_id,
-				);
-				transaction.outbox[eventId] ??= {
-					id: eventId,
-					transaction_revision: transaction.revision + 1,
-					kind: "turn.waiting_for_answer",
-					entity: "turn",
-					entity_id: turn.turn_id,
-					payload: {
-						session_id: sessionId,
-						turn_id: turn.turn_id,
-						status: "waiting_for_answer",
-						created_at: turn.updated_at,
-					},
-					emitted: false,
-					public_event_id: eventId,
-					public_delivery: {
-						public_event_id: eventId,
-						state: "pending",
-						claim_fence: null,
-						claim_expires_at: null,
-						journal_seq: null,
-						acknowledged_at: null,
-					},
-				};
-				transitioned = true;
-			},
-			{ signal: options.signal },
-		);
-		if (transitioned) {
-			// Reacquire canonical authority immediately before projection so a terminal
-			// commit between the two phases cannot be resurrected as waiting.
-			await repairCanonicalProjections(sessionId, { signal: options.signal });
-		}
 	}
 
 	async function reconcileWatchEventSessions(
@@ -5980,39 +6727,53 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			)
 				break;
 			try {
-				await ensureCanonicalWaitingTurn(sessionId, options);
 				await reconcileSessionRuntime(sessionId, options);
 				await reconcileQuestions(sessionId, options);
 			} catch (error) {
-				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+				if (!(error instanceof Error) || (error.message !== "resource_gone" && !isSessionAuthorityError(error)))
+					throw error;
 			}
 		}
 	}
 
+	/** Reconcile a bounded, persisted round-robin slice of Q12 sessions. */
 	async function reconcileWatchQuestions(
 		prioritySessionId: string | undefined,
 		options: { absoluteDeadline?: number; signal?: AbortSignal } = {},
 	): Promise<void> {
 		const rosterState = await readSchedulerRoster(questionPaths, { signal: options.signal });
-		const eligible = rosterState.roster;
-		const prioritized = prioritySessionId
-			? [
-					...eligible.filter(entry => entry.session_id === prioritySessionId),
-					...eligible.filter(entry => entry.session_id !== prioritySessionId),
-				]
+		const eligible = [...rosterState.roster].sort((left, right) => left.session_id.localeCompare(right.session_id));
+		const priority = prioritySessionId ? eligible.filter(entry => entry.session_id === prioritySessionId) : [];
+		const roundRobinPool = prioritySessionId
+			? eligible.filter(entry => entry.session_id !== prioritySessionId)
 			: eligible;
-		for (const entry of prioritized.slice(0, MAX_Q12_ATTEMPTS_PER_WATCH_PASS)) {
+		const start = roundRobinPool.findIndex(entry => entry.session_id > rosterState.cursor);
+		const rotated = [
+			...roundRobinPool.slice(start < 0 ? 0 : start),
+			...roundRobinPool.slice(0, start < 0 ? 0 : start),
+		];
+		const ordered = [...priority, ...rotated];
+		let processedCursor: string | null = null;
+		for (const entry of ordered.slice(0, MAX_Q12_ATTEMPTS_PER_WATCH_PASS)) {
 			if (
 				options.signal?.aborted ||
 				(options.absoluteDeadline !== undefined && Date.now() >= options.absoluteDeadline)
 			)
 				break;
+			processedCursor = entry.session_id;
 			try {
 				await reconcileQuestions(entry.session_id, options);
 			} catch (error) {
-				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+				if (
+					!(error instanceof Error) ||
+					(error.message !== "resource_gone" &&
+						(prioritySessionId !== undefined || !isSessionAuthorityError(error)))
+				)
+					throw error;
 			}
 		}
+		if (processedCursor && !options.signal?.aborted)
+			await advanceSchedulerCursor(questionPaths, processedCursor, { signal: options.signal });
 	}
 
 	async function reconcileActiveTurnAcknowledgements(
@@ -6040,9 +6801,22 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				break;
 			let turn: TurnRecord | null = null;
 			try {
+				const transaction = await readSessionTransaction(questionPaths, entry.session_id);
+				if (!transaction) {
+					processedCursor = entry.session_id;
+					continue;
+				}
+				await assertPersistedSessionAuthority(transaction.canonical.session);
 				turn = await readActiveTurn(namespaceDir, entry.session_id);
 			} catch (error) {
-				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+				if (
+					!(error instanceof Error) ||
+					(error.message !== "resource_gone" &&
+						error.message !== "coordinator_workdir_outside_allowed_roots" &&
+						error.message !== "coordinator_workdir_roots_required" &&
+						error.message !== "coordinator_workspace_required")
+				)
+					throw error;
 			}
 			processedCursor = entry.session_id;
 			if (!turn) continue;
@@ -6121,6 +6895,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						if (creation.request.phase === "completed" && creation.request.safe_response)
 							return creation.request.safe_response;
 						const binding = await exactBrokerSessionBinding(sessionId, cwd);
+						const priorSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+						const priorAuthority =
+							priorSession &&
+							priorSession.broker_workspace === binding.workspace &&
+							priorSession.endpoint_generation === binding.endpointGeneration &&
+							optionalString(priorSession.endpoint_incarnation) === binding.endpointIncarnation
+								? (priorSession.sidecar_verifier as { key_id: string; public_key: string } | undefined)
+								: undefined;
 						const session = normalizeSession({
 							session_id: sessionId,
 							cwd,
@@ -6132,12 +6914,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							broker_workspace: binding.workspace,
 							endpoint_generation: binding.endpointGeneration,
 							endpoint_incarnation: binding.endpointIncarnation,
+							sidecar_verifier: priorAuthority ?? creation.request.sidecar_verifier,
 						});
 						const intent: CanonicalCreateIntentV1 = {
 							kind: "register",
 							session: canonicalCreationSnapshot(session),
 							initial_state: "ready_for_input",
-							initial_events: [],
+							initial_events: [
+								{
+									kind: "session.registered",
+									entity: "session",
+									entity_id: sessionId,
+									created_at: new Date().toISOString(),
+								},
+							],
 						};
 						await bindCreationRequest(questionPaths, creation.keyDigest, intent);
 						await commitCreationWal(questionPaths, creation.keyDigest, intent);
@@ -6147,6 +6937,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							reason: null,
 						});
 						await appendCoordinatorEvent(namespaceDir, {
+							stableId: deterministicOutboxId(sessionId, 1, "session.registered", "session", sessionId),
 							kind: "session.registered",
 							sessionId,
 							summary: `Session ${sessionId} registered for coordinator control`,
@@ -6174,11 +6965,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				requireCoordinatorMutation(config, "sessions", args);
 				const idempotencyKey = requiredIdempotencyKey(args);
 				const sessionId = safeExternalId("session", args.session_id);
-				if (!(await readJsonFile(sessionFile(sessionId))))
-					return {
-						ok: false,
-						error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
-					};
+				try {
+					await assertCanonicalHandoffAuthority(sessionId);
+				} catch (error) {
+					if (error instanceof Error && error.message === "resource_gone")
+						return {
+							ok: false,
+							error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
+						};
+					throw error;
+				}
 				if (Object.hasOwn(args, "token")) return { ok: false, error: { code: "token_material_not_allowed" } };
 				return await withToolIdempotency(
 					name,
@@ -6192,6 +6988,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					},
 					async () => {
 						try {
+							await fs.mkdir(config.codexTokenRoot, { recursive: true, mode: 0o700 });
 							const handoff = await registerCodexHandoff(namespaceDir, {
 								work_unit: sessionId,
 								thread_id: typeof args.thread_id === "string" ? args.thread_id : "",
@@ -6199,6 +6996,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									| { kind: "unix"; path: string }
 									| { kind: "tcp"; host: string; port: number },
 								token_file: args.token_file as string | null | undefined,
+								token_root: config.codexTokenRoot,
 							});
 							return {
 								ok: true,
@@ -6211,6 +7009,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								code === "invalid_codex_endpoint" ||
 								code === "codex_endpoint_not_loopback" ||
 								code === "token_material_not_allowed" ||
+								code === "codex_token_file_not_authorized" ||
 								code === "invalid_thread_id"
 							)
 								return { ok: false, error: { code } };
@@ -6221,15 +7020,26 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_read_codex_handoff") {
 				const sessionId = safeExternalId("session", args.session_id);
+				try {
+					await assertCanonicalHandoffAuthority(sessionId);
+				} catch (error) {
+					if (error instanceof Error && error.message === "resource_gone")
+						return {
+							ok: false,
+							error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
+						};
+					throw error;
+				}
 				const wakeEvents = (await listCodexWakeEvents(namespaceDir, sessionId))
 					.slice(-100)
 					.map(event => ({ ...event, lifecycle: codexWakeLifecycle(event.status) }));
 				const pendingWakeEvents = (await listPendingCodexWakeEvents(namespaceDir, sessionId))
 					.slice(-100)
 					.map(event => ({ ...event, lifecycle: codexWakeLifecycle(event.status) }));
+				const handoff = boundedCodexHandoff(await readCodexHandoff(namespaceDir, sessionId));
 				return {
 					ok: true,
-					handoff: await readCodexHandoff(namespaceDir, sessionId),
+					...(handoff ? { handoff } : {}),
 					heartbeat: { supported: false, reason: "automation_update_unavailable" },
 					lifecycle_schema: {
 						version: 1,
@@ -6248,6 +7058,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				requireCoordinatorMutation(config, "sessions", args);
 				const idempotencyKey = requiredIdempotencyKey(args);
 				const sessionId = safeExternalId("session", args.session_id);
+				await assertCanonicalHandoffAuthority(sessionId);
 				const wakeKey = typeof args.wake_key === "string" ? args.wake_key : "";
 				return await withToolIdempotency(
 					name,
@@ -6309,13 +7120,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								candidate => brokerSessionId(candidate) === canonicalSessionId,
 							);
 						}
+						const sessionState = publicCoordinatorSessionState(
+							await readSessionState(namespaceDir, canonicalSessionId),
+						);
 						return {
 							ok: true,
 							session: publicCoordinatorStatusSession(session),
-							status: brokerLiveness(indexedSession ?? null),
-							session_state: publicCoordinatorSessionState(
-								await readSessionState(namespaceDir, canonicalSessionId),
-							),
+							status: { ...brokerLiveness(indexedSession ?? null), ...(sessionState ?? {}) },
+							session_state: sessionState,
 						};
 					} catch (error) {
 						return sdkError(error);
@@ -6361,9 +7173,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (name === "gjc_coordinator_read_artifact")
 				return await readCoordinatorArtifact(config, { path: args.path });
 			if (name === "gjc_coordinator_read_coordination_status") {
-				await recoverCanonicalNamespaceProjections();
-				await reconcileActiveTurnAcknowledgements();
 				const scopedSessionId = args.session_id == null ? null : safeExternalId("session", args.session_id);
+				if (scopedSessionId) await ensureQuestionTransaction(scopedSessionId);
+				await recoverCanonicalNamespaceProjections(scopedSessionId);
+				await reconcileActiveTurnAcknowledgements();
 				const allBrokerSessions = await listSessions();
 				const brokerSessions = scopedSessionId
 					? allBrokerSessions.filter(session => brokerSessionId(session) === scopedSessionId)
@@ -6374,21 +7187,32 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const turns = jsonRecords(await listJsonFiles(turnsDir(namespaceDir))).filter(
 					turn => scopedSessionId === null || turn.session_id === scopedSessionId,
 				);
-				const questionSessionIds = scopedSessionId
-					? [scopedSessionId]
-					: [
-							...new Set(
-								[...allBrokerSessions.map(brokerSessionId), ...sessionStates, ...turns]
-									.map(value =>
-										typeof value === "string"
-											? value
-											: value && typeof value === "object"
-												? optionalString((value as Record<string, unknown>).session_id)
-												: null,
-									)
-									.filter((value): value is string => value !== null && value.length > 0),
-							),
-						];
+				const reportRecords = jsonRecords(await listJsonFiles(path.join(namespaceDir, "reports"))).filter(
+					report => scopedSessionId === null || report.session_id === scopedSessionId,
+				);
+				const persistedSessionIds = (await fs.readdir(questionPaths.sessions).catch(() => [])).filter(entry =>
+					COORDINATOR_SESSION_ID_PATTERN.test(entry),
+				);
+				const representedSessionIds = [
+					...persistedSessionIds,
+					...allBrokerSessions.map(brokerSessionId),
+					...sessionStates.map(state => optionalString(state.session_id)),
+					...turns.map(turn => optionalString(turn.session_id)),
+					...reportRecords.map(report => optionalString(report.session_id)),
+				];
+				const authorizedSessionIds = await authorizedCanonicalSessionIds(
+					representedSessionIds.filter((value): value is string => value !== null && value.length > 0),
+					scopedSessionId,
+				);
+				const authorizedBrokerSessions = brokerSessions.filter(session => {
+					const sessionId = brokerSessionId(session);
+					return sessionId !== null && authorizedSessionIds.has(sessionId);
+				});
+				const authorizedSessionStates = sessionStates.filter(state =>
+					authorizedSessionIds.has(String(state.session_id)),
+				);
+				const authorizedTurns = turns.filter(turn => authorizedSessionIds.has(String(turn.session_id)));
+				const questionSessionIds = [...authorizedSessionIds];
 				const questionResults = await Promise.all(
 					questionSessionIds.map(async session_id => {
 						try {
@@ -6432,14 +7256,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					.map(({ answer_binding: _answerBinding, ...question }) => question);
 				const questionSnapshotComplete = questionResults.every(result => result.reconciliation.complete);
 				const questionDiagnostics = questionResults.flatMap(result => result.diagnostics);
-				const reports = jsonRecords(await listJsonFiles(path.join(namespaceDir, "reports"))).filter(
-					report => scopedSessionId === null || report.session_id === scopedSessionId,
+				const reports = reportRecords.filter(
+					report =>
+						authorizedSessionIds.has(String(report.session_id)) ||
+						(scopedSessionId === null && report.session_id === null),
 				);
 				await exportRetainedDeliveries();
 				const journalSnapshot = await readJournalSnapshot(namespaceDir);
-				const scopedJournalEvents = scopedSessionId
-					? journalSnapshot.events.filter(event => event.session_id === scopedSessionId)
-					: journalSnapshot.events;
+				const scopedJournalEvents = (
+					await authorizedCoordinatorEvents(journalSnapshot.events, scopedSessionId)
+				).filter(event => scopedSessionId === null || event.session_id === scopedSessionId);
 				return capabilityFreeStatusValue({
 					ok: true,
 					schema_version: 1,
@@ -6447,12 +7273,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					scope: scopedSessionId ? { session_id: scopedSessionId } : { session_id: null },
 					transport: { mcp: "long_poll", push_subscriptions: false },
 					summary: {
-						sessions: brokerSessions.length,
-						active_sessions: activeSessionStates(sessionStates).length,
-						turns: turns.length,
-						active_turns: turns.filter(turn => ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus)).length,
-						queued_turns: turns.filter(turn => turn.status === "queued").length,
-						terminal_turns: turns.filter(turn => TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus)).length,
+						sessions: authorizedBrokerSessions.length,
+						active_sessions: activeSessionStates(authorizedSessionStates).length,
+						turns: authorizedTurns.length,
+						active_turns: authorizedTurns.filter(turn => ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus))
+							.length,
+						queued_turns: authorizedTurns.filter(turn => turn.status === "queued").length,
+						terminal_turns: authorizedTurns.filter(turn => TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus))
+							.length,
 						questions: questionSnapshotComplete ? questions.length : null,
 						open_questions: questionSnapshotComplete
 							? questions.filter(question => question.status === "pending").length
@@ -6461,11 +7289,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						questions_complete: questionSnapshotComplete,
 						question_diagnostics: questionDiagnostics,
 					},
-					sessions: brokerSessions.map(publicBrokerSession),
-					session_states: sessionStates.map(state =>
+					sessions: authorizedBrokerSessions.map(publicBrokerSession),
+					session_states: authorizedSessionStates.map(state =>
 						publicCoordinatorSessionState(state as unknown as CoordinatorSessionState),
 					),
-					turns: turns.map(turn =>
+					turns: authorizedTurns.map(turn =>
 						boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
 					),
 					questions: questions.map(question =>
@@ -6477,13 +7305,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					reports: reports.map(report =>
 						boundedPublicValue(report, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
 					),
-					events: buildCanonicalCoordinatorEvents({ sessionStates, turns, questions, reports }),
+					events: buildCanonicalCoordinatorEvents({
+						sessionStates: authorizedSessionStates,
+						turns: authorizedTurns,
+						questions,
+						reports,
+					}),
 					latest_event_seq: journalSnapshot.watermark,
 					recent_events: eventSummaries(scopedJournalEvents.slice(-10)),
 				}) as Record<string, unknown>;
 			}
 			if (name === "gjc_coordinator_watch_events") {
-				await recoverCanonicalNamespaceProjections();
 				const timeoutMs = boundedEventWatchTimeoutMs(args.timeout_ms);
 				const absoluteDeadline = Date.now() + timeoutMs;
 				const limit = boundedEventLimit(args.limit);
@@ -6492,46 +7324,42 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const deadlineTimer = setTimeout(() => watchController.abort(new Error("deadline_exceeded")), timeoutMs);
 				deadlineTimer.unref?.();
 				const prioritySessionId = args.session_id == null ? undefined : safeExternalId("session", args.session_id);
-				try {
-					await exportRetainedDeliveries(32, timeoutMs > 0 ? watchController.signal : undefined);
-				} catch (error) {
-					if (
-						!(timeoutMs > 0 && watchController.signal.aborted) &&
-						!(error instanceof Error && error.message === "resource_gone")
-					)
-						throw error;
-				}
-				if (timeoutMs > 0 && !watchController.signal.aborted && Date.now() < absoluteDeadline) {
+				if (prioritySessionId) await ensureQuestionTransaction(prioritySessionId);
+				const reconcileOptions = timeoutMs > 0 ? { absoluteDeadline, signal: watchController.signal } : {};
+				if (timeoutMs === 0) {
 					try {
-						await reconcileWatchAdmissions(prioritySessionId, {
-							absoluteDeadline,
-							signal: watchController.signal,
-						});
-						await reconcileActiveTurnAcknowledgements(MAX_RUNTIME_SESSIONS_PER_WATCH_PASS, prioritySessionId, {
-							absoluteDeadline,
-							signal: watchController.signal,
-						});
+						await reconcileWatchAdmissions(prioritySessionId, reconcileOptions);
+						await reconcileActiveTurnAcknowledgements(
+							MAX_RUNTIME_SESSIONS_PER_WATCH_PASS,
+							prioritySessionId,
+							reconcileOptions,
+						);
+						if (args.session_id != null)
+							await reconcileQuestions(safeExternalId("session", args.session_id), reconcileOptions);
+						else await reconcileWatchQuestions(undefined, reconcileOptions);
+						// Runtime admission must observe the sidecar before canonical projection
+						// repair. The fresh journal snapshot below is the first public read after
+						// that repair/export sequence, so events are visible after the caller's
+						// cursor without allowing recovery to erase a terminal observation.
+						await recoverCanonicalNamespaceProjections(prioritySessionId ?? null);
+						await exportRetainedDeliveries(32);
 					} catch (error) {
-						if (!watchController.signal.aborted && !(error instanceof Error && error.message === "resource_gone"))
-							throw error;
+						if (!(error instanceof Error && error.message === "resource_gone")) throw error;
 					}
+				} else if (!watchController.signal.aborted && Date.now() < absoluteDeadline) {
+					await recoverCanonicalNamespaceProjections(prioritySessionId ?? null);
 					try {
 						await exportRetainedDeliveries(32, watchController.signal);
-					} catch (error) {
-						if (!watchController.signal.aborted && !(error instanceof Error && error.message === "resource_gone"))
-							throw error;
-					}
-					try {
+						await reconcileWatchAdmissions(prioritySessionId, reconcileOptions);
+						await reconcileActiveTurnAcknowledgements(
+							MAX_RUNTIME_SESSIONS_PER_WATCH_PASS,
+							prioritySessionId,
+							reconcileOptions,
+						);
+						await exportRetainedDeliveries(32, watchController.signal);
 						if (args.session_id != null)
-							await reconcileQuestions(safeExternalId("session", args.session_id), {
-								absoluteDeadline,
-								signal: watchController.signal,
-							});
-						else
-							await reconcileWatchQuestions(undefined, {
-								absoluteDeadline,
-								signal: watchController.signal,
-							});
+							await reconcileQuestions(safeExternalId("session", args.session_id), reconcileOptions);
+						else await reconcileWatchQuestions(undefined, reconcileOptions);
 					} catch (error) {
 						if (!watchController.signal.aborted && !(error instanceof Error && error.message === "resource_gone"))
 							throw error;
@@ -6566,9 +7394,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					};
 				}
 				if (watchController.signal.aborted || Date.now() >= absoluteDeadline) {
-					const publicEvents = filterCoordinatorEvents(snapshot.events, afterSeq, args, limit).map(
-						publicCoordinatorEvent,
-					);
+					const publicEvents = filterCoordinatorEvents(
+						await authorizedCoordinatorEvents(snapshot.events, prioritySessionId ?? null),
+						afterSeq,
+						args,
+						limit,
+					).map(publicCoordinatorEvent);
 					const lastMatching = publicEvents.at(-1)?.seq;
 					clearTimeout(deadlineTimer);
 					return publicWatchSuccess(
@@ -6608,7 +7439,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						transport: { mcp: "long_poll", push_subscriptions: false },
 					};
 				}
-				let matched = filterCoordinatorEvents(snapshot.events, afterSeq, args, limit);
+				let matched = filterCoordinatorEvents(
+					await authorizedCoordinatorEvents(snapshot.events, prioritySessionId ?? null),
+					afterSeq,
+					args,
+					limit,
+				);
 				let timedOut = false;
 				if (matched.length === 0 && timeoutMs > 0) {
 					const deadline = absoluteDeadline;
@@ -6687,7 +7523,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								absoluteDeadline,
 								signal: watchController.signal,
 							});
-						matched = filterCoordinatorEvents(snapshot.events, afterSeq, args, limit);
+						matched = filterCoordinatorEvents(
+							await authorizedCoordinatorEvents(snapshot.events, prioritySessionId ?? null),
+							afterSeq,
+							args,
+							limit,
+						);
 					}
 					timedOut = matched.length === 0;
 				}
@@ -6755,146 +7596,155 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					...(explicitHostWorkUnit !== null ? { codex_host_session_id: explicitHostWorkUnit } : {}),
 					allow_mutation: true,
 				};
+				let creationRemoteStarted = false;
 				return await withToolIdempotency(
 					name,
 					idempotencyKey,
 					canonicalArgs,
 					async () => {
-						const remoteSession = { value: null as string | null };
-						const delegate = async () =>
-							withRemoteSessionCompensation(canonicalCwd, remoteSession, async () => {
-								let sessionId: string;
-								let session: Record<string, unknown>;
-								let reusedSession = false;
-								let creationKey: string | null = null;
-								if (reusedSessionId) {
-									sessionId = reusedSessionId;
-									const existing = asRecord(await readJsonFile(sessionFile(sessionId)));
-									if (!existing)
-										return {
-											ok: false,
-											error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
-										};
-									const sessionMpreset = optionalString(existing.mpreset);
-									if (mpresetResolution.mpreset !== null && sessionMpreset !== mpresetResolution.mpreset) {
-										return {
-											ok: false,
-											reason: "mpreset_conflict",
-											session_id: sessionId,
-											session_mpreset: sessionMpreset,
-											requested_mpreset: mpresetResolution.mpreset,
-										};
-									}
-									const existingCwd = optionalString(existing.cwd);
-									if (
-										!existingCwd ||
-										!sameCanonicalPath(await canonicalBrokerWorkspace(existingCwd), canonicalCwd, platform)
-									)
-										return {
-											ok: false,
-											error: {
-												code: "workspace_mismatch",
-												message: "Coordinator session is bound to another workspace.",
-											},
-										};
-									const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
-									if (
-										!sameCanonicalPath(
-											optionalString(existing.broker_workspace) ?? "",
+						const delegate = async () => {
+							let sessionId: string;
+							let session: Record<string, unknown>;
+							let reusedSession = false;
+							let creationKey: string | null = null;
+							if (reusedSessionId) {
+								sessionId = reusedSessionId;
+								const existing = asRecord(await readJsonFile(sessionFile(sessionId)));
+								if (!existing)
+									return {
+										ok: false,
+										error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
+									};
+								const sessionMpreset = optionalString(existing.mpreset);
+								if (mpresetResolution.mpreset !== null && sessionMpreset !== mpresetResolution.mpreset) {
+									return {
+										ok: false,
+										reason: "mpreset_conflict",
+										session_id: sessionId,
+										session_mpreset: sessionMpreset,
+										requested_mpreset: mpresetResolution.mpreset,
+									};
+								}
+								const existingCwd = optionalString(existing.cwd);
+								if (
+									!existingCwd ||
+									!sameCanonicalPath(await canonicalBrokerWorkspace(existingCwd), canonicalCwd, platform)
+								)
+									return {
+										ok: false,
+										error: {
+											code: "workspace_mismatch",
+											message: "Coordinator session is bound to another workspace.",
+										},
+									};
+								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
+								if (
+									!sameCanonicalPath(
+										optionalString(existing.broker_workspace) ?? "",
+										canonicalCwd,
+										platform,
+									) ||
+									existing.endpoint_generation !== binding.endpointGeneration ||
+									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
+								)
+									return {
+										ok: false,
+										error: {
+											code: "endpoint_stale",
+											message: "Coordinator session endpoint incarnation binding is stale.",
+										},
+									};
+								session = normalizeSession({
+									...existing,
+									session_id: sessionId,
+									cwd: canonicalCwd,
+									broker_workspace: binding.workspace,
+									endpoint_generation: binding.endpointGeneration,
+									endpoint_incarnation: binding.endpointIncarnation,
+									sidecar_verifier: existing.sidecar_verifier as { key_id: string; public_key: string },
+								});
+								reusedSession = true;
+							} else {
+								const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
+								if (creation.request.phase === "completed" && creation.request.safe_response)
+									return creation.request.safe_response;
+								creationKey = creation.keyDigest;
+								if (creation.request.canonical_create_intent) {
+									session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
+									await bindCreationRequest(
+										questionPaths,
+										creation.keyDigest,
+										creation.request.canonical_create_intent,
+									);
+									await commitCreationWal(
+										questionPaths,
+										creation.keyDigest,
+										creation.request.canonical_create_intent,
+									);
+									sessionId = creation.request.canonical_create_intent.session.session_id;
+								} else {
+									const remote = await prepareCreationBrokerCall(creation);
+									creationRemoteStarted = true;
+									const created = brokerResult(
+										await brokerSession(
 											canonicalCwd,
-											platform,
-										) ||
-										existing.endpoint_generation !== binding.endpointGeneration ||
-										optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
-									)
-										return {
-											ok: false,
-											error: {
-												code: "endpoint_stale",
-												message: "Coordinator session endpoint incarnation binding is stale.",
+											"session.create",
+											{
+												cwd: canonicalCwd,
+												target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
+												...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+												// Thread the coordinator state dir so the broker-spawned runtime
+												// writes terminal state to the coordinator-shared file (#2549).
+												coordinatorStateDir: namespaceDir,
+												coordinatorSidecarSigningKey:
+													sidecarSigningKeys.get(remote.candidate.key_id) ??
+													(() => {
+														throw new Error("sidecar_signing_key_unavailable");
+													})(),
+												coordinatorSidecarKeyId: remote.candidate.key_id,
 											},
-										};
+											remote.request.remote_create_key,
+										),
+									);
+									const reconciled = await reconcileCreationBrokerCall(
+										creation.keyDigest,
+										remote.candidate,
+										created,
+									);
+									sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
+									const createdCwd = await canonicalBrokerWorkspace(
+										optionalString(created.cwd) ?? canonicalCwd,
+									);
+									const binding = await exactBrokerSessionBinding(sessionId, createdCwd);
 									session = normalizeSession({
-										...existing,
 										session_id: sessionId,
 										cwd: canonicalCwd,
 										broker_workspace: binding.workspace,
 										endpoint_generation: binding.endpointGeneration,
 										endpoint_incarnation: binding.endpointIncarnation,
+										sidecar_verifier: reconciled.sidecar_verifier,
 									});
-									reusedSession = true;
-								} else {
-									const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
-									if (creation.request.phase === "completed" && creation.request.safe_response)
-										return creation.request.safe_response;
-									creationKey = creation.keyDigest;
-									if (creation.request.canonical_create_intent) {
-										session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
-										await bindCreationRequest(
-											questionPaths,
-											creation.keyDigest,
-											creation.request.canonical_create_intent,
-										);
-										await commitCreationWal(
-											questionPaths,
-											creation.keyDigest,
-											creation.request.canonical_create_intent,
-										);
-										sessionId = creation.request.canonical_create_intent.session.session_id;
-									} else {
-										const created = brokerResult(
-											await brokerSession(
-												canonicalCwd,
-												"session.create",
-												{
-													cwd: canonicalCwd,
-													target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
-													...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
-													// Thread the coordinator state dir so the broker-spawned runtime
-													// writes terminal state to the coordinator-shared file (#2549).
-													coordinatorStateDir: namespaceDir,
-												},
-												idempotencyKey,
-											),
-										);
-										const createdSessionId = optionalString(created.sessionId ?? created.session_id);
-										if (!createdSessionId)
-											throw new SdkClientError(
-												UNOBSERVED_COMPENSATION_CODE,
-												"SDK broker created a session but returned no usable session identity; the outcome is unobserved.",
-												{ creation_response: created },
-											);
-										remoteSession.value = createdSessionId;
-										sessionId = safeExternalId("session", createdSessionId);
-										const createdCwd = await canonicalBrokerWorkspace(
-											optionalString(created.cwd) ?? canonicalCwd,
-										);
-										const binding = await exactBrokerSessionBinding(sessionId, createdCwd);
-										session = normalizeSession({
-											session_id: sessionId,
-											cwd: createdCwd,
-											ephemeral: true,
-											created_at: new Date().toISOString(),
-											...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
-											broker_workspace: binding.workspace,
-											endpoint_generation: binding.endpointGeneration,
-											endpoint_incarnation: binding.endpointIncarnation,
-										});
-										const intent: CanonicalCreateIntentV1 = {
-											kind: "delegate",
-											workflow: delegateWorkflow,
-											session: canonicalCreationSnapshot(session),
-											remote_create_key: creation.request.remote_create_key,
-											initial_state: "running",
-											initial_prompt: {
-												text: taggedPrompt,
-												caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
+									const intent: CanonicalCreateIntentV1 = {
+										kind: "delegate",
+										workflow: delegateWorkflow,
+										session: canonicalCreationSnapshot(session),
+										remote_create_key: creation.request.remote_create_key,
+										initial_state: "running",
+										initial_prompt: {
+											text: taggedPrompt,
+											caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
+										},
+										initial_events: [
+											{
+												kind: "session.started",
+												entity: "session",
+												entity_id: sessionId,
+												created_at: new Date().toISOString(),
 											},
-											initial_events: [],
-										};
-										await bindCreationRequest(questionPaths, creation.keyDigest, intent);
-										await commitCreationWal(questionPaths, creation.keyDigest, intent);
-									}
+										],
+									};
+									await bindCreationRequest(questionPaths, creation.keyDigest, intent);
+									await commitCreationWal(questionPaths, creation.keyDigest, intent);
 								}
 							}
 							await writeJsonFile(sessionFile(sessionId), session);
@@ -6942,6 +7792,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								explicitHostWorkUnit,
 							);
 							await appendCoordinatorEvent(namespaceDir, {
+								stableId: `delegation:${sessionId}:${turn.turn_id}`,
 								kind: "delegation.started",
 								sessionId,
 								turnId: turn.turn_id,
@@ -6964,22 +7815,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									result: publicSdkAcknowledgement(acknowledgement),
 									codex_handoff: codexHandoff,
 									...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
-								};
-								if (creationKey) {
-									await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
-									await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
-								}
-								return args.await_completion === true
-									? {
-											...response,
-											completion: await awaitTurnPayload(
-												turn.turn_id,
-												sessionId,
-												args.timeout_ms,
-												args.poll_interval_ms,
-											),
-										}
-									: response;
+								},
 							});
 							const response = {
 								ok: true,
@@ -7022,6 +7858,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						return reusedSessionId ? await withSessionTransition(reusedSessionId, delegate) : await delegate();
 					},
 					true,
+					response => creationRemoteStarted || isRouterRequestAmbiguous(response),
 				);
 			}
 			if (name === "gjc_coordinator_stop_session") {
@@ -7090,6 +7927,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								"prepare_existing_thread cannot carry an initial prompt; activate the session first, then send_prompt.",
 						},
 					};
+				let creationRemoteStarted = false;
 				const canonicalArgs = {
 					cwd,
 					mpreset: mpresetResolution.mpreset,
@@ -7102,90 +7940,68 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					idempotencyKey,
 					canonicalArgs,
 					async () => {
-						const remoteSession = { value: null as string | null };
-						return await withRemoteSessionCompensation(cwd, remoteSession, async () => {
-							const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
-							if (creation.request.phase === "completed" && creation.request.safe_response)
-								return creation.request.safe_response;
-							let created: Record<string, unknown>;
-							let session: Record<string, unknown>;
-							let sessionId: string;
-							if (creation.request.canonical_create_intent) {
-								session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
-								sessionId = creation.request.canonical_create_intent.session.session_id;
-								created = { session_id: sessionId };
-							} else {
-								created = brokerResult(
-									await brokerSession(
+						const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
+						if (creation.request.phase === "completed" && creation.request.safe_response)
+							return creation.request.safe_response;
+						let created: Record<string, unknown>;
+						let session: Record<string, unknown>;
+						let sessionId: string;
+						if (creation.request.canonical_create_intent) {
+							session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
+							sessionId = creation.request.canonical_create_intent.session.session_id;
+							created = { session_id: sessionId };
+						} else {
+							const remote = await prepareCreationBrokerCall(creation);
+							creationRemoteStarted = true;
+							created = brokerResult(
+								await brokerSession(
+									cwd,
+									"session.create",
+									{
 										cwd,
-										"session.create",
-										{
-											cwd,
-											target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
-											...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
-											...(preparesExistingThread ? { readiness: "deferred" } : {}),
-											// Thread the coordinator state dir so the broker-spawned runtime
-											// writes terminal state to the coordinator-shared file (#2549).
-											coordinatorStateDir: namespaceDir,
-										},
-										idempotencyKey,
-									),
-								);
-								const createdSessionId = optionalString(created.sessionId ?? created.session_id);
-								/**
-								 * Preparation is only real when the broker proves it. A create that
-								 * silently published readiness would leave a live session whose root
-								 * is already claimed, so the session is closed rather than reported
-								 * what the schema promises. Reject a non-boolean before any mutation.
-								 */
-								if (preparesExistingThread && created.readiness !== "prepared") {
-									if (!createdSessionId)
-										throw new SdkClientError(
-											UNOBSERVED_COMPENSATION_CODE,
-											"SDK broker did not prepare the requested session and returned no usable session identity.",
-											{ creation_response: created },
-										);
-									remoteSession.value = createdSessionId;
-									const unpreparedId = safeExternalId("session", createdSessionId);
-									let compensated = true;
-									if (unpreparedId) {
-										try {
-											strictBrokerSessionClose(
-												await brokerSession(
-													cwd,
-													"session.close",
-													{ sessionId: unpreparedId },
-													`${idempotencyKey}:unprepared-close`,
-												),
-												unpreparedId,
-											);
-										} catch {
-											compensated = false;
-										}
-									}
-									// A swallowed compensation leaves a live, untracked session while
-									// idempotency seals the failure, so exact retries only replay the
-									// cached error and never reach the session again. Name the session
-									// and mark the outcome unobserved so the key is not sealed.
-									if (!compensated)
-										throw new SdkClientError(
-											UNOBSERVED_COMPENSATION_CODE,
-											`SDK broker did not prepare the requested session, and closing the unprepared session ${unpreparedId} failed; it may still be running.`,
-										);
-									remoteSession.value = null;
-									throw new SdkClientError(
-										"broker_request_unavailable",
-										"SDK broker did not prepare the requested session.",
+										target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
+										...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+										...(preparesExistingThread ? { readiness: "deferred" } : {}),
+										// Thread the coordinator state dir so the broker-spawned runtime
+										// writes terminal state to the coordinator-shared file (#2549).
+										coordinatorStateDir: namespaceDir,
+										coordinatorSidecarSigningKey:
+											sidecarSigningKeys.get(remote.candidate.key_id) ??
+											(() => {
+												throw new Error("sidecar_signing_key_unavailable");
+											})(),
+										coordinatorSidecarKeyId: remote.candidate.key_id,
+									},
+									remote.request.remote_create_key,
+								),
+							);
+							/**
+							 * Preparation is only real when the broker proves it. A create that
+							 * silently published readiness would leave a live session whose root
+							 * is already claimed, so the session is closed rather than reported
+							 * as prepared.
+							 */
+							if (preparesExistingThread && created.readiness !== "prepared") {
+								const unpreparedId = optionalString(created.sessionId ?? created.session_id);
+								let compensated = true;
+								if (unpreparedId) {
+									compensated = await brokerSession(
+										cwd,
+										"session.close",
+										{ sessionId: unpreparedId },
+										`${idempotencyKey}:unprepared-close`,
+									).then(
+										() => true,
+										() => false,
 									);
 								}
-								if (!createdSessionId)
+								if (!unpreparedId)
 									throw new SdkClientError(
 										UNOBSERVED_COMPENSATION_CODE,
 										"SDK broker created a session but returned no usable session identity; the outcome is unobserved.",
 										{ creation_response: created },
 									);
-								remoteSession.value = createdSessionId;
-								sessionId = safeExternalId("session", createdSessionId);
+								sessionId = safeExternalId("session", unpreparedId);
 								const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
 								const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
 								session = normalizeSession({
@@ -7197,6 +8013,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									endpoint_incarnation: binding.endpointIncarnation,
 								});
 							}
+							const reconciled = await reconcileCreationBrokerCall(
+								creation.keyDigest,
+								remote.candidate,
+								created,
+							);
 							sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
 							const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
 							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
@@ -7207,6 +8028,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								broker_workspace: binding.workspace,
 								endpoint_generation: binding.endpointGeneration,
 								endpoint_incarnation: binding.endpointIncarnation,
+								sidecar_verifier: reconciled.sidecar_verifier,
 							});
 						}
 						const intent: CanonicalCreateIntentV1 = {
@@ -7217,7 +8039,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							initial_prompt: prompt
 								? { text: prompt, caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex") }
 								: null,
-							initial_events: [],
+							initial_events: [
+								{
+									kind: "session.started",
+									entity: "session",
+									entity_id: sessionId,
+									created_at: new Date().toISOString(),
+								},
+							],
 						};
 						await bindCreationRequest(questionPaths, creation.keyDigest, intent);
 						await commitCreationWal(questionPaths, creation.keyDigest, intent);
@@ -7264,10 +8093,26 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
 							return response;
+						}
+						const sessionState = await writeSessionState(
+							namespaceDir,
+							sessionId,
+							preparesExistingThread ? "prepared" : "ready_for_input",
+							{ live: null, reason: null },
+						);
+						await appendCoordinatorEvent(namespaceDir, {
+							stableId: deterministicOutboxId(sessionId, 1, "session.started", "session", sessionId),
+							kind: "session.started",
+							sessionId,
+							summary: preparesExistingThread
+								? `Session ${sessionId} prepared through SDK lifecycle control`
+								: `Session ${sessionId} started through SDK lifecycle control`,
+							payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
 						});
 					},
 					true,
-					response => isUnobservedCompensation(response) || isRouterRequestAmbiguous(response),
+					response =>
+						isUnobservedCompensation(response) || creationRemoteStarted || isRouterRequestAmbiguous(response),
 				);
 			}
 			if (name === "gjc_coordinator_activate_session") {
@@ -7343,6 +8188,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								reason: null,
 							});
 							await appendCoordinatorEvent(namespaceDir, {
+								stableId: `activation:${sessionId}:${activated.endpointGeneration}`,
 								kind: "session.started",
 								sessionId,
 								summary: `Session ${sessionId} activated its withheld readiness`,
@@ -7713,7 +8559,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										canonicalJson({
 											namespace_id: admissionToken.session_id === sessionId ? config.namespace.identity : "",
 											session_id: admissionToken.session_id,
-											endpoint_incarnation: admissionToken.sidecar_endpoint_incarnation,
+											endpoint_incarnation: transaction.canonical.session.broker.endpoint_incarnation,
 											coordinator_turn_id: admissionToken.coordinator_turn_id,
 											runtime_turn_id: admissionToken.runtime_turn_id,
 											gate_created_at: authority.observation.first_provenance.gate_created_at,
@@ -7762,7 +8608,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								};
 							}
 							const requestId = `c07:${createHash("sha256")
-								.update(`coordinator-question-v1${question.authority_id}${requestDigest}`)
+								.update(`coordinator-question-v1${question.authority_id}${keyDigest}${requestDigest}`)
 								.digest("hex")}`;
 							question.status = "resolving";
 							question.claim_fence_epoch = transaction.revision + 1;
@@ -7811,6 +8657,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								throw new Error("terminal_uncertain");
 							request.updated_at = new Date().toISOString();
 						});
+						await services.afterAnswerRemoteStarted?.(sessionId);
 						const latestAdmission = await reconcileSessionRuntime(sessionId, { observeQuestions: true });
 						const latestState = latestAdmission.session_state;
 						const latestToken = latestAdmission.waiting_token;
@@ -7824,7 +8671,31 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							(latestState?.source === "agent_session_event" &&
 								latestState.live === true &&
 								(latestState.state !== "needs_user_input" || latestState.current_turn_id !== turnId))
-						)
+						) {
+							// No remote call has occurred. Undo the durable dispatch claim so this
+							// outer request remains retryable rather than stranding the question in
+							// remote_started/resolving.
+							await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+								const request = transaction.requests.answers[keyDigest];
+								const pendingQuestion = transaction.canonical.questions[questionId];
+								if (
+									request?.claim_fence_epoch === (claimed as { fence: number }).fence &&
+									request.phase === "remote_started" &&
+									pendingQuestion?.status === "resolving" &&
+									pendingQuestion.claim_fence_epoch === (claimed as { fence: number }).fence
+								) {
+									pendingQuestion.status = "pending";
+									pendingQuestion.claim_fence_epoch = null;
+									pendingQuestion.answer_request_id = null;
+									pendingQuestion.updated_at = new Date().toISOString();
+									pendingQuestion.history.push({
+										at: pendingQuestion.updated_at,
+										status: "pending",
+										reason: "dispatch_admission_lost",
+									});
+									delete transaction.requests.answers[keyDigest];
+								}
+							});
 							return {
 								ok: false,
 								error: {
@@ -7832,6 +8703,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									message: "Turn became non-answerable before answer dispatch.",
 								},
 							};
+						}
 
 						try {
 							const result = await controlSession(
@@ -7851,6 +8723,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									) {
 										question.status = "pending";
 										question.claim_fence_epoch = null;
+										question.answer_request_id = null;
 										question.updated_at = new Date().toISOString();
 										question.history.push({
 											at: question.updated_at,
@@ -7952,6 +8825,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						}
 					},
 					true,
+					response => {
+						if (isRouterRequestAmbiguous(response)) return true;
+						const error = asRecord(response.error);
+						return (
+							error?.code === "terminal_uncertain" &&
+							error.message === "Turn became non-answerable before answer dispatch."
+						);
+					},
 				);
 			}
 			if (name === "gjc_coordinator_report_status") {
@@ -8112,9 +8993,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							}
 							if (recovered) return recovered;
 						} else {
-							const persisted = asRecord(
-								await readJsonFile(path.join(namespaceDir, "reports", `${reportId}.json`)),
-							);
+							const persisted = asRecord(await readJsonFile(reportProjectionFile(namespaceDir, reportId)));
 							if (persisted) return responseFor(persisted, turn);
 						}
 						const evidence = await validateEvidencePaths(args.evidence_paths);
@@ -8248,7 +9127,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							});
 							await services.afterCanonicalReportSafeResponse?.(ledgerSessionId, response);
 						}
-						const reportPath = path.join(namespaceDir, "reports", `${reportId}.json`);
+						const reportPath = reportProjectionFile(namespaceDir, reportId);
 						await writeJsonFile(reportPath, report);
 						await exportRetainedDeliveries();
 						return response;
@@ -8301,6 +9180,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		handleJsonRpc,
 		handle: handleJsonRpc,
 		reapSession,
+		signRuntimeSidecarPayloadForTest,
 		sessionReaper,
 		router,
 		close: async () => {

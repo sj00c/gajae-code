@@ -348,6 +348,31 @@ it("SDK lifecycle launch requests require a worktree identity", () => {
 		),
 	).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 });
+
+it("SDK lifecycle launch requests retain Coordinator verifier metadata but reject private signing keys", () => {
+	const cwd = "/workspace/repo";
+	const request = {
+		operation: "session.create",
+		sessionId: "session-1",
+		stateRoot: path.join(cwd, ".gjc", "state"),
+		cwd,
+		...deriveLifecycleDeadlines(Date.now(), 10_000),
+	};
+	const publicRequest = {
+		...request,
+		coordinatorStateDir: "/coordinator/state",
+		coordinatorSidecarKeyId: "a".repeat(64),
+	};
+	expect(readSessionLifecycleLaunchRequest(JSON.stringify(request))).toMatchObject(request);
+	expect(readSessionLifecycleLaunchRequest(JSON.stringify(publicRequest))).toMatchObject(publicRequest);
+	for (const target of [
+		{ coordinatorStateDir: "/coordinator/state" },
+		{ coordinatorSidecarSigningKey: "private-key", coordinatorSidecarKeyId: "a".repeat(64) },
+	])
+		expect(() => readSessionLifecycleLaunchRequest(JSON.stringify({ ...request, ...target }))).toThrow(
+			"GJC_SDK_LIFECYCLE_REQUEST is invalid.",
+		);
+});
 it("SDK lifecycle transcript authority requires and preserves a full sha256 identity", () => {
 	const cwd = "/workspace/repo";
 	const request = {

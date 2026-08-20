@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, randomUUID, sign, verify } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -34,6 +34,70 @@ export const GJC_COORDINATOR_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
 export const GJC_COORDINATOR_SESSION_BRANCH_ENV = "GJC_COORDINATOR_SESSION_BRANCH";
 export const GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV = "GJC_COORDINATOR_SESSION_LAUNCH_ID";
 export const GJC_COORDINATOR_SESSION_READINESS_FILE_ENV = "GJC_COORDINATOR_SESSION_READINESS_FILE";
+export const GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV = "GJC_COORDINATOR_SIDECAR_SIGNING_KEY";
+export const GJC_COORDINATOR_SIDECAR_KEY_ID_ENV = "GJC_COORDINATOR_SIDECAR_KEY_ID";
+/** Explicitly binds this launch to Coordinator-minted sidecar signing authority. */
+export const GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV = "GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED";
+
+/**
+ * Capture the bootstrap secret before runtime initialization can evaluate tools or spawn
+ * children. The process environment is deliberately scrubbed synchronously even when the
+ * key is malformed, so a rejected launch cannot leak it to descendants.
+ */
+const coordinatorSidecarSigningKeyBootstrap = process.env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+const coordinatorSidecarSigningKey = (() => {
+	const encoded = coordinatorSidecarSigningKeyBootstrap;
+	delete process.env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	if (!encoded) return null;
+	try {
+		return createPrivateKey({ key: Buffer.from(encoded, "base64"), format: "der", type: "pkcs8" });
+	} catch {
+		return null;
+	}
+})();
+
+export function coordinatorSidecarSigningBootstrapEnv(): Record<string, string> {
+	const keyId = process.env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]?.trim();
+	return coordinatorSidecarSigningKeyBootstrap && keyId && coordinatorSidecarSigningKey
+		? {
+				[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+				[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: coordinatorSidecarSigningKeyBootstrap,
+				[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: keyId,
+			}
+		: {};
+}
+
+export function canonicalCoordinatorSidecarPayload(value: Record<string, unknown>): string {
+	const canonicalize = (entry: unknown): unknown => {
+		if (Array.isArray(entry)) return entry.map(canonicalize);
+		if (entry && typeof entry === "object")
+			return Object.fromEntries(
+				Object.keys(entry)
+					.sort()
+					.map(key => [key, canonicalize((entry as Record<string, unknown>)[key])]),
+			);
+		return entry;
+	};
+	return JSON.stringify(canonicalize(value));
+}
+
+function finalizeSidecarPayload(payload: Record<string, unknown>, keyId: string | null): Record<string, unknown> {
+	const unsigned = { ...payload };
+	delete unsigned.sidecar_key_id;
+	delete unsigned.sidecar_signature;
+	if (!keyId) return unsigned;
+	if (!coordinatorSidecarSigningKey) throw new PreviousRuntimeStateReadError();
+	Object.assign(unsigned, { sidecar_key_id: keyId });
+	const signedPayload = unsigned;
+	return {
+		...signedPayload,
+		sidecar_signature: sign(
+			null,
+			Buffer.from(canonicalCoordinatorSidecarPayload(unsigned)),
+			coordinatorSidecarSigningKey,
+		).toString("base64"),
+	};
+}
 
 export type RuntimeInputReadyMarker = Readonly<{
 	schema_version: 1;
@@ -568,6 +632,7 @@ interface RuntimeStateIdentity {
 	workdir: string;
 	sessionFile: string | null;
 	platform: NodeJS.Platform;
+	sidecarKeyId: string | null;
 }
 
 interface RuntimeStateSidecarPayload {
@@ -579,6 +644,8 @@ interface RuntimeStateSidecarPayload {
 	workdir?: unknown;
 	session_file?: unknown;
 	final_response?: { source?: unknown };
+	sidecar_key_id?: unknown;
+	sidecar_signature?: unknown;
 }
 
 export type TerminalRuntimeStateStatus =
@@ -746,13 +813,24 @@ function normalizedIdentity(
 	const cwd = context.cwd.trim();
 	const platform = context.platform ?? process.platform;
 	const pathApi = platform === "win32" ? path.win32 : path;
-	if (!sessionId || !cwd) throw new PreviousRuntimeStateReadError();
+	const sidecarSignatureRequired = process.env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]?.trim() === "true";
+	const sidecarKeyId = sidecarSignatureRequired
+		? process.env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]?.trim() || null
+		: null;
+	if (
+		!sessionId ||
+		!cwd ||
+		(sidecarSignatureRequired &&
+			(!sidecarKeyId || !/^[a-f0-9]{64}$/.test(sidecarKeyId) || !coordinatorSidecarSigningKey))
+	)
+		throw new PreviousRuntimeStateReadError();
 	return {
 		sessionId,
 		cwd: pathApi.resolve(cwd),
 		workdir: pathApi.resolve(cwd),
 		sessionFile: context.sessionFile == null ? null : pathApi.resolve(context.sessionFile),
 		platform,
+		sidecarKeyId,
 	};
 }
 
@@ -1048,6 +1126,25 @@ function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, i
 	// same session — the session_id match plus the broker-scoped file path is
 	// sufficient identity. Only refuse a genuinely foreign session_id.
 	if (previous.session_id !== input.sessionId) throw new PreviousRuntimeStateReadError();
+	// An explicit shared file requires a signature made by this launch's bootstrap key.
+	if (input.sidecarKeyId !== null && Object.keys(previous).length > 0 && previous.sidecar_key_id !== undefined) {
+		if (
+			previous.sidecar_key_id !== input.sidecarKeyId ||
+			typeof previous.sidecar_signature !== "string" ||
+			!coordinatorSidecarSigningKey
+		)
+			throw new PreviousRuntimeStateReadError();
+		const { sidecar_signature: signature, ...unsigned } = previous;
+		if (
+			!verify(
+				null,
+				Buffer.from(canonicalCoordinatorSidecarPayload(unsigned)),
+				createPublicKey(coordinatorSidecarSigningKey),
+				Buffer.from(signature, "base64"),
+			)
+		)
+			throw new PreviousRuntimeStateReadError();
+	}
 	// If the previous payload has runtime identity fields, verify them fully.
 	if (typeof previous.cwd === "string" && typeof previous.workdir === "string") {
 		if (
@@ -1097,7 +1194,7 @@ function basePayload(input: {
 		: classifyRuntimeToolActivity(input.previous.activity);
 	const activity =
 		readout.kind === "absent" ? undefined : readout.kind === "valid" ? readout.activity : input.previous.activity;
-	return {
+	const payload = {
 		schema_version: 1,
 		session_id: identity.sessionId,
 		state: input.state,
@@ -1116,6 +1213,7 @@ function basePayload(input: {
 		...(activity === undefined ? {} : { activity }),
 		...(input.context.ownerTerminal ? { owner_generation: input.context.ownerTerminal.generation } : {}),
 	};
+	return payload;
 }
 function booleanFromUnknown(value: unknown): boolean | null {
 	if (typeof value === "boolean") return value;
@@ -1272,8 +1370,14 @@ function postmortemExitDetails(
 	};
 }
 
-async function writeStateFileSync(stateFile: string, payload: Record<string, unknown>): Promise<void> {
-	await writeStateFile(stateFile, payload);
+async function writeStateFileSync(
+	stateFile: string,
+	payload: Record<string, unknown>,
+	keyId: string | null = process.env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]?.trim() === "true"
+		? process.env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]?.trim() || null
+		: null,
+): Promise<void> {
+	await writeStateFile(stateFile, finalizeSidecarPayload(payload, keyId));
 }
 
 /**
@@ -1365,16 +1469,20 @@ async function persistCoordinatorRuntimeToolActivity(
 						const priorActivity = readout.kind === "valid" ? readout.activity : null;
 						if (!Number.isSafeInteger((priorActivity?.seq ?? 0) + 1))
 							throw new RuntimeToolActivityRefusedError("its sequence cannot advance safely");
-						await writeStateFile(stateFile, {
-							...previous,
-							activity: nextRuntimeToolActivity(priorActivity, {
-								phase,
-								label,
-								digest: toolCallDigest(identity.sessionId, event.toolCallId),
-								isError: event.isError === true,
-								observedAt,
-							}),
-						});
+						await writeStateFileSync(
+							stateFile,
+							{
+								...previous,
+								activity: nextRuntimeToolActivity(priorActivity, {
+									phase,
+									label,
+									digest: toolCallDigest(identity.sessionId, event.toolCallId),
+									isError: event.isError === true,
+									observedAt,
+								}),
+							},
+							identity.sidecarKeyId,
+						);
 					}),
 			),
 	);
@@ -1474,7 +1582,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 									: {}),
 						};
 						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
-						await writeStateFile(stateFile, payload);
+						await writeStateFileSync(stateFile, payload, identity.sidecarKeyId);
 					}),
 			),
 	);

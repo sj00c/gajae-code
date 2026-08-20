@@ -191,8 +191,18 @@ const LIFECYCLE_OPERATIONS = new Set([
 	"session.delete",
 ]);
 
-function lifecycleFingerprint(operation: string, input: unknown): string {
-	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
+/** Bootstrap signing material and its public candidate id authorize a launch but are not lifecycle request identity. */
+function lifecycleRequestIdentity(input: Record<string, unknown>): Record<string, unknown> {
+	const identity = { ...input };
+	delete identity.coordinatorSidecarSigningKey;
+	delete identity.coordinatorSidecarKeyId;
+	return identity;
+}
+
+function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
+	return createHash("sha256")
+		.update(JSON.stringify({ operation, input: lifecycleRequestIdentity(input) }))
+		.digest("hex");
 }
 function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (response.ok) return "terminal_ok";
@@ -1576,7 +1586,10 @@ export class Broker {
 		}
 		const storedRequestHash = reconstructedDeleteCleanup ? this.ledger.get(identity)?.requestHash : undefined;
 		const requestHash =
-			storedRequestHash ?? createHash("sha256").update(canonicalJson({ operation, input })).digest("hex");
+			storedRequestHash ??
+			createHash("sha256")
+				.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
+				.digest("hex");
 		const prev = this.#chains.get(target) ?? Promise.resolve();
 		let release!: () => void;
 		const current = new Promise<void>(resolve => (release = resolve));

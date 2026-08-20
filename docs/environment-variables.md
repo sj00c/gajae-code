@@ -307,14 +307,17 @@ Set `mouse.enabled: true` to make the wheel scroll GJC's virtual session viewpor
 
 `gjc mcp-serve coordinator` exposes a GJC-native outward MCP bridge for Hermes-style coordinators. `gjc mcp-serve hermes` is a compatibility alias for the same bridge. The bridge is read-only by default and fails closed until roots and mutation classes are explicitly configured.
 
-Coordinator MCP currently exposes durable polling/await tools, not push subscriptions. Consume `gjc_coordinator_read_coordination_status`, `gjc_coordinator_read_turn`, or bounded `gjc_coordinator_await_turn` for state changes.
+Coordinator MCP currently exposes durable polling/await tools, not push subscriptions. Existing legacy handoffs that contain a token path but no authorization identity must be explicitly re-registered; reads report `codex_token_file_reregistration_required` rather than treating the state as corrupt or silently binding it. Re-registration re-proves the managed token file under the configured root.
+
+ Consume `gjc_coordinator_read_coordination_status`, `gjc_coordinator_read_turn`, or bounded `gjc_coordinator_await_turn` for state changes.
 
 | Variable | Behavior |
 | --- | --- |
 | `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. `gjc setup hermes` renders absolute normalized paths joined with the platform path delimiter (`:` on POSIX, `;` on Windows). The bridge parser also accepts commas, semicolons, and newlines for legacy manual configs. |
 | `GJC_COORDINATOR_MCP_MUTATIONS` | Enables mutating tool classes as a comma-separated list (`sessions`, `questions`, `reports`) or `all`. `sessions` covers session startup, prompt delivery, durable turn journal updates, queue, and force operations. Per-call `allow_mutation: true` is still required. |
-| `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by artifact reads (default `65536`, capped at `1048576`). |
+| `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by Linux-only artifact reads (default `65536`, capped at `1048576`). On macOS and Windows, artifact reads fail closed with generic `artifact_unavailable`; detect support through MCP `tools/list`; use the controller's approved repository/worktree reader and report bounded results instead. |
 | `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/coordinator-mcp`). |
+| `GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT` | Root for managed Codex handoff token files (default `<state-root>/codex-tokens`). Registered files must be owner-only regular non-symlink files beneath this root. Authenticated token-file handoff is unavailable on native Windows unless an equivalent secure ACL proof is provided; registration fails closed with `codex_authenticated_handoff_unavailable_windows`. |
 | `GJC_COORDINATOR_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
 | `GJC_COORDINATOR_MCP_REPO` | Optional repo namespace for session/question/report state. Missing scope never widens to global session enumeration. |
 | `GJC_COORDINATOR_MCP_SESSION_COMMAND` | Optional **typed SDK lifecycle selector**, never a shell command that the coordinator executes. The only supported values are exactly `gjc` and `gjc --worktree [name]`; the latter optionally selects the GJC-managed worktree name. Wrapper binaries, shell syntax, model/provider flags, tmux flags, and other legacy command shapes fail closed before session creation. `gjc setup hermes` renders `gjc --worktree` by default. When omitted, SDK lifecycle creation still uses the requested coordinator workdir; no coordinator-owned tmux startup or prompt injection is performed. |

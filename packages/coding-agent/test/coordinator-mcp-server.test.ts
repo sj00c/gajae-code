@@ -8,6 +8,7 @@ import {
 	readCodexHandoff,
 	registerCodexHandoff,
 } from "../src/coordinator-mcp/codex-handoff";
+import { buildCoordinatorMcpConfig } from "../src/coordinator-mcp/policy";
 import {
 	buildCoordinatorAskAnswerSchema,
 	type PrivateAskGateCodecV1,
@@ -16,7 +17,9 @@ import {
 import {
 	acknowledgePublicDelivery,
 	admitSessionClose,
+	advanceDeletion,
 	advanceDeliveryDiscoveryCursor,
+	claimPublicDelivery,
 	coordinatorStatePaths,
 	enumeratePublicDeliveries,
 	readDeliveryDiscoveryCursor,
@@ -29,6 +32,7 @@ import {
 	awaitCodexWakePublishesForTest,
 	awaitEventWebhookDeliveriesForTest,
 	createCoordinatorMcpServer,
+	readCoordinatorArtifact,
 } from "../src/coordinator-mcp/server";
 import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import { persistMcpDelegateHostContext } from "../src/hooks/mcp-delegate-host-context";
@@ -142,6 +146,10 @@ type SdkControlServerOptions = {
 	controlOptions?: Array<{ idempotencyKey?: string; timeoutMs?: number }>;
 	/** Per-query transport options, in dispatch order, parallel to the recorded query names. */
 	queryOptions?: Array<{ timeoutMs?: number } | undefined>;
+	/** Deterministic barrier after the accepted prompt receipt is durable and before turn finalization. */
+	afterPromptReceiptPersisted?: (sessionId: string) => void | Promise<void>;
+	/** Deterministic barrier after an answer dispatch is claimed and before final admission. */
+	afterAnswerRemoteStarted?: (sessionId: string) => void | Promise<void>;
 	/** Deterministic barrier between canonical acknowledgement and projection. */
 	afterCanonicalTurnCommit?: (sessionId: string) => void | Promise<void>;
 	/** Deterministic barrier between a canonical report commit and projection repair. */
@@ -213,7 +221,7 @@ function testBrokerDiscovery(): BrokerDiscovery {
 		packageGeneration: "test",
 		ownerId: "test-owner",
 		pid: process.pid,
-		incarnation: "test-incarnation",
+		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
 		host: "127.0.0.1",
 		port: 1,
 		url: "ws://broker.example.test",
@@ -347,6 +355,8 @@ async function createSdkControlServer(
 			canonicalizePath: serverOptions.canonicalizePath,
 			codexTransportFactory: serverOptions.codexTransportFactory,
 			eventWebhookDelivery: serverOptions.eventWebhookDelivery,
+			afterPromptReceiptPersisted: serverOptions.afterPromptReceiptPersisted,
+			afterAnswerRemoteStarted: serverOptions.afterAnswerRemoteStarted,
 			afterCanonicalTurnCommit: serverOptions.afterCanonicalTurnCommit,
 			afterCanonicalReportCommit: serverOptions.afterCanonicalReportCommit,
 			afterCanonicalReportSafeResponse: serverOptions.afterCanonicalReportSafeResponse,
@@ -397,6 +407,9 @@ async function createSdkControlServer(
 								ok: true,
 								result: {
 									sessionId,
+									...(typeof input.coordinatorSidecarKeyId === "string"
+										? { coordinatorSidecarKeyId: input.coordinatorSidecarKeyId }
+										: {}),
 									...(lifecycleCwd
 										? {
 												cwd: lifecycleCwd,
@@ -475,6 +488,7 @@ async function createSdkControlServer(
 		packageGeneration: "test",
 		ownerId: "test",
 		pid: process.pid,
+		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
 		host: "127.0.0.1",
 		port: 1,
 		url: "ws://sdk.example.test",
@@ -493,6 +507,93 @@ async function registerSdkSession(server: ReturnType<typeof createCoordinatorMcp
 		tmux_target: "visible-session:0.0",
 		idempotency_key: "register-1",
 		allow_mutation: true,
+	});
+}
+
+function coordinatorNamespace(root: string): string {
+	const config = buildCoordinatorMcpConfig({
+		GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+		GJC_COORDINATOR_MCP_PROFILE: "local",
+		GJC_COORDINATOR_MCP_REPO: "repo",
+	});
+	return path.join(config.stateRoot, "v1", config.namespace.identity, "projections");
+}
+
+function coordinatorSessionStatePath(root: string, sessionId: string): string {
+	return path.join(coordinatorNamespace(root), "session-states", `${sessionId}.json`);
+}
+
+async function materializeLegacyProjectionFixture(
+	root: string,
+	namespaceIdentity: string,
+	sessionId: string,
+): Promise<string> {
+	const projections = coordinatorNamespace(root);
+	const legacy = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+	for (const directory of ["sessions", "turns", "active-turns", "questions", "reports", "session-states"]) {
+		const sourceDirectory = path.join(projections, directory);
+		const names = await fs.readdir(sourceDirectory).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return [] as string[];
+			throw error;
+		});
+		for (const name of names) {
+			if (name.startsWith(".") || !name.endsWith(".json")) continue;
+			const source = path.join(sourceDirectory, name);
+			let value: Record<string, unknown> | null = null;
+			for (let attempt = 0; attempt < 10 && !value; attempt += 1) {
+				const raw = await fs.readFile(source, "utf8");
+				try {
+					if (raw.trim().length > 0) value = JSON.parse(raw) as Record<string, unknown>;
+				} catch (error) {
+					if (!(error instanceof SyntaxError) || attempt === 9) throw error;
+				}
+				if (!value) await Bun.sleep(5);
+			}
+			if (!value) throw new Error(`empty_legacy_projection:${source}`);
+			if (value.session_id !== sessionId) continue;
+			const targetDirectory = path.join(legacy, directory);
+			await fs.mkdir(targetDirectory, { recursive: true });
+			await fs.writeFile(
+				path.join(targetDirectory, name),
+				JSON.stringify({ ...value, namespace_identity: namespaceIdentity }),
+			);
+		}
+	}
+	return legacy;
+}
+
+async function currentEventCursor(root: string): Promise<number> {
+	const journal = path.join(coordinatorNamespace(root), "events", "event-journal.jsonl");
+	const raw = await fs.readFile(journal, "utf8").catch(() => "");
+	const lines = raw.trim().split("\n").filter(Boolean);
+	if (lines.length === 0) return 0;
+	const last = JSON.parse(lines.at(-1)!) as { seq?: unknown };
+	return typeof last.seq === "number" && Number.isSafeInteger(last.seq) ? last.seq : 0;
+}
+
+async function patchSessionState(
+	server: ReturnType<typeof createCoordinatorMcpServer>,
+	root: string,
+	sessionId: string,
+	patch: Record<string, unknown>,
+): Promise<void> {
+	const file = coordinatorSessionStatePath(root, sessionId);
+	const prior = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+	const signed = await server.signRuntimeSidecarPayloadForTest(sessionId, { ...prior, ...patch });
+	await fs.writeFile(file, JSON.stringify(signed));
+}
+
+async function patchTurnDelivery(
+	server: ReturnType<typeof createCoordinatorMcpServer>,
+	sessionId: string,
+	turnId: string,
+	patch: Record<string, unknown>,
+): Promise<void> {
+	const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+	await withSessionTransaction(paths, sessionId, async transaction => {
+		const turn = transaction.canonical.turns[turnId];
+		if (!turn) throw new Error(`missing turn ${turnId}`);
+		turn.delivery = { ...turn.delivery, ...patch };
 	});
 }
 
@@ -610,7 +711,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const registered = await registerSdkSession(server, root);
 		expect(registered).toMatchObject({ ok: true, registered: true, session_state: { state: "ready_for_input" } });
 		await Bun.write(
-			path.join(root, ".gjc", "coordinator-state", "local", "repo", "sessions", "visible-session.json"),
+			path.join(coordinatorNamespace(root), "sessions", "visible-session.json"),
 			JSON.stringify({
 				session_id: "visible-session",
 				cwd: root,
@@ -619,7 +720,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			}),
 		);
 		await Bun.write(
-			path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json"),
+			path.join(coordinatorNamespace(root), "session-states", "visible-session.json"),
 			JSON.stringify({
 				schema_version: 1,
 				session_id: "visible-session",
@@ -658,7 +759,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 	const DIGEST_B = `b${"1".repeat(63)}`;
 
 	function sessionStatePath(root: string): string {
-		return path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json");
+		return path.join(coordinatorNamespace(root), "session-states", "visible-session.json");
 	}
 
 	/** A sidecar-shaped snapshot, including the private correlation state readers must never see. */
@@ -1198,10 +1299,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const turnId = sent.turn_id;
 		if (typeof turnId !== "string") throw new Error("missing durable coordinator turn id");
 		const persisted = JSON.parse(
-			await fs.readFile(
-				path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${turnId}.json`),
-				"utf8",
-			),
+			await fs.readFile(path.join(coordinatorNamespace(root), "turns", `${turnId}.json`), "utf8"),
 		) as { delivery: Record<string, unknown> };
 		expect(persisted.delivery).toMatchObject({
 			runtime_command_id: "runtime-command-1",
@@ -1317,10 +1415,66 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		}
 		expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(8);
 		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(1);
+		await expect(fs.readdir(path.join(coordinatorNamespace(root), "turns"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 		await expect(
-			fs.readdir(path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns")),
-		).rejects.toMatchObject({ code: "ENOENT" });
+			server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			status: { state: "ready_for_input", ready_for_input: true, current_turn_id: null },
+		});
+		const repairedSidecar = JSON.parse(
+			await fs.readFile(coordinatorSessionStatePath(root, "visible-session"), "utf8"),
+		) as Record<string, unknown>;
+		expect(repairedSidecar.current_turn_id).toBeNull();
+		expect(repairedSidecar.state).toBe("ready_for_input");
 	});
+
+	it("restores the prior active turn correlation after a decided abort-and-prompt failure", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control =>
+				control.operation === "turn.abort_and_prompt"
+					? { accepted: true, commandId: "failed-force-command" }
+					: { accepted: true, command_id: "initial-command", turn_id: "initial-runtime-turn" },
+		});
+		await registerSdkSession(server, root);
+		const first = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "keep this turn active",
+			idempotency_key: "rollback-initial",
+			allow_mutation: true,
+		});
+		expect(first).toMatchObject({ ok: true, status: "active" });
+		const failed = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "this replacement must not be recorded",
+			force: true,
+			idempotency_key: "rollback-force",
+			allow_mutation: true,
+		});
+		expect(failed).toMatchObject({ ok: false, error: { code: "unavailable" } });
+		expect(await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" })).toMatchObject({
+			ok: true,
+			session_state: { state: "running", ready_for_input: false, current_turn_id: first.turn_id },
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+			canonical: {
+				queue: { active_turn_id: string | null };
+				turns: Record<string, { status?: string }>;
+			};
+		};
+		const firstTurnId = first.turn_id;
+		expect(typeof firstTurnId).toBe("string");
+		if (typeof firstTurnId !== "string") throw new Error("missing_first_turn_id");
+		expect(transaction.canonical.queue.active_turn_id).toBe(firstTurnId);
+		expect(transaction.canonical.turns[firstTurnId]?.status).toBe("active");
+		expect(Object.keys(transaction.canonical.turns)).toEqual([firstTurnId]);
+	});
+
 	it("surfaces Router request timeout errors without persisting a turn", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -1346,9 +1500,9 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			{ operation: "turn.prompt", input: { text: "bounded timeout" }, idempotencyKey: "bounded-timeout" },
 		]);
 		expect(controlOptions).toContainEqual({ idempotencyKey: "bounded-timeout" });
-		await expect(
-			fs.readdir(path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns")),
-		).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.readdir(path.join(coordinatorNamespace(root), "turns"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 	});
 	it("keeps post-send Router ambiguity retryable under the same prompt idempotency key", async () => {
 		const root = await tempRoot();
@@ -1622,18 +1776,93 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					cwd: root,
 					target: { path: root },
 					modelPreset: "codex-eco",
-					coordinatorStateDir: path.join(root, ".gjc", "coordinator-state", "local", "repo"),
+					coordinatorStateDir: coordinatorNamespace(root),
+					coordinatorSidecarSigningKey: expect.any(String),
+					coordinatorSidecarKeyId: expect.stringMatching(/^[0-9a-f]{64}$/),
 				},
-				idempotencyKey: "preset-start",
+				idempotencyKey: expect.stringMatching(/^remote_[a-f0-9]{64}$/),
 			},
 		]);
-		await expect(
-			fs.readFile(
-				path.join(root, ".gjc", "coordinator-state", "local", "repo", "sessions", "created-session-1.json"),
-				"utf8",
-			),
-		).resolves.toContain('"mpreset": "codex-eco"');
+		const durableSession = JSON.parse(
+			await fs.readFile(path.join(coordinatorNamespace(root), "sessions", "created-session-1.json"), "utf8"),
+		) as Record<string, unknown>;
+		const lifecycleKeyId = (lifecycleControls(controls)[0]!.input as Record<string, unknown>).coordinatorSidecarKeyId;
+		expect(lifecycleKeyId).toBe((durableSession.sidecar_verifier as { key_id: string }).key_id);
+		expect(lifecycleKeyId).toMatch(/^[0-9a-f]{64}$/);
+		expect(durableSession.mpreset).toBe("codex-eco");
 	});
+	it("fences lifecycle creation with remote_started registry and replays without duplication", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const deferred = Promise.withResolvers<unknown>();
+		let lifecycleInput: Record<string, unknown> | undefined;
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			globalResult: (operation, input, brokerSessions) => {
+				if (operation !== "session.create") return undefined;
+				lifecycleInput = input;
+				return deferred.promise.then(async result => {
+					const endpointPath = path.join(root, ".gjc", "state", "sdk", "created-session-1.json");
+					await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+					await Bun.write(
+						endpointPath,
+						JSON.stringify({
+							sessionId: "created-session-1",
+							pid: process.pid,
+							url: "ws://sdk.example.test",
+							token: "test-token",
+						}),
+					);
+					brokerSessions.push({
+						sessionId: "created-session-1",
+						locator: { repo: root },
+						live: true,
+						endpointGeneration: 1,
+						pid: process.pid,
+						endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+					});
+					return {
+						...(result as Record<string, unknown>),
+						result: {
+							...(result as { result: Record<string, unknown> }).result,
+							coordinatorSidecarKeyId: input.coordinatorSidecarKeyId,
+						},
+					};
+				});
+			},
+		});
+		const startedPromise = server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "deferred-create-fence",
+			allow_mutation: true,
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		let creation: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 50 && (!creation || !lifecycleInput); attempt++) {
+			try {
+				const registry = JSON.parse(await fs.readFile(paths.registry, "utf8")) as Record<string, unknown>;
+				const creations = registry.creations as Record<string, Record<string, unknown>> | undefined;
+				const candidate = creations ? Object.values(creations)[0] : undefined;
+				creation = candidate?.phase === "remote_started" ? candidate : undefined;
+			} catch {
+				// The registry may not exist until the initial claim transaction completes.
+			}
+			if (!creation || !lifecycleInput) await Bun.sleep(5);
+		}
+		expect(creation).toMatchObject({ phase: "remote_started" });
+		expect((creation?.sidecar_verifier as Record<string, unknown>)?.key_id).toBe(
+			lifecycleInput?.coordinatorSidecarKeyId,
+		);
+		deferred.resolve({
+			ok: true,
+			result: {
+				sessionId: "created-session-1",
+				endpoint: { url: "ws://broker.example.test", token: "test-token" },
+			},
+		});
+		await expect(startedPromise).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
+	});
+
 	it("keeps lifecycle endpoint credentials out of start_session results", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -1688,9 +1917,11 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			input: {
 				cwd: root,
 				target: { path: root, worktree: { enabled: true, name: "hermes" } },
-				coordinatorStateDir: path.join(root, ".gjc", "coordinator-state", "local", "repo"),
+				coordinatorStateDir: coordinatorNamespace(root),
+				coordinatorSidecarSigningKey: expect.any(String),
+				coordinatorSidecarKeyId: expect.stringMatching(/^[0-9a-f]{64}$/),
 			},
-			idempotencyKey: "worktree-start",
+			idempotencyKey: expect.stringMatching(/^remote_[a-f0-9]{64}$/),
 		});
 	});
 
@@ -1804,11 +2035,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		};
 		const first = await server.callTool("gjc_coordinator_report_status", request);
 		const receiptPath = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
+			coordinatorNamespace(root),
 			"idempotency",
 			`${createHash("sha256").update(request.idempotency_key).digest("hex")}.json`,
 		);
@@ -1862,10 +2089,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			terminal_fence: { status: "completed" },
 		});
 		const journal = (
-			await fs.readFile(
-				path.join(root, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl"),
-				"utf8",
-			)
+			await fs.readFile(path.join(coordinatorNamespace(root), "events", "event-journal.jsonl"), "utf8")
 		)
 			.trim()
 			.split("\n")
@@ -1912,11 +2136,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		await expect(server.callTool("gjc_coordinator_report_status", request)).resolves.toMatchObject({ ok: false });
 		if (!persistedSafeResponse) throw new Error("canonical safe response was not persisted");
 		const receiptPath = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
+			coordinatorNamespace(root),
 			"idempotency",
 			`${createHash("sha256").update(request.idempotency_key).digest("hex")}.json`,
 		);
@@ -1938,7 +2158,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const reportId = Object.keys(transaction.canonical.reports)[0];
 		if (!reportId) throw new Error("missing canonical report");
 		await expect(
-			fs.readFile(path.join(server.config.stateRoot, "local", "repo", "reports", `${reportId}.json`), "utf8"),
+			fs.readFile(path.join(coordinatorNamespace(root), "reports", `${reportId}.json`), "utf8"),
 		).resolves.toContain("safe response barrier");
 	});
 
@@ -1978,11 +2198,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		};
 		await expect(server.callTool("gjc_coordinator_report_status", request)).resolves.toMatchObject({ ok: false });
 		const receiptPath = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
+			coordinatorNamespace(root),
 			"idempotency",
 			`${createHash("sha256").update(request.idempotency_key).digest("hex")}.json`,
 		);
@@ -2002,7 +2218,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const queuedTurnId = String(queued.turn_id);
 		const reportId = Object.keys(transaction.canonical.reports)[0];
 		if (!reportId) throw new Error("missing recovered report");
-		const projectionRoot = path.join(server.config.stateRoot, "local", "repo");
+		const projectionRoot = coordinatorNamespace(root);
 		expect(transaction.canonical.queue).toMatchObject({ active_turn_id: queuedTurnId });
 		expect(transaction.canonical.turns[String(sent.turn_id)]).toMatchObject({ status: "completed" });
 		const activeProjection = JSON.parse(
@@ -2095,6 +2311,22 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		}
 	});
 
+	it("accepts the advertised explicit other:false answer form", () => {
+		const codec: PrivateAskGateCodecV1 = {
+			schema_version: 1,
+			labels: ["Continue"],
+			recommended_index: null,
+			multi: false,
+			allow_empty: true,
+			other_allowed: true,
+			clarification_allowed: true,
+		};
+		expect(validateCoordinatorAskAnswer(codec, { selected: ["opt_0"], other: false })).toEqual({
+			selected: ["opt_0"],
+			other: false,
+		});
+	});
+
 	it("replays composite start and report mutations without allocating another turn or report", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -2150,15 +2382,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		];
 		const server = await createSdkControlServer(root, controls, undefined, undefined, sessions);
 		await registerSdkSession(server, root);
-		const recordPath = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
-			"sessions",
-			"visible-session.json",
-		);
+		const recordPath = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
 		const record = JSON.parse(await fs.readFile(recordPath, "utf8"));
 		await Bun.write(
 			recordPath,
@@ -2280,11 +2504,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const server = await createSdkControlServer(root, controls);
 		const corruptKey = "corrupt-report";
 		const corruptFile = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
+			coordinatorNamespace(root),
 			"idempotency",
 			`${createHash("sha256").update(corruptKey).digest("hex")}.json`,
 		);
@@ -2298,17 +2518,11 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				allow_mutation: true,
 			}),
 		).resolves.toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
-		expect(
-			await fs.readdir(path.join(root, ".gjc", "coordinator-state", "local", "repo", "reports")).catch(() => []),
-		).toEqual([]);
+		expect(await fs.readdir(path.join(coordinatorNamespace(root), "reports")).catch(() => [])).toEqual([]);
 
 		await registerSdkSession(server, root);
 		const registerFile = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
+			coordinatorNamespace(root),
 			"idempotency",
 			`${createHash("sha256").update("register-1").digest("hex")}.json`,
 		);
@@ -2383,15 +2597,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			},
 		];
 		const server = await createSdkControlServer(root, controls, undefined, undefined, sessions);
-		const recordPath = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
-			"sessions",
-			"visible-session.json",
-		);
+		const recordPath = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
 		for (const [registrationKey, endpointMtimeMs] of [
 			["reap-first-registration", 1],
 			["reap-second-registration", 2],
@@ -2444,15 +2650,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
 		await registerSdkSession(server, root);
-		const recordPath = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
-			"sessions",
-			"visible-session.json",
-		);
+		const recordPath = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
 		const record = JSON.parse(await fs.readFile(recordPath, "utf8"));
 		await Bun.write(
 			recordPath,
@@ -2511,10 +2709,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		if (typeof queuedTurnId !== "string") throw new Error("missing queued coordinator turn id");
 		const queuedAcknowledgement = queued.result as { command_id?: unknown; turn_id?: unknown };
 		const persistedQueuedTurn = JSON.parse(
-			await fs.readFile(
-				path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${queuedTurnId}.json`),
-				"utf8",
-			),
+			await fs.readFile(path.join(coordinatorNamespace(root), "turns", `${queuedTurnId}.json`), "utf8"),
 		) as { delivery: Record<string, unknown> };
 		expect(persistedQueuedTurn.delivery).toMatchObject({
 			runtime_command_id: queuedAcknowledgement.command_id,
@@ -2868,9 +3063,11 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					input: {
 						cwd: root,
 						target: { path: root },
-						coordinatorStateDir: path.join(root, ".gjc", "coordinator-state", "local", "repo"),
+						coordinatorStateDir: coordinatorNamespace(root),
+						coordinatorSidecarSigningKey: expect.any(String),
+						coordinatorSidecarKeyId: expect.stringMatching(/^[0-9a-f]{64}$/),
 					},
-					idempotencyKey: "plan",
+					idempotencyKey: expect.stringMatching(/^remote_[a-f0-9]{64}$/),
 				},
 				{
 					operation: "turn.prompt",
@@ -2889,7 +3086,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		const host = await persistMcpDelegateHostContext({
 			cwd: root,
 			sessionId: "visible-session",
@@ -2897,11 +3094,16 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			prompt: "$gjc-mcp-delegate-flow",
 		});
 		if (!host) throw new Error("host context was not persisted");
+		const tokenRoot = path.join(namespace, "codex-tokens");
+		await fs.mkdir(tokenRoot, { recursive: true, mode: 0o700 });
+		const tokenFile = path.join(tokenRoot, "codex-bridge.token");
+		await fs.writeFile(tokenFile, "test-token", { mode: 0o600 });
+		await fs.chmod(tokenFile, 0o600);
 		const source = await registerCodexHandoff(namespace, {
 			work_unit: "visible-session",
 			thread_id: "thread-codex-1",
 			endpoint: { kind: "unix", path: "/tmp/codex-bridge.sock" },
-			token_file: "/tmp/codex-bridge.token",
+			token_file: tokenFile,
 		});
 		const sourceFile = path.join(namespace, "codex-handoffs", "visible-session.json");
 		const sourceBefore = await fs.readFile(sourceFile, "utf8");
@@ -2962,7 +3164,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await registerCodexHandoff(namespace, {
 			work_unit: "codex-host-1",
 			thread_id: "thread-explicit-one",
@@ -2990,7 +3192,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await persistMcpDelegateHostContext({
 			cwd: root,
 			sessionId: "ambient-codex-host",
@@ -3026,7 +3228,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 
 		await expect(
 			server.callTool("gjc_delegate_execute", {
@@ -3045,7 +3247,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 
 		await expect(
 			server.callTool("gjc_delegate_execute", {
@@ -3064,7 +3266,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await fs.mkdir(path.join(namespace, "codex-handoffs"), { recursive: true });
 		await fs.writeFile(path.join(namespace, "codex-handoffs", "corrupt-codex-host.json"), "{ not json", "utf8");
 
@@ -3085,7 +3287,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		for (const [sessionId, threadId] of [
 			["host-one", "thread-one"],
 			["host-two", "thread-two"],
@@ -3114,7 +3316,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		for (const sessionId of ["same-thread-one", "same-thread-two"]) {
 			await persistMcpDelegateHostContext({ cwd: root, sessionId, prompt: "$gjc-mcp-delegate-flow" });
 			await registerCodexHandoff(namespace, {
@@ -3140,7 +3342,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		for (const [directory, sessionId, promptExcerpt] of [
 			["_session-traversal", "../evil", "resume"],
 			["_session-oversized", "oversized", "x".repeat(1024 * 1024)],
@@ -3195,7 +3397,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				close: async () => {},
 			}),
 		});
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await persistMcpDelegateHostContext({
 			cwd: root,
 			sessionId: "visible-session",
@@ -3241,7 +3443,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await persistMcpDelegateHostContext({
 			cwd: root,
 			sessionId: "host-without-handoff",
@@ -3276,7 +3478,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await persistMcpDelegateHostContext({
 			cwd: root,
 			sessionId: "host-context",
@@ -3320,7 +3522,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await persistMcpDelegateHostContext({
 			cwd: root,
 			sessionId: "host-context",
@@ -3352,7 +3554,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await persistMcpDelegateHostContext({
 			cwd: root,
 			sessionId: "host-context-mixed",
@@ -3396,7 +3598,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await persistMcpDelegateHostContext({
 			cwd: root,
 			sessionId: "host-context-all-stale",
@@ -3433,7 +3635,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await persistMcpDelegateHostContext({
 			cwd: root,
 			sessionId: "direct-host",
@@ -3463,7 +3665,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await persistMcpDelegateHostContext({
 			cwd: root,
 			sessionId: "valid-host",
@@ -3497,7 +3699,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		const contextPath = path.join(root, ".gjc", "_session-corrupt-host", "state", "mcp-delegate-host-context.json");
 		await fs.mkdir(path.dirname(contextPath), { recursive: true });
 		await fs.writeFile(contextPath, "{", "utf8");
@@ -3625,6 +3827,17 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
 		await registerSdkSession(server, root);
+		const creationPaths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const creationTransaction = await withSessionTransaction(
+			creationPaths,
+			"visible-session",
+			async transaction => transaction,
+		);
+		expect(Object.values(creationTransaction.outbox)).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ kind: "session.registered", entity_id: "visible-session" }),
+			]),
+		);
 		const report = await server.callTool("gjc_coordinator_report_status", {
 			session_id: "visible-session",
 			status: "blocked",
@@ -3794,15 +4007,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
 		await registerSdkSession(server, root);
-		const sessionFile = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
-			"sessions",
-			"visible-session.json",
-		);
+		const sessionFile = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
 		const record = JSON.parse(await fs.readFile(sessionFile, "utf8"));
 		await Bun.write(
 			sessionFile,
@@ -3826,6 +4031,83 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			}),
 		]);
 		expect(await Bun.file(sessionFile).exists()).toBe(false);
+		const cleanupRegistry = JSON.parse(
+			await fs.readFile(
+				coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity).registry,
+				"utf8",
+			),
+		) as {
+			deletions: Record<string, { cleanup?: { turn_ids?: string[]; report_ids?: string[] } }>;
+		};
+		const cleanupEntry = Object.values(cleanupRegistry.deletions).find(entry => entry.cleanup !== undefined);
+		expect(cleanupEntry?.cleanup?.turn_ids).toEqual(expect.any(Array));
+		expect(cleanupEntry?.cleanup?.report_ids).toEqual(expect.any(Array));
+	});
+
+	it("recovers deletion after a crash between WAL unlink and cleanup progress", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sessionFile = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
+		const session = JSON.parse(await fs.readFile(sessionFile, "utf8")) as Record<string, unknown>;
+		await Bun.write(sessionFile, JSON.stringify({ ...session, ephemeral: true }));
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+			endpoint?: { incarnation?: unknown };
+			canonical: { turns: Record<string, unknown>; reports: Record<string, unknown> };
+		};
+		const endpointIncarnation = String(transaction.endpoint?.incarnation ?? "");
+		if (!endpointIncarnation) throw new Error("missing endpoint incarnation");
+		// The close admission requires no retained public delivery. Mark the
+		// already-exported creation edge acknowledged, then simulate the exact
+		// crash point by unlinking only the canonical WAL.
+		await withSessionTransaction(paths, "visible-session", async current => {
+			for (const event of Object.values(current.outbox)) {
+				event.emitted = true;
+				event.public_delivery.state = "acknowledged";
+				event.public_delivery.journal_seq = 1;
+				event.public_delivery.acknowledged_at = new Date().toISOString();
+			}
+		});
+		const deletionId = `delete:visible-session:${endpointIncarnation}`;
+		const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+		await admitSessionClose(paths, {
+			deletion_id: deletionId,
+			session_id: "visible-session",
+			endpoint_incarnation: endpointIncarnation,
+			operation_id: deletionId,
+			key_digest: deletionKey,
+			request_digest: deletionKey,
+			close_key: deletionId,
+			phase: "intent",
+			cleanup: { wal: false, turns: false, reports: false, session: false, events: false },
+			authority_digest: deletionKey,
+			created_at: new Date().toISOString(),
+			updated_at: new Date().toISOString(),
+		});
+		await advanceDeletion(paths, deletionId, "broker_closed", {
+			turn_ids: Object.keys(transaction.canonical.turns),
+			report_ids: Object.keys(transaction.canonical.reports),
+		});
+		// Simulate the crash window after the WAL unlink but before the registry
+		// cleanup checkpoint. The deletion manifest is the remaining authority.
+		await fs.rm(transactionPath(paths, "visible-session"));
+
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", {
+				session_id: "visible-session",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, closed: true });
+		const registry = JSON.parse(await fs.readFile(paths.registry, "utf8")) as {
+			deletions: Record<string, { phase?: string; cleanup?: { wal?: boolean } }>;
+			roster?: Record<string, unknown>;
+			retained_sessions?: Record<string, unknown>;
+		};
+		expect(registry.deletions[deletionId]).toMatchObject({ phase: "completed", cleanup: { wal: true } });
+		expect(registry.roster?.["visible-session"]).toBeUndefined();
+		expect(registry.retained_sessions?.["visible-session"]).toBeUndefined();
 	});
 
 	it("does not repeat broker close after post-close verification becomes uncertain", async () => {
@@ -3893,7 +4175,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				allow_mutation: true,
 			}),
 		).resolves.toMatchObject({ ok: true });
-		const sessionsDir = path.join(root, ".gjc", "coordinator-state", "local", "repo", "sessions");
+		const sessionsDir = path.join(coordinatorNamespace(root), "sessions");
 		const idleFile = path.join(sessionsDir, "idle-session.json");
 		const staleAt = new Date(Date.now() - 31 * 60_000).toISOString();
 		const idle = JSON.parse(await fs.readFile(idleFile, "utf8"));
@@ -3910,7 +4192,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			transaction.projection.applied_active_revision = nextRevision;
 			transaction.projection.applied_events_revision = nextRevision;
 		});
-		await fs.rm(path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "idle-session.json"));
+		await fs.rm(path.join(coordinatorNamespace(root), "session-states", "idle-session.json"));
 		await Bun.write(
 			path.join(sessionsDir, "registered-session.json"),
 			JSON.stringify({
@@ -4350,20 +4632,12 @@ it("repairs one terminal session without deleting another session's projections"
 			allow_mutation: true,
 		}),
 	).resolves.toMatchObject({ ok: true });
-	const secondTurnPath = path.join(
-		root,
-		".gjc",
-		"coordinator-state",
-		"local",
-		"repo",
-		"turns",
-		`${String(second.turn_id)}.json`,
-	);
+	const secondTurnPath = path.join(coordinatorNamespace(root), "turns", `${String(second.turn_id)}.json`);
 	await expect(fs.readFile(secondTurnPath, "utf8")).resolves.toContain("other-session");
 });
 
 function coordinatorSessionStateFile(root: string): string {
-	return path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json");
+	return path.join(coordinatorNamespace(root), "session-states", "visible-session.json");
 }
 
 async function writeCoordinatorSessionState(root: string, state: string): Promise<void> {
@@ -4621,7 +4895,7 @@ describe("Coordinator MCP prepared session activation", () => {
 
 		const first = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
 		const question = (first.questions as Array<Record<string, unknown>>)[0]!;
-		const journal = path.join(root, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl");
+		const journal = path.join(coordinatorNamespace(root), "events", "event-journal.jsonl");
 		const opened = (await fs.readFile(journal, "utf8"))
 			.trim()
 			.split("\n")
@@ -4644,15 +4918,7 @@ describe("Coordinator MCP prepared session activation", () => {
 		expect(
 			JSON.parse(
 				await fs.readFile(
-					path.join(
-						root,
-						".gjc",
-						"coordinator-state",
-						"local",
-						"repo",
-						"codex-wake-events",
-						`visible-session__${opened[0]?.seq}.json`,
-					),
+					path.join(coordinatorNamespace(root), "codex-wake-events", `visible-session__${opened[0]?.seq}.json`),
 					"utf8",
 				),
 			),
@@ -4738,14 +5004,9 @@ it("keeps parallel pending questions isolated when one answer is submitted", asy
 		updated_at: questionBBefore.updated_at,
 		answer_binding: questionBBefore.answer_binding,
 	});
-	const journalB = await fs.readFile(
-		path.join(rootB, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl"),
-		"utf8",
-	);
+	const journalB = await fs.readFile(path.join(coordinatorNamespace(rootB), "events", "event-journal.jsonl"), "utf8");
 	expect(journalB).not.toContain("question.answered");
-	await expect(
-		fs.access(path.join(rootB, ".gjc", "coordinator-state", "local", "repo", "codex-wake-events")),
-	).rejects.toThrow();
+	await expect(fs.access(path.join(coordinatorNamespace(rootB), "codex-wake-events"))).rejects.toThrow();
 });
 
 it("issue-4351: completed coordinator session reports ready_for_input false and ended_at", async () => {
@@ -4769,15 +5030,7 @@ it("issue-4351: completed coordinator session reports ready_for_input false and 
 		idempotency_key: "issue-4351-terminal",
 		allow_mutation: true,
 	});
-	const statePath = path.join(
-		root,
-		".gjc",
-		"coordinator-state",
-		"local",
-		"repo",
-		"session-states",
-		"visible-session.json",
-	);
+	const statePath = path.join(coordinatorNamespace(root), "session-states", "visible-session.json");
 	const durable = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
 	expect(durable.state).toBe("completed");
 	expect(durable.ready_for_input).toBe(false);
@@ -4815,8 +5068,17 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 				idempotency_key: key,
 				allow_mutation: true,
 			});
-		await injectPendingDeliveryForTest(server, "gamma-session", "event-gamma-empty", 1);
 		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		for (const sessionId of ["alpha-session", "beta-session", "gamma-session"] as const)
+			await withSessionTransaction(paths, sessionId, async transaction => {
+				for (const event of Object.values(transaction.outbox)) {
+					event.emitted = true;
+					event.public_delivery.state = "acknowledged";
+					event.public_delivery.journal_seq = 1;
+					event.public_delivery.acknowledged_at = new Date().toISOString();
+				}
+			});
+		await injectPendingDeliveryForTest(server, "gamma-session", "event-gamma-empty", 1);
 		const empty = await enumeratePublicDeliveries(paths, "@session:", 1);
 		expect(empty.claims).toHaveLength(0);
 		expect(empty.next_cursor).toBe("@session:beta-session");
@@ -4865,14 +5127,66 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
 		await registerSdkSession(server, root);
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await withSessionTransaction(paths, "visible-session", async transaction => {
+			for (const event of Object.values(transaction.outbox)) {
+				event.emitted = true;
+				event.public_delivery.state = "acknowledged";
+				event.public_delivery.journal_seq = 1;
+				event.public_delivery.acknowledged_at = new Date().toISOString();
+			}
+		});
 		await injectPendingDeliveryForTest(server, "visible-session", "event-revision-9", 9);
 		await injectPendingDeliveryForTest(server, "visible-session", "event-revision-10", 10);
-		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
 		const first = await enumeratePublicDeliveries(paths, "", 1);
 		expect(first.claims.map(claim => claim.event.transaction_revision)).toEqual([9]);
 		if (!first.next_cursor) throw new Error("missing continuation cursor");
 		const second = await enumeratePublicDeliveries(paths, first.next_cursor, 1);
 		expect(second.claims.map(claim => claim.event.transaction_revision)).toEqual([10]);
+	});
+
+	it("does not lease events beyond the aggregate delivery page", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [
+			{ sessionId: "alpha-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+			{ sessionId: "beta-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+		]);
+		for (const [sessionId, key] of [
+			["alpha-session", "register-aggregate-alpha"],
+			["beta-session", "register-aggregate-beta"],
+		] as const)
+			await server.callTool("gjc_coordinator_register_session", {
+				session_id: sessionId,
+				cwd: root,
+				idempotency_key: key,
+				allow_mutation: true,
+			});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		for (const sessionId of ["alpha-session", "beta-session"] as const)
+			await withSessionTransaction(paths, sessionId, async transaction => {
+				for (const event of Object.values(transaction.outbox)) {
+					event.emitted = true;
+					event.public_delivery.state = "acknowledged";
+					event.public_delivery.journal_seq = 1;
+					event.public_delivery.acknowledged_at = new Date().toISOString();
+				}
+			});
+		await injectPendingDeliveryForTest(server, "alpha-session", "aggregate-alpha", 1);
+		for (const [index, eventId] of [
+			"aggregate-beta-1",
+			"aggregate-beta-2",
+			"aggregate-beta-3",
+			"aggregate-beta-4",
+		].entries())
+			await injectPendingDeliveryForTest(server, "beta-session", eventId, index + 1);
+		const page = await enumeratePublicDeliveries(paths, "", 2);
+		expect(page.claims.map(claim => claim.event.public_event_id)).toEqual(["aggregate-alpha", "aggregate-beta-1"]);
+		const beta = await withSessionTransaction(paths, "beta-session", async transaction =>
+			Object.values(transaction.outbox).filter(event => event.public_event_id.startsWith("aggregate-beta")),
+		);
+		expect(beta.filter(event => event.public_delivery.state === "claimed")).toHaveLength(1);
+		expect(beta.filter(event => event.public_delivery.state === "pending")).toHaveLength(3);
 	});
 
 	it("reconciles newly opened session-scoped questions after a filesystem wake", async () => {
@@ -4903,33 +5217,19 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 			(sent.turn as Record<string, unknown>).delivery &&
 				((sent.turn as Record<string, unknown>).delivery as Record<string, unknown>).runtime_turn_id,
 		);
-		const sessionStateFile = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
-			"session-states",
-			"visible-session.json",
-		);
-		const sessionState = JSON.parse(await fs.readFile(sessionStateFile, "utf8")) as Record<string, unknown>;
-		await fs.writeFile(
-			sessionStateFile,
-			JSON.stringify({
-				...sessionState,
-				state: "needs_user_input",
-				ready_for_input: false,
-				live: true,
-				source: "agent_session_event",
-				current_turn_id: String(sent.turn_id),
-				activity: {
-					seq: 1,
-					phase: "waiting",
-					active_tool_count: 0,
-					active_tools: [],
-				},
-			}),
-		);
+		await patchSessionState(server, root, "visible-session", {
+			state: "needs_user_input",
+			ready_for_input: false,
+			live: true,
+			source: "agent_session_event",
+			current_turn_id: String(sent.turn_id),
+			activity: {
+				seq: 1,
+				phase: "waiting",
+				active_tool_count: 0,
+				active_tools: [],
+			},
+		});
 		const initial = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
 		const cursor = Number(initial.next_after_seq);
 		gateAvailable = true;
@@ -4938,7 +5238,7 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 			after_seq: cursor,
 			timeout_ms: 500,
 		});
-		await appendCoordinatorEventForTest(path.join(root, ".gjc", "coordinator-state", "local", "repo"), {
+		await appendCoordinatorEventForTest(coordinatorNamespace(root), {
 			kind: "session.state_changed",
 			sessionId: "visible-session",
 			summary: "wake",
@@ -4949,6 +5249,415 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 			events: expect.arrayContaining([
 				expect.objectContaining({ kind: "question.opened", question_id: "wake-gate" }),
 			]),
+		});
+	});
+
+	it("imports a pre-WAL active Q12 turn into canonical admission, listing, and answer handling", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "unbound";
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: [sharedAskGate("legacy-q12", runtimeTurnId)],
+								complete: true,
+								revision: "legacy-q12",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				controlResult: control =>
+					control.operation === "workflow.gate_answer" ? { status: "accepted" } : undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "legacy waiting gate",
+			idempotency_key: "legacy-q12-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.result as Record<string, unknown>).turn_id);
+		await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		await patchSessionState(server, root, "visible-session", {
+			state: "needs_user_input",
+			ready_for_input: false,
+			live: true,
+			source: "agent_session_event",
+			current_turn_id: sent.turn_id,
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await materializeLegacyProjectionFixture(root, server.config.namespace.identity, "visible-session");
+		await fs.rm(transactionPath(paths, "visible-session"));
+
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		expect(listed).toMatchObject({
+			ok: true,
+			questions: [expect.objectContaining({ question_id: "legacy-q12", status: "pending" })],
+		});
+		const imported = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+			canonical: { queue: { active_turn_id: string | null }; turns: Record<string, { status: string }> };
+		};
+		const sentTurnId = sent.turn_id;
+		expect(typeof sentTurnId).toBe("string");
+		if (typeof sentTurnId !== "string") throw new Error("missing_legacy_turn_id");
+		expect(imported.canonical.queue.active_turn_id).toBe(sentTurnId);
+		expect(imported.canonical.turns[sentTurnId]).toMatchObject({
+			status: "waiting_for_answer",
+			question_ids: ["legacy-q12"],
+			runtime_provenance: expect.objectContaining({
+				coordinator_turn_id: sentTurnId,
+				runtime_turn_id: runtimeTurnId,
+			}),
+		});
+		const answer = await server.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "legacy-q12",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "legacy-q12-answer",
+			allow_mutation: true,
+		});
+		expect(answer).toMatchObject({ ok: true, operation: "workflow.gate_answer", status: "accepted" });
+		const replay = await server.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "legacy-q12",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "legacy-q12-answer",
+			allow_mutation: true,
+		});
+		expect(replay).toEqual(answer);
+		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(1);
+	});
+
+	it("quarantines inconsistent pre-WAL active projections without creating canonical state", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "inconsistent legacy projection",
+			idempotency_key: "inconsistent-legacy-prompt",
+			allow_mutation: true,
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const legacy = await materializeLegacyProjectionFixture(
+			root,
+			server.config.namespace.identity,
+			"visible-session",
+		);
+		const activePath = path.join(legacy, "active-turns", "visible-session.json");
+		const active = JSON.parse(await fs.readFile(activePath, "utf8")) as Record<string, unknown>;
+		const hostileActive = JSON.stringify({ ...active, turn_id: "missing-legacy-turn" });
+		await fs.writeFile(activePath, hostileActive);
+		await fs.rm(transactionPath(paths, "visible-session"));
+
+		const result = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(result).toMatchObject({ ok: false, error: { code: "unavailable" } });
+		await expect(fs.access(transactionPath(paths, "visible-session"))).rejects.toThrow();
+		expect(await fs.readFile(activePath, "utf8")).toBe(hostileActive);
+		expect(sent).toMatchObject({ ok: true });
+	});
+
+	it("quarantines hostile nested legacy terminal and report fields before creating a WAL", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "terminal legacy validation",
+			idempotency_key: "terminal-legacy-validation",
+			allow_mutation: true,
+		});
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			status: "completed",
+			summary: "done",
+			idempotency_key: "terminal-legacy-report",
+			allow_mutation: true,
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const legacy = await materializeLegacyProjectionFixture(
+			root,
+			server.config.namespace.identity,
+			"visible-session",
+		);
+		const turnPath = path.join(legacy, "turns", `${sent.turn_id}.json`);
+		const turn = JSON.parse(await fs.readFile(turnPath, "utf8")) as Record<string, unknown>;
+		const hostileTurn = JSON.stringify({
+			...turn,
+			delivery: {
+				...(turn.delivery as Record<string, unknown>),
+				attempts: [{ delivered: "yes", created_at: "never", reason: 7 }],
+			},
+			final_response: { text: 7 },
+			evidence: ["not-a-record"],
+			error: { code: 1, message: null, recoverable: "no" },
+			liveness: { checked_at: "never", live: "yes", reason: 4 },
+			runtime_provenance: { namespace_id: "wrong" },
+			terminal_fence: { epoch: 0, status: "active", reason: 7, at: "never" },
+		});
+		await fs.writeFile(turnPath, hostileTurn);
+		const [reportName] = (await fs.readdir(path.join(legacy, "reports"))).filter(name => name.endsWith(".json"));
+		if (!reportName) throw new Error("missing_legacy_report");
+		const reportPath = path.join(legacy, "reports", reportName);
+		const report = JSON.parse(await fs.readFile(reportPath, "utf8")) as Record<string, unknown>;
+		const hostileReport = JSON.stringify({ ...report, evidence_paths: [7], created_at: "never" });
+		await fs.writeFile(reportPath, hostileReport);
+		await fs.rm(transactionPath(paths, "visible-session"));
+
+		const result = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(result).toMatchObject({ ok: false, error: { code: "unavailable" } });
+		await expect(fs.access(transactionPath(paths, "visible-session"))).rejects.toThrow();
+		expect(await fs.readFile(turnPath, "utf8")).toBe(hostileTurn);
+		expect(await fs.readFile(reportPath, "utf8")).toBe(hostileReport);
+	});
+
+	const unavailableEnvelope = {
+		ok: false,
+		error: { code: "unavailable", message: "Coordinator service is unavailable." },
+	};
+	it.each([
+		"null",
+		"false",
+		"0",
+		'""',
+	])("quarantines present scalar WAL root %s without changing its bytes", async hostile => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "scalar root corruption",
+			idempotency_key: `scalar-root-${hostile}`,
+			allow_mutation: true,
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const file = transactionPath(paths, "visible-session");
+		await fs.writeFile(file, hostile);
+
+		expect(await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" })).toEqual(
+			unavailableEnvelope,
+		);
+		expect(await fs.readFile(file, "utf8")).toBe(hostile);
+	});
+
+	const walCorruptions: ReadonlyArray<readonly [string, (value: Record<string, unknown>) => void]> = [
+		[
+			"questions",
+			(value: Record<string, unknown>) => ((value.canonical as Record<string, unknown>).questions = null),
+		],
+		[
+			"gate authorities",
+			(value: Record<string, unknown>) => ((value.canonical as Record<string, unknown>).gate_authorities = null),
+		],
+		[
+			"answer requests",
+			(value: Record<string, unknown>) => ((value.requests as Record<string, unknown>).answers = null),
+		],
+		[
+			"operation requests",
+			(value: Record<string, unknown>) => ((value.requests as Record<string, unknown>).operations = null),
+		],
+		["outbox delivery", (value: Record<string, unknown>) => (value.outbox = null)],
+		["endpoint", (value: Record<string, unknown>) => (value.endpoint = { incarnation: 7, observed_at: "never" })],
+		["projection", (value: Record<string, unknown>) => (value.projection = null)],
+		[
+			"recovery",
+			(value: Record<string, unknown>) =>
+				(value.recovery = { prompt_watermark_at: "never", last_repaired_at: null }),
+		],
+		["revision", (value: Record<string, unknown>) => (value.revision = 0)],
+		[
+			"queue membership",
+			(value: Record<string, unknown>) =>
+				(((value.canonical as Record<string, unknown>).queue as Record<string, unknown>).ordered_turn_ids = [
+					"missing-turn",
+				]),
+		],
+		[
+			"outbox delivery identity",
+			(value: Record<string, unknown>) => {
+				const event = Object.values(value.outbox as Record<string, Record<string, unknown>>)[0]!;
+				(event.public_delivery as Record<string, unknown>).public_event_id = "wrong-public-event";
+			},
+		],
+		[
+			"prompt turn receipt",
+			(value: Record<string, unknown>) => {
+				const request = Object.values(
+					(value.requests as Record<string, Record<string, Record<string, unknown>>>).prompts,
+				)[0]!;
+				request.runtime_receipt = { accepted: true, command_id: "wrong-command", turn_id: "wrong-runtime-turn" };
+			},
+		],
+	];
+	it.each(walCorruptions)("rejects corrupt existing WAL %s without changing its bytes", async (_field, corrupt) => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "canonical corruption",
+			idempotency_key: `canonical-${_field.replaceAll(" ", "-")}`,
+			allow_mutation: true,
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const file = transactionPath(paths, "visible-session");
+		const value = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+		corrupt(value);
+		const hostile = JSON.stringify(value);
+		await fs.writeFile(file, hostile);
+		const result = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(result).toEqual(unavailableEnvelope);
+		expect(await fs.readFile(file, "utf8")).toBe(hostile);
+	});
+
+	it.each([
+		[
+			"admitted authority-question linkage",
+			(value: Record<string, unknown>) => {
+				const authorities = (value.canonical as Record<string, unknown>).gate_authorities as Record<
+					string,
+					Record<string, unknown>
+				>;
+				(Object.values(authorities)[0]!.outcome as Record<string, unknown>).question_id = "wrong-question";
+			},
+		],
+		[
+			"question-answer fence linkage",
+			(value: Record<string, unknown>) => {
+				const question = Object.values(
+					(value.canonical as Record<string, unknown>).questions as Record<string, Record<string, unknown>>,
+				)[0]!;
+				question.claim_fence_epoch = Number(question.claim_fence_epoch) + 1;
+			},
+		],
+	] as const)("quarantines corrupt existing WAL %s without changing its bytes", async (_field, corrupt) => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "";
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: [sharedAskGate("cross-record-corruption", runtimeTurnId)],
+								complete: true,
+								revision: "cross-record-corruption",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				controlResult: control =>
+					control.operation === "workflow.gate_answer"
+						? { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } }
+						: undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "cross-record corruption",
+			idempotency_key: `cross-record-${_field.replaceAll(" ", "-")}`,
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		if (_field === "question-answer fence linkage")
+			await server.callTool("gjc_coordinator_submit_question_answer", {
+				session_id: "visible-session",
+				turn_id: sent.turn_id,
+				question_id: "cross-record-corruption",
+				answer_binding: question.answer_binding,
+				answer: { selected: ["opt_0"] },
+				idempotency_key: "cross-record-answer-fence",
+				allow_mutation: true,
+			});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const file = transactionPath(paths, "visible-session");
+		const value = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+		corrupt(value);
+		const hostile = JSON.stringify(value);
+		await fs.writeFile(file, hostile);
+
+		expect(await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" })).toEqual(
+			unavailableEnvelope,
+		);
+		expect(await fs.readFile(file, "utf8")).toBe(hostile);
+	});
+
+	it("accepts a valid unlinked deferred gate authority", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "deferred authority",
+			idempotency_key: "deferred-authority-prompt",
+			allow_mutation: true,
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const file = transactionPath(paths, "visible-session");
+		const transaction = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+		const canonical = transaction.canonical as Record<string, unknown>;
+		const session = canonical.session as Record<string, unknown>;
+		const broker = session.broker as Record<string, unknown>;
+		const firstTurn = Object.values(canonical.turns as Record<string, Record<string, unknown>>)[0]!;
+		const runtimeTurnId = (firstTurn.delivery as Record<string, unknown>).runtime_turn_id;
+		if (typeof runtimeTurnId !== "string") throw new Error("missing_runtime_turn");
+		const now = new Date().toISOString();
+		(canonical.gate_authorities as Record<string, unknown>)["deferred-authority"] = {
+			authority: {
+				namespace_id: server.config.namespace.identity,
+				session_id: "visible-session",
+				endpoint_incarnation: broker.endpoint_incarnation,
+				gate_id: "deferred-gate",
+			},
+			observation: {
+				kind: "valid",
+				first_provenance: {
+					namespace_id: server.config.namespace.identity,
+					session_id: "visible-session",
+					endpoint_incarnation: broker.endpoint_incarnation,
+					coordinator_turn_id: "",
+					runtime_turn_id: runtimeTurnId,
+					gate_created_at: now,
+					schema_hash: "deferred-schema",
+					stage: "plan",
+					kind: "ask",
+				},
+			},
+			outcome: { state: "deferred_link", first_seen_at: now },
+			first_seen_at: now,
+			updated_at: now,
+		};
+		await fs.writeFile(file, JSON.stringify(transaction));
+
+		expect(await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" })).toMatchObject({
+			ok: true,
 		});
 	});
 
@@ -4963,27 +5672,13 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 			idempotency_key: "provenance-mismatch-prompt",
 			allow_mutation: true,
 		});
-		const stateFile = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
-			"session-states",
-			"visible-session.json",
-		);
-		const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
-		await fs.writeFile(
-			stateFile,
-			JSON.stringify({
-				...state,
-				state: "needs_user_input",
-				current_turn_id: sent.turn_id,
-				source: "agent_session_event",
-				live: true,
-				session_id: "wrong-session",
-			}),
-		);
+		await patchSessionState(server, root, "visible-session", {
+			state: "needs_user_input",
+			current_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+			session_id: "wrong-session",
+		});
 		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
 		expect(listed).toMatchObject({ reconciliation: { complete: false, reason: "terminal_uncertain" } });
 	});
@@ -5011,27 +5706,13 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		});
 		const turn = sent.turn as Record<string, unknown>;
 		const delivery = turn.delivery as Record<string, unknown>;
-		const stateFile = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
-			"session-states",
-			"visible-session.json",
-		);
-		const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
-		await fs.writeFile(
-			stateFile,
-			JSON.stringify({
-				...state,
-				state: "needs_user_input",
-				live: true,
-				source: "agent_session_event",
-				current_turn_id: sent.turn_id,
-				activity: { seq: 1, phase: "waiting", active_tool_count: 0, active_tools: [] },
-			}),
-		);
+		await patchSessionState(server, root, "visible-session", {
+			state: "needs_user_input",
+			live: true,
+			source: "agent_session_event",
+			current_turn_id: sent.turn_id,
+			activity: { seq: 1, phase: "waiting", active_tool_count: 0, active_tools: [] },
+		});
 		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
 		expect(listed).toMatchObject({
 			questions: [],
@@ -5042,6 +5723,514 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 });
 
 describe("Coordinator MCP deep-audit regressions", () => {
+	it("returns delivery_pending after broker close for an unexpired retained lease, then expires and emits it once", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await injectPendingDeliveryForTest(server, "visible-session", "close-retained-lease", 99);
+		await withSessionTransaction(paths, "visible-session", async transaction => {
+			for (const event of Object.values(transaction.outbox)) {
+				if (event.public_event_id !== "close-retained-lease") {
+					event.emitted = true;
+					event.public_delivery.state = "acknowledged";
+					event.public_delivery.journal_seq = 1;
+					event.public_delivery.acknowledged_at = new Date().toISOString();
+				}
+			}
+		});
+		expect(await claimPublicDelivery(paths, "visible-session", { leaseMs: 1_000 })).toHaveLength(1);
+		const sessionFile = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
+		const session = JSON.parse(await fs.readFile(sessionFile, "utf8")) as Record<string, unknown>;
+		await fs.writeFile(sessionFile, JSON.stringify({ ...session, ephemeral: true }));
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", { session_id: "visible-session", allow_mutation: true }),
+		).resolves.toMatchObject({ ok: false, reason: "delivery_pending", closed: false });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
+		await withSessionTransaction(paths, "visible-session", async transaction => {
+			const retained = Object.values(transaction.outbox).find(
+				event => event.public_event_id === "close-retained-lease",
+			);
+			if (!retained) throw new Error("missing retained delivery");
+			retained.public_delivery.claim_expires_at = new Date(Date.now() - 1).toISOString();
+		});
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", { session_id: "visible-session", allow_mutation: true }),
+		).resolves.toMatchObject({ ok: true, closed: true });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
+		const journal = (
+			await fs.readFile(path.join(coordinatorNamespace(root), "events", "event-journal.jsonl"), "utf8")
+		)
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { id: string });
+		expect(journal.filter(event => event.id === "close-retained-lease")).toHaveLength(1);
+	});
+
+	it("reconciles an acknowledged errored terminal sidecar as one failed turn with its receipt fields", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "errored terminal",
+			idempotency_key: "errored-terminal",
+			allow_mutation: true,
+		});
+		const turnId = String(sent.turn_id);
+		const cursor = await currentEventCursor(root);
+		const runtimeError = { code: "runtime_failed", message: "runtime terminal error" };
+		await patchSessionState(server, root, "visible-session", {
+			state: "errored",
+			ready_for_input: false,
+			current_turn_id: turnId,
+			last_turn_id: turnId,
+			source: "agent_session_event",
+			live: false,
+			updated_at: "2026-08-19T00:00:00.000Z",
+			error: runtimeError,
+			execution_state: "failed",
+			receipt_state: "received",
+		});
+		const watched = await server.callTool("gjc_coordinator_watch_events", { after_seq: cursor, timeout_ms: 0 });
+		const terminal = (watched.events as Array<Record<string, unknown>>).filter(
+			event => event.turn_id === turnId && (event.kind === "turn.failed" || event.kind === "turn.completed"),
+		);
+		expect(terminal).toEqual([expect.objectContaining({ kind: "turn.failed", turn_id: turnId })]);
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = await withSessionTransaction(paths, "visible-session", async current => current);
+		expect(transaction.canonical.turns[turnId]).toMatchObject({
+			status: "failed",
+			terminal_fence: { status: "failed" },
+			error: { code: "runtime_errored", message: "Runtime turn failed." },
+		});
+		expect(transaction.canonical.queue.active_turn_id).toBeNull();
+		await expect(
+			fs.access(path.join(coordinatorNamespace(root), "active-turns", "visible-session.json")),
+		).rejects.toThrow();
+		const repaired = await readCoordinatorSessionState(root);
+		expect(repaired).toMatchObject({
+			state: "errored",
+			error: runtimeError,
+			execution_state: "failed",
+			receipt_state: "received",
+		});
+	});
+
+	it("advertises Linux-only artifact capability consistently across platform discovery", async () => {
+		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+		if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
+		try {
+			for (const [platform, available] of [
+				["linux", true],
+				["darwin", false],
+				["win32", false],
+			] as const) {
+				Object.defineProperty(process, "platform", { ...originalPlatform, value: platform });
+				const server = await createSdkControlServer(
+					await tempRoot(),
+					[],
+					[],
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					{
+						platform,
+					},
+				);
+				const discovery = await server.handleJsonRpc({ jsonrpc: "2.0", id: platform, method: "tools/list" });
+				const artifact = (discovery.result as { tools: Array<Record<string, unknown>> }).tools.find(
+					tool => tool.name === "gjc_coordinator_read_artifact",
+				);
+				expect(artifact?.description).toContain(
+					available ? "Read one bounded artifact" : "Unavailable on this platform",
+				);
+				if (!available) {
+					await expect(
+						server.callTool("gjc_coordinator_read_artifact", { path: "/unsupported" }),
+					).resolves.toEqual({
+						ok: false,
+						error: { code: "artifact_unavailable", message: "Coordinator artifact could not be read." },
+					});
+				}
+			}
+		} finally {
+			Object.defineProperty(process, "platform", originalPlatform);
+		}
+	});
+
+	it.skipIf(process.platform !== "linux")(
+		"decodes UTF-8 artifacts only through complete scalar boundaries",
+		async () => {
+			const root = await tempRoot();
+			const artifactRoot = path.join(root, "artifacts");
+			await fs.mkdir(artifactRoot, { recursive: true });
+			const config = buildCoordinatorMcpConfig({
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: artifactRoot,
+				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, "coordinator-state"),
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			});
+			const cases: Array<[string, Buffer, number, string]> = [
+				["exact", Buffer.from("a€"), 4, "a€"],
+				["split", Buffer.from("a€"), 3, "a"],
+				["continuation", Buffer.from([0x61, 0xe2, 0x28, 0xa1]), 4, "a"],
+				["overlong", Buffer.from([0x61, 0xc0, 0x80]), 3, "a"],
+				["surrogate", Buffer.from([0x61, 0xed, 0xa0, 0x80]), 4, "a"],
+				["out-of-range", Buffer.from([0x61, 0xf4, 0x90, 0x80, 0x80]), 5, "a"],
+				["zero", Buffer.from("€"), 0, ""],
+			];
+			for (const [name, bytes, cap, expected] of cases) {
+				const artifact = path.join(artifactRoot, `${name}.bin`);
+				await fs.writeFile(artifact, bytes);
+				const result = await readCoordinatorArtifact({ ...config, artifactByteCap: cap }, { path: artifact });
+				expect(result).toMatchObject({ ok: true, text: expected, bytes: Buffer.byteLength(expected) });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "linux")("truncates malformed artifact bytes in one valid UTF-8 pass", async () => {
+		const root = await tempRoot();
+		const artifactRoot = path.join(root, "artifacts");
+		await fs.mkdir(artifactRoot, { recursive: true });
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: artifactRoot,
+				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, "coordinator-state"),
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+		});
+		const artifact = path.join(artifactRoot, "malformed-artifact.bin");
+		await fs.writeFile(
+			artifact,
+			Buffer.concat([Buffer.from("valid-prefix"), Buffer.from([0xff]), Buffer.alloc(64 * 1024, 0x61)]),
+		);
+		await expect(server.callTool("gjc_coordinator_read_artifact", { path: artifact })).resolves.toMatchObject({
+			ok: true,
+			text: "valid-prefix",
+		});
+	});
+
+	it("does not admit a pre-acknowledgement terminal sidecar", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "pre-ack terminal",
+			idempotency_key: "pre-ack-terminal",
+			allow_mutation: true,
+		});
+		const turnId = String(sent.turn_id);
+		const cursor = await currentEventCursor(root);
+		await patchTurnDelivery(server, "visible-session", turnId, {
+			prompt_acknowledged: false,
+			runtime_command_id: undefined,
+			runtime_turn_id: undefined,
+			state: "queued",
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "completed",
+			ready_for_input: false,
+			current_turn_id: turnId,
+			last_turn_id: turnId,
+			source: "agent_session_event",
+			live: true,
+			updated_at: "2026-08-19T00:00:00.000Z",
+			final_response: {
+				text: "runtime completed before broker acknowledgement",
+				format: "markdown",
+				source: "runtime",
+				artifact_path: null,
+				truncated: false,
+			},
+		});
+		const watched = await server.callTool("gjc_coordinator_watch_events", {
+			after_seq: cursor,
+			timeout_ms: 0,
+		});
+		expect(watched).toMatchObject({ ok: true });
+		expect(
+			(watched.events as Array<Record<string, unknown>>).some(
+				event => event.turn_id === turnId && (event.kind === "turn.completed" || event.kind === "turn.failed"),
+			),
+		).toBe(false);
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: turnId }),
+		).resolves.toMatchObject({
+			ok: true,
+			turn: { turn_id: turnId, status: "active" },
+		});
+	});
+
+	it("does not admit a pre-acknowledgement waiting sidecar or question", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], query =>
+			query === "Q12"
+				? { ok: true, page: { items: [], complete: true, revision: "pre-ack-waiting" } }
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "pre-ack waiting",
+			idempotency_key: "pre-ack-waiting",
+			allow_mutation: true,
+		});
+		const turnId = String(sent.turn_id);
+		const cursor = await currentEventCursor(root);
+		await patchTurnDelivery(server, "visible-session", turnId, {
+			prompt_acknowledged: false,
+			runtime_command_id: undefined,
+			runtime_turn_id: undefined,
+			state: "queued",
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "needs_user_input",
+			ready_for_input: false,
+			current_turn_id: turnId,
+			last_turn_id: turnId,
+			source: "agent_session_event",
+			live: true,
+			updated_at: "2026-08-19T00:00:00.000Z",
+		});
+		const watched = await server.callTool("gjc_coordinator_watch_events", {
+			after_seq: cursor,
+			timeout_ms: 0,
+		});
+		expect(watched).toMatchObject({ ok: true });
+		expect(
+			(watched.events as Array<Record<string, unknown>>).some(
+				event =>
+					event.turn_id === turnId &&
+					(event.kind === "turn.waiting_for_answer" || event.kind === "question.opened"),
+			),
+		).toBe(false);
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: turnId }),
+		).resolves.toMatchObject({
+			ok: true,
+			turn: { turn_id: turnId, status: "active" },
+		});
+	});
+
+	it("performs one immediate zero-time reconcile for waiting and question events", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let gateAvailable = false;
+		let runtimeTurnId = "";
+		const server = await createSdkControlServer(root, controls, [], query => {
+			if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
+			return gateAvailable
+				? {
+						ok: true,
+						page: {
+							items: [sharedAskGate("zero-time-gate", runtimeTurnId)],
+							complete: true,
+							revision: "zero-time-open",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "zero-time-empty" } };
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "zero-time waiting",
+			idempotency_key: "zero-time-waiting",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String(
+			(sent.turn as Record<string, unknown>).delivery &&
+				((sent.turn as Record<string, unknown>).delivery as Record<string, unknown>).runtime_turn_id,
+		);
+		const cursor = await currentEventCursor(root);
+		await patchSessionState(server, root, "visible-session", {
+			state: "needs_user_input",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+			updated_at: "2026-08-19T00:00:00.000Z",
+			activity: { seq: 1, phase: "waiting", active_tool_count: 0, active_tools: [] },
+		});
+		gateAvailable = true;
+		const watched = await server.callTool("gjc_coordinator_watch_events", { after_seq: cursor, timeout_ms: 0 });
+		expect(watched).toMatchObject({
+			ok: true,
+			events: expect.arrayContaining([
+				expect.objectContaining({ kind: "turn.waiting_for_answer", turn_id: sent.turn_id }),
+				expect.objectContaining({ kind: "question.opened", question_id: "zero-time-gate" }),
+			]),
+		});
+	});
+
+	it("performs one immediate zero-time reconcile for a terminal sidecar", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "zero-time terminal",
+			idempotency_key: "zero-time-terminal",
+			allow_mutation: true,
+		});
+		expect(sent).toMatchObject({
+			ok: true,
+			result: { accepted: true },
+			turn: {
+				turn_id: sent.turn_id,
+				delivery: { prompt_acknowledged: true, runtime_turn_id: expect.any(String) },
+			},
+		});
+		const cursor = await currentEventCursor(root);
+		await patchSessionState(server, root, "visible-session", {
+			state: "completed",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+			updated_at: "2026-08-19T00:00:00.000Z",
+			final_response: {
+				text: "zero-time terminal result",
+				format: "markdown",
+				source: "runtime",
+				artifact_path: null,
+				truncated: false,
+			},
+		});
+		await expect(
+			server.callTool("gjc_coordinator_watch_events", { after_seq: cursor, timeout_ms: 0 }),
+		).resolves.toMatchObject({
+			ok: true,
+			events: expect.arrayContaining([expect.objectContaining({ kind: "turn.completed", turn_id: sent.turn_id })]),
+		});
+	});
+
+	it("rotates bounded Q12 attempts across sessions with a persisted cursor", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let q12Calls = 0;
+		const runtimeTurns = new Map<string, string>();
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query => {
+				if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
+				q12Calls += 1;
+				if (q12Calls === 2)
+					return {
+						ok: true,
+						page: {
+							items: [sharedAskGate("fair-beta", runtimeTurns.get("beta-session") ?? "")],
+							complete: true,
+							revision: "fair-beta",
+						},
+					};
+				if (q12Calls === 3)
+					return {
+						ok: true,
+						page: {
+							items: [sharedAskGate("fair-gamma", runtimeTurns.get("gamma-session") ?? "")],
+							complete: true,
+							revision: "fair-gamma",
+						},
+					};
+				return { ok: true, page: { items: [], complete: false, revision: `fair-incomplete-${q12Calls}` } };
+			},
+			[
+				{ sessionId: "alpha-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+				{ sessionId: "beta-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+				{ sessionId: "gamma-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+			],
+		);
+		for (const [sessionId, key] of [
+			["alpha-session", "fair-register-alpha"],
+			["beta-session", "fair-register-beta"],
+			["gamma-session", "fair-register-gamma"],
+		] as const)
+			await expect(
+				server.callTool("gjc_coordinator_register_session", {
+					session_id: sessionId,
+					cwd: root,
+					idempotency_key: key,
+					allow_mutation: true,
+				}),
+			).resolves.toMatchObject({ ok: true });
+		for (const sessionId of ["alpha-session", "beta-session", "gamma-session"] as const) {
+			const sent = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: sessionId,
+				prompt: `fair ${sessionId}`,
+				idempotency_key: `fair-prompt-${sessionId}`,
+				allow_mutation: true,
+			});
+			runtimeTurns.set(
+				sessionId,
+				String(((sent.turn as Record<string, unknown>).delivery as Record<string, unknown>).runtime_turn_id),
+			);
+			await patchSessionState(server, root, sessionId, {
+				state: "needs_user_input",
+				ready_for_input: false,
+				current_turn_id: sent.turn_id,
+				last_turn_id: sent.turn_id,
+				source: "agent_session_event",
+				live: true,
+				updated_at: "2026-08-19T00:00:00.000Z",
+			});
+		}
+		const cursor = await currentEventCursor(root);
+		const first = await server.callTool("gjc_coordinator_watch_events", { after_seq: cursor, timeout_ms: 0 });
+		expect(
+			(first.events as Array<Record<string, unknown>>).some(
+				event => event.kind === "question.opened" && event.session_id === "gamma-session",
+			),
+		).toBe(false);
+		const second = await server.callTool("gjc_coordinator_watch_events", {
+			after_seq: first.next_after_seq,
+			timeout_ms: 0,
+		});
+		expect(second).toMatchObject({
+			ok: true,
+			events: expect.arrayContaining([
+				expect.objectContaining({
+					kind: "question.opened",
+					session_id: "gamma-session",
+					question_id: "fair-gamma",
+				}),
+			]),
+		});
+		expect(q12Calls).toBeGreaterThanOrEqual(3);
+	});
+
+	it("keeps both controller guides on the watch-first optional-report contract", async () => {
+		const docsRoot = path.resolve(import.meta.dir, "../../../docs");
+		const hermes = await fs.readFile(path.join(docsRoot, "hermes-mcp-bridge.md"), "utf8");
+		const bot = await fs.readFile(path.join(docsRoot, "bot-integration.md"), "utf8");
+		for (const guide of [hermes, bot]) {
+			expect(guide).toContain("gjc_coordinator_watch_events");
+			expect(guide).toContain("next_after_seq");
+			expect(guide).toContain("turn.waiting_for_answer");
+			expect(guide).toContain("question.opened");
+			expect(guide).toContain("turn.completed");
+			expect(guide).toContain("turn.failed");
+			expect(guide).toContain("optional");
+		}
+		expect(hermes).not.toContain(
+			"Use `gjc_coordinator_report_status` with `session_id` and `turn_id` to write explicit completion/failure evidence.",
+		);
+		expect(bot).not.toContain("When the work is done, your bot must call `gjc_coordinator_report_status`");
+		expect(bot).not.toContain("marks turn completion/failure with report_status");
+	});
+
 	it("keeps an unrelated active turn when a queued turn receives a terminal report", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -5172,7 +6361,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		expect(watchTool).toMatchObject({
 			inputSchema: { properties: { after_seq: { type: "integer", minimum: 0 } } },
 		});
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await appendCoordinatorEventForTest(namespace, {
 			stableId: "audit-watermark-event",
 			kind: "session.registered",
@@ -5204,6 +6393,99 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		)
 			throw new Error(`watch_events returned an invalid deadline snapshot: ${JSON.stringify(deadline)}`);
 		expect(deadline.next_after_seq as number).toBeLessThanOrEqual(deadline.latest_seq as number);
+	});
+
+	it("migrates the legacy journal index once before scaled stable appends", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const namespace = coordinatorNamespace(root);
+		const events = path.join(namespace, "events");
+		const legacyFile = path.join(events, "event-journal-index.v1.json");
+		const migrationFile = path.join(events, "event-journal-index.v1.migrated.json");
+		const stableIndexDir = path.join(events, "event-index");
+		const historicalIds = Array.from(
+			{ length: 96 },
+			(_, index) => `legacy-scale-${index.toString().padStart(3, "0")}`,
+		);
+		for (const stableId of historicalIds)
+			await appendCoordinatorEventForTest(namespace, {
+				stableId,
+				kind: "turn.completed",
+				sessionId: "visible-session",
+				summary: "historical event",
+			});
+		const journal = await fs.readFile(path.join(events, "event-journal.jsonl"), "utf8");
+		const byId: Record<string, { seq: number; offset: number }> = {};
+		let offset = 0;
+		for (const line of journal.split("\n")) {
+			if (line.trim()) {
+				const event = JSON.parse(line) as { id: string; seq: number };
+				byId[event.id] = { seq: event.seq, offset };
+			}
+			offset += Buffer.byteLength(line) + 1;
+		}
+		await fs.writeFile(legacyFile, JSON.stringify({ schema_version: 1, by_id: byId }));
+		await fs.rm(migrationFile, { force: true });
+		await fs.rm(stableIndexDir, { recursive: true, force: true });
+
+		const recovered = await appendCoordinatorEventForTest(namespace, {
+			stableId: historicalIds[37]!,
+			kind: "turn.completed",
+			sessionId: "visible-session",
+			summary: "recovered historical event",
+		});
+		expect(recovered.id).toBe(historicalIds[37]);
+		expect(await Bun.file(migrationFile).exists()).toBe(true);
+		expect((await fs.readdir(stableIndexDir)).length).toBeGreaterThanOrEqual(historicalIds.length);
+		await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
+		const legacyBefore = await fs.readFile(legacyFile);
+		for (let index = 0; index < 128; index++)
+			await appendCoordinatorEventForTest(namespace, {
+				stableId: `legacy-scale-novel-${index.toString().padStart(3, "0")}`,
+				kind: "turn.failed",
+				sessionId: "visible-session",
+				summary: "novel stable event",
+			});
+		expect(await fs.readFile(legacyFile)).toEqual(legacyBefore);
+	});
+
+	it("recovers a missing newest stable-id sidecar without duplicating the journal event", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const namespace = coordinatorNamespace(root);
+		const events = path.join(namespace, "events");
+		const stableId = "post-fsync-sidecar-gap";
+		const first = await appendCoordinatorEventForTest(namespace, {
+			stableId,
+			kind: "turn.completed",
+			sessionId: "visible-session",
+			summary: "durable before sidecar",
+		});
+		await fs.rm(path.join(events, "event-index", `${createHash("sha256").update(stableId).digest("hex")}.json`), {
+			force: true,
+		});
+		const recovered = await appendCoordinatorEventForTest(namespace, {
+			stableId,
+			kind: "turn.completed",
+			sessionId: "visible-session",
+			summary: "retry after sidecar gap",
+		});
+		expect(recovered).toMatchObject({ id: stableId, seq: first.seq });
+		expect(
+			await Bun.file(
+				path.join(events, "event-index", `${createHash("sha256").update(stableId).digest("hex")}.json`),
+			).exists(),
+		).toBe(true);
+		const matching = (await fs.readFile(path.join(events, "event-journal.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { id: string })
+			.filter(event => event.id === stableId);
+		expect(matching).toHaveLength(1);
 	});
 
 	it("scopes coordination status and preserves evidence fields", async () => {
@@ -5288,11 +6570,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		};
 		const first = await server.callTool("gjc_coordinator_send_prompt", args);
 		const receiptFile = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
+			coordinatorNamespace(root),
 			"idempotency",
 			`${createHash("sha256").update(args.idempotency_key).digest("hex")}.json`,
 		);
@@ -5379,59 +6657,40 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		let server!: ReturnType<typeof createCoordinatorMcpServer>;
 		let reconciledTurnId: string | null = null;
 		server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
-			controlResult: async control => {
-				if (control.operation !== "turn.prompt")
-					return { accepted: true, command_id: "sdk-command-unrelated", turn_id: "sdk-turn-unrelated" };
+			controlResult: control =>
+				control.operation === "turn.prompt"
+					? { accepted: true, command_id: "barrier-command", turn_id: "barrier-runtime-turn" }
+					: { accepted: true, command_id: "sdk-command-unrelated", turn_id: "sdk-turn-unrelated" },
+			afterPromptReceiptPersisted: async sessionId => {
 				const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
-				const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+				const transaction = JSON.parse(await fs.readFile(transactionPath(paths, sessionId), "utf8")) as {
 					canonical: {
 						turns: Record<string, Record<string, unknown>>;
 					};
+					requests: { prompts: Record<string, Record<string, unknown>> };
 				};
+				const promptRequest = Object.values(transaction.requests.prompts)[0];
+				expect(promptRequest).toMatchObject({ phase: "accepted", runtime_receipt: { accepted: true } });
 				const reservation = Object.values(transaction.canonical.turns).find(turn => turn.status === "delivering");
 				if (!reservation || typeof reservation.turn_id !== "string")
 					throw new Error("missing delivering reservation");
 				reconciledTurnId = reservation.turn_id;
-				const stateFile = path.join(
-					root,
-					".gjc",
-					"coordinator-state",
-					"local",
-					"repo",
-					"session-states",
-					"visible-session.json",
-				);
-				const priorState = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
-				await fs.writeFile(
-					stateFile,
-					JSON.stringify({
-						...priorState,
-						state: "completed",
-						ready_for_input: false,
-						current_turn_id: reservation.turn_id,
-						last_turn_id: reservation.turn_id,
-						source: "agent_session_event",
-						live: true,
-						updated_at: "2026-08-19T00:00:00.000Z",
-						final_response: {
-							text: "terminal sidecar result",
-							format: "markdown",
-							source: "runtime",
-							artifact_path: null,
-							truncated: false,
-						},
-					}),
-				);
-				await expect(
-					server.callTool("gjc_coordinator_read_turn", {
-						session_id: "visible-session",
-						turn_id: reservation.turn_id,
-					}),
-				).resolves.toMatchObject({
-					ok: true,
-					turn: { turn_id: reservation.turn_id, status: "completed" },
+				await patchSessionState(server, root, sessionId, {
+					state: "completed",
+					ready_for_input: false,
+					current_turn_id: reservation.turn_id,
+					last_turn_id: reservation.turn_id,
+					source: "agent_session_event",
+					live: false,
+					updated_at: "2026-08-19T00:00:00.000Z",
+					final_response: {
+						text: "terminal sidecar result",
+						format: "markdown",
+						source: "runtime",
+						artifact_path: null,
+						truncated: false,
+					},
 				});
-				return { accepted: true, command_id: "barrier-command", turn_id: "barrier-runtime-turn" };
 			},
 		});
 		await registerSdkSession(server, root);
@@ -5445,11 +6704,22 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		expect(sent).toMatchObject({
 			ok: true,
 			turn_id: reconciledTurnId,
-			active_turn_id: null,
-			status: "completed",
-			turn: { turn_id: reconciledTurnId, status: "completed" },
+			active_turn_id: reconciledTurnId,
+			status: "active",
+			turn: { turn_id: reconciledTurnId, status: "active" },
 			result: { accepted: true, command_id: "barrier-command", turn_id: "barrier-runtime-turn" },
 		});
+		const watched = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
+		const watchedEvents = watched.events as Array<Record<string, unknown>>;
+		expect(watched).toMatchObject({
+			ok: true,
+			events: expect.arrayContaining([
+				expect.objectContaining({ kind: "turn.completed", turn_id: reconciledTurnId }),
+			]),
+		});
+		expect(
+			watchedEvents.filter(event => event.turn_id === reconciledTurnId && event.kind === "turn.failed"),
+		).toHaveLength(0);
 		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
 		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
 			canonical: {
@@ -5462,6 +6732,8 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		expect(turn).toMatchObject({
 			status: "completed",
 			terminal_fence: { status: "completed" },
+			final_response: { text: "terminal sidecar result", source: "runtime" },
+			error: null,
 			delivery: {
 				runtime_command_id: "barrier-command",
 				runtime_turn_id: "barrier-runtime-turn",
@@ -5469,31 +6741,27 @@ describe("Coordinator MCP deep-audit regressions", () => {
 			},
 		});
 		expect(transaction.canonical.queue).toMatchObject({ active_turn_id: null, ordered_turn_ids: [] });
-		const activeProjection = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
-			"active-turns",
-			"visible-session.json",
-		);
+		const activeProjection = path.join(coordinatorNamespace(root), "active-turns", "visible-session.json");
 		await expect(fs.access(activeProjection)).rejects.toThrow();
 		const turnProjection = JSON.parse(
-			await fs.readFile(
-				path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${reconciledTurnId}.json`),
-				"utf8",
-			),
+			await fs.readFile(path.join(coordinatorNamespace(root), "turns", `${reconciledTurnId}.json`), "utf8"),
 		) as Record<string, unknown>;
 		expect(turnProjection).toMatchObject({ turn_id: reconciledTurnId, status: "completed" });
-		const journal = path.join(root, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl");
+		const journal = path.join(coordinatorNamespace(root), "events", "event-journal.jsonl");
 		const lifecycleEvents = (await fs.readFile(journal, "utf8"))
 			.trim()
 			.split("\n")
 			.filter(Boolean)
 			.map(line => JSON.parse(line) as Record<string, unknown>)
 			.filter(event => event.turn_id === reconciledTurnId);
-		expect(lifecycleEvents.some(event => event.kind === "turn.active")).toBe(false);
+		const terminalEventIndex = lifecycleEvents.findIndex(
+			event => event.kind === "turn.completed" || event.kind === "turn.failed",
+		);
+		expect(terminalEventIndex).toBeGreaterThanOrEqual(0);
+		const activeEventIndices = lifecycleEvents.flatMap((event, index) =>
+			event.kind === "turn.active" ? [index] : [],
+		);
+		expect(activeEventIndices.every(index => index < terminalEventIndex)).toBe(true);
 		expect(lifecycleEvents.filter(event => event.kind === "turn.completed")).toHaveLength(1);
 		expect(lifecycleEvents.filter(event => event.kind === "turn.acknowledged")).toHaveLength(1);
 		const promptRequest = Object.values(transaction.requests.prompts)[0];
@@ -5502,6 +6770,373 @@ describe("Coordinator MCP deep-audit regressions", () => {
 			runtime_receipt: { accepted: true, command_id: "barrier-command", turn_id: "barrier-runtime-turn" },
 		});
 		expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+	});
+
+	it("ignores a stale-authority terminal sidecar after a successor turn is accepted", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const first = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "first incarnation turn",
+			idempotency_key: "old-incarnation-first",
+			allow_mutation: true,
+		});
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			turn_id: first.turn_id,
+			status: "completed",
+			summary: "first turn complete",
+			idempotency_key: "old-incarnation-first-terminal",
+			allow_mutation: true,
+		});
+		const successor = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "successor turn",
+			idempotency_key: "old-incarnation-successor",
+			allow_mutation: true,
+		});
+		const staleStateFile = coordinatorSessionStatePath(root, "visible-session");
+		const stalePrior = JSON.parse(await fs.readFile(staleStateFile, "utf8")) as Record<string, unknown>;
+		await fs.writeFile(
+			staleStateFile,
+			JSON.stringify({
+				...stalePrior,
+				state: "completed",
+				ready_for_input: false,
+				current_turn_id: first.turn_id,
+				last_turn_id: first.turn_id,
+				source: "agent_session_event",
+				live: false,
+				endpoint_incarnation: "test-incarnation",
+				sidecar_key_id: "stale-key",
+				sidecar_signature: "forged",
+				final_response: {
+					text: "stale terminal output",
+					format: "markdown",
+					source: "runtime",
+					artifact_path: null,
+					truncated: false,
+				},
+			}),
+		);
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: successor.turn_id }),
+		).resolves.toMatchObject({ ok: true, turn: { turn_id: successor.turn_id, status: "active" } });
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = await withSessionTransaction(paths, "visible-session", async current => current);
+		const canonicalSuccessor = transaction.canonical.turns[String(successor.turn_id)]!;
+		expect(canonicalSuccessor).toMatchObject({
+			status: "active",
+			final_response: { text: null, format: "markdown", source: null, artifact_path: null, truncated: false },
+			terminal_fence: null,
+		});
+		const serializedSuccessor = JSON.stringify(canonicalSuccessor);
+		expect(serializedSuccessor).not.toContain("stale terminal output");
+		expect(serializedSuccessor).not.toContain('terminal_fence":{');
+	});
+
+	it("repairs projection metadata without changing canonical state for malformed runtime terminal responses", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "malformed runtime terminal",
+			idempotency_key: "malformed-runtime-terminal",
+			allow_mutation: true,
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const wal = transactionPath(paths, "visible-session");
+		const before = await fs.readFile(wal, "utf8");
+		const beforeTransaction = JSON.parse(before) as {
+			revision: number;
+			endpoint: unknown;
+			canonical: unknown;
+		};
+		const beforeRevision = beforeTransaction.revision;
+		await patchSessionState(server, root, "visible-session", {
+			state: "completed",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: false,
+			final_response: { text: 7, format: null, source: [], artifact_path: 1, truncated: "no" },
+		});
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id }),
+		).resolves.toMatchObject({ ok: true, turn: { turn_id: sent.turn_id, status: "active" } });
+		const afterTransaction = JSON.parse(await fs.readFile(wal, "utf8")) as {
+			revision: number;
+			endpoint: unknown;
+			canonical: unknown;
+			projection: {
+				applied_turns_revision: number;
+				applied_reports_revision: number;
+				applied_session_revision: number;
+				applied_active_revision: number;
+				applied_events_revision: number;
+			};
+		};
+		// Repair may advance bookkeeping, but malformed runtime ingress must not alter business state or endpoint authority.
+		expect(afterTransaction.canonical).toEqual(beforeTransaction.canonical);
+		expect(afterTransaction.endpoint).toEqual(beforeTransaction.endpoint);
+		expect(afterTransaction.revision).toBeGreaterThan(beforeRevision);
+		expect(afterTransaction.projection).toMatchObject({
+			applied_turns_revision: afterTransaction.revision,
+			applied_reports_revision: afterTransaction.revision,
+			applied_session_revision: afterTransaction.revision,
+			applied_active_revision: afterTransaction.revision,
+			applied_events_revision: afterTransaction.revision,
+		});
+	});
+
+	it("persists and exactly replays a runtime gate rejection as an unlinked pending question", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "";
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: [sharedAskGate("rejected-answer", runtimeTurnId)],
+								complete: true,
+								revision: "rejected-answer",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				controlResult: control =>
+					control.operation === "workflow.gate_answer" ? { ok: true, result: { status: "rejected" } } : undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "rejected answer",
+			idempotency_key: "rejected-answer-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		const args = {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "rejected-answer",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "rejected-answer",
+			allow_mutation: true,
+		};
+		const expected = {
+			ok: false,
+			schema_version: 1,
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "rejected-answer",
+			error: { code: "validation_rejected", message: "Coordinator answer failed workflow validation." },
+			question_status: "pending",
+		};
+		expect(await server.callTool("gjc_coordinator_submit_question_answer", args)).toEqual(expected);
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const persisted = await withSessionTransaction(paths, "visible-session", async current => current);
+		expect(persisted.canonical.questions["rejected-answer"]).toMatchObject({
+			status: "pending",
+			claim_fence_epoch: null,
+			answer_request_id: null,
+		});
+		const request = Object.values(persisted.requests.answers)[0]!;
+		expect(request).toMatchObject({
+			phase: "rejected",
+			question_id: "rejected-answer",
+			safe_receipt: { status: "rejected" },
+		});
+		expect(await server.callTool("gjc_coordinator_submit_question_answer", args)).toEqual(expected);
+		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(1);
+	});
+
+	it("retains a rejected receipt while a corrected answer under a new key is accepted", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "";
+		let answerCalls = 0;
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: [sharedAskGate("rejected-then-accepted", runtimeTurnId)],
+								complete: true,
+								revision: "rejected-then-accepted",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				controlResult: control => {
+					if (control.operation !== "workflow.gate_answer") return undefined;
+					answerCalls += 1;
+					return answerCalls === 1
+						? { ok: true, result: { status: "rejected" } }
+						: { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } };
+				},
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "rejected then accepted answer",
+			idempotency_key: "rejected-then-accepted-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		const firstArgs = {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "rejected-then-accepted",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "rejected-then-accepted-first",
+			allow_mutation: true,
+		};
+		const rejected = await server.callTool("gjc_coordinator_submit_question_answer", firstArgs);
+		expect(rejected).toMatchObject({ ok: false, error: { code: "validation_rejected" }, question_status: "pending" });
+		const accepted = await server.callTool("gjc_coordinator_submit_question_answer", {
+			...firstArgs,
+			idempotency_key: "rejected-then-accepted-corrected",
+		});
+		expect(accepted).toMatchObject({ ok: true, operation: "workflow.gate_answer", status: "accepted" });
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const persisted = await withSessionTransaction(paths, "visible-session", async current => current);
+		expect(persisted.canonical.questions["rejected-then-accepted"]).toMatchObject({ status: "answered" });
+		const requests = Object.values(persisted.requests.answers);
+		expect(requests).toHaveLength(2);
+		const rejectedRequest = requests.find(request => request.phase === "rejected");
+		const completedRequest = requests.find(request => request.phase === "completed");
+		expect(rejectedRequest).toMatchObject({ safe_receipt: { status: "rejected" } });
+		expect(completedRequest).toMatchObject({ safe_receipt: { status: "accepted" } });
+		expect(rejectedRequest?.request_id).not.toBe(completedRequest?.request_id);
+		expect(persisted.canonical.questions["rejected-then-accepted"]).toMatchObject({
+			status: "answered",
+			answer_request_id: completedRequest?.request_id,
+			claim_fence_epoch: completedRequest?.claim_fence_epoch,
+		});
+		expect(await server.callTool("gjc_coordinator_submit_question_answer", firstArgs)).toEqual(rejected);
+		expect(answerCalls).toBe(2);
+	});
+
+	it("reverts an answer claim when runtime admission changes before dispatch and permits exact retry", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "";
+		const admissionStarted = Promise.withResolvers<void>();
+		const releaseAdmission = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: [sharedAskGate("admission-race", runtimeTurnId)],
+								complete: true,
+								revision: "race",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				afterAnswerRemoteStarted: async () => {
+					admissionStarted.resolve();
+					await releaseAdmission.promise;
+				},
+				controlResult: control =>
+					control.operation === "workflow.gate_answer"
+						? { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } }
+						: undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "answer admission race",
+			idempotency_key: "answer-admission-race-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		await patchSessionState(server, root, "visible-session", {
+			state: "needs_user_input",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+			activity: { seq: 1, phase: "waiting", active_tool_count: 0, active_tools: [] },
+		});
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		const args = {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "admission-race",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "answer-admission-race",
+			allow_mutation: true,
+		};
+		const admittedAnswer = server.callTool("gjc_coordinator_submit_question_answer", args);
+		await admissionStarted.promise;
+		await patchSessionState(server, root, "visible-session", { state: "running", ready_for_input: false });
+		releaseAdmission.resolve();
+		await expect(admittedAnswer).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(0);
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const reverted = await withSessionTransaction(paths, "visible-session", async current => current);
+		expect(reverted.canonical.questions["admission-race"]).toMatchObject({
+			status: "pending",
+			answer_request_id: null,
+		});
+		expect(reverted.requests.answers).toEqual({});
+		await patchSessionState(server, root, "visible-session", {
+			state: "needs_user_input",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+		await expect(server.callTool("gjc_coordinator_submit_question_answer", args)).resolves.toMatchObject({
+			ok: true,
+			status: "accepted",
+		});
+		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(1);
 	});
 
 	it("repairs projections when terminal reconciliation wins after accepted finalization", async () => {
@@ -5522,36 +7157,22 @@ describe("Coordinator MCP deep-audit regressions", () => {
 				);
 				expect(finalized).toBeDefined();
 				finalizedTurnId = String(finalized!.turn_id);
-				const stateFile = path.join(
-					root,
-					".gjc",
-					"coordinator-state",
-					"local",
-					"repo",
-					"session-states",
-					`${sessionId}.json`,
-				);
-				const priorState = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
-				await fs.writeFile(
-					stateFile,
-					JSON.stringify({
-						...priorState,
-						state: "completed",
-						ready_for_input: false,
-						current_turn_id: finalizedTurnId,
-						last_turn_id: finalizedTurnId,
-						source: "agent_session_event",
-						live: true,
-						updated_at: "2026-08-19T00:00:00.000Z",
-						final_response: {
-							text: "terminal after finalization",
-							format: "markdown",
-							source: "runtime",
-							artifact_path: null,
-							truncated: false,
-						},
-					}),
-				);
+				await patchSessionState(server, root, sessionId, {
+					state: "completed",
+					ready_for_input: false,
+					current_turn_id: finalizedTurnId,
+					last_turn_id: finalizedTurnId,
+					source: "agent_session_event",
+					live: true,
+					updated_at: "2026-08-19T00:00:00.000Z",
+					final_response: {
+						text: "terminal after finalization",
+						format: "markdown",
+						source: "runtime",
+						artifact_path: null,
+						truncated: false,
+					},
+				});
 				await expect(
 					server.callTool("gjc_coordinator_read_turn", {
 						session_id: sessionId,
@@ -5589,28 +7210,14 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		const turn = transaction.canonical.turns[finalizedTurnId!];
 		expect(turn).toMatchObject({ status: "completed", terminal_fence: { status: "completed" } });
 		expect(transaction.canonical.queue).toMatchObject({ active_turn_id: null, ordered_turn_ids: [] });
-		const activeProjection = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
-			"active-turns",
-			"visible-session.json",
-		);
+		const activeProjection = path.join(coordinatorNamespace(root), "active-turns", "visible-session.json");
 		await expect(fs.access(activeProjection)).rejects.toThrow();
 		const turnProjection = JSON.parse(
-			await fs.readFile(
-				path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${finalizedTurnId}.json`),
-				"utf8",
-			),
+			await fs.readFile(path.join(coordinatorNamespace(root), "turns", `${finalizedTurnId}.json`), "utf8"),
 		) as Record<string, unknown>;
 		expect(turnProjection).toMatchObject({ turn_id: finalizedTurnId, status: "completed" });
 		const sessionState = JSON.parse(
-			await fs.readFile(
-				path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json"),
-				"utf8",
-			),
+			await fs.readFile(path.join(coordinatorNamespace(root), "session-states", "visible-session.json"), "utf8"),
 		) as Record<string, unknown>;
 		expect(sessionState).toMatchObject({ state: "completed", current_turn_id: null });
 	});
@@ -5667,7 +7274,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		});
 		await server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id });
 		await server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id });
-		const journal = path.join(root, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl");
+		const journal = path.join(coordinatorNamespace(root), "events", "event-journal.jsonl");
 		const acknowledged = (await fs.readFile(journal, "utf8"))
 			.trim()
 			.split("\n")
@@ -5682,7 +7289,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
 		await registerSdkSession(server, root);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await appendCoordinatorEventForTest(namespace, {
 			stableId: "audit-filtered-match",
 			kind: "delegation.started",
@@ -5723,5 +7330,111 @@ describe("Coordinator MCP deep-audit regressions", () => {
 			allow_mutation: true,
 		});
 		expect(response).toMatchObject({ ok: false, error: { code: "invalid_session_id" } });
+	});
+
+	it("separates projection namespaces whose legacy labels collide", () => {
+		const root = "/tmp/coordinator-state";
+		const first = buildCoordinatorMcpConfig({
+			GJC_COORDINATOR_MCP_STATE_ROOT: root,
+			GJC_COORDINATOR_MCP_PROFILE: "team/a",
+			GJC_COORDINATOR_MCP_REPO: "repo",
+		});
+		const second = buildCoordinatorMcpConfig({
+			GJC_COORDINATOR_MCP_STATE_ROOT: root,
+			GJC_COORDINATOR_MCP_PROFILE: "team:a",
+			GJC_COORDINATOR_MCP_REPO: "repo",
+		});
+		expect(first.namespace.profile).toBe(second.namespace.profile);
+		expect(coordinatorNamespace(root)).not.toBe(path.join(root, "local", "repo"));
+		expect(first.namespace.identity).not.toBe(second.namespace.identity);
+		expect(path.join(first.stateRoot, "v1", first.namespace.identity)).not.toBe(
+			path.join(second.stateRoot, "v1", second.namespace.identity),
+		);
+	});
+
+	it("quarantines imported reports with traversal ids", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const legacy = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await fs.mkdir(path.join(legacy, "sessions"), { recursive: true });
+		await fs.mkdir(path.join(legacy, "reports"), { recursive: true });
+		await fs.writeFile(
+			path.join(legacy, "sessions", "visible-session.json"),
+			JSON.stringify({
+				namespace_identity: server.config.namespace.identity,
+				session_id: "visible-session",
+				cwd: root,
+				broker_workspace: root,
+				endpoint_incarnation: "legacy-incarnation",
+			}),
+		);
+		const fileId = `report-${"a".repeat(64)}`;
+		await fs.writeFile(
+			path.join(legacy, "reports", `${fileId}.json`),
+			JSON.stringify({ session_id: "visible-session", report_id: "../escape" }),
+		);
+		const response = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(response.ok).toBe(false);
+	});
+
+	it("quarantines every foreign legacy child in a same-session collision", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const legacy = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await fs.mkdir(path.join(legacy, "sessions"), { recursive: true });
+		await fs.mkdir(path.join(legacy, "active-turns"), { recursive: true });
+		await fs.writeFile(
+			path.join(legacy, "sessions", "visible-session.json"),
+			JSON.stringify({
+				namespace_identity: server.config.namespace.identity,
+				session_id: "visible-session",
+				cwd: root,
+				broker_workspace: root,
+				endpoint_incarnation: "legacy-incarnation",
+			}),
+		);
+		await fs.writeFile(
+			path.join(legacy, "active-turns", "visible-session.json"),
+			JSON.stringify({ namespace_identity: "foreign-namespace", session_id: "visible-session" }),
+		);
+		const response = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(response.ok).toBe(false);
+	});
+
+	it("revokes narrowed-root coordination status and watch disclosures", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		await server.callTool("gjc_coordinator_report_status", {
+			status: "blocked",
+			summary: "namespace report remains visible",
+			idempotency_key: "narrowed-root-namespace-report",
+			allow_mutation: true,
+		});
+		const narrowed = path.join(root, "narrowed");
+		await fs.mkdir(narrowed);
+		server.config.allowedRoots = [narrowed];
+		const scopedStatus = await server.callTool("gjc_coordinator_read_coordination_status", {
+			session_id: "visible-session",
+		});
+		expect(scopedStatus.ok).toBe(false);
+		const globalStatus = await server.callTool("gjc_coordinator_read_coordination_status");
+		expect(globalStatus).toMatchObject({
+			ok: true,
+			summary: { sessions: 0, turns: 0, reports: 1 },
+			reports: [expect.objectContaining({ session_id: null, summary: "namespace report remains visible" })],
+		});
+		expect(JSON.stringify(globalStatus)).not.toContain("visible-session");
+		const scopedWatch = await server.callTool("gjc_coordinator_watch_events", {
+			session_id: "visible-session",
+			after_seq: 0,
+			timeout_ms: 0,
+		});
+		expect(scopedWatch.ok).toBe(false);
+		const globalWatch = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
+		expect(globalWatch).toMatchObject({ ok: true, events: [] });
 	});
 });

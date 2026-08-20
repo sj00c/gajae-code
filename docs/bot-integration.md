@@ -23,7 +23,7 @@ external controller / bot
   ├─ discovers or starts one SDK-backed GJC session
   ├─ sends one bounded turn at a time
   ├─ answers structured questions explicitly
-  ├─ marks turn completion/failure with report_status
+  ├─ watches the durable lifecycle event cursor first
   └─ reads artifacts/reports from allowlisted roots
 ```
 
@@ -98,7 +98,7 @@ Read-only tools:
 - `gjc_coordinator_read_artifact`
 - `gjc_coordinator_read_coordination_status`
 - `gjc_coordinator_watch_events`
-- `gjc_coordinator_read_codex_handoff` — reads the Codex app-server resume bridge registration and durable wake state; endpoints are unix sockets or loopback TCP only, and token-file references only. Returned wake events expose lifecycle schema version 1 (`pending` → `requested`, `published` → `delivered`, `acked` → `acknowledged`, `failed` → `failed`); durable `attempts` and `last_error` are its failure/retry metadata. Heartbeats are unsupported (`automation_update_unavailable`), so delivery remains event-driven with startup drain.
+- `gjc_coordinator_read_codex_handoff` — reads the Codex app-server resume bridge registration and durable wake state; endpoints are unix sockets or loopback TCP only. Public handoffs report only whether a token is configured, never its path. Token files are independently authorized under `GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT` (default: the coordinator state root's managed `codex-tokens` directory), must be owner-only (`0600` or stricter), regular non-symlink files owned by the coordinator user, 1–4096 bytes, and contain neither CR nor LF. The coordinator binds the canonical no-follow file identity at registration and rejects replacement at delivery. Returned wake events expose lifecycle schema version 1 (`pending` → `requested`, `published` → `delivered`, `acked` → `acknowledged`, `failed` → `failed`); durable `attempts` and `last_error` are its failure/retry metadata. Heartbeats are unsupported (`automation_update_unavailable`), so delivery remains event-driven with startup drain.
 
 Mutating tools:
 
@@ -109,7 +109,7 @@ Mutating tools:
 - `gjc_coordinator_submit_question_answer`
 - `gjc_coordinator_report_status`
 - `gjc_coordinator_stop_session`
-- `gjc_coordinator_register_codex_handoff` — registers the Codex app-server resume bridge with a unix/loopback endpoint and token-file reference only.
+- `gjc_coordinator_register_codex_handoff` — registers the Codex app-server resume bridge with a unix/loopback endpoint and an independently authorized token-file reference only; raw token material and paths outside the configured token root are rejected.
 - `gjc_coordinator_ack_codex_handoff` — acknowledges a Codex resume wake by durable `wake_key`; wake prompts never include GJC final responses.
 
 `gjc_coordinator_stop_session` closes a coordinator delegate-created (ephemeral) session through canonical SDK broker lifecycle control, then removes its coordinator metadata only after the broker reports success. It refuses sessions with an active turn. User-registered sessions require both `force: true` and the `GJC_COORDINATOR_MCP_FORCE_STOP` capability; the same SDK lifecycle path reaps abandoned ephemeral delegate sessions after the configured idle TTL.
@@ -206,22 +206,19 @@ A session may have one active turn by default. A second prompt returns `active_t
 
 ### Wait or watch for completion
 
-Use `gjc_coordinator_read_turn` for polling or `gjc_coordinator_await_turn` for bounded waiting:
+Use `gjc_coordinator_watch_events` as the primary lifecycle loop. Persist and resume with `next_after_seq`, not `latest_seq`: `latest_seq` is the snapshot watermark, while a filtered or limited page can intentionally return `next_after_seq < latest_seq`. A zero-time watch performs one bounded immediate reconcile/export pass; a positive `timeout_ms` is a bounded long poll. Handle metadata-only `turn.waiting_for_answer`, `question.opened`, `turn.completed`, and `turn.failed` events, and read details through `gjc_coordinator_read_turn` or `gjc_coordinator_list_questions`.
 
 ```json
 {
-  "session_id": "gjc-demo",
-  "turn_id": "turn-00000000-0000-0000-0000-000000000000",
+  "after_seq": 0,
   "timeout_ms": 30000,
-  "poll_interval_ms": 1000
+  "limit": 100
 }
 ```
 
-Terminal turn statuses are `completed`, `failed`, `cancelled`, and `superseded`. Non-terminal statuses include `queued`, `delivering`, `active`, `waiting_for_answer`, and `completing`.
+A cursor ahead of the snapshot returns `reason: "cursor_ahead"` with `snapshot_watermark`; reconcile from that watermark according to your retention policy. Malformed or fractional cursors return the public `invalid_input` error. `gjc_coordinator_read_turn` and `gjc_coordinator_await_turn` remain available for snapshots and bounded compatibility waits. Terminal turn statuses are `completed`, `failed`, `cancelled`, and `superseded`; non-terminal statuses include `queued`, `delivering`, `active`, `waiting_for_answer`, and `completing`.
 
-`gjc_coordinator_watch_events` accepts a non-negative integer `after_seq`. Persist and resume with `next_after_seq`, not `latest_seq`: `latest_seq` is the snapshot watermark, while a filtered or limited page can intentionally return `next_after_seq < latest_seq`. A cursor ahead of the snapshot returns `reason: "cursor_ahead"` with `snapshot_watermark`; reconcile from that watermark according to your retention policy. Malformed or fractional cursors return the public `invalid_input` error.
-
-When the work is done, your bot must call `gjc_coordinator_report_status` with the turn id. The report idempotency key is crash-recoverable: retrying the identical request after a disconnect repairs the canonical queue/session/report projections and retained event delivery before replaying the committed report/terminal turn response without creating another report. The durable receipt/canonical report is consulted before mutable evidence paths are revalidated, so an evidence file may be deleted or renamed after commit without breaking an identical replay. This writes the final response/error, evidence paths, and coordinator report that later reads consume:
+`gjc_coordinator_report_status` is optional additive controller-authored evidence. Use it when the bot has an explicit summary/evidence record, needs to record policy cancellation, or must provide a fallback provider/tool failure. Runtime-derived watch events do not require a preceding report. The report idempotency key is crash-recoverable: retrying an identical request after a disconnect repairs canonical projections and retained event delivery before replaying the committed report response without creating another report. The durable receipt/canonical report is consulted before mutable evidence paths are revalidated, so an evidence file may be deleted or renamed after commit without breaking an identical replay. When used, this writes the final response/error, evidence paths, and coordinator report that later reads consume:
 
 ```json
 {
@@ -242,7 +239,7 @@ Use `status: "cancelled"` when the coordinator policy intentionally stops tracki
 
 Discord, Hermes, Clawhip, and similar external notifiers should be opt-in and should forward only the public lifecycle surface. Use one of these supported paths:
 
-- Coordinator controllers: watch or poll turn state with `gjc_coordinator_watch_events`, `gjc_coordinator_await_turn`, or `gjc_coordinator_read_turn`, then notify from the terminal turn status your controller records with `gjc_coordinator_report_status`.
+- Coordinator controllers: watch `gjc_coordinator_watch_events` first, persist `next_after_seq`, and notify from the metadata-only `turn.completed`, `turn.failed`, `turn.waiting_for_answer`, or `question.opened` events. Read details through the existing authorized tools; use `gjc_coordinator_report_status` only for optional controller-authored evidence, cancellation, or fallback reporting.
 - In-process extensions or hooks: subscribe to the public lifecycle events `turn_end` and `agent_end` from the shared hook/extension event contract.
 
 Recommended notification mapping:
@@ -251,8 +248,8 @@ Recommended notification mapping:
 | --- | --- | --- |
 | Turn finished | `turn_end` or terminal coordinator turn status `completed` | One LLM turn produced its final assistant message. |
 | Agent stopped / finished | `agent_end` | The agent loop ended for the submitted prompt. |
-| Waiting for user | Coordinator turn status `waiting_for_answer` | The agent is blocked on a structured question. |
-| Failed or blocked | Coordinator status `failed` with a public `blocker` summary | The controller recorded a terminal failure. |
+| Waiting for user | Public `turn.waiting_for_answer` or `question.opened` event | The agent is blocked on a structured question. |
+| Failed or blocked | Public `turn.failed` event, with optional controller `report_status` evidence | The runtime or controller recorded a terminal failure. |
 | Cancelled / superseded | Coordinator status `cancelled` or `superseded` | The controller intentionally stopped tracking or replaced the turn. |
 
 Do not forward raw prompts, transcripts, tool outputs, hidden instructions, private configs, host paths, channel ids, webhook URLs, or tokens. If your notifier needs a human-readable sentence, create a caller-supplied sanitized summary and keep provider/tool details out of the payload.
@@ -323,7 +320,7 @@ Use `gjc_coordinator_list_artifacts` to inspect safe roots and `gjc_coordinator_
 { "path": "/path/to/repo/.gjc/ultragoal/ledger.jsonl" }
 ```
 
-Artifact paths are canonicalized, symlink escapes are rejected, and output is byte-capped. Use `gjc_coordinator_read_coordination_status` for status reports written through `gjc_coordinator_report_status`.
+Artifact reads are Linux-only because they require identity-bound handle authorization; on macOS and Windows the tool returns the generic `artifact_unavailable` error; detect support through `tools/list` rather than invocation errors. Controllers on those platforms must use their own approved repository/worktree access for artifact collection, then submit bounded paths or summaries with `gjc_coordinator_report_status`. Linux artifact paths are canonicalized, symlink escapes are rejected, and output is byte-capped. Use `gjc_coordinator_read_coordination_status` for status reports written through `gjc_coordinator_report_status`.
 
 ## Managed SDK attachment integration
 
@@ -364,8 +361,8 @@ and have no compatibility shim; migrate controllers to Coordinator MCP,
 | `timeout` from `await_turn` | Treat as non-terminal. Poll again or inspect `read_status`; do not mark failure solely from a bounded wait timeout. |
 | Coordinator cancellation | Use `gjc_coordinator_report_status` with `status: "cancelled"` for an intentionally stopped turn, or send replacement work with `force: true` when supersession is policy-approved. This is coordinator state, not process control. |
 | Stale session state | Check `read_status.session_state` and broker-backed session status. Report a recoverable blocker rather than inspecting endpoint state. |
-| Provider/auth failure | Capture the model/provider error in `report_status` with `status: "failed"`; do not retry forever without a policy budget. |
-| Artifact denied | Keep the artifact inside allowlisted roots and avoid symlink escapes. |
+| Provider/auth failure | Optionally capture the model/provider error in `report_status` with `status: "failed"`; watch `turn.failed` and do not retry forever without a policy budget. |
+| Artifact denied | On Linux, keep the artifact inside allowlisted roots and avoid symlink escapes. On macOS/Windows, use the controller's approved repository/worktree reader and report the bounded result instead. |
 | Malformed or invalid question answer | Re-read the question/gate schema and submit a value matching the advertised shape. |
 | Bot shutdown | Persist `session_id` and active `turn_id`; on restart use `read_turn` and `read_status` before sending more work. |
 

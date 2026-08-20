@@ -7,6 +7,7 @@ import * as path from "node:path";
 import type { CodexHandoffRegistrationV1, CodexWakeEventV1 } from "../src/coordinator-mcp/codex-handoff";
 import {
 	assertSafeCodexEndpoint,
+	authorizeCodexTokenFile,
 	buildCodexWakePrompt,
 	type CodexAppServerTransport,
 	type CodexTransportFactory,
@@ -31,6 +32,7 @@ function handoff(tokenFile: string | null = null): CodexHandoffRegistrationV1 {
 		thread_id: "thread-1",
 		endpoint: { kind: "unix", path: "/tmp/codex.sock" },
 		token_file: tokenFile,
+		token_file_identity: null,
 		registered_at: "2026-01-01T00:00:00.000Z",
 		updated_at: "2026-01-01T00:00:00.000Z",
 	};
@@ -310,7 +312,8 @@ describe("Codex wake publisher", () => {
 	it("passes file token content to the transport and hides unreadable-file details", async () => {
 		const root = await tempRoot();
 		const tokenFile = path.join(root, "token.txt");
-		await fs.writeFile(tokenFile, "token-value\n");
+		await fs.writeFile(tokenFile, "token-value", { mode: 0o600 });
+		const tokenIdentity = await authorizeCodexTokenFile(tokenFile, root);
 		let suppliedToken: string | null = null;
 		const factory = async (_endpoint: unknown, token: string | null): Promise<CodexAppServerTransport> => {
 			suppliedToken = token;
@@ -320,11 +323,15 @@ describe("Codex wake publisher", () => {
 				close: async () => {},
 			};
 		};
-		await publishCodexWake({ handoff: handoff(tokenFile), event: event(), transportFactory: factory });
+		await publishCodexWake({
+			handoff: { ...handoff(tokenFile), token_file_identity: tokenIdentity },
+			event: event(),
+			transportFactory: factory,
+		});
 		expect(suppliedToken as string | null).toBe("token-value");
 		await fs.rm(tokenFile);
-		await expect(readCodexTokenFile(tokenFile)).rejects.toThrow("codex_token_file_unreadable");
-		await expect(readCodexTokenFile(tokenFile)).rejects.not.toThrow("token-value");
+		await expect(readCodexTokenFile(tokenFile, tokenIdentity)).rejects.toThrow("codex_token_file_unreadable");
+		await expect(readCodexTokenFile(tokenFile, tokenIdentity)).rejects.not.toThrow("token-value");
 	});
 
 	it("publishes over the default unix WebSocket JSON-RPC transport", async () => {
@@ -457,11 +464,16 @@ describe("Codex wake publisher", () => {
 		const root = await tempRoot();
 		const socketPath = path.join(root, "codex-protocol.sock");
 		const tokenFile = path.join(root, "token.txt");
-		await fs.writeFile(tokenFile, "bearer-secret\n");
+		await fs.writeFile(tokenFile, "bearer-secret", { mode: 0o600 });
+		const tokenIdentity = await authorizeCodexTokenFile(tokenFile, root);
 		const fixture = await createWebSocketFixture(socketPath, "idle", { ping: true, noiseBeforeResponse: true });
 		try {
 			const result = await publishCodexWake({
-				handoff: { ...handoff(tokenFile), endpoint: { kind: "unix", path: socketPath } },
+				handoff: {
+					...handoff(tokenFile),
+					token_file_identity: tokenIdentity,
+					endpoint: { kind: "unix", path: socketPath },
+				},
 				event: event(),
 				transportFactory: createDefaultCodexTransportFactory(),
 			});
@@ -513,12 +525,17 @@ describe("Codex wake publisher", () => {
 		}
 
 		const tokenFile = path.join(root, "token.txt");
-		await fs.writeFile(tokenFile, "frame-secret-b1c2\n");
+		await fs.writeFile(tokenFile, "frame-secret-b1c2", { mode: 0o600 });
+		const frameTokenIdentity = await authorizeCodexTokenFile(tokenFile, root);
 		const withTokenPath = path.join(root, "codex-with-token.sock");
 		const withToken = await createWebSocketFixture(withTokenPath, "idle");
 		try {
 			await publishCodexWake({
-				handoff: { ...handoff(tokenFile), endpoint: { kind: "unix", path: withTokenPath } },
+				handoff: {
+					...handoff(tokenFile),
+					token_file_identity: frameTokenIdentity,
+					endpoint: { kind: "unix", path: withTokenPath },
+				},
 				event: event(),
 				transportFactory: createDefaultCodexTransportFactory(),
 			});

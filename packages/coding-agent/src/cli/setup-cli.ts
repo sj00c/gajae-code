@@ -114,6 +114,31 @@ const VALID_COMPONENTS: SetupComponent[] = [
  * behavior changes.
  */
 const PASEO_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = ["remove", "mpreset"];
+const HERMES_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = [
+	"smoke",
+	"install",
+	"sessionCommand",
+	"noWorktree",
+	"worktreeName",
+	"stateRoot",
+	"mutation",
+	"artifactByteCap",
+	"serverKey",
+	"gjcCommand",
+	"target",
+	"profile",
+	"profileDir",
+];
+
+function rejectHermesFlagsOutsideHermes(component: SetupComponent, flags: SetupCommandArgs["flags"]): void {
+	if (component === "hermes") return;
+	const offending = HERMES_ONLY_FLAGS.filter(flag => flags[flag] !== undefined);
+	if (offending.length === 0) return;
+	const flagList = offending.map(flag => `--${flag.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}`);
+	process.stderr.write(`${chalk.red(`${flagList.join(", ")} require the explicit \`hermes\` component.`)}\n`);
+	process.stderr.write(`${chalk.dim(`Run: ${APP_NAME} setup hermes ${flagList.join(" ")}`)}\n`);
+	process.exit(1);
+}
 
 function rejectPaseoFlagsOutsidePaseo(component: SetupComponent, flags: SetupCommandArgs["flags"]): void {
 	if (component === "paseo") return;
@@ -241,6 +266,7 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 
 	rejectProviderFlagsOutsideProvider(component, flags);
 	rejectPaseoFlagsOutsidePaseo(component, flags);
+	rejectHermesFlagsOutsideHermes(component, flags);
 
 	return {
 		component,
@@ -299,6 +325,7 @@ async function checkPythonSetup(): Promise<PythonCheckResult> {
 export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 	rejectProviderFlagsOutsideProvider(cmd.component, cmd.flags);
 	rejectPaseoFlagsOutsidePaseo(cmd.component, cmd.flags);
+	rejectHermesFlagsOutsideHermes(cmd.component, cmd.flags);
 	switch (cmd.component) {
 		case "claude":
 			handleHostPluginSetup("claude", cmd.flags);
@@ -338,10 +365,13 @@ async function handleHermesSetup(flags: HermesSetupFlags): Promise<void> {
 		const result = await runHermesSetup(flags);
 		if (flags.json) {
 			process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-			return;
+		} else {
+			process.stdout.write(
+				`${result.ok ? chalk.green(`${theme.status.success} Hermes MCP setup ready`) : chalk.red(`${theme.status.error} Hermes MCP setup check failed`)}\n`,
+			);
+			process.stdout.write(`${chalk.dim(formatHermesSetupResult(result))}\n`);
 		}
-		process.stdout.write(`${chalk.green(`${theme.status.success} Hermes MCP setup ready`)}\n`);
-		process.stdout.write(`${chalk.dim(formatHermesSetupResult(result))}\n`);
+		if (!result.ok) process.exit(4);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		if (flags.json) {
@@ -891,7 +921,8 @@ ${chalk.bold("Hermes example:")}
   ${APP_NAME} setup hermes --root /path/to/repo
   ${APP_NAME} setup hermes --root /path/to/repo --profile my-bot --repo gajae-code --profile-dir /path/to/hermes/profile --install
   ${APP_NAME} setup hermes --root /path/to/repo --worktree-name hermes-gajae-code
-  ${APP_NAME} setup hermes --root /path/to/repo --session-command "gjc --worktree hermes-custom --model <provider/model>"
+  ${APP_NAME} setup hermes --root /path/to/repo --session-command "gjc --worktree hermes-custom"
+  ${APP_NAME} setup hermes --root /path/to/repo --session-command gjc
 
 ${chalk.bold("Options:")}
   -c, --check       Check if dependencies are installed without installing
@@ -909,7 +940,7 @@ ${chalk.bold("Options:")}
   --root            Allowed Hermes MCP workdir/artifact root (repeatable)
   --profile         Hermes MCP profile namespace
   --repo            Hermes MCP repo namespace
-  --session-command Explicit GJC session command; disables generated worktree flags
+  --session-command Typed GJC lifecycle selector: gjc | gjc --worktree [name]; disables generated worktree flags
   --no-worktree     Disable default GJC --worktree isolation for Hermes sessions
   --worktree-name   Named GJC --worktree branch for Hermes sessions
   --mutation        Hermes MCP mutation classes: sessions,questions,reports,all

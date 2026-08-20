@@ -33,6 +33,9 @@ import {
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 } from "../../gjc-runtime/session-state-sidecar";
 import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
 import {
@@ -231,7 +234,7 @@ export interface SessionLifecycleTranscriptIdentity {
  * be produced by an inherited process-global flag.
  */
 export type SessionLifecycleReadiness = "immediate" | "deferred";
-export interface SessionLifecycleLaunchRequest {
+export interface SessionLifecycleLaunchRequestBase {
 	operation: "session.create" | "session.fork" | "session.resume";
 	sessionId: string;
 	cwd: string;
@@ -254,10 +257,48 @@ export interface SessionLifecycleLaunchRequest {
 	semanticReadyDeadlineAt: number;
 	terminationStartDeadlineAt: number;
 	lifecycleCleanupDeadlineAt: number;
-	/** Coordinator namespace dir; broker computes the state file path from launch.id (#2549). */
-	coordinatorStateDir?: string;
 	coordinatorSessionId?: string;
 	coordinatorSessionBranch?: string;
+}
+
+export type SessionLifecycleLaunchRequest = SessionLifecycleLaunchRequestBase &
+	(
+		| {
+				coordinatorStateDir?: undefined;
+				coordinatorSidecarSigningKey?: undefined;
+				coordinatorSidecarKeyId?: undefined;
+		  }
+		| {
+				/** Coordinator namespace dir; broker computes the state file path from launch.id. */
+				coordinatorStateDir: string;
+				/** Public Coordinator signing authority metadata. */
+				coordinatorSidecarKeyId: string;
+				coordinatorSidecarSigningKey?: undefined;
+		  }
+	);
+
+function hasValidCoordinatorSidecarTarget(stateDir: unknown, keyId?: unknown): boolean {
+	if (stateDir === undefined && keyId === undefined) return true;
+	return (
+		typeof stateDir === "string" &&
+		stateDir.length > 0 &&
+		typeof keyId === "string" &&
+		/^[a-f0-9]{64}$/.test(keyId) &&
+		stateDir.length <= 4096
+	);
+}
+
+function hasValidCoordinatorSidecarLaunchTarget(stateDir: unknown, signingKey: unknown, keyId?: unknown): boolean {
+	if (stateDir === undefined && signingKey === undefined && keyId === undefined) return true;
+	return (
+		typeof stateDir === "string" &&
+		stateDir.length > 0 &&
+		typeof signingKey === "string" &&
+		signingKey.length > 0 &&
+		typeof keyId === "string" &&
+		/^[a-f0-9]{64}$/.test(keyId) &&
+		stateDir.length <= 4096
+	);
 }
 
 function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionLifecycleTranscriptIdentity {
@@ -405,8 +446,8 @@ export function readSessionLifecycleLaunchRequest(
 		(request.operation === "session.fork" &&
 			(!hasValidTranscriptAuthority(request.sourceSessionPath, request.sourceSessionIdentity) ||
 				request.sourceSessionId === undefined)) ||
-		(request.coordinatorStateDir !== undefined &&
-			(typeof request.coordinatorStateDir !== "string" || request.coordinatorStateDir.length > 4096)) ||
+		request.coordinatorSidecarSigningKey !== undefined ||
+		!hasValidCoordinatorSidecarTarget(request.coordinatorStateDir, request.coordinatorSidecarKeyId) ||
 		(request.coordinatorSessionId !== undefined &&
 			(typeof request.coordinatorSessionId !== "string" ||
 				!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(request.coordinatorSessionId))) ||
@@ -433,6 +474,8 @@ type SessionLaunch = {
 	coordinatorStateDir?: string;
 	coordinatorSessionId?: string;
 	coordinatorSessionBranch?: string;
+	coordinatorSidecarSigningKey?: string;
+	coordinatorSidecarKeyId?: string;
 	worktree?: SessionLifecycleWorktreeTarget;
 	readiness?: SessionLifecycleReadiness;
 	worktreePlan?: GjcLaunchWorktreePlan;
@@ -2890,6 +2933,27 @@ async function launchInput(
 	const coordinatorStateDir = text(input.coordinatorStateDir);
 	const coordinatorSessionId = text(input.coordinatorSessionId);
 	const coordinatorSessionBranch = text(input.coordinatorSessionBranch);
+	const coordinatorSidecarSigningKey =
+		typeof input.coordinatorSidecarSigningKey === "string" ? input.coordinatorSidecarSigningKey : undefined;
+	const coordinatorSidecarKeyId =
+		typeof input.coordinatorSidecarKeyId === "string" ? input.coordinatorSidecarKeyId : undefined;
+	if (
+		(input.coordinatorStateDir !== undefined && !coordinatorStateDir) ||
+		(input.coordinatorSidecarSigningKey !== undefined && !coordinatorSidecarSigningKey) ||
+		!hasValidCoordinatorSidecarLaunchTarget(
+			coordinatorStateDir,
+			coordinatorSidecarSigningKey,
+			coordinatorSidecarKeyId,
+		)
+	)
+		return fail(
+			"invalid_input",
+			"Coordinator state directory, signing key, and verifier id must be supplied together as a valid target.",
+		);
+	const coordinatorAuthority =
+		coordinatorSidecarSigningKey && coordinatorSidecarKeyId
+			? { coordinatorSidecarSigningKey, coordinatorSidecarKeyId }
+			: {};
 
 	if (operation === "session.create")
 		return {
@@ -2904,6 +2968,7 @@ async function launchInput(
 			...(coordinatorStateDir ? { coordinatorStateDir } : {}),
 			...(coordinatorSessionId ? { coordinatorSessionId } : {}),
 			...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
+			...coordinatorAuthority,
 		};
 	if (operation === "session.resume") {
 		if (!requested) return fail("invalid_input", "sessionId is required to resume a saved session.");
@@ -2924,6 +2989,7 @@ async function launchInput(
 			...(coordinatorStateDir ? { coordinatorStateDir } : {}),
 			...(coordinatorSessionId ? { coordinatorSessionId } : {}),
 			...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
+			...coordinatorAuthority,
 		};
 	}
 	const sourceSessionId = text(input.sourceSessionId) ?? text(input.sourceId);
@@ -2949,6 +3015,7 @@ async function launchInput(
 		...(coordinatorStateDir ? { coordinatorStateDir } : {}),
 		...(coordinatorSessionId ? { coordinatorSessionId } : {}),
 		...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
+		...coordinatorAuthority,
 	};
 }
 
@@ -3627,6 +3694,13 @@ async function executeLifecycleResponse(
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
 
+		const coordinatorSidecarTarget =
+			typeof launch.coordinatorStateDir === "string" && typeof launch.coordinatorSidecarKeyId === "string"
+				? {
+						coordinatorStateDir: launch.coordinatorStateDir,
+						coordinatorSidecarKeyId: launch.coordinatorSidecarKeyId,
+					}
+				: {};
 		const request: SessionLifecycleLaunchRequest = {
 			operation,
 			sessionId: launch.id,
@@ -3648,7 +3722,7 @@ async function executeLifecycleResponse(
 			...(launch.mcpServers ? { mcpServers: launch.mcpServers } : {}),
 			...(launch.worktree ? { worktree: launch.worktree } : {}),
 			...(launch.readiness ? { readiness: launch.readiness } : {}),
-			...(launch.coordinatorStateDir ? { coordinatorStateDir: launch.coordinatorStateDir } : {}),
+			...coordinatorSidecarTarget,
 			...(launch.coordinatorSessionId ? { coordinatorSessionId: launch.coordinatorSessionId } : {}),
 			...(launch.coordinatorSessionBranch ? { coordinatorSessionBranch: launch.coordinatorSessionBranch } : {}),
 		};
@@ -3688,6 +3762,13 @@ async function executeLifecycleResponse(
 							: {}),
 						...(launch.coordinatorSessionBranch
 							? { [GJC_COORDINATOR_SESSION_BRANCH_ENV]: launch.coordinatorSessionBranch }
+							: {}),
+						...(launch.coordinatorSidecarSigningKey
+							? {
+									[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+									[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: launch.coordinatorSidecarSigningKey,
+									[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: launch.coordinatorSidecarKeyId,
+								}
 							: {}),
 					},
 				});
@@ -3803,6 +3884,9 @@ async function executeLifecycleResponse(
 				pid: verified.endpoint.pid,
 				endpointMtimeMs: verified.endpointMtimeMs,
 				endpoint: verified.endpoint,
+				// Public, ledger-replayable evidence of the bootstrap authority that
+				// reached this runtime. The private key never enters the response.
+				...(launch.coordinatorSidecarKeyId ? { coordinatorSidecarKeyId: launch.coordinatorSidecarKeyId } : {}),
 				...(launch.readiness === "deferred" ? { readiness: "prepared" as const } : {}),
 				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
 			},
