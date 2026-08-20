@@ -125,11 +125,13 @@ describe("sdk broker package generation", () => {
 		const stale = staleBroker(dir);
 		const stop = vi.spyOn(stale, "stop").mockResolvedValue(undefined);
 		try {
-			await stale.start();
+			const published = await stale.start();
 			const expected = resolveSdkPackageGeneration();
 			await expect(ensureBroker({ agentDir: dir, expectedPackageGeneration: expected })).rejects.toThrow(
 				"stale broker retirement was not verified",
 			);
+			const current = await readBrokerDiscovery(dir);
+			expect(current?.pid).toBe(published.pid);
 		} finally {
 			stop.mockRestore();
 			await cleanup(dir, stale);

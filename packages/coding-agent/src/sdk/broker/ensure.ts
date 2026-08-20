@@ -399,7 +399,7 @@ async function retireStaleBroker(
 		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 		if (!current) return true;
 		if (!sameBrokerIdentity(current, stale)) return true;
-		signalExactBroker(stale.pid, stale.incarnation);
+		if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
 	}
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
 	while (Date.now() < deadline) {
@@ -445,7 +445,13 @@ async function retireAndReadReplacement(
 		throw new Error("SDK broker package installation identity changed before retirement.");
 	if (!canRetireStaleBroker(stale, authority))
 		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
-	await retireStaleBroker(settings.agentDir, stale, expectedPackageGeneration, settings.heartbeatTtlMs);
+	const retired = await retireStaleBroker(
+		settings.agentDir,
+		stale,
+		expectedPackageGeneration,
+		settings.heartbeatTtlMs,
+	);
+	if (!retired) throw staleBrokerRetirementUnverified(expectedPackageGeneration, stale.packageGeneration);
 	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 	if (!replacement) return undefined;
 	const currentPackageGeneration = resolveSdkPackageAuthority().generation;
