@@ -421,7 +421,9 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 		note?: string;
 	} = { sessionId };
 	if (typeof record.cwd === "string") result.cwd = record.cwd;
-	if (typeof record.endpointGeneration === "number") result.endpointGeneration = record.endpointGeneration;
+	const endpointGeneration = record.endpointGeneration;
+	if (typeof endpointGeneration === "number" && Number.isSafeInteger(endpointGeneration) && endpointGeneration > 0)
+		result.endpointGeneration = endpointGeneration;
 	if (typeof record.reused === "boolean") result.reused = record.reused;
 	if (typeof record.note === "string") result.note = record.note;
 	return result;

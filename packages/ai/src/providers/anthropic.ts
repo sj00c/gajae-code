@@ -2053,6 +2053,15 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const trackBlockByAnthropicIndex = (anthropicIndex: number, block: Block) => {
 				const orphaned = blocksByAnthropicIndex.get(anthropicIndex);
 				if (orphaned) {
+					if (orphaned.type === "toolCall") {
+						orphaned.incompleteArguments = true;
+						orphaned.incompleteArgumentsReason = "ambiguous";
+						truncatedToolCalls.add(orphaned);
+					}
+					if (block.type === "toolCall") {
+						block.incompleteArguments = true;
+						block.incompleteArgumentsReason = "ambiguous";
+					}
 					throw new Error("Anthropic stream reused an active content block index");
 				}
 				blocksByAnthropicIndex.set(anthropicIndex, block);
@@ -2392,7 +2401,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "toolCall") {
-									if (!isCompleteJson(block.partialJson)) truncatedToolCalls.add(block);
+									if (!isCompleteJson(block.partialJson)) {
+										truncatedToolCalls.add(block);
+										block.incompleteArguments = true;
+										block.incompleteArgumentsReason = "truncated";
+									}
 									if (block.partialJson.trim()) {
 										const parsedArguments: unknown = parseStreamingJson(block.partialJson);
 										if (
@@ -2892,6 +2905,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				delete (block as { index?: number }).index;
 				if (block.type === "toolCall") {
 					truncatedToolCalls.add(block);
+					block.incompleteArguments = true;
+					block.incompleteArgumentsReason = "truncated";
 					if (block.partialJson.trim()) {
 						block.arguments = parseStreamingJson(block.partialJson);
 						if (findUnnecessaryUnicodeEscape(block.partialJson)) {

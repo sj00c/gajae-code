@@ -20,9 +20,8 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { $env, isEnoent, logger } from "@gajae-code/utils";
+import { $env, getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
 import {
 	type AwsIniFile,
 	classifyAwsProfileCapability,
@@ -201,7 +200,7 @@ async function loadSsoCachedToken(
 	startUrl: string,
 	sessionName: string | undefined,
 ): Promise<SsoCachedToken | undefined> {
-	const cacheDir = path.join(os.homedir(), ".aws", "sso", "cache");
+	const cacheDir = path.join(getTrustedHomeDir(), ".aws", "sso", "cache");
 	let entries: string[];
 	try {
 		entries = await fs.promises.readdir(cacheDir);

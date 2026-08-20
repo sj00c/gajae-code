@@ -24,6 +24,7 @@ export const CRASH_EVENT_MESSAGE_MAX_BYTES = 256;
 
 export type CrashEvent =
 	| CrashOccurrenceEvent
+	| CrashRefusedEvent
 	| CrashReportedEvent
 	| CrashRelayedEvent
 	| CrashAcknowledgedEvent
@@ -37,6 +38,15 @@ export interface CrashOccurrenceEvent {
 	readonly at: number;
 	readonly errorName: string;
 	readonly messageClass: string;
+}
+
+export interface CrashRefusedEvent {
+	readonly kind: "refused";
+	readonly fingerprint: string;
+	readonly fpv: number;
+	readonly recordId: string;
+	readonly contractVersion: string;
+	readonly at: number;
 }
 
 export interface CrashReportedEvent {
@@ -109,11 +119,20 @@ export function formatCrashEventLine(event: CrashEvent): string {
 							u: sanitizeEventText(truncateUtf8(event.issueUrl, 256)),
 							...(event.commented ? { c: 1 } : {}),
 						}
-					: event.kind === "relayed"
-						? { k: "relayed", fp: event.fingerprint, at: event.at, e: event.eventId, r: event.recordId }
-						: event.kind === "acknowledged"
-							? { k: "acknowledged", fp: event.fingerprint, at: event.at }
-							: { k: "nudged", at: event.at };
+					: event.kind === "refused"
+						? {
+								k: "refused",
+								fp: event.fingerprint,
+								v: event.fpv,
+								r: event.recordId,
+								c: sanitizeEventText(truncateUtf8(event.contractVersion, 64)),
+								at: event.at,
+							}
+						: event.kind === "relayed"
+							? { k: "relayed", fp: event.fingerprint, at: event.at, e: event.eventId, r: event.recordId }
+							: event.kind === "acknowledged"
+								? { k: "acknowledged", fp: event.fingerprint, at: event.at }
+								: { k: "nudged", at: event.at };
 		return `${CRASH_EVENT_KIND} ${JSON.stringify(body)}\n`;
 	};
 
@@ -168,6 +187,14 @@ export function parseCrashEventLine(line: string): CrashEvent | undefined {
 			if (!fingerprint) return undefined;
 			if (typeof body.u !== "string" || body.u.length === 0) return undefined;
 			return { kind: "reported", fingerprint, at, issueUrl: sanitizeEventText(body.u), commented: body.c === 1 };
+		}
+		case "refused": {
+			if (!fingerprint) return undefined;
+			if (typeof body.r !== "string" || !/^[0-9a-f]{8,32}$/.test(body.r)) return undefined;
+			if (typeof body.v !== "number" || !Number.isSafeInteger(body.v) || body.v < 1) return undefined;
+			if (typeof body.c !== "string" || body.c.length === 0 || /[\u0000-\u001f\u007f-\u009f]/.test(body.c))
+				return undefined;
+			return { kind: "refused", fingerprint, fpv: body.v, recordId: body.r, contractVersion: body.c, at };
 		}
 		case "relayed": {
 			if (!fingerprint) return undefined;

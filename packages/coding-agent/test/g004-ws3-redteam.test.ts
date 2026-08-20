@@ -79,6 +79,7 @@ function controllerContext(overrides: Record<string, unknown> = {}) {
 			model: undefined,
 			messages: [],
 			queuedMessageCount: 0,
+			drainableQueuedMessageCount: 0,
 			isStreaming: false,
 			isCompacting: false,
 			getRoleModelCycleCandidateCount: () => 0,
@@ -239,6 +240,38 @@ describe("G004 WS3 red-team: queue/send-now boundaries", () => {
 		expect(statuses).toEqual(["No visible queued message to send"]);
 	});
 
+	it("does not advertise send-now for hidden next-turn context alone (#4741)", () => {
+		// `sendNow()` can only send visible queue entries, so enabling the action
+		// for hidden next-turn context advertises a key whose only outcome is
+		// "No visible queued message to send".
+		const hiddenOnly = new InputController(
+			controllerContext({
+				session: {
+					...controllerContext().session,
+					isStreaming: true,
+					queuedMessageCount: 1,
+					drainableQueuedMessageCount: 0,
+					getQueuedMessageEntries: () => [],
+				},
+			}) as never,
+		);
+		expect(hiddenOnly.actionRegistry.isAvailable("app.message.sendNow")).toBe(false);
+
+		// A visible entry alongside hidden context still enables it.
+		const withVisible = new InputController(
+			controllerContext({
+				session: {
+					...controllerContext().session,
+					isStreaming: true,
+					queuedMessageCount: 2,
+					drainableQueuedMessageCount: 1,
+					getQueuedMessageEntries: () => [{ id: "q", text: "queue head" }],
+				},
+			}) as never,
+		);
+		expect(withVisible.actionRegistry.isAvailable("app.message.sendNow")).toBe(true);
+	});
+
 	it("uses composer text ahead of queue head", async () => {
 		const sent: string[] = [];
 		let removed = 0;
@@ -254,6 +287,7 @@ describe("G004 WS3 red-team: queue/send-now boundaries", () => {
 					...controllerContext().session,
 					isStreaming: true,
 					queuedMessageCount: 1,
+					drainableQueuedMessageCount: 1,
 					getQueuedMessageEntries: () => [{ id: "q", text: "queue head" }],
 					removeQueuedMessageForEditing: () => {
 						removed++;
@@ -280,6 +314,7 @@ describe("G004 WS3 red-team: queue/send-now boundaries", () => {
 					...controllerContext().session,
 					isStreaming: true,
 					queuedMessageCount: 1,
+					drainableQueuedMessageCount: 1,
 					getQueuedMessageEntries: () => queue,
 					removeQueuedMessageForEditing: (id: string) => {
 						const entry = queue.find(item => item.id === id);

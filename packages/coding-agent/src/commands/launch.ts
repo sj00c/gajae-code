@@ -2,12 +2,11 @@
  * Root command for the coding agent CLI.
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import { APP_NAME, setProjectDir } from "@gajae-code/utils";
 import { Args, Command } from "@gajae-code/utils/cli";
 import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
 import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
+import { writeCoordinatorAtomic } from "../coordinator-mcp/durability";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
 import { type PreparedLaunchWorktree, prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
 import {
@@ -54,8 +53,7 @@ export async function persistCoordinatorLaunchFailure(
 			? { owner_generation: env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null }
 			: {}),
 	};
-	await fs.mkdir(path.dirname(stateFile), { recursive: true });
-	await Bun.write(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
 }
 
 export default class Index extends Command {

@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
-import { $pickCredentialEnv, getAgentDir, isEnoent } from "@gajae-code/utils";
+import { $pickCredentialEnv, getAgentDir, isEnoent, sanitizeHeaderComponent } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import type { OAuthController, OAuthCredentials } from "./types";
 
@@ -90,18 +90,24 @@ let getDeviceId = (): string => {
 	return deviceId;
 };
 
-export let getKimiCommonHeaders = () => {
-	const headers = Object.freeze({
+/** @internal Exported for tests. Builds unsanitized-input-safe Kimi common headers. */
+export function buildKimiCommonHeaders(): Readonly<Record<string, string>> {
+	return Object.freeze({
 		"User-Agent": `KimiCLI/${packageJson.version}`,
 		"X-Msh-Platform": "kimi_cli",
 		"X-Msh-Version": packageJson.version,
-		"X-Msh-Device-Name": os.hostname(),
-		"X-Msh-Device-Model": getDeviceModel(),
-		"X-Msh-Os-Version": os.version(),
+		"X-Msh-Device-Name": sanitizeHeaderComponent(os.hostname()),
+		"X-Msh-Device-Model": sanitizeHeaderComponent(getDeviceModel()),
+		"X-Msh-Os-Version": sanitizeHeaderComponent(os.version()),
 		"X-Msh-Device-Id": getDeviceId(),
 	});
-	getKimiCommonHeaders = () => headers;
-	return headers;
+}
+
+let memoizedKimiCommonHeaders: Readonly<Record<string, string>> | undefined;
+
+export const getKimiCommonHeaders = () => {
+	memoizedKimiCommonHeaders ??= buildKimiCommonHeaders();
+	return memoizedKimiCommonHeaders;
 };
 
 async function requestDeviceAuthorization(): Promise<{

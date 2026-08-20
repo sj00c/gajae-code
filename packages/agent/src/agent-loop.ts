@@ -134,10 +134,60 @@ const MANAGED_LOCAL_FAILURE_STAGE_SET: ReadonlySet<string> = new Set(MANAGED_LOC
  */
 class ManagedAttemptBufferOverflowError extends Error {
 	readonly errorKind = "local_buffer_overflow" as const;
-	constructor(readonly stage: ManagedLocalFailureStage) {
-		super("Managed fallback attempt exceeded the provisional event buffer limit");
+	/**
+	 * Shape-only overflow diagnostics: the rejecting stage, which cap was
+	 * exceeded, the staged counters at rejection, the incoming event's size
+	 * (so a single oversized event explains itself), and the limits. Every
+	 * field is synthesized locally (closed stage/cap vocabulary, numeric
+	 * counters, numeric limits), so no provider or prompt text can reach a
+	 * downstream surface through this object.
+	 *
+	 * `exceeded` names the cap that tripped: `events`, `bytes`, or `both`.
+	 * The staged counters alone cannot say which — after #4610's compaction
+	 * they describe the retained batch, which is at or below both caps; the
+	 * projected values (`stagedBytes + incomingEventBytes`,
+	 * `stagedEventCount + 1`) are what crossed a limit.
+	 *
+	 * The `.message` keeps its stable prefix (session retry policy
+	 * prefix-classifies on it) and appends the same shape, because the thrown
+	 * error itself — not the `managedFailureMessage` wrapper — is what surfaces
+	 * on the non-retryable local exit path and issue reports (#4618). Parent
+	 * task receipts consume the structured shape, never this string.
+	 */
+	constructor(
+		readonly stage: ManagedLocalFailureStage,
+		readonly overflow: {
+			stage: ManagedLocalFailureStage;
+			exceeded: "events" | "bytes" | "both";
+			stagedEventCount: number;
+			stagedBytes: number;
+			incomingEventBytes: number;
+			maxStagedEvents: number;
+			maxStagedBytes: number;
+		},
+	) {
+		super(managedBufferOverflowMessage(overflow));
 		this.name = "ManagedAttemptBufferOverflowError";
 	}
+}
+
+/**
+ * Stable, prefix-anchored, shape-only message for a provisional staging-buffer
+ * overflow. The leading sentence is load-bearing (the session prefix-classifies
+ * legacy messages on it); the parenthetical names the stage, the exceeded cap,
+ * the projected counters, and the limits so the failure reads as the local,
+ * reproducible staging condition it is — not a provider or context-window
+ * problem.
+ */
+function managedBufferOverflowMessage(overflow: ManagedAttemptBufferOverflowError["overflow"]): string {
+	return (
+		"Managed fallback attempt exceeded the provisional event buffer limit " +
+		`(stage=${overflow.stage}; exceeded=${overflow.exceeded}; staged ${overflow.stagedEventCount}/${
+			overflow.maxStagedEvents
+		} events, ${overflow.stagedBytes} staged bytes + ${overflow.incomingEventBytes} incoming = ` +
+		`${overflow.stagedBytes + overflow.incomingEventBytes}/${overflow.maxStagedBytes} projected bytes; local staging ` +
+		"buffer limit, not a provider or context-window failure; re-issuing the same request will reproduce it)"
+	);
 }
 
 /**
@@ -404,7 +454,9 @@ function managedContextOverflowOutcome(message: AssistantMessage, scope?: Attemp
 function managedFailureMessage(error: unknown, config: AgentLoopConfig): AssistantMessage {
 	const errorMessage = managedProperty(error, "message");
 	const transportFailure = managedTransportFailure(error);
-	const errorKind = managedProperty(error, "errorKind");
+	// One identity-checked source for BOTH local-diagnostic fields: a foreign
+	// error that self-labels `errorKind` gets neither (#4618).
+	const localDiagnostic = managedLocalErrorDiagnostic(error);
 	let fallbackMessage = "Managed fallback attempt failed";
 	if (typeof errorMessage === "string") fallbackMessage = errorMessage;
 	else {
@@ -414,6 +466,9 @@ function managedFailureMessage(error: unknown, config: AgentLoopConfig): Assista
 			// Keep the stable local message for hostile wrappers.
 		}
 	}
+	// The overflow error's own message already carries the stable prefix plus
+	// the shape-only stage/counters/limits diagnostic, so nothing needs to be
+	// appended here; the prefix keeps the legacy prefix-classification stable.
 	return {
 		role: "assistant",
 		content: [],
@@ -431,7 +486,7 @@ function managedFailureMessage(error: unknown, config: AgentLoopConfig): Assista
 		stopReason: "error",
 		errorMessage: fallbackMessage,
 		...(transportFailure ? { transportFailure } : {}),
-		...(errorKind === "local_snapshot_failure" || errorKind === "local_buffer_overflow" ? { errorKind } : {}),
+		...(localDiagnostic ?? {}),
 		timestamp: Date.now(),
 	};
 }
@@ -713,6 +768,66 @@ function publishAgentEnd(
 		config.resourceLedger.seal(config.resourceRunId);
 	}
 }
+/**
+ * Structured, shape-only overflow diagnostic carried on the terminal
+ * `AssistantMessage` of a managed run that died of a staging-buffer overflow.
+ * Every field is closed-vocabulary or numeric, so parent surfaces can render a
+ * trustworthy summary WITHOUT trusting the free-form `errorMessage` string
+ * (which a foreign, self-labeled error can still fill with arbitrary text).
+ */
+export interface ManagedBufferOverflowDiagnostic {
+	stage: ManagedLocalFailureStage | "unknown";
+	exceeded: "events" | "bytes" | "both";
+	stagedEventCount: number;
+	stagedBytes: number;
+	incomingEventBytes: number;
+	maxStagedEvents: number;
+	maxStagedBytes: number;
+}
+
+/**
+ * The complete set of local-diagnostic authority fields a terminal
+ * `AssistantMessage` may carry. Produced only by
+ * {@link managedLocalErrorDiagnostic}, so `errorKind` and `bufferOverflow`
+ * always travel together from one identity check.
+ */
+export interface ManagedLocalErrorDiagnostic {
+	errorKind: "local_snapshot_failure" | "local_buffer_overflow";
+	bufferOverflow?: ManagedBufferOverflowDiagnostic;
+}
+
+/**
+ * Single identity-checked source of local-failure authority. Returns
+ * `undefined` unless the error is genuinely `instanceof` one of this module's
+ * private local-failure classes — a foreign error that merely sets
+ * `errorKind: "local_buffer_overflow"` fails the identity check and receives
+ * NEITHER the kind nor the structured shape, so a provider or custom-stream
+ * failure can never be reported to the parent as a local staging-buffer
+ * overflow (#4618).
+ *
+ * Every producer of a terminal assistant message (`managedFailureMessage` and
+ * the `Agent` run catch) MUST derive both fields from this function instead of
+ * reading `errorKind`/`errorMessage` off the thrown value.
+ */
+export function managedLocalErrorDiagnostic(error: unknown): ManagedLocalErrorDiagnostic | undefined {
+	if (error instanceof ManagedAttemptBufferOverflowError) {
+		const overflow = error.overflow;
+		return {
+			errorKind: "local_buffer_overflow",
+			bufferOverflow: {
+				stage: MANAGED_LOCAL_FAILURE_STAGE_SET.has(overflow.stage) ? overflow.stage : "unknown",
+				exceeded: overflow.exceeded === "events" || overflow.exceeded === "bytes" ? overflow.exceeded : "both",
+				stagedEventCount: overflow.stagedEventCount,
+				stagedBytes: overflow.stagedBytes,
+				incomingEventBytes: overflow.incomingEventBytes,
+				maxStagedEvents: overflow.maxStagedEvents,
+				maxStagedBytes: overflow.maxStagedBytes,
+			},
+		};
+	}
+	if (error instanceof ManagedAttemptSnapshotError) return { errorKind: "local_snapshot_failure" };
+	return undefined;
+}
 
 /**
  * Hard work budget for one degraded snapshot: every visited node AND every
@@ -938,6 +1053,7 @@ const LOSSLESS_SNAPSHOT_KEYS = [
 	"errorStatus",
 	"transportFailure",
 	"disabledFeatures",
+	"bufferOverflow",
 	"providerPayload",
 	"timestamp",
 	"duration",
@@ -1083,6 +1199,14 @@ function managedAssistantShell(
 	delete safeMetadata.errorMessage;
 	delete safeMetadata.errorStatus;
 	delete safeMetadata.transportFailure;
+	// Local diagnostic authority fields are never foreign-provider-settable.
+	// errorKind/bufferOverflow on the terminal assistant message are attached
+	// ONLY by this module's own runtime-error paths (managedFailureMessage and
+	// the Agent catch), so a provider/stream payload that smuggles them through
+	// its message snapshot is stripped here — the executor's parent-facing
+	// summary may never trust a shape that arrived via provider data (#4618).
+	delete safeMetadata.errorKind;
+	delete safeMetadata.bufferOverflow;
 	return {
 		...safeMetadata,
 		role: "assistant",
@@ -1523,6 +1647,34 @@ class ManagedAttemptTransaction {
 			this.#stagedBytes + bytes > MANAGED_ATTEMPT_MAX_STAGED_BYTES
 		);
 	}
+	/**
+	 * Shape snapshot for a buffer-overflow diagnostic: the rejecting stage,
+	 * which cap tripped, the retained staged counters (post-#4610-compaction),
+	 * the incoming event's own size, and the limits. Must be called AFTER
+	 * `discard()` so the staged counters report the retained batch shape — the
+	 * volume that still could not fit after superseded-delta compaction, not
+	 * zeroes. `exceeded` is derived from the projected values, not the
+	 * retained ones, because the retained batch is by definition within both
+	 * caps; `incomingEventBytes` lets the parent render why a single event
+	 * alone blew a cap.
+	 */
+	#overflowShape(
+		stage: ManagedLocalFailureStage,
+		incomingEventBytes: number,
+	): ManagedAttemptBufferOverflowError["overflow"] {
+		const staged = this.stagedShape();
+		const eventsExceeded = staged.stagedEventCount + 1 > MANAGED_ATTEMPT_MAX_STAGED_EVENTS;
+		const bytesExceeded = staged.stagedBytes + incomingEventBytes > MANAGED_ATTEMPT_MAX_STAGED_BYTES;
+		return {
+			stage,
+			exceeded: eventsExceeded && bytesExceeded ? "both" : eventsExceeded ? "events" : "bytes",
+			stagedEventCount: staged.stagedEventCount,
+			stagedBytes: staged.stagedBytes,
+			incomingEventBytes,
+			maxStagedEvents: MANAGED_ATTEMPT_MAX_STAGED_EVENTS,
+			maxStagedBytes: MANAGED_ATTEMPT_MAX_STAGED_BYTES,
+		};
+	}
 
 	/**
 	 * Reclaim staged frames that later staged frames already supersede.
@@ -1620,10 +1772,16 @@ class ManagedAttemptTransaction {
 			// A long turn reaches the cap through accumulated streaming increments,
 			// not through one oversized payload. Reclaim the superseded increments
 			// first; only a batch that still cannot fit is a real local overflow.
+			// The overflow shape snapshots the retained POST-COMPACTION batch (the
+			// volume that still cannot fit even after reclamation), because #4610
+			// made the pre-compaction shape describe deltas it already reclaimed.
 			this.#compactSupersededFrames();
 			if (this.#wouldOverflow(bytes)) {
 				this.discard();
-				throw new ManagedAttemptBufferOverflowError("overflow.preMeasure");
+				throw new ManagedAttemptBufferOverflowError(
+					"overflow.preMeasure",
+					this.#overflowShape("overflow.preMeasure", bytes),
+				);
 			}
 		}
 		const repaired = this.#repairAssistantEvent(event);
@@ -1644,10 +1802,16 @@ class ManagedAttemptTransaction {
 			throw new ManagedAttemptSnapshotError("staging.sanitize");
 		}
 		if (this.#wouldOverflow(bytes)) {
+			// Same ordering as the pre-measure path: compact first, then fail only
+			// if the retained post-compaction batch still cannot fit — and report
+			// that retained shape, not the pre-compaction one.
 			this.#compactSupersededFrames();
 			if (this.#wouldOverflow(bytes)) {
 				this.discard();
-				throw new ManagedAttemptBufferOverflowError("overflow.staged");
+				throw new ManagedAttemptBufferOverflowError(
+					"overflow.staged",
+					this.#overflowShape("overflow.staged", bytes),
+				);
 			}
 		}
 		// Retain each frame's accounted size so compaction can debit exactly what

@@ -159,10 +159,10 @@ is treated as absent, so a hand-edited global config fails closed. The
 `GJC_CRASH_SENTRY_DSN` environment variable is only consulted once that trusted global
 opt-in is already on; it cannot enable the relay by itself.
 
-The automatic relay reads fatal and handled stores only from the provenance-checked
-agent directory (`getTrustedAgentFile`), never from the XDG-aware state resolver. A
-checkout `.env` that sets `XDG_STATE_HOME` and creates `$XDG_STATE_HOME/gjc` can still
-move ordinary crash-index paths, but those files are not uploaded.
+The automatic relay always reads fatal and handled stores from the trusted agent
+directory (`getTrustedAgentFile`); it never uses XDG-selected paths as automatic-egress
+input. Ordinary crash state operations may still use trusted inherited XDG state, but
+checkout-controlled XDG paths are never uploaded.
 
 The relay never runs on the fatal path. It runs at the next **interactive** startup during index
 compaction; other modes can explicitly invoke `gjc crash relay`, preserving the crashing
@@ -199,6 +199,24 @@ watermark is written.
 
 `gjc crash relay` exits non-zero when any signature was refused by the sanitizer or failed
 in transport, so a partially delivered batch is never reported to automation as a success.
+
+### State provenance and legacy stores
+
+User-level state is anchored to the provenance-checked home selected by the shared directory
+resolver, not to raw `HOME`/`USERPROFILE` values supplied by a checkout. External XDG directories
+(`XDG_STATE_HOME`, `XDG_DATA_HOME`, and `XDG_CACHE_HOME`) are accepted only from trusted process
+configuration; values declared by the current checkout's `.env` cannot redirect trusted agent files
+or the relay's input stores. A checkout may still declare an XDG variable for ordinary project-facing
+caches, so those paths can move, but they are never trusted crash-report input.
+If a checkout declares `HOME` in its `.env`, the resolver uses the OS account home
+instead of treating that declaration as a trusted user root. It never uses a filesystem
+root as the refusal sentinel for user state.
+
+Project discovery uses the nearest existing `.gjc` directory, then the checkout's `.git` root as a
+fallback anchor. With an explicit project scope and neither anchor, the resolver uses `<cwd>/.gjc`
+instead of falling back to the user's home. The historical `~/.gemini` store remains a read-only
+compatibility source after trusted `.gjc/agent`; it is not a crash relay store and cannot override
+trusted state.
 
 The fingerprint remains a public, pseudonymous correlation token, not a confidentiality
 control. In addition to its local correlation role, it links the same crash class across

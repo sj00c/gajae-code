@@ -1,7 +1,12 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { $credentialEnv, $env, $pickCredentialEnv, extractHttpStatusFromError } from "@gajae-code/utils";
+import {
+	$credentialEnv,
+	$env,
+	$pickCredentialEnv,
+	extractHttpStatusFromError,
+	getTrustedHomeDir,
+} from "@gajae-code/utils";
 import { assertManagedAttempt, classifyFallbackTrigger, type TransportFailureFacts } from "./utils/fallback-transport";
 
 const managedAttemptValidated = Symbol("managedAttemptValidated");
@@ -77,7 +82,7 @@ function hasVertexAdcCredentials(): boolean {
 			cachedVertexAdcCredentialsExists = fs.existsSync(gacPath);
 		} else {
 			cachedVertexAdcCredentialsExists = fs.existsSync(
-				path.join(os.homedir(), ".config", "gcloud", "application_default_credentials.json"),
+				path.join(getTrustedHomeDir(), ".config", "gcloud", "application_default_credentials.json"),
 			);
 		}
 	}

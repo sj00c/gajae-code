@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Project dotenv declarations are now excluded from credential and agent-directory provenance even when Bun expands their values before startup, preventing repository-controlled redirects of trusted state and egress (#4715).
 
 ### Fixed
 - `postmortem.test.ts` no longer writes its crash fixtures into the developer's real crash store. Every scenario there deliberately crashes a subprocess, and the fatal handler resolved `getCrashLogPath()` with no override, so each run injected a dozen `fixture: ...` signatures into `~/.gjc/agent/gjc-crash.log` -- visible in `gjc crash list`, offered up by `gjc crash report`, eligible for the opt-in upstream relay, and competing for the log's fixed byte cap against a genuine crash the developer might need to file. The spawned fixtures now run under a temp `GJC_CODING_AGENT_DIR`, and the tests assert the fixture store received the records and the real store was untouched.
@@ -11,6 +12,7 @@
 - `recordHandledError` captures non-fatal errors that were caught and handled, into a store parallel to the fatal one (`gjc-error.log`, `gjc-error-events.jsonl`, `gjc-error-index.json`) reachable via the new `getHandledErrorLogPath` / `getHandledErrorEventsPath` / `getHandledErrorIndexPath` resolvers. Separate files rather than a shared cap, because handled errors are high-volume and would otherwise evict the rare fatal records. Only an `Error` with a non-empty stack is recorded -- without a stack the v1 fingerprint degrades to `<no-app-frame>` and unrelated failures would collapse into one group. A fingerprint is recorded at most once while it stays hot; the dedupe set is bounded at 256 entries with LRU eviction, so a tool failing in a loop cannot flood the store and a long-lived process never goes blind to new failure classes. `writeCrashRecord` now returns the written record instead of appending the journal event itself, so the fatal path keeps its one-write latch while the handled path stays unlatched; record format, `redactCrashSecrets` scrubbing, and marker emission are unchanged and shared.
 - The crash event journal carries five event kinds; the new `relayed` kind records that a signature was accepted by a configured crash upstream (`fingerprint`, `at`, the represented record id, and a locally generated 32-hex `eventId` sent upstream — it is generated here, not returned by the upstream). It serializes through the same bounded single-line path as every other event and parses under the same strictness — a malformed fingerprint, record id, non-lowercase-hex event id, or out-of-range timestamp yields `undefined` rather than a partially populated event.
 - `getTrustedAgentFile()` joins a filename under the provenance-checked agent directory and never follows `XDG_STATE_HOME`, so automatic crash relay cannot read a checkout-controlled XDG state root.
+- New `sanitizeHeaderComponent()` helper strips everything outside printable ASCII from a value destined for an HTTP header, so runtime-derived components (Android kernel release names embed non-ASCII like `Minimal™`) can never make `Headers`/`fetch` throw.
 
 ## [0.14.1] - 2026-08-18
 

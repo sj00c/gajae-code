@@ -382,6 +382,7 @@ export async function loginKiro(options: KiroLoginOptions): Promise<OAuthCredent
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { getTrustedHomeDir } from "@gajae-code/utils";
 
 interface SsoCachedAccessToken {
 	accessToken: string;
@@ -398,8 +399,7 @@ interface SsoCachedAccessToken {
  * credential store.
  */
 export function importSsoCacheToken(): OAuthCredentials | undefined {
-	const homeDir = process.env.HOME ?? process.env.USERPROFILE;
-	if (!homeDir) return undefined;
+	const homeDir = getTrustedHomeDir();
 	const cacheDir = path.join(homeDir, ".aws", "sso", "cache");
 
 	let files: string[];

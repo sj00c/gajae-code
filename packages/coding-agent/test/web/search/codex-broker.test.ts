@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import * as os from "node:os";
 import type { AuthStorage } from "@gajae-code/ai";
 import { hookFetch } from "@gajae-code/utils";
 import { AgentStorage } from "../../../src/session/agent-storage";
@@ -58,5 +59,37 @@ describe("Codex web search broker auth", () => {
 		expect(requestHeaders?.get("authorization")).toBe("Bearer broker-refreshed-access-token");
 		expect(requestHeaders?.get("chatgpt-account-id")).toBe("broker-account-id");
 		expect(openSpy).not.toHaveBeenCalled();
+	});
+
+	it("sanitizes non-ASCII OS components in the User-Agent header", async () => {
+		const platformSpy = vi.spyOn(os, "platform").mockReturnValue("linux" as NodeJS.Platform);
+		const releaseSpy = vi.spyOn(os, "release").mockReturnValue("4.4.302-Minimal™-EAS-QTI_Haptic-R26");
+		const archSpy = vi.spyOn(os, "arch").mockReturnValue("arm64" as NodeJS.Architecture);
+		const getOAuthAccess = vi.fn(async () => ({
+			accessToken: "broker-refreshed-access-token",
+			accountId: "broker-account-id",
+		}));
+		const authStorage = { getOAuthAccess } as unknown as AuthStorage;
+		let userAgent: string | undefined;
+
+		using _hook = hookFetch(async (_url, init) => {
+			const headers = new Headers(init?.headers);
+			userAgent = headers.get("User-Agent") ?? undefined;
+			return new Response(makeSseResponse(), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+		});
+
+		const result = await searchCodex({
+			query: "android codex search",
+			systemPrompt: "Use web search.",
+			authStorage,
+			sessionId: "codex-broker-session",
+		});
+
+		expect(result.provider).toBe("codex");
+		expect(userAgent).toMatch(/^pi\/[^\s]+ \(linux 4\.4\.302-Minimal-EAS-QTI_Haptic-R26; arm64\)$/);
+		expect(userAgent).toMatch(/^[\x20-\x7e]+$/);
+		platformSpy.mockRestore();
+		releaseSpy.mockRestore();
+		archSpy.mockRestore();
 	});
 });

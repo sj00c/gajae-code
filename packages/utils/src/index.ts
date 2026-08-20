@@ -12,6 +12,7 @@ export * from "./format";
 export * from "./frontmatter";
 export * from "./fs-error";
 export * from "./glob";
+export * from "./header-value";
 export * from "./hook-fetch";
 export * from "./json";
 export * as logger from "./logger";

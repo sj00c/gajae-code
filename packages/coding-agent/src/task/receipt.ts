@@ -42,6 +42,7 @@ export interface TaskResultReceipt {
 	persistence?: SingleResult["persistence"];
 	retryFailure?: { attempt: number; errorSummary: string };
 	setupFailure?: { summary: string };
+	localErrorSummary?: SingleResult["localErrorSummary"];
 	errorSummary?: string;
 	duplicateDisposition?: SingleResult["duplicateDisposition"];
 	abortSummary?: string;
@@ -144,6 +145,9 @@ function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outp
 	}
 	if (raw.abortReason) {
 		return `Task ${status}; abort reason recorded.`;
+	}
+	if (raw.localErrorSummary) {
+		return `Task ${status}; local failure (${raw.localErrorSummary.kind}): ${raw.localErrorSummary.summary}`;
 	}
 	if (raw.error) {
 		return `Task ${status}; error recorded.`;
@@ -295,8 +299,10 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
 			: undefined,
 		duplicateDisposition: raw.duplicateDisposition,
+		localErrorSummary: raw.localErrorSummary,
 		errorSummary:
 			raw.setupFailure?.summary ??
+			raw.localErrorSummary?.summary ??
 			(raw.error
 				? "Error recorded."
 				: raw.persistence?.outcome === "recovery_available"

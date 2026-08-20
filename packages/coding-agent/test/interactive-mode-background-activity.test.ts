@@ -11,7 +11,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Container, Loader } from "@gajae-code/tui";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 
@@ -79,6 +79,20 @@ describe("interactive background activity indicator", () => {
 		expect(resolveActivityIndicatorMessage(false, 1, "Working…")).toBe("Background: 1 task…");
 		expect(resolveActivityIndicatorMessage(false, 2, "Working…")).toBe("Background: 2 tasks…");
 		expect(resolveActivityIndicatorMessage(true, 2, "Working…")).toBe("Working… · 2 background tasks");
+	});
+	it("schedules the startup crash relay hook from trusted global settings", async () => {
+		const debug = vi.spyOn(logger, "debug");
+		Settings.instance.set("crashReport.upstream", "sentry");
+		Settings.instance.set("crashReport.upstreamDsn", "ftp://invalid.example/1");
+		mode.stop();
+		mode = new InteractiveMode(session, "test");
+		await mode.init();
+		await Bun.sleep(20);
+
+		expect(debug).toHaveBeenCalledWith("Crash relay finished", {
+			outcome: { status: "skipped", reason: "invalid-dsn" },
+		});
+		debug.mockRestore();
 	});
 	it("rejects pending user input when the interactive mode stops", async () => {
 		const input = mode.getUserInput();

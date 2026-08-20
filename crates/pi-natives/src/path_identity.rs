@@ -212,8 +212,12 @@ pub fn retain_broker_publication(
 	agent_dir: String,
 ) -> napi::Result<NativeRetainedBrokerPublication> {
 	let publication =
-		publication::RetainedPublication::open(Path::new(&agent_dir)).ok_or_else(|| {
-			napi::Error::from_reason("Retained broker publication authority is unavailable.")
+		publication::RetainedPublication::open(Path::new(&agent_dir)).map_err(|failure| {
+			napi::Error::from_reason(format!(
+				"Retained broker publication authority is unavailable. [retained-publication \
+				 object={}; reason={}]",
+				failure.object, failure.reason
+			))
 		})?;
 	Ok(NativeRetainedBrokerPublication::retain(publication))
 }
@@ -1445,6 +1449,12 @@ mod publication {
 		ino: u64,
 	}
 
+	#[derive(Debug)]
+	pub(super) struct RetainedPublicationOpenFailure {
+		pub(super) object: &'static str,
+		pub(super) reason: String,
+	}
+
 	impl Identity {
 		fn of(file: &File) -> Option<Self> {
 			let metadata = file.metadata().ok()?;
@@ -1468,6 +1478,7 @@ mod publication {
 		let flags = (if write { libc::O_RDWR } else { libc::O_RDONLY })
 			| libc::O_CLOEXEC
 			| libc::O_NOFOLLOW
+			| libc::O_NONBLOCK
 			| if directory { libc::O_DIRECTORY } else { 0 };
 		// SAFETY: `name` is a live NUL-terminated path and `flags` contains only
 		// valid open(2) flags. A non-negative descriptor is uniquely transferred
@@ -1481,8 +1492,35 @@ mod publication {
 		Ok(unsafe { File::from_raw_fd(fd) })
 	}
 
-	fn open(path: &Path, directory: bool, write: bool) -> Option<File> {
-		open_result(path, directory, write).ok()
+	fn open(
+		path: &Path,
+		object: &'static str,
+		directory: bool,
+		write: bool,
+	) -> Result<File, RetainedPublicationOpenFailure> {
+		open_result(path, directory, write).map_err(|error| RetainedPublicationOpenFailure {
+			object,
+			reason: error.raw_os_error().map_or_else(
+				|| format!("io-{}", error.kind()),
+				|code| format!("errno-{}", errno_name(code)),
+			),
+		})
+	}
+
+	const fn errno_name(errno: i32) -> &'static str {
+		match errno {
+			libc::EACCES => "EACCES",
+			libc::EISDIR => "EISDIR",
+			libc::ELOOP => "ELOOP",
+			libc::ENOTDIR => "ENOTDIR",
+			libc::ENOENT => "ENOENT",
+			libc::ENXIO => "ENXIO",
+			_ => "UNKNOWN",
+		}
+	}
+
+	fn failure(object: &'static str, reason: impl Into<String>) -> RetainedPublicationOpenFailure {
+		RetainedPublicationOpenFailure { object, reason: reason.into() }
 	}
 
 	pub(super) struct RetainedPublication {
@@ -1500,32 +1538,55 @@ mod publication {
 	}
 
 	impl RetainedPublication {
-		pub(super) fn open(agent_dir: &Path) -> Option<Self> {
-			let root = open(&agent_dir.join("sdk"), true, false)?;
-			let lock = open(&agent_dir.join("sdk/broker.lock"), true, false)?;
-			let owner = open(&agent_dir.join("sdk/broker.lock/owner.json"), false, false)?;
-			let discovery = open(&agent_dir.join("sdk/broker.json"), false, true)?;
-			let mut readable = discovery.try_clone().ok()?;
+		pub(super) fn open(agent_dir: &Path) -> Result<Self, RetainedPublicationOpenFailure> {
+			let root = open(&agent_dir.join("sdk"), "sdk", true, false)?;
+			let lock = open(&agent_dir.join("sdk/broker.lock"), "sdk/broker.lock", true, false)?;
+			let owner = open(
+				&agent_dir.join("sdk/broker.lock/owner.json"),
+				"sdk/broker.lock/owner.json",
+				false,
+				false,
+			)?;
+			if owner
+				.metadata()
+				.map_err(|error| {
+					failure("sdk/broker.lock/owner.json", format!("metadata-{}", error.kind()))
+				})?
+				.mode() & mode_kind(libc::S_IFMT)
+				!= mode_kind(libc::S_IFREG)
+			{
+				return Err(failure("sdk/broker.lock/owner.json", "non-regular"));
+			}
+			let discovery = open(&agent_dir.join("sdk/broker.json"), "sdk/broker.json", false, true)?;
+			let mut readable = discovery
+				.try_clone()
+				.map_err(|error| failure("sdk/broker.json", format!("clone-{}", error.kind())))?;
 			let mut bytes = Vec::new();
-			readable.read_to_end(&mut bytes).ok()?;
+			readable
+				.read_to_end(&mut bytes)
+				.map_err(|error| failure("sdk/broker.json", format!("read-{}", error.kind())))?;
 			let needle = b"\"heartbeatAt\":";
 			let start = bytes
 				.windows(needle.len())
-				.position(|window| window == needle)?
+				.position(|window| window == needle)
+				.ok_or_else(|| failure("sdk/broker.json", "heartbeat-missing"))?
 				+ needle.len();
-			if bytes
-				.get(start..start + 13)?
-				.iter()
-				.any(|byte| !byte.is_ascii_digit())
+			let digits = bytes
+				.get(start..start + 13)
+				.ok_or_else(|| failure("sdk/broker.json", "heartbeat-width"))?;
+			if digits.iter().any(|byte| !byte.is_ascii_digit())
 				|| bytes.get(start + 13).is_some_and(u8::is_ascii_digit)
 			{
-				return None;
+				return Err(failure("sdk/broker.json", "heartbeat-width"));
 			}
-			Some(Self {
-				root_identity: Identity::of(&root)?,
-				lock_identity: Identity::of(&lock)?,
-				owner_identity: Identity::of(&owner)?,
-				discovery_identity: Identity::of(&discovery)?,
+			Ok(Self {
+				root_identity: Identity::of(&root).ok_or_else(|| failure("sdk", "metadata"))?,
+				lock_identity: Identity::of(&lock)
+					.ok_or_else(|| failure("sdk/broker.lock", "metadata"))?,
+				owner_identity: Identity::of(&owner)
+					.ok_or_else(|| failure("sdk/broker.lock/owner.json", "metadata"))?,
+				discovery_identity: Identity::of(&discovery)
+					.ok_or_else(|| failure("sdk/broker.json", "metadata"))?,
 				agent_dir: agent_dir.to_path_buf(),
 				_root: root,
 				_lock: lock,
@@ -1602,12 +1663,21 @@ mod publication {
 mod publication {
 	use std::path::Path;
 
+	#[derive(Debug)]
+	pub(super) struct RetainedPublicationOpenFailure {
+		pub(super) object: &'static str,
+		pub(super) reason: String,
+	}
+
 	/// Windows retained HANDLE/FileIdInfo authority is intentionally unavailable
 	/// until its reparse-safe implementation lands; acquisition fails closed.
 	pub(super) struct RetainedPublication;
 	impl RetainedPublication {
-		pub(super) fn open(_: &Path) -> Option<Self> {
-			None
+		pub(super) fn open(_: &Path) -> Result<Self, RetainedPublicationOpenFailure> {
+			Err(RetainedPublicationOpenFailure {
+				object: "sdk",
+				reason: "unsupported-platform".to_owned(),
+			})
 		}
 
 		pub(super) fn observe(&self) -> String {
@@ -1620,6 +1690,23 @@ mod publication {
 
 		pub(super) fn sync(&self) -> String {
 			"ambiguous".to_owned()
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::path::Path;
+
+		use super::RetainedPublication;
+
+		#[test]
+		fn retained_publication_reports_structured_unsupported_platform_failure() {
+			let failure = match RetainedPublication::open(Path::new("sdk")) {
+				Ok(_) => panic!("Windows retention is unavailable"),
+				Err(failure) => failure,
+			};
+			assert_eq!(failure.object, "sdk");
+			assert_eq!(failure.reason, "unsupported-platform");
 		}
 	}
 }
@@ -8532,8 +8619,14 @@ mod owner_only_security_tests {
 #[cfg(all(test, unix))]
 mod retained_broker_publication_tests {
 	use std::{
+		ffi::CString,
+		os::unix::ffi::OsStrExt,
 		path::PathBuf,
-		sync::atomic::{AtomicU64, Ordering},
+		sync::{
+			atomic::{AtomicU64, Ordering},
+			mpsc,
+		},
+		time::Duration,
 	};
 
 	use super::{NativeRetainedBrokerPublication, publication::RetainedPublication};
@@ -8606,6 +8699,30 @@ mod retained_broker_publication_tests {
 
 		assert_eq!(publication.observe(), "replaced");
 		assert_eq!(publication.heartbeat("not-a-timestamp"), "ambiguous");
+	}
+
+	#[test]
+	fn retained_publication_does_not_block_on_an_owner_fifo() {
+		let dir = TempDir::new();
+		publish(&dir.0);
+		let owner = dir.0.join("sdk/broker.lock/owner.json");
+		std::fs::remove_file(&owner).expect("remove regular owner record");
+		let owner_name = CString::new(owner.as_os_str().as_bytes()).expect("owner path has no NUL");
+		assert_eq!(unsafe { libc::mkfifo(owner_name.as_ptr(), 0o600) }, 0, "create owner FIFO");
+
+		let (sender, receiver) = mpsc::channel();
+		let root = dir.0.clone();
+		let worker =
+			std::thread::spawn(move || sender.send(RetainedPublication::open(&root).is_err()));
+		assert!(
+			receiver
+				.recv_timeout(Duration::from_secs(2))
+				.expect("owner FIFO must not block")
+		);
+		worker
+			.join()
+			.expect("retained publication probe thread must not panic")
+			.expect("retained publication result must be delivered");
 	}
 
 	/// The shutdown contract under an unresolved blocking worker (#4704).

@@ -100,6 +100,21 @@ describe("parseEnvFile", () => {
 			MULTI_WORD: "a b",
 		});
 	});
+
+	it("loads Bun colon-form declarations in the project dotenv", () => {
+		const filePath = writeTempEnv(
+			[
+				"AWS_ACCESS_KEY_ID: project-access",
+				"GOOGLE_APPLICATION_CREDENTIALS: /tmp/project-adc.json",
+				"DSN: postgres://project",
+			].join("\n"),
+		);
+		expect(parseEnvFile(filePath)).toEqual({
+			AWS_ACCESS_KEY_ID: "project-access",
+			GOOGLE_APPLICATION_CREDENTIALS: "/tmp/project-adc.json",
+			DSN: "postgres://project",
+		});
+	});
 });
 
 describe("parseShellEnvFile", () => {
@@ -158,6 +173,87 @@ assertEqual($env.GJC_ENV_TEST_INHERITED_ONLY, undefined, "deleted key is gone fr
 });
 
 describe("$credentialEnv", () => {
+	it("keeps colon-form project credentials out of the credential view", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-colon-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		fs.writeFileSync(
+			path.join(dir, ".env"),
+			[
+				"DSN: postgres://project",
+				"AWS_ACCESS_KEY_ID: project-access",
+				"GOOGLE_APPLICATION_CREDENTIALS: /tmp/project-adc.json",
+			].join("\n"),
+		);
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $credentialEnv, $env } from ${JSON.stringify(envSourceUrl)};
+if ($env.DSN !== "postgres://project" || $env.AWS_ACCESS_KEY_ID !== "project-access" || $env.GOOGLE_APPLICATION_CREDENTIALS !== "/tmp/project-adc.json") throw new Error("colon dotenv values were not loaded");
+for (const key of ["DSN", "AWS_ACCESS_KEY_ID", "GOOGLE_APPLICATION_CREDENTIALS"]) if ($credentialEnv(key) !== undefined) throw new Error("project colon credential leaked");
+`,
+			{ HOME: home, GJC_CODING_AGENT_DIR: agentDir },
+			dir,
+		);
+	});
+
+	it("lets a static higher-precedence dotenv value clear dynamic provenance", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-dynamic-layer-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		fs.writeFileSync(path.join(dir, ".env"), "LAYERED_PROVIDER_KEY: $UNTRUSTED_DYNAMIC\n");
+		fs.writeFileSync(path.join(dir, ".env.local"), "LAYERED_PROVIDER_KEY: static-project\n");
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $credentialEnv } from ${JSON.stringify(envSourceUrl)};
+if ($credentialEnv("LAYERED_PROVIDER_KEY") !== "inherited-trusted") throw new Error("static winning dotenv layer was tainted by a lower dynamic declaration");
+`,
+			{ HOME: home, GJC_CODING_AGENT_DIR: agentDir, LAYERED_PROVIDER_KEY: "inherited-trusted" },
+			dir,
+		);
+	});
+
+	it("uses only the platform-effective HOME variable for trusted home files", () => {
+		if (process.platform === "win32") return;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-platform-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		fs.writeFileSync(path.join(home, ".env"), "HOME_TRUSTED_KEY: trusted-home\n");
+		fs.writeFileSync(path.join(dir, ".env"), "USERPROFILE: $ATTACKER_HOME\n");
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $credentialEnv } from ${JSON.stringify(envSourceUrl)};
+if ($credentialEnv("HOME_TRUSTED_KEY") !== "trusted-home") throw new Error("non-effective USERPROFILE changed trusted HOME selection");
+`,
+			{ HOME: home, GJC_CODING_AGENT_DIR: agentDir },
+			dir,
+		);
+	});
+
+	it("preserves inherited credentials when a hostile project HOME overlays the runtime HOME", () => {
+		if (process.platform === "win32") return;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-hostile-home-"));
+		const hostileHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-hostile-home-root-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, hostileHome, agentDir);
+		fs.writeFileSync(path.join(hostileHome, ".env"), "HOSTILE_HOME_CREDENTIAL=must-not-load\n");
+		fs.writeFileSync(path.join(dir, ".env"), "HOME=$HOSTILE_HOME\n");
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $credentialEnv } from ${JSON.stringify(envSourceUrl)};
+if ($credentialEnv("HOSTILE_HOME_CREDENTIAL") !== undefined) throw new Error("hostile HOME credential was loaded");
+if ($credentialEnv("PRESERVED_OPERATOR_CREDENTIAL") !== "operator-value") throw new Error("inherited credential was dropped");
+`,
+			{ HOME: hostileHome, GJC_CODING_AGENT_DIR: agentDir, PRESERVED_OPERATOR_CREDENTIAL: "operator-value" },
+			dir,
+		);
+	});
 	it("does not read provider credentials from the current project's .env overlay", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-"));
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));

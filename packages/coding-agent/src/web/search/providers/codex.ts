@@ -9,7 +9,7 @@
 import * as os from "node:os";
 import { type AuthStorage, getBundledModels } from "@gajae-code/ai/core";
 import { decodeJwt } from "@gajae-code/ai/utils/oauth/openai-codex";
-import { $env, readSseJson } from "@gajae-code/utils";
+import { $env, readSseJson, sanitizeHeaderComponent } from "@gajae-code/utils";
 import packageJson from "../../../../package.json" with { type: "json" };
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
@@ -158,7 +158,7 @@ function buildCodexHeaders(accessToken: string, accountId: string): Record<strin
 		"chatgpt-account-id": accountId,
 		"OpenAI-Beta": "responses=experimental",
 		originator: "pi",
-		"User-Agent": `pi/${packageJson.version} (${os.platform()} ${os.release()}; ${os.arch()})`,
+		"User-Agent": `pi/${packageJson.version} (${sanitizeHeaderComponent(os.platform())} ${sanitizeHeaderComponent(os.release())}; ${sanitizeHeaderComponent(os.arch())})`,
 		Accept: "text/event-stream",
 		"Content-Type": "application/json",
 	};

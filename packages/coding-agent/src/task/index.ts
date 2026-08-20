@@ -132,7 +132,7 @@ function renderTaskAssignment(assignment: string, simpleMode: TaskSimpleMode): s
 export function subagentRunOutcomeFromSingleResult(
 	finalText: string,
 	singleResult:
-		| (Pick<SingleResult, "aborted" | "exitCode" | "paused" | "setupFailure"> &
+		| (Pick<SingleResult, "aborted" | "exitCode" | "paused" | "setupFailure" | "localErrorSummary"> &
 				Partial<Pick<TaskResultReceipt, "status">>)
 		| undefined,
 ): string | SubagentRunOutcome {
@@ -145,6 +145,9 @@ export function subagentRunOutcomeFromSingleResult(
 			...(singleResult.setupFailure && !singleResult.aborted
 				? { setupFailureSummary: singleResult.setupFailure.summary }
 				: {}),
+			...(singleResult.localErrorSummary && !singleResult.aborted
+				? { localErrorSummary: singleResult.localErrorSummary }
+				: {}),
 		};
 	}
 	if (singleResult && ((singleResult.aborted ?? false) || singleResult.exitCode !== 0)) {
@@ -153,6 +156,9 @@ export function subagentRunOutcomeFromSingleResult(
 			text: finalText,
 			...(singleResult.setupFailure && !singleResult.aborted
 				? { setupFailureSummary: singleResult.setupFailure.summary }
+				: {}),
+			...(singleResult.localErrorSummary && !singleResult.aborted
+				? { localErrorSummary: singleResult.localErrorSummary }
 				: {}),
 		};
 	}

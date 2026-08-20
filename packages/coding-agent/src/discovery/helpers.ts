@@ -1,5 +1,4 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
@@ -8,6 +7,7 @@ import {
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
+	getTrustedHomeDir,
 	logger,
 	parseFrontmatter,
 	tryParseJson,
@@ -795,8 +795,8 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
  */
 export async function resolveActiveProjectRegistryPath(cwd: string): Promise<string | null> {
 	// Pass 1: walk up looking for an existing .gjc/ directory (nearest wins).
-	// Stop before os.homedir() — ~/.gjc/ is the user-level config dir, not a project root.
-	const homeDir = os.homedir();
+	// Stop before the provenance-checked home — ~/.gjc/ is the user-level config dir, not a project root.
+	const homeDir = getTrustedHomeDir();
 	let dir = path.resolve(cwd);
 	while (dir !== homeDir) {
 		try {
@@ -837,7 +837,7 @@ export async function resolveActiveProjectRegistryPath(cwd: string): Promise<str
  * bootstrapped directory (no .gjc/ or .git/ yet) works: writeInstalledPluginsRegistry auto-creates
  * the directory tree on first write.
  *
- * Returns undefined when cwd is os.homedir() — that path is already the user registry and must
+ * Returns undefined when cwd is the trusted home — that path is already the user registry and must
  * never alias as the project registry.
  */
 export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<string | undefined> {
@@ -846,7 +846,7 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 	// Home directory must not be treated as a project root: the fallback path would alias
 	// getInstalledPluginsRegistryPath(), causing MarketplaceManager to load the same file
 	// as both user and project registry and producing duplicates / disambiguation errors.
-	if (path.resolve(cwd) === os.homedir()) return undefined;
+	if (path.resolve(cwd) === getTrustedHomeDir()) return undefined;
 	return path.join(cwd, getConfigDirName(), "plugins", "installed_plugins.json");
 }
 
@@ -873,7 +873,7 @@ export async function listClaudePluginRoots(
 	const projectRoots: ClaudePluginRoot[] = [];
 
 	// ── GJC installed plugins registry ───────────────────────────────────────
-	// In production `home` is `os.homedir()`, so `getPluginsDir(home)` resolves to the
+	// In production `home` is the provenance-checked home, so `getPluginsDir(home)` resolves to the
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
 	const gjcRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");

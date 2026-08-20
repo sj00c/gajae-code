@@ -370,4 +370,43 @@ describe("deferred shell execution publication boundary", () => {
 		expect(shellMessages(harness.agent.state.messages, "bashExecution")).toHaveLength(1);
 		expect(persistedShellMessages(harness.sessionManager, "bashExecution")).toHaveLength(1);
 	});
+
+	it("auto-delivers steering queued during post-prompt unwind for every terminal role", async () => {
+		for (const role of ["assistant", "bashExecution", "pythonExecution"] as const) {
+			const harness = createHarness(sessions);
+			const steerQueued = Promise.withResolvers<void>();
+			let queued = false;
+			const queueSteer = () => {
+				if (queued) return;
+				queued = true;
+				void harness.session.steer(`steer after ${role}`).then(steerQueued.resolve, steerQueued.reject);
+			};
+			const unsubscribe =
+				role === "assistant"
+					? harness.session.subscribe(event => {
+							if (event.type === "agent_end") queueSteer();
+						})
+					: undefined;
+			const first = await harness.startTurn("hello");
+			if (role === "bashExecution") {
+				harness.session.recordBashResult("printf unwind", shellResult("unwind"), { onPersisted: queueSteer });
+			} else if (role === "pythonExecution") {
+				harness.session.recordPythonResult("print('unwind')", shellResult("unwind"), { onPersisted: queueSteer });
+			}
+
+			first.turn.finish();
+			await first.prompt;
+			await steerQueued.promise;
+			await harness.session.waitForIdle();
+			unsubscribe?.();
+
+			expect(harness.agent.hasQueuedSteering()).toBe(false);
+			expect(harness.agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(2);
+			expect(
+				harness.agent.state.messages.some(
+					message => message.role === "user" && JSON.stringify(message.content).includes(`steer after ${role}`),
+				),
+			).toBe(true);
+		}
+	});
 });

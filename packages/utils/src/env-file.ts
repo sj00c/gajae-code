@@ -110,7 +110,7 @@ export function parseShellEnvFile(filePath: string): Record<string, string> {
  * `filterCredentialInheritedEnv`) decide provenance by comparing
  * `process.env` against this parse, so the accepted syntax must be a superset
  * of what Bun's own dotenv loader honors in `cwd/.env`: `export KEY=value`,
- * whitespace around `=`, and `#` comments after unquoted values (quotes keep
+ * whitespace around `=` or `:`, and `#` comments after unquoted values (quotes keep
  * their `#`). Values that Bun would expand (`$VAR`, `${VAR}`, backticks,
  * command substitution) are kept as their literal text: the trust rule only
  * needs the parser to see the key at all, and an operator environment value
@@ -134,7 +134,7 @@ export function parseEnvFileContent(content: string): Record<string, string> {
 		// Skip comments and blank lines
 		if (!trimmed || trimmed.startsWith("#")) continue;
 
-		const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(trimmed);
+		const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|:)\s*(.*)$/.exec(trimmed);
 		if (!match) continue;
 
 		const key = match[1];

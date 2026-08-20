@@ -431,6 +431,62 @@ async function registerSdkSession(server: ReturnType<typeof createCoordinatorMcp
 }
 
 describe("Coordinator MCP canonical SDK controls", () => {
+	it("fails closed instead of reusing a sequence after a malformed journal line", async () => {
+		const root = await tempRoot();
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const journal = path.join(namespace, "events", "event-journal.jsonl");
+		await fs.mkdir(path.dirname(journal), { recursive: true });
+		await fs.writeFile(
+			journal,
+			'{"schema_version":1,"seq":4,"id":"event-000000000004","timestamp":"2026-08-19T00:00:00.000Z","kind":"turn.completed","summary":"complete"}\n{torn',
+			"utf8",
+		);
+		await expect(
+			appendCoordinatorEventForTest(namespace, { kind: "turn.completed", summary: "must not reuse seq" }),
+		).rejects.toThrow("state_corrupt");
+		await fs.writeFile(
+			journal,
+			'{"schema_version":1,"seq":9007199254740992,"id":"unsafe","timestamp":"2026-08-19T00:00:00.000Z","kind":"turn.completed","summary":"unsafe"}\n',
+			"utf8",
+		);
+		await expect(
+			appendCoordinatorEventForTest(namespace, { kind: "turn.completed", summary: "must not reuse unsafe seq" }),
+		).rejects.toThrow("state_corrupt");
+	});
+
+	it("serializes event sequence allocation across coordinator processes", async () => {
+		const root = await tempRoot();
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const marker = path.join(root, "start");
+		const modulePath = path.resolve(import.meta.dir, "../src/coordinator-mcp/server.ts");
+		const script = (writer: string) => `
+import { appendCoordinatorEventForTest } from ${JSON.stringify(modulePath)};
+while (!(await Bun.file(${JSON.stringify(marker)}).exists())) await Bun.sleep(1);
+console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(namespace)}, {
+	kind: "turn.completed",
+	summary: ${JSON.stringify(`writer:${writer}`)},
+})));
+`;
+		const first = Bun.spawn({ cmd: [process.execPath, "-e", script("one")], stdout: "pipe", stderr: "pipe" });
+		const second = Bun.spawn({ cmd: [process.execPath, "-e", script("two")], stdout: "pipe", stderr: "pipe" });
+		await Bun.sleep(10);
+		await Bun.write(marker, "");
+		const [firstExit, secondExit, firstOutput, secondOutput] = await Promise.all([
+			first.exited,
+			second.exited,
+			new Response(first.stdout).text(),
+			new Response(second.stdout).text(),
+		]);
+		expect([firstExit, secondExit]).toEqual([0, 0]);
+		const journal = await fs.readFile(path.join(namespace, "events", "event-journal.jsonl"), "utf8");
+		const events = journal
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as { seq: number; summary: string });
+		expect(events.map(event => event.seq)).toEqual([1, 2]);
+		expect([firstOutput, secondOutput].every(output => output.includes('"seq"'))).toBe(true);
+	});
+
 	async function pingServer(root: string) {
 		const server = createCoordinatorMcpServer({
 			env: {
@@ -864,6 +920,161 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			session_state: { state: "ready_for_input", ready_for_input: true },
 		});
 		expect(controls.map(control => control.operation)).toEqual(["session.create", "session.list"]);
+	});
+
+	it("compensates a remote session when local binding fails after creation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation === "session.create")
+					return { ok: true, result: { sessionId: "unbound-session", cwd: root } };
+				if (operation === "session.list") return { ok: true, result: { sessions: [] } };
+				return undefined;
+			},
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "compensate-unbound-session",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false });
+		expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([
+			expect.objectContaining({ input: { sessionId: "unbound-session" } }),
+		]);
+	});
+
+	it("leaves malformed remote creation outcomes retryable", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => (operation === "session.create" ? { ok: true, result: { cwd: root } } : undefined),
+		});
+		const args = { cwd: root, idempotency_key: "ambiguous-remote-create", allow_mutation: true };
+
+		const first = await server.callTool("gjc_coordinator_start_session", args);
+		const second = await server.callTool("gjc_coordinator_start_session", args);
+
+		expect(first).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+		expect(second).toEqual(first);
+		expect(controls.filter(control => control.operation === "session.create")).toHaveLength(2);
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(0);
+	});
+
+	it("keeps compensation unobserved when broker close is rejected", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation === "session.create")
+					return { ok: true, result: { sessionId: "close-rejected-session", cwd: root } };
+				if (operation === "session.list") return { ok: true, result: { sessions: [] } };
+				if (operation === "session.close")
+					return { ok: false, error: { code: "close_refused", message: "close refused" } };
+				return undefined;
+			},
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "close-rejected-compensation",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
+	});
+
+	it("does not seal a prepared-session failure when compensation is rejected", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation === "session.create")
+					return { ok: true, result: { sessionId: "unprepared-session", readiness: "ready", cwd: root } };
+				if (operation === "session.close")
+					return { ok: false, error: { code: "close_refused", message: "close refused" } };
+				return undefined;
+			},
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			prepare_existing_thread: true,
+			idempotency_key: "prepared-close-rejected",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(2);
+	});
+
+	it("treats a malformed compensation close response as unobserved", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation === "session.create")
+					return { ok: true, result: { sessionId: "malformed-close-session", cwd: root } };
+				if (operation === "session.list") return { ok: true, result: { sessions: [] } };
+				if (operation === "session.close") return { ok: true, result: {} };
+				return undefined;
+			},
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "malformed-close-compensation",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
+	});
+
+	it("compensates a broker session before rejecting an unsafe coordinator identity", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation === "session.create") return { ok: true, result: { sessionId: "../unsafe", cwd: root } };
+				if (operation === "session.list") return { ok: true, result: { sessions: [] } };
+				return undefined;
+			},
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "unsafe-identity-compensation",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false });
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([
+			expect.objectContaining({ input: { sessionId: "../unsafe" } }),
+		]);
+	});
+
+	it("classifies a prepared-session response without identity as unobserved", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation =>
+				operation === "session.create" ? { ok: true, result: { readiness: "ready", cwd: root } } : undefined,
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			prepare_existing_thread: true,
+			idempotency_key: "prepared-missing-identity",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(0);
 	});
 
 	it("preserves multiline delegated task text in one SDK turn.prompt control", async () => {
@@ -2399,7 +2610,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			"codex_handoff_explicit_source_missing",
 		);
 	});
-	it("treats a corrupt explicit handoff registration as missing without failing delegation", async () => {
+	it("fails closed for a corrupt explicit handoff registration", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
@@ -2415,7 +2626,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				allow_mutation: true,
 				codex_host_session_id: "corrupt-codex-host",
 			}),
-		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+		).resolves.toMatchObject({ ok: false, error: { code: "unavailable", message: "state_corrupt" } });
 		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
 			"codex_handoff_explicit_source_missing",
 		);
@@ -3019,6 +3230,60 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(posts).toHaveLength(3);
 		expect(posts.every(post => post.token === null)).toBe(true);
 	});
+	it("replays committed journal rows after restart and repairs an interrupted outbox publication", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const firstPosts: string[] = [];
+		const webhookEnv = { GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: "https://sink.example.test/hook" };
+		const firstServer = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			eventWebhookEnv: webhookEnv,
+			eventWebhookDelivery: {
+				post: async body => {
+					firstPosts.push(body);
+					return { ok: true, status: 200, error: null };
+				},
+				sleep: async () => {},
+				now: () => Date.now(),
+			},
+		});
+		await registerSdkSession(firstServer, root);
+		await firstServer.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			status: "blocked",
+			summary: "Committed before restart.",
+			idempotency_key: "report-webhook-restart-1",
+			allow_mutation: true,
+		});
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await awaitEventWebhookDeliveriesForTest(namespace);
+		const journalRows = (await firstServer.callTool("gjc_coordinator_watch_events", { after_seq: 0 }))
+			.events as Array<Record<string, unknown>>;
+		const outboxDir = path.join(namespace, "webhook-outbox");
+		const firstEventId = String(journalRows[0]!.id);
+		await fs.rm(outboxDir, { recursive: true, force: true });
+		await fs.mkdir(outboxDir, { recursive: true });
+		await fs.writeFile(path.join(outboxDir, `${firstEventId}.json`), '{"schema_version":1', "utf8");
+
+		const replayedPosts: string[] = [];
+		await createSdkControlServer(root, [], [], undefined, undefined, undefined, undefined, {
+			eventWebhookEnv: webhookEnv,
+			eventWebhookDelivery: {
+				post: async body => {
+					replayedPosts.push(body);
+					return { ok: true, status: 200, error: null };
+				},
+				sleep: async () => {},
+				now: () => Date.now(),
+			},
+		});
+		await awaitEventWebhookDeliveriesForTest(namespace);
+
+		expect(replayedPosts.map(body => JSON.parse(body).id)).toEqual(journalRows.map(row => row.id));
+		expect(JSON.parse(await fs.readFile(path.join(outboxDir, `${firstEventId}.json`), "utf8"))).toMatchObject({
+			event_id: firstEventId,
+			status: "delivered",
+		});
+	});
 	it("posts nothing to any webhook when no webhook is configured", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -3111,6 +3376,49 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			}),
 		]);
 		expect(await Bun.file(sessionFile).exists()).toBe(false);
+	});
+
+	it("does not repeat broker close after post-close verification becomes uncertain", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let listCalls = 0;
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation !== "session.list") return undefined;
+				listCalls += 1;
+				if (listCalls === 2) return { ok: true, result: { sessions: "malformed" } };
+				return undefined;
+			},
+		});
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "reap-recovery-start",
+			allow_mutation: true,
+		});
+		expect(started).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const sessionFile = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"sessions",
+			"created-session-1.json",
+		);
+		const sessionRecord = JSON.parse(await fs.readFile(sessionFile, "utf8"));
+		await Bun.write(sessionFile, JSON.stringify({ ...sessionRecord, ephemeral: true }));
+
+		const first = await server.callTool("gjc_coordinator_stop_session", {
+			session_id: "created-session-1",
+			allow_mutation: true,
+		});
+		expect(first).toMatchObject({ ok: false, reason: "close_failed" });
+		const second = await server.callTool("gjc_coordinator_stop_session", {
+			session_id: "created-session-1",
+			allow_mutation: true,
+		});
+		expect(second).toMatchObject({ ok: true, closed: true });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
 
 	it("idle reaping selects only stale ephemeral coordinator records and uses incarnation-bound session.close", async () => {

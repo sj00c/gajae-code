@@ -19,7 +19,11 @@ const PROBE = path.join(import.meta.dir, "fixtures", "agent-dir-trust-probe.ts")
 const PROBE_VAR = "GJC_TRUST_PROBE_VALUE";
 
 interface Resolved {
+	trustedHome: string;
 	agentDir: string;
+	configRoot: string;
+	pluginsDir: string;
+	pythonGatewayDir: string;
 	probeValue: string | null;
 }
 
@@ -61,6 +65,25 @@ async function resolveIn(cwd: string, overrides: Record<string, string> = {}): P
 	env.HOME = tempDir();
 	Object.assign(env, overrides);
 
+	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
+	return JSON.parse(stdout.trim()) as Resolved;
+}
+
+async function resolveWithoutPlatformHome(cwd: string, hostileHome: string): Promise<Resolved> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined) env[key] = value;
+	}
+	if (process.platform === "win32") {
+		delete env.USERPROFILE;
+		env.HOME = hostileHome;
+	} else {
+		delete env.HOME;
+		env.USERPROFILE = hostileHome;
+	}
 	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
 	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
 	const exitCode = await proc.exited;
@@ -152,5 +175,58 @@ describe("agent directory trust boundary", () => {
 			PI_CODING_AGENT_DIR: piDir,
 		});
 		expect(resolved.agentDir).toBe(gjcDir);
+	});
+
+	it("uses the static higher-precedence dotenv layer for agent and XDG resolution", async () => {
+		if (process.platform !== "linux") return;
+		const operatorAgent = agentDirWith("from-layered-operator-agent");
+		const home = tempDir();
+		const xdgState = tempDir();
+		const staticXdgState = tempDir();
+		const xdgData = tempDir();
+		const xdgCache = tempDir();
+		for (const root of [xdgState, xdgData, xdgCache]) fs.mkdirSync(path.join(root, "gjc"), { recursive: true });
+		const cwd = projectDir(
+			`GJC_CODING_AGENT_DIR=$LOWER_DYNAMIC\nGJC_CONFIG_DIR=.layered\nXDG_STATE_HOME=$LOWER_STATE\n`,
+		);
+		fs.writeFileSync(
+			path.join(cwd, ".env.local"),
+			"GJC_CODING_AGENT_DIR=/tmp/static-project-agent\nGJC_CONFIG_DIR=.layered-static\nXDG_STATE_HOME=" +
+				staticXdgState +
+				"\n",
+		);
+		const resolved = await resolveIn(cwd, {
+			HOME: home,
+			NODE_ENV: "production",
+			GJC_CODING_AGENT_DIR: operatorAgent,
+			GJC_CONFIG_DIR: ".operator-config",
+			XDG_STATE_HOME: xdgState,
+			XDG_DATA_HOME: xdgData,
+			XDG_CACHE_HOME: xdgCache,
+		});
+		expect(resolved.agentDir).toBe(operatorAgent);
+		expect(resolved.configRoot).toBe(path.join(home, ".operator-config"));
+		expect(resolved.pythonGatewayDir).toBe(path.join(operatorAgent, "python-gateway"));
+		expect(resolved.pluginsDir).toBe(path.join(home, ".operator-config", "plugins"));
+	});
+
+	it("uses the account home when POSIX HOME is absent despite hostile USERPROFILE", async () => {
+		if (process.platform === "win32") return;
+		const cwd = projectDir("SOMETHING_ELSE=1\n");
+		const hostileHome = tempDir();
+		const resolved = await resolveWithoutPlatformHome(cwd, hostileHome);
+		expect(resolved.trustedHome).toBe(os.userInfo().homedir);
+		expect(resolved.trustedHome).not.toBe(hostileHome);
+		expect(resolved.configRoot).toBe(path.join(os.userInfo().homedir, ".gjc"));
+	});
+
+	it("uses the account home when Windows USERPROFILE is absent despite hostile HOME", async () => {
+		if (process.platform !== "win32") return;
+		const cwd = projectDir("SOMETHING_ELSE=1\n");
+		const hostileHome = tempDir();
+		const resolved = await resolveWithoutPlatformHome(cwd, hostileHome);
+		expect(resolved.trustedHome).toBe(os.userInfo().homedir);
+		expect(resolved.trustedHome).not.toBe(hostileHome);
+		expect(resolved.configRoot).toBe(path.join(os.userInfo().homedir, ".gjc"));
 	});
 });

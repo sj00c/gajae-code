@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
+import { getTrustedHomeDir } from "@gajae-code/utils";
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
@@ -47,7 +47,7 @@ export interface DiscoverRuntimeSkillsOptions {
 }
 
 function getRuntimeHome(): string {
-	return process.env.HOME || os.homedir();
+	return getTrustedHomeDir();
 }
 
 const DEFAULT_LIMIT = 20;

@@ -31,9 +31,12 @@ import {
 	listCrashSignatures,
 	recordCrashStateEvent,
 } from "../index-store";
-import { findLatestRecord } from "../record-loader";
+import { findRecordById } from "../record-loader";
 import { parseSentryDsn, type SentryDsn } from "./dsn";
 import { buildCrashEnvelope, type CrashEventFrame, sentryAuthHeader } from "./envelope";
+
+/** Version of the complete sanitizer/egress contract persisted in refusals. */
+export const SANITIZER_EGRESS_CONTRACT_VERSION = "sanitize-external-crash-v1";
 
 /** Trusted environment variable form of the DSN, for CI and one-off runs. */
 export const CRASH_UPSTREAM_DSN_ENV = "GJC_CRASH_SENTRY_DSN";
@@ -45,6 +48,25 @@ export const CRASH_UPSTREAM_DSN_ENV = "GJC_CRASH_SENTRY_DSN";
 const MAX_RELAY_PER_RUN = 8;
 const RELAY_TIMEOUT_MS = 10_000;
 const RELAY_CLAIM_TTL_MS = RELAY_TIMEOUT_MS * 2;
+const CRASH_LOG_READ_MAX_BYTES = 1024 * 1024;
+const NOFOLLOW = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+
+async function readCrashLogNoFollow(filePath: string): Promise<string | undefined> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(filePath, fs.constants.O_RDONLY | NOFOLLOW);
+		const stat = await handle.stat();
+		if (!stat.isFile()) return undefined;
+		const length = Math.min(stat.size, CRASH_LOG_READ_MAX_BYTES);
+		const buffer = Buffer.allocUnsafe(length);
+		await handle.read(buffer, 0, length, Math.max(0, stat.size - length));
+		return buffer.toString("utf8");
+	} catch {
+		return undefined;
+	} finally {
+		await handle?.close().catch(() => {});
+	}
+}
 
 export interface CrashRelayConfig {
 	readonly upstream: "off" | "sentry";
@@ -159,6 +181,18 @@ export function resolveRelayDsn(
  */
 export function isRelayDue(signature: CrashSignatureView): boolean {
 	const appendId = signature.lastAppendRecordId ?? signature.lastRecordId;
+	if (
+		signature.relayRefusedRecordId === appendId &&
+		signature.relayRefusedVersion === SANITIZER_EGRESS_CONTRACT_VERSION
+	)
+		return false;
+	// Modern entries with a durable relay record id use exact identity. Legacy
+	// entries upgraded from a wall-clock-only relay have no relayedRecordId, so
+	// retain their timestamp coverage compatibility until a new append exists.
+	if (signature.lastAppendRecordId !== undefined) {
+		if (signature.relayedRecordId !== undefined) return signature.relayedRecordId !== appendId;
+		return true;
+	}
 	if (signature.relayedRecordId !== undefined) {
 		if (signature.relayedRecordId === appendId) return false;
 		if (
@@ -184,9 +218,37 @@ function relayEventId(signature: CrashSignatureView): string {
 		.slice(0, 32);
 }
 
+async function persistRefusal(
+	paths: CrashStatePaths,
+	signature: CrashSignatureView,
+	now: () => number,
+): Promise<boolean> {
+	try {
+		const index = await recordCrashStateEvent(
+			{
+				kind: "refused",
+				fingerprint: signature.fingerprint,
+				fpv: signature.fpv,
+				recordId: relayAppendRecordId(signature),
+				contractVersion: SANITIZER_EGRESS_CONTRACT_VERSION,
+				at: signature.lastSeen,
+			},
+			{ paths, now: now() },
+		);
+		const entry = index.signatures[signature.fingerprint];
+		return (
+			entry?.relayRefusedRecordId === relayAppendRecordId(signature) &&
+			entry.relayRefusedVersion === SANITIZER_EGRESS_CONTRACT_VERSION
+		);
+	} catch {
+		return false;
+	}
+}
+
 /**
- * Automatic relay stores live under the provenance-checked agent directory.
- * These resolvers never consult XDG state, even when `$XDG_STATE_HOME/gjc` exists.
+ * Automatic relay always reads the trusted agent stores. XDG-aware paths remain
+ * available to ordinary crash state operations, but never select automatic-egress
+ * input files.
  */
 export function resolveTrustedRelayStatePaths(): CrashStatePaths {
 	return {
@@ -257,10 +319,8 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 	// the feature not existing.
 	if (!resolved.ok) return { status: "skipped", reason: resolved.reason };
 
-	// Relay historical crashes only from the provenance-checked agent
-	// directory. Ordinary crash-state resolvers honor XDG_STATE_HOME, which a
-	// repository `.env` can set and populate with a `gjc` child; those files
-	// are untrusted for automatic egress.
+	// The shared directory resolver permits trusted XDG state and rejects XDG
+	// values declared by the checkout's `.env` before they can select a store.
 	const paths = options.paths ?? resolveTrustedRelayStatePaths();
 	const fetchImpl = options.fetchImpl ?? fetch;
 	const now = options.now ?? Date.now;
@@ -280,10 +340,8 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		.slice(0, limit);
 	if (signatures.length === 0) return { status: "skipped", reason: "nothing-to-relay" };
 
-	let crashLog = "";
-	try {
-		crashLog = await fs.readFile(paths.crashLog, "utf8");
-	} catch {
+	const crashLog = await readCrashLogNoFollow(paths.crashLog);
+	if (crashLog === undefined) {
 		// A missing or unreadable log means no stack to attach; the signature
 		// metadata alone is not worth a send.
 		return { status: "skipped", reason: "nothing-to-relay" };
@@ -302,9 +360,10 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 			if (claim.status === "failed") failed++;
 			continue;
 		}
-		const record = findLatestRecord(crashLog, signature.fingerprint);
-		if (!record) {
-			refused++;
+		const record = findRecordById(crashLog, signature.fingerprint, relayAppendRecordId(signature));
+		if (!record || record.fpv !== signature.fpv) {
+			if (await persistRefusal(paths, signature, now)) refused++;
+			else failed++;
 			await claim.release().catch(() => {});
 			continue;
 		}
@@ -312,8 +371,8 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		const envelope = buildCrashEnvelope({
 			eventId,
 			fingerprint: signature.fingerprint,
-			errorName: signature.errorName,
-			messageClass: signature.messageClass,
+			errorName: record.errorName,
+			messageClass: record.messageClass,
 			frames: toEventFrames(record.body),
 			firstSeen: signature.firstSeen,
 			lastSeen: signature.lastSeen,
@@ -326,7 +385,8 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		});
 		if (!envelope.ok) {
 			// Fail closed. Deliberately no retry with a reduced payload.
-			refused++;
+			if (await persistRefusal(paths, signature, now)) refused++;
+			else failed++;
 			await claim.release().catch(() => {});
 			continue;
 		}

@@ -147,3 +147,10 @@ export function findLatestRecord(contents: string, fingerprint: string): LoadedC
 	const matches = parseCrashRecords(contents).filter(record => record.fingerprint === fingerprint);
 	return matches.at(-1);
 }
+
+/** Identity-bearing record bound to the indexed append-order identity. */
+export function findRecordById(contents: string, fingerprint: string, recordId: string): LoadedCrashRecord | undefined {
+	return parseRecoverableCrashRecords(contents).find(
+		record => record.fingerprint === fingerprint && record.recordId === recordId,
+	);
+}

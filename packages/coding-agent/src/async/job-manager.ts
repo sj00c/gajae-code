@@ -6,7 +6,7 @@ import {
 	retireOwnedRegistrationForDeadLetter,
 	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
-import type { AgentProgress, AgentSource } from "../task/types";
+import type { AgentProgress, AgentSource, LocalErrorSummary } from "../task/types";
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -42,6 +42,8 @@ export interface AsyncJob {
 	errorText?: string;
 	/** Safe, bounded cause when session setup failed before the LLM began work. */
 	setupFailureSummary?: string;
+	/** Safe, bounded summary of a terminal local (non-provider) failure kind. */
+	localErrorSummary?: LocalErrorSummary;
 	metadata?: AsyncJobMetadata;
 	/**
 	 * Registry id of the agent that registered the job (e.g. "0-Main",
@@ -85,7 +87,7 @@ export interface AsyncJobMetadata {
  */
 export type SubagentRunOutcome =
 	| { kind: "completed"; text: string }
-	| { kind: "failed"; text: string; setupFailureSummary?: string }
+	| { kind: "failed"; text: string; setupFailureSummary?: string; localErrorSummary?: LocalErrorSummary }
 	| { kind: "paused"; note?: string };
 
 /** Canonical lifecycle of a subagent across pause/resume cycles. */
@@ -985,6 +987,7 @@ export class AsyncJobManager {
 				if (outcome.kind === "failed") {
 					job.status = "failed";
 					job.setupFailureSummary = outcome.setupFailureSummary;
+					job.localErrorSummary = outcome.localErrorSummary;
 					this.#freezeEndTime(job);
 					job.errorText = outcome.text;
 					this.#markRecordTerminal(id, "failed", job.generation);

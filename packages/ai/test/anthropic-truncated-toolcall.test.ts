@@ -133,7 +133,7 @@ describe("Anthropic truncated tool calls", () => {
 		expect(tool && "index" in tool).toBe(false);
 	});
 
-	it("preserves truncation evidence when a duplicate index orphans a block", async () => {
+	it("marks replacement calls non-executable when a duplicate index aborts the stream", async () => {
 		const result = await run([
 			messageStart("msg_orphan"),
 			toolStart(0, "tool_orphan"),
@@ -148,10 +148,11 @@ describe("Anthropic truncated tool calls", () => {
 		expect(tools).toHaveLength(2);
 		expect(tools[0].id).toBe("tool_orphan");
 		expect(tools[0].incompleteArguments).toBe(true);
-		expect(tools[1].incompleteArguments).toBeFalsy();
+		expect(tools[1].incompleteArguments).toBe(true);
+		expect(result.stopReason).toBe("error");
 	});
 
-	it("does not transfer orphan truncation state to a same-ID replacement", async () => {
+	it("marks same-ID replacement calls non-executable when a duplicate index aborts the stream", async () => {
 		const result = await run([
 			messageStart("msg_same_id_orphan"),
 			toolStart(0, "tool_shared"),
@@ -167,10 +168,27 @@ describe("Anthropic truncated tool calls", () => {
 		expect(tools[0].id).toBe("tool_shared");
 		expect(tools[0].incompleteArguments).toBe(true);
 		expect(tools[1].id).toBe("tool_shared");
-		expect(tools[1].incompleteArguments).toBeFalsy();
+		expect(tools[1].incompleteArguments).toBe(true);
+		expect(result.stopReason).toBe("error");
 	});
 
-	it("keeps an incomplete same-ID orphan blocked on an explicit tool-use stop", async () => {
+	it("marks a complete duplicate-index orphan non-executable before the integrity error", async () => {
+		const result = await run([
+			messageStart("msg_complete_orphan"),
+			toolStart(0, "tool_complete_orphan"),
+			toolDelta(0, '{"path":"orphan.ts"}'),
+			toolStart(0, "tool_replacement"),
+		]);
+
+		const tools = toolCalls(result);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("reused an active content block index");
+		expect(tools).toHaveLength(2);
+		expect(tools[0]).toMatchObject({ incompleteArguments: true, incompleteArgumentsReason: "ambiguous" });
+		expect(tools[1]).toMatchObject({ incompleteArguments: true, incompleteArgumentsReason: "ambiguous" });
+	});
+
+	it("does not parse a replacement call after a duplicate index aborts the stream", async () => {
 		const result = await run([
 			messageStart("msg_same_id_tool_use"),
 			toolStart(0, "tool_shared"),
@@ -185,8 +203,9 @@ describe("Anthropic truncated tool calls", () => {
 		expect(tools).toHaveLength(2);
 		expect(tools[0].arguments).toEqual({ path: "a.ts", content: "partial" });
 		expect(tools[0].incompleteArguments).toBe(true);
-		expect(tools[1].arguments).toEqual({ path: "b.ts", content: "ok" });
-		expect(tools[1].incompleteArguments).toBeFalsy();
+		expect(tools[1].arguments).toEqual({});
+		expect(tools[1].incompleteArguments).toBe(true);
+		expect(result.stopReason).toBe("error");
 	});
 
 	it("flags incomplete arguments when message_stop omits the terminal reason", async () => {
@@ -227,7 +246,7 @@ describe("Anthropic truncated tool calls", () => {
 		expect(toolCalls(result)[0]?.incompleteArguments).toBeFalsy();
 	});
 
-	it("does not flag incomplete JSON when the turn ends for tool use", async () => {
+	it("flags incomplete JSON when the turn ends for tool use", async () => {
 		const result = await run([
 			messageStart("msg_tool_use"),
 			toolStart(0, "tool_use"),
@@ -237,10 +256,20 @@ describe("Anthropic truncated tool calls", () => {
 		]);
 
 		expect(result.stopReason).toBe("toolUse");
-		expect(toolCalls(result)[0]?.incompleteArguments).toBeFalsy();
+		expect(toolCalls(result)[0]).toMatchObject({
+			incompleteArguments: true,
+			incompleteArgumentsReason: "truncated",
+		});
 	});
 
-	it("finalizes but does not flag an open block when the turn ends for tool use", async () => {
+	it("keeps complete JSON executable and blocks an open buffer when the turn ends for tool use", async () => {
+		const completeResult = await run([
+			messageStart("msg_complete_tool_use"),
+			toolStart(0, "tool_complete_use"),
+			toolDelta(0, '{"path":"a.ts","content":"complete"}'),
+			{ type: "content_block_stop", index: 0 },
+			...terminal("tool_use"),
+		]);
 		const result = await run([
 			messageStart("msg_open_tool_use"),
 			toolStart(0, "tool_open_use"),
@@ -248,9 +277,17 @@ describe("Anthropic truncated tool calls", () => {
 			...terminal("tool_use"),
 		]);
 
+		expect(completeResult.stopReason).toBe("toolUse");
+		expect(toolCalls(completeResult)[0]).toMatchObject({
+			arguments: { path: "a.ts", content: "complete" },
+		});
+		expect(toolCalls(completeResult)[0]?.incompleteArguments).toBeFalsy();
 		const [tool] = toolCalls(result);
 		expect(result.stopReason).toBe("toolUse");
-		expect(tool?.incompleteArguments).toBeFalsy();
+		expect(tool).toMatchObject({
+			incompleteArguments: true,
+			incompleteArgumentsReason: "truncated",
+		});
 		expect(tool && "partialJson" in tool).toBe(false);
 		expect(tool && "index" in tool).toBe(false);
 	});

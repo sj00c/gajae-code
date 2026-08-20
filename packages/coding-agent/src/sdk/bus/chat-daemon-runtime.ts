@@ -365,6 +365,11 @@ export class ChatDaemonRuntime {
 		return this.#transportHealthy?.() ?? false;
 	}
 
+	/** Reconcile indexed attachments and optionally wait for their replay tails. */
+	async reconcile(options: { waitForReplay?: boolean } = {}): Promise<void> {
+		await this.#router.reconcile(options);
+	}
+
 	async stop(): Promise<void> {
 		const providerResults = await Promise.allSettled([this.#discord?.stop(), this.#slack?.stop()]);
 		const discordRestartBlocked = this.#discord?.restartBlocked() ?? false;

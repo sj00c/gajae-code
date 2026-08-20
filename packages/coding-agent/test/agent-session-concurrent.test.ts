@@ -393,6 +393,105 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toBe(true);
 	});
 
+	it("excludes undrained hidden nextTurn context from the drainable queue count after the turn settles", async () => {
+		// The busy-recovery UI gate (#4741) must see only queues its restore/clear
+		// handlers can return. A hidden nextTurn entry queued without triggerTurn
+		// deliberately survives turn completion, so the aggregate count stays
+		// nonzero forever; the drainable count must not, or every Esc/Ctrl+C would
+		// perform a no-op abort and lock the user out of their own input.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const firstTurn = Promise.withResolvers<void>();
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					void (async () => {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						await firstTurn.promise;
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+					})();
+				});
+				return stream;
+			},
+		});
+
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-drainable.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir, "models.yml")),
+		});
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		// Mirrors the todo_write failure reminder: hidden, agent-attributed, and
+		// explicitly not triggering a turn of its own.
+		session.sendCustomMessage(
+			{
+				customType: "todo-write-failure",
+				content: "Hidden todo reminder",
+				display: false,
+				attribution: "agent",
+			},
+			{ deliverAs: "nextTurn", triggerTurn: false },
+		);
+
+		firstTurn.resolve();
+		await firstPrompt;
+		await session.waitForIdle();
+
+		// The turn settled and the hidden entry was never delivered or drained.
+		expect(session.isStreaming).toBe(false);
+		expect(session.pendingMessageCounts).toEqual({ steering: 0, followUp: 0, nextTurn: 1 });
+		expect(session.queuedMessageCount).toBe(1);
+		// What the recovery gate reads: nothing a key press could drain.
+		expect(session.drainableQueuedMessageCount).toBe(0);
+		// And the drain handlers confirm it: they return nothing and leave it in place.
+		expect(session.getQueuedMessageEntries()).toEqual([]);
+		expect(session.popLastQueuedMessage()).toBeUndefined();
+		expect(session.clearQueue()).toEqual({ steering: [], followUp: [] });
+		expect(session.pendingMessageCounts.nextTurn).toBe(1);
+		expect(session.getPendingNextTurnMessagesForTests()).toHaveLength(1);
+	});
+
+	it("counts steering and follow-up entries as drainable while hidden context coexists", async () => {
+		await createSession();
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		session.sendCustomMessage(
+			{
+				customType: "todo-write-failure",
+				content: "Hidden todo reminder",
+				display: false,
+				attribution: "agent",
+			},
+			{ deliverAs: "nextTurn", triggerTurn: false },
+		);
+		session.steer("visible steer");
+		session.followUp("visible follow-up");
+
+		expect(session.pendingMessageCounts).toEqual({ steering: 1, followUp: 1, nextTurn: 1 });
+		expect(session.queuedMessageCount).toBe(3);
+		// Both visible queues are drainable; the hidden one is not.
+		expect(session.drainableQueuedMessageCount).toBe(2);
+
+		// Draining returns exactly the drainable entries and preserves hidden order.
+		expect(session.clearQueue()).toEqual({ steering: ["visible steer"], followUp: ["visible follow-up"] });
+		expect(session.drainableQueuedMessageCount).toBe(0);
+		expect(session.pendingMessageCounts.nextTurn).toBe(1);
+
+		session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
 	it("should allow prompt() after previous completes", async () => {
 		// Create session with a stream that completes immediately
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;

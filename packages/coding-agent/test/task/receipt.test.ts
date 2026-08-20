@@ -14,6 +14,7 @@ import {
 	sanitizeTaskToolDetails,
 } from "../../src/task/receipt";
 import {
+	createLocalErrorSummary,
 	hasCompleteAggregateUsageCostBreakdown,
 	hasCompleteUsageCostBreakdown,
 	type SingleResult,
@@ -400,6 +401,91 @@ describe("task result receipts", () => {
 		expect(receipt.abortSummary).toBe("Abort reason recorded.");
 		expect(receipt.retryFailure?.errorSummary).toBe("Retry failure recorded.");
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+	});
+
+	it("surfaces a local_buffer_overflow summary in the parent preview instead of the generic error text (#4618)", () => {
+		const structuredSummary = createLocalErrorSummary("local_buffer_overflow", "ignored message text", {
+			stage: "overflow.staged",
+			exceeded: "bytes",
+			stagedEventCount: 12,
+			stagedBytes: 0,
+			incomingEventBytes: 16_777_217,
+			maxStagedEvents: 10_000,
+			maxStagedBytes: 16 * 1024 * 1024,
+		});
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				exitCode: 1,
+				error: "provider-ish error recorded",
+				localErrorSummary: { kind: "local_buffer_overflow", summary: structuredSummary.summary },
+			}),
+		);
+		expect(receipt.status).toBe("failed");
+		// The preview names the local kind and carries the actionable shape, so
+		// the parent session cannot misread this as a provider/context failure.
+		expect(receipt.preview).toBe(`Task failed; local failure (local_buffer_overflow): ${structuredSummary.summary}`);
+		expect(receipt.localErrorSummary).toMatchObject({ kind: "local_buffer_overflow" });
+		expect(receipt.errorSummary).toContain("overflow.staged");
+		expect(receipt.errorSummary).toContain("exceeded=bytes");
+		expect(receipt.errorSummary).toContain("not a provider or context-window failure");
+	});
+
+	it("redacts credentials and local paths inside a local error summary (#4618)", () => {
+		// The producer boundary sanitizes; buildTaskReceipt trusts the summary
+		// exactly as it trusts setupFailure summaries.
+		const summary = createLocalErrorSummary(
+			"local_snapshot_failure",
+			"boom Authorization: Bearer sk-ant-abcdefghijklmnopqrst1234 at /Users/veritas/.gjc/secrets.env",
+		);
+		expect(summary.kind).toBe("local_snapshot_failure");
+		expect(summary.summary).not.toContain("sk-ant-abcdefghijklmnopqrst1234");
+		expect(summary.summary).not.toContain("/Users/veritas");
+		const receipt = buildTaskReceipt(makeRaw({ exitCode: 1, error: "leak", localErrorSummary: summary }));
+		const serialized = JSON.stringify(receipt);
+		expect(serialized).not.toContain("sk-ant-abcdefghijklmnopqrst1234");
+		expect(serialized).not.toContain("/Users/veritas");
+		expect(receipt.localErrorSummary?.kind).toBe("local_snapshot_failure");
+		expect(receipt.preview).toContain("Task failed; local failure (local_snapshot_failure):");
+	});
+
+	it("degrades a foreign errorKind to the neutral local kind with a fixed sentence (#4618)", () => {
+		// A self-labeled kind cannot forward free-form message text either:
+		// the summary is the fixed neutral sentence, never child-controlled.
+		const summary = createLocalErrorSummary("<script>alert(1)</script>", "boom");
+		expect(summary.kind).toBe("local");
+		expect(summary.summary).toBe("Subagent failed with a local error.");
+	});
+
+	it("renders overflow summaries from the structured shape only and degrades shape-less overflow kinds (#4618)", () => {
+		const marker = "FORGED-CONTENT-must-not-be-forwarded";
+		// Shape present: summary built from numbers/vocabulary only.
+		const withShape = createLocalErrorSummary("local_buffer_overflow", `prefix ${marker} suffix`, {
+			stage: "overflow.preMeasure",
+			exceeded: "both",
+			// Internally consistent with the caps: projected events
+			// (10000 + 1) and projected bytes (16777000 + 4096) both cross.
+			stagedEventCount: 10_000,
+			stagedBytes: 16_777_000,
+			incomingEventBytes: 4096,
+			maxStagedEvents: 10_000,
+			maxStagedBytes: 16 * 1024 * 1024,
+		});
+		expect(withShape.summary).not.toContain(marker);
+		expect(withShape.summary).toContain("exceeded=both");
+		expect(withShape.summary).toContain("10000/10000 events");
+		expect(withShape.summary).toContain("16777000 staged bytes");
+		expect(withShape.summary).toContain("rejected event 4096 bytes");
+		expect(withShape.summary).toContain("projected 16781096/16777216 bytes");
+		// Shape absent: neutral sentence, no message forwarding.
+		const withoutShape = createLocalErrorSummary("local_buffer_overflow", `prefix ${marker} suffix`);
+		expect(withoutShape.summary).toBe("Local staging-buffer overflow; structured diagnostic unavailable.");
+	});
+
+	it("keeps the generic error preview when no local error summary is present (#4618 fallback isolation)", () => {
+		const receipt = buildTaskReceipt(makeRaw({ exitCode: 1, error: "provider exploded" }));
+		expect(receipt.preview).toBe("Task failed; error recorded.");
+		expect(receipt.localErrorSummary).toBeUndefined();
+		expect(receipt.errorSummary).toBe("Error recorded.");
 	});
 
 	it("exposes identity-bound isolated persistence and recovery outcomes", () => {

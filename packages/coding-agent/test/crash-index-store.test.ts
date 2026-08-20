@@ -12,7 +12,9 @@ import {
 } from "@gajae-code/utils";
 import {
 	applyCrashEvent,
+	CRASH_INDEX_ENTRY_MAX_BYTES,
 	CRASH_INDEX_MAX_SIGNATURES,
+	type CrashSignatureEntry,
 	type CrashStatePaths,
 	compactCrashIndex,
 	listCrashSignatures,
@@ -87,6 +89,109 @@ describe("compactCrashIndex", () => {
 		// Re-running with an empty journal must not change counts.
 		const again = await compactCrashIndex({ paths, now: NOW });
 		expect(again.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(8);
+	});
+
+	it("keeps a maximum-sized legacy entry readable after a later occurrence compaction", async () => {
+		const paths = await tempPaths();
+		const fingerprint = fingerprintFor(2);
+		const firstRecordId = recordId(20);
+		const legacyEntry = {
+			fpv: 1,
+			errorName: "Error",
+			messageClass: "x".repeat(200),
+			lifetimeCount: 1,
+			retainedCount: 0,
+			firstSeen: NOW - 1000,
+			lastSeen: NOW,
+			lastRecordId: firstRecordId,
+			relayedAt: NOW - 100,
+			relayedRecordId: firstRecordId,
+			reportedAt: NOW - 50,
+			reportedIssueUrl: `https://github.com/Yeachan-Heo/gajae-code/issues/${"r".repeat(180)}`,
+			commentedIssues: [
+				`https://github.com/Yeachan-Heo/gajae-code/issues/${"x".repeat(180)}`,
+				`https://x/${"y".repeat(50)}`,
+			],
+		};
+		const index = {
+			version: 1,
+			updatedAt: NOW,
+			lastNudgedAt: 0,
+			overflow: false,
+			recentEventIds: [firstRecordId],
+			recentJournalDigests: [],
+			recoveredRecordIds: [],
+			retiredFingerprints: [],
+			signatures: { [fingerprint]: legacyEntry },
+		};
+		expect(Buffer.byteLength(JSON.stringify(legacyEntry), "utf8")).toBeLessThanOrEqual(CRASH_INDEX_ENTRY_MAX_BYTES);
+		expect(
+			Buffer.byteLength(JSON.stringify({ ...legacyEntry, lastAppendRecordId: recordId(21) }), "utf8"),
+		).toBeGreaterThan(CRASH_INDEX_ENTRY_MAX_BYTES);
+		await fs.writeFile(paths.index, `${JSON.stringify(index)}\n`);
+		appendCrashEvent({ ...occurrence(fingerprint, recordId(21), NOW - 500), messageClass: "" }, paths.events);
+
+		const compacted = await compactCrashIndex({ paths, now: NOW });
+		expect(compacted.signatures[fingerprint]?.lifetimeCount).toBe(2);
+		expect(compacted.signatures[fingerprint]?.lastAppendRecordId).toBe(recordId(21));
+		expect(compacted.signatures[fingerprint]?.relayedRecordId).toBe(firstRecordId);
+		expect(compacted.signatures[fingerprint]?.commentedIssues).toContain(`https://x/${"y".repeat(50)}`);
+
+		const reparsed = parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW);
+		expect(reparsed?.signatures[fingerprint]?.lifetimeCount).toBe(2);
+		expect(reparsed?.signatures[fingerprint]?.lastAppendRecordId).toBe(recordId(21));
+		expect(reparsed?.signatures[fingerprint]?.relayedRecordId).toBe(firstRecordId);
+	});
+
+	it("persists refusal markers at the exact entry cap by dropping report metadata", () => {
+		const fingerprint = fingerprintFor(22);
+		const index = {
+			version: 1,
+			updatedAt: NOW,
+			lastNudgedAt: 0,
+			overflow: false,
+			recentEventIds: [],
+			recentJournalDigests: [],
+			recoveredRecordIds: [],
+			retiredFingerprints: [],
+			signatures: {
+				[fingerprint]: {
+					fpv: 1,
+					errorName: "Error",
+					messageClass: "x".repeat(512),
+					lifetimeCount: 1,
+					retainedCount: 1,
+					firstSeen: NOW - 1,
+					lastSeen: NOW,
+					lastRecordId: recordId(22),
+					lastAppendRecordId: recordId(22),
+					relayedAt: NOW - 1,
+					relayedRecordId: recordId(22),
+					reportedAt: NOW - 1,
+					reportedIssueUrl: `https://github.com/example/issues/${"r".repeat(180)}`,
+					commentedIssues: [`https://github.com/example/issues/${"c".repeat(180)}`],
+				},
+			},
+		};
+		const entry = index.signatures[fingerprint] as CrashSignatureEntry;
+		expect(Buffer.byteLength(JSON.stringify(entry), "utf8")).toBeGreaterThan(CRASH_INDEX_ENTRY_MAX_BYTES);
+		expect(
+			applyCrashEvent(
+				index,
+				{
+					kind: "refused",
+					fingerprint,
+					fpv: 1,
+					recordId: recordId(22),
+					contractVersion: "sanitize-external-crash-v1",
+					at: NOW,
+				},
+				NOW,
+			),
+		).toBe(true);
+		expect(Buffer.byteLength(JSON.stringify(entry), "utf8")).toBeLessThanOrEqual(CRASH_INDEX_ENTRY_MAX_BYTES);
+		expect(entry.relayRefusedRecordId).toBe(recordId(22));
+		expect(entry.relayRefusedVersion).toBe("sanitize-external-crash-v1");
 	});
 
 	it("deduplicates a replayed rotated journal containing more than the recent id window", async () => {
@@ -528,6 +633,31 @@ describe("parseCrashIndex", () => {
 
 	it("accepts a well-formed index", () => {
 		expect(parseCrashIndex(JSON.stringify(valid), NOW)?.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(2);
+	});
+
+	it("accepts a maximum-sized legacy entry while deriving its relay watermark", () => {
+		const legacyEntry = {
+			...valid.signatures[fingerprintFor(1)],
+			messageClass: "x".repeat(512),
+			commentedIssues: [
+				`https://github.com/Yeachan-Heo/gajae-code/issues/${"x".repeat(180)}`,
+				`https://x/${"y".repeat(50)}`,
+			],
+		};
+		const legacySize = Buffer.byteLength(JSON.stringify(legacyEntry), "utf8");
+		const upgradedSize = Buffer.byteLength(
+			JSON.stringify({ ...legacyEntry, lastAppendRecordId: legacyEntry.lastRecordId }),
+			"utf8",
+		);
+		expect(legacySize).toBeLessThanOrEqual(CRASH_INDEX_ENTRY_MAX_BYTES);
+		expect(upgradedSize).toBeGreaterThan(CRASH_INDEX_ENTRY_MAX_BYTES);
+
+		const parsed = parseCrashIndex(
+			JSON.stringify({ ...valid, signatures: { [fingerprintFor(1)]: legacyEntry } }),
+			NOW,
+		);
+		expect(parsed?.signatures[fingerprintFor(1)]).toBeDefined();
+		expect(parsed?.signatures[fingerprintFor(1)]?.lastAppendRecordId).toBeUndefined();
 	});
 
 	it.each([

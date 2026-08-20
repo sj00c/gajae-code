@@ -20,6 +20,7 @@ import {
 	managedDirectoryRoot,
 } from "../../src/session/internal/managed-session-storage";
 import { createManagedTaskPersistence, runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
+import { buildTaskReceipt } from "../../src/task/receipt";
 
 import {
 	type AgentDefinition,
@@ -1684,6 +1685,203 @@ describe("runSubprocess telemetry propagation", () => {
 		});
 		// Child loop falls back to its own session id for gen_ai.conversation.id.
 		expect(forwarded.conversationId).toBeUndefined();
+	});
+
+	it("propagates a terminal local_buffer_overflow into localErrorSummary from the structured shape (#4618)", async () => {
+		// Free-form message deliberately carries marker text: the summary must
+		// be built from the structured shape only, never from this string.
+		const marker = "SECRET-PROMPT-MATERIAL-must-not-reach-receipt";
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: `Managed fallback attempt exceeded the provisional event buffer limit ... ${marker}`,
+				errorKind: "local_buffer_overflow",
+				bufferOverflow: {
+					stage: "overflow.staged",
+					exceeded: "bytes",
+					stagedEventCount: 9000,
+					stagedBytes: 4194304,
+					incomingEventBytes: 16777216,
+					maxStagedEvents: 10_000,
+					maxStagedBytes: 16 * 1024 * 1024,
+				},
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-overflow-propagation" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary).toMatchObject({
+			kind: "local_buffer_overflow",
+		});
+		expect(result.localErrorSummary?.summary).toContain("overflow.staged");
+		expect(result.localErrorSummary?.summary).toContain("exceeded=bytes");
+		expect(result.localErrorSummary?.summary).toContain("9000/10000 events");
+		expect(result.localErrorSummary?.summary).toContain("not a provider or context-window failure");
+		// Trust boundary: free-form message text never reaches the summary.
+		expect(result.localErrorSummary?.summary).not.toContain(marker);
+	});
+
+	it("degrades a self-labeled overflow without the structured shape to a neutral summary (#4618)", async () => {
+		const marker = "FORGED-TEXT-must-not-reach-parent";
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: `local_buffer_overflow: ${marker}`,
+				// Self-labeled kind WITHOUT the identity-checked shape.
+				errorKind: "local_buffer_overflow",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-forged-overflow-kind" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary?.kind).toBe("local_buffer_overflow");
+		// Neutral sentence only: the forged message text is not forwarded.
+		expect(result.localErrorSummary?.summary).not.toContain(marker);
+		expect(result.localErrorSummary?.summary).toContain("structured diagnostic unavailable");
+	});
+
+	it("rejects a foreign shape with free-form stage, string counters, or inconsistent caps (#4618)", async () => {
+		const marker = "PROMPT-MATERIAL-must-not-reach-parent";
+		// Deliberately invalid runtime shapes (the point of the test), so the
+		// array is typed as the public field while the literals stay hostile.
+		const forgedShapes = [
+			// Free-form stage carrying arbitrary text.
+			{
+				stage: marker,
+				exceeded: "bytes",
+				stagedEventCount: 1,
+				stagedBytes: 0,
+				incomingEventBytes: 16_777_217,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			},
+			// Nominally-numeric fields as strings.
+			{
+				stage: "overflow.staged",
+				exceeded: "bytes",
+				stagedEventCount: "9000",
+				stagedBytes: 0,
+				incomingEventBytes: 16_777_217,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			},
+			// Free-form exceeded discriminator.
+			{
+				stage: "overflow.staged",
+				exceeded: marker,
+				stagedEventCount: 1,
+				stagedBytes: 0,
+				incomingEventBytes: 16_777_217,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			},
+			// Internally inconsistent: claims bytes exceeded but the projection fits.
+			{
+				stage: "overflow.staged",
+				exceeded: "bytes",
+				stagedEventCount: 1,
+				stagedBytes: 100,
+				incomingEventBytes: 200,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			},
+			// Negative counter.
+			{
+				stage: "overflow.staged",
+				exceeded: "events",
+				stagedEventCount: -1,
+				stagedBytes: 0,
+				incomingEventBytes: 1,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			},
+		] as unknown as Array<AssistantMessage["bufferOverflow"]>;
+		for (const [index, bufferOverflow] of forgedShapes.entries()) {
+			const session = createMockSession(({ state }) => {
+				state.messages.push({
+					...createAssistantStopMessage(""),
+					stopReason: "error",
+					errorMessage: `cover ${marker} text`,
+					errorKind: "local_buffer_overflow",
+					bufferOverflow,
+				});
+			});
+			mockCreateAgentSession(session);
+
+			const result = await runSubprocess({ ...baseOptions, id: `subagent-forged-shape-${index}` });
+
+			expect(result.exitCode).toBe(1);
+			// Validation rejected the shape: fixed neutral sentence, no marker.
+			expect(result.localErrorSummary?.summary).toBe(
+				"Local staging-buffer overflow; structured diagnostic unavailable.",
+			);
+			expect(result.localErrorSummary?.summary).not.toContain(marker);
+		}
+	});
+
+	it("uses the fixed snapshot-failure sentence instead of forwarding free-form message text (#4618)", async () => {
+		const marker = "SNAPSHOT-FAILURE-must-not-reach-parent";
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: `local snapshot failure: ${marker}`,
+				errorKind: "local_snapshot_failure",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-snapshot-failure-fixed" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary?.kind).toBe("local_snapshot_failure");
+		expect(result.localErrorSummary?.summary).toContain("serializable event snapshot");
+		expect(result.localErrorSummary?.summary).not.toContain(marker);
+	});
+
+	it("keeps a forged local errorKind out of the receipt when the runtime never produced one (#4618)", async () => {
+		// The agent runtime strips `errorKind` from any terminal message it did
+		// not itself produce from an identity-checked local error, so a provider
+		// failure never arrives here labeled local. Pin the executor's behavior
+		// for that contract: no local summary, ordinary provider error text.
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: "upstream stream terminated unexpectedly",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-unlabeled-provider-error" });
+		const receipt = buildTaskReceipt(result);
+
+		expect(result.localErrorSummary).toBeUndefined();
+		expect(receipt.preview).not.toContain("local failure");
+		expect(receipt.preview).not.toContain("staging-buffer");
+	});
+
+	it("keeps localErrorSummary undefined for an ordinary provider error (#4618 fallback isolation)", async () => {
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: "500 Internal Server Error",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-ordinary-error" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary).toBeUndefined();
+		expect(result.error).toBe("500 Internal Server Error");
 	});
 
 	it("forwards no telemetry when the parent has none", async () => {

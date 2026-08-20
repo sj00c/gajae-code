@@ -16,6 +16,13 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 
+/**
+ * Anthropic's statusless capacity-overload envelope exactly as observed in a
+ * live session, including the trailing padding the provider sends.
+ */
+const ANTHROPIC_OVERLOAD_ENVELOPE =
+	'{"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CeCBq4Y2KiEGipdTbzvNH"             }';
+
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 
@@ -1241,6 +1248,114 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 		}
 	});
+	it("retries the observed Anthropic capacity overload under bare defaults", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			bareDefault: true,
+			errorMessage: ANTHROPIC_OVERLOAD_ENVELOPE,
+			recoveredContent: "recovered after the overload cleared",
+			requestedModels,
+		});
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("recover Anthropic overload");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]?.delayMs).toBeGreaterThan(0);
+		expect(waitSpy).toHaveBeenCalledWith(retryStartEvents[0]?.delayMs, expect.anything());
+		expect(requestedModels).toHaveLength(2);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "recovered after the overload cleared" }]);
+	});
+	it("bounds a persistent Anthropic capacity overload under bare defaults", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			bareDefault: true,
+			errorMessage: ANTHROPIC_OVERLOAD_ENVELOPE,
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("exhaust persistent Anthropic overload");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(4);
+		expect(retryStartEvents).toHaveLength(3);
+		expect(retryStartEvents.map(event => event.unbounded)).toEqual([false, false, false]);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it("does not retry Anthropic overload near misses under bare defaults", async () => {
+		for (const testCase of [
+			// Transient prose that names the overload code but is not the typed envelope.
+			{ errorMessage: "503 service unavailable: overloaded_error" },
+			// Correct envelope shape carrying a different typed error.
+			{ errorMessage: '{"type":"error","error":{"type":"api_error","message":"Internal error."}}' },
+			// The Anthropic envelope delivered by a different provider API.
+			{ errorMessage: ANTHROPIC_OVERLOAD_ENVELOPE, messageApi: "openai-responses" as const },
+			// A conflicting transport fact means the attempt is not provably content-free.
+			{ errorMessage: ANTHROPIC_OVERLOAD_ENVELOPE, errorStatus: 529 },
+		]) {
+			const requestedModels: string[] = [];
+			session = buildStatusErrorSession({
+				bareDefault: true,
+				errorMessage: testCase.errorMessage,
+				...("messageApi" in testCase ? { messageApi: testCase.messageApi } : {}),
+				...("errorStatus" in testCase ? { errorStatus: testCase.errorStatus } : {}),
+				recoveredContent: "should not retry",
+				requestedModels,
+			});
+			const { retryStartEvents } = track(session);
+
+			await session.prompt("surface non-admitted overload");
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(0);
+			expect(requestedModels).toHaveLength(1);
+			expect(lastAssistant(session).stopReason).toBe("error");
+			await session.dispose();
+			session = undefined;
+		}
+	});
+	it("does not retry an Anthropic overload after visible progress or when retry is disabled", async () => {
+		const progressModels: string[] = [];
+		session = buildStatusErrorSession({
+			bareDefault: true,
+			errorMessage: ANTHROPIC_OVERLOAD_ENVELOPE,
+			partialContent: "already streamed",
+			recoveredContent: "should not retry",
+			requestedModels: progressModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const progressEvents = track(session);
+
+		await session.prompt("overload after visible progress");
+		await session.waitForIdle();
+
+		expect(progressEvents.retryStartEvents).toHaveLength(0);
+		expect(progressModels).toHaveLength(1);
+		await session.dispose();
+
+		const disabledModels: string[] = [];
+		session = buildStatusErrorSession({
+			bareDefault: true,
+			errorMessage: ANTHROPIC_OVERLOAD_ENVELOPE,
+			recoveredContent: "should not retry",
+			requestedModels: disabledModels,
+			settingsOverrides: { "retry.enabled": false },
+		});
+		const disabledEvents = track(session);
+
+		await session.prompt("overload with retry disabled");
+		await session.waitForIdle();
+
+		expect(disabledEvents.retryStartEvents).toHaveLength(0);
+		expect(disabledModels).toHaveLength(1);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
 	it("forwards only explicit first-event timeout settings to provider stream options", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
@@ -2032,6 +2147,46 @@ describe("AgentSession resilient retry", () => {
 		const { retryStartEvents } = track(session);
 
 		await session.prompt("bare-default auto-retry lifecycle empty response");
+		await session.waitForIdle();
+
+		expect(hookCalls).toBe(1);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(streamCalls).toBe(2);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it("does not replay a second bare-default Anthropic overload after auto_retry_start handlers participate", async () => {
+		let hookCalls = 0;
+		let streamCalls = 0;
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		session = buildBareStreamingSession({
+			streamFn: () => {
+				streamCalls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure = assistantMessage(model, [], "error", ANTHROPIC_OVERLOAD_ENVELOPE);
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+			extensionRunner: createExtensionRunner(
+				new Map([
+					[
+						"auto_retry_start",
+						[
+							async () => {
+								hookCalls++;
+							},
+						],
+					],
+				]),
+			),
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("bare-config auto-retry lifecycle Anthropic overload");
 		await session.waitForIdle();
 
 		expect(hookCalls).toBe(1);

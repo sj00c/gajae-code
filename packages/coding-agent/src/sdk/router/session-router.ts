@@ -126,6 +126,8 @@ export interface SessionRouterDeps {
 	createBrokerClient?: () => Promise<SessionRouterClient>;
 	/** Receives only an opaque capability and correlated provider-neutral frames. */
 	onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => Promise<void> | void;
+	/** Test/runtime observer invoked after a frame's delivery and cursor update settle. */
+	onFrameSettled?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void;
 	onAttachment?: (attachment: SessionAttachment) => Promise<void> | void;
 	/** Called only after the opaque capability becomes externally current. */
 	onAttachmentReady?: (attachment: SessionAttachment) => Promise<void> | void;
@@ -394,10 +396,15 @@ export class SessionRouter {
 	 * Explicit callers still join each attachment's replay tail after the scan; the
 	 * periodic timer uses `#scanSerialized` only so a wedged `event_replay` cannot
 	 * freeze fleet convergence (#4527).
+	 *
+	 * `waitForReplay: false` returns as soon as the index scan has settled, without
+	 * joining the per-attachment replay tails. Deterministic callers use it to observe
+	 * attachment/retirement bookkeeping without blocking on an in-flight `event_replay`.
 	 */
-	async reconcile(): Promise<void> {
+	async reconcile(options: { waitForReplay?: boolean } = {}): Promise<void> {
 		if (!this.#started) return;
 		await this.#scanSerialized();
+		if (options.waitForReplay === false) return;
 		await this.#joinAttachmentTails();
 	}
 
@@ -1056,12 +1063,19 @@ export class SessionRouter {
 					return;
 				await this.#deliverFrame(attached, event);
 			}
-			for (const entry of [...held]) {
+			// Drain owned batches: take each batch out of the live buffer *before* awaiting
+			// publication, so frames the live callback appends while we are suspended stay in
+			// `held` and are picked up by the next batch instead of being erased by a trailing
+			// clear. The barrier stays raised until the buffer is observed empty.
+			while (held.length > 0) {
 				if (attached.disposed || attached.barrierFailed) return;
-				if (entry.frame.type === "event_replay_result") continue;
-				await this.#deliverFrame(attached, entry.frame);
+				const batch = held.splice(0, held.length);
+				for (const entry of batch) {
+					if (attached.disposed || attached.barrierFailed) return;
+					if (entry.frame.type === "event_replay_result") continue;
+					await this.#deliverFrame(attached, entry.frame);
+				}
 			}
-			held.splice(0, held.length);
 		} finally {
 			attached.replaying = false;
 			if (attached.held === held) attached.held = undefined;
@@ -1131,6 +1145,7 @@ export class SessionRouter {
 			if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached) return;
 			if (seq === undefined || !ownsSequence) throw error;
 			this.#failDelivery(attached, seq, error, frame);
+			this.#deps.onFrameSettled?.(attached.capability, { ...correlated, seq });
 			return;
 		}
 		if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached) return;
@@ -1138,6 +1153,7 @@ export class SessionRouter {
 			this.#undelivered.delete(attached.sessionId);
 			this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
 			if (seq > attached.cursor.seq) attached.cursor.seq = seq;
+			this.#deps.onFrameSettled?.(attached.capability, { ...delivered, seq });
 		}
 	}
 

@@ -3,6 +3,12 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withFileLock } from "../config/file-lock";
 import { assertSafeCodexEndpoint } from "./codex-wake-publisher";
+import {
+	ensureCoordinatorDirectory,
+	syncCoordinatorDirectory,
+	syncCoordinatorFile,
+	writeCoordinatorAtomic,
+} from "./durability";
 
 export const CODEX_WAKE_EVENT_KINDS = [
 	"question.opened",
@@ -108,52 +114,71 @@ function wakeEventPath(namespaceDir: string, workUnit: string, eventSeq: number)
 	return path.join(namespaceDir, "codex-wake-events", `${assertWorkUnit(workUnit)}__${assertEventSeq(eventSeq)}.json`);
 }
 
-async function fsyncDirectory(directory: string): Promise<void> {
-	const handle = await fs.open(directory, "r");
-	try {
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-}
-
 async function writeAtomic(file: string, value: unknown): Promise<void> {
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-	const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-	const handle = await fs.open(temp, "wx", 0o600);
-	try {
-		await handle.writeFile(JSON.stringify(value));
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	await fs.rename(temp, file);
-	await fsyncDirectory(path.dirname(file));
+	await writeCoordinatorAtomic(file, JSON.stringify(value));
 }
 
 async function writeExclusive(file: string, value: unknown): Promise<boolean> {
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(path.dirname(file));
 	const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-	const handle = await fs.open(temp, "wx", 0o600);
+	let linked = false;
+	let result = false;
+	let primaryError: unknown;
+	let tempCreated = false;
 	try {
-		await handle.writeFile(JSON.stringify(value));
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	try {
-		await fs.link(temp, file);
-	} catch (error) {
-		await fs.unlink(temp).catch(() => {});
-		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-			await fsyncDirectory(path.dirname(file));
-			return false;
+		const handle = await fs.open(temp, "wx", 0o600);
+		tempCreated = true;
+		let writeError: unknown;
+		try {
+			await handle.writeFile(JSON.stringify(value));
+			await syncCoordinatorFile(handle);
+		} catch (error) {
+			writeError = error;
 		}
-		throw error;
+		try {
+			await handle.close();
+		} catch (closeError) {
+			if (writeError) throw new AggregateError([writeError, closeError], "exclusive write and close failed");
+			throw closeError;
+		}
+		if (writeError) throw writeError;
+		try {
+			await fs.link(temp, file);
+			linked = true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			await syncCoordinatorDirectory(path.dirname(file));
+			result = false;
+		}
+		if (linked) {
+			await syncCoordinatorDirectory(path.dirname(file));
+			result = true;
+		}
+	} catch (error) {
+		primaryError = error;
 	}
-	await fs.unlink(temp);
-	await fsyncDirectory(path.dirname(file));
-	return true;
+	let cleanupError: unknown;
+	if (tempCreated) {
+		try {
+			await fs.unlink(temp);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") cleanupError = error;
+		}
+	}
+	let cleanupBarrierError: unknown;
+	if (tempCreated && !cleanupError) {
+		try {
+			await syncCoordinatorDirectory(path.dirname(file));
+		} catch (error) {
+			cleanupBarrierError = error;
+		}
+	}
+	const failures = [primaryError, cleanupError, cleanupBarrierError].filter(
+		(error): error is unknown => error !== undefined,
+	);
+	if (failures.length > 1) throw new AggregateError(failures, "exclusive publication and cleanup failed");
+	if (failures.length === 1) throw failures[0];
+	return result;
 }
 
 async function readJson<T>(file: string): Promise<T | null> {
@@ -161,7 +186,8 @@ async function readJson<T>(file: string): Promise<T | null> {
 		return JSON.parse(await fs.readFile(file, "utf8")) as T;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw new Error("state_corrupt");
+		if (error instanceof SyntaxError) throw new Error("state_corrupt");
+		throw error;
 	}
 }
 
@@ -343,7 +369,7 @@ export async function listCodexHandoffs(namespaceDir: string): Promise<CodexHand
 		names = await fs.readdir(directory);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw new Error("state_corrupt");
+		throw error;
 	}
 	const handoffs: CodexHandoffRegistrationV1[] = [];
 	for (const name of names) {
@@ -418,7 +444,7 @@ export async function updateCodexWakeEvent(
 	const file = eventPathForKey(namespaceDir, key);
 	if (patch.status !== undefined && !["pending", "published", "acked", "failed"].includes(patch.status))
 		throw new Error("invalid_wake_event_status");
-	if (patch.attempts_delta !== undefined && !Number.isInteger(patch.attempts_delta))
+	if (patch.attempts_delta !== undefined && (!Number.isSafeInteger(patch.attempts_delta) || patch.attempts_delta < 0))
 		throw new Error("invalid_attempts_delta");
 	return await withFileLock(file, async () => {
 		const event = await readJson<CodexWakeEventV1>(file);
@@ -457,7 +483,7 @@ export async function listCodexWakeEvents(namespaceDir: string, workUnit?: strin
 		names = await fs.readdir(directory);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw new Error("state_corrupt");
+		throw error;
 	}
 	const events: CodexWakeEventV1[] = [];
 	for (const name of names) {

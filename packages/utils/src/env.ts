@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, getConfigRootDir } from "./dirs";
+import { getAgentDir, getConfigRootDir, getTrustedHomeDir } from "./dirs";
 import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
@@ -10,6 +10,32 @@ import { parseEnvFile, parseEnvFileContent, parseShellEnvFile } from "./env-file
 
 // Re-exported so the public surface of this module is unchanged.
 export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
+
+function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string> } {
+	const cwd = process.cwd();
+	const nodeEnv = process.env.NODE_ENV || Bun.env.NODE_ENV;
+	// Match Bun's dotenv precedence. Validate before interpolation so a hostile
+	// NODE_ENV cannot introduce separators or `..` path segments.
+	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
+	const files = [
+		".env",
+		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
+		...(validNodeEnv !== "test" ? [".env.local"] : []),
+		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
+	];
+	const values: Record<string, string> = {};
+	const dynamic = new Set<string>();
+	for (const file of files) {
+		const parsed = parseEnvFile(path.join(cwd, file));
+		for (const [key, value] of Object.entries(parsed)) {
+			values[key] = value;
+			// Track dynamic provenance only for the winning declaration.
+			if (/[$`]/.test(value)) dynamic.add(key);
+			else dynamic.delete(key);
+		}
+	}
+	return { values, dynamic };
+}
 
 function resolveFileEnvValue(file: Record<string, string>, name: string): string | undefined {
 	if (!isSafeEnvName(name)) return undefined;
@@ -25,7 +51,12 @@ type TrustedAgentEnvRead =
 	| { status: "ok"; values: Record<string, string> };
 
 function readTrustedAgentEnv(): TrustedAgentEnvRead {
-	const filePath = path.join(getAgentDir(), ".env");
+	let filePath: string;
+	try {
+		filePath = path.join(getAgentDir(), ".env");
+	} catch {
+		return { status: "unavailable", values: {} };
+	}
 	let fileDescriptor: number | undefined;
 	try {
 		const linkStats = fs.lstatSync(filePath);
@@ -51,30 +82,64 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 		if (!isSafeEnvName(key) || value === undefined || !isSafeEnvValue(value)) continue;
 
 		// Bun may have already loaded cwd/.env before JS runs. It does not expose the
-		// source of each entry, so an exact match with projectEnv is ambiguous. Use
-		// the safer credential rule: ambiguous project matches are excluded from the
-		// credential-only inherited snapshot, while remaining available through $env.
+		// source of each entry, so a matching project declaration is ambiguous. A
+		// dynamic dotenv declaration is also ambiguous even when expansion changes
+		// its runtime value. Exclude those from the credential-only snapshot while
+		// keeping them available through $env.
 		const projectValue = resolveFileEnvValue(projectEnv, key);
-		if (projectValue !== undefined && projectValue === value) continue;
+		if (projectValue !== undefined && (projectSnapshot.dynamic.has(key) || projectValue === value)) continue;
 
 		result[key] = value;
 	}
 	return result;
 }
 
-// Eagerly parse the user's $HOME/.env and the current project's .env (from cwd)
-const homeShellEnv = {
-	...parseShellEnvFile(path.join(os.homedir(), ".zshenv")),
-	...parseShellEnvFile(path.join(os.homedir(), ".zprofile")),
-	...parseShellEnvFile(path.join(os.homedir(), ".zshrc")),
-	...parseShellEnvFile(path.join(os.homedir(), ".bash_profile")),
-	...parseShellEnvFile(path.join(os.homedir(), ".bashrc")),
-};
-const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
-const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
-const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
-const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
+// Parse the current project's .env first. Bun may have overlaid HOME from it
+// before this module runs, so a declared HOME must never select user credential
+// files for the credential-only snapshot.
+const projectSnapshot = loadProjectEnv();
+const projectEnv = projectSnapshot.values;
+const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+const declaredHome = projectEnv[authoritativeHomeKey];
+const runtimeHome = process.env[authoritativeHomeKey];
+const rejectProjectHome =
+	declaredHome !== undefined &&
+	runtimeHome !== undefined &&
+	(projectSnapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
+let trustedEnvHome: string | undefined;
+try {
+	trustedEnvHome = rejectProjectHome ? getTrustedHomeDir() : os.homedir();
+} catch {
+	// No trustworthy account home means no user credential files are trusted.
+	trustedEnvHome = undefined;
+}
+
+// Eagerly parse the trusted user's env files and the project .env (from cwd)
+const homeShellEnv = trustedEnvHome
+	? {
+			...parseShellEnvFile(path.join(trustedEnvHome, ".zshenv")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".zprofile")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".zshrc")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".bash_profile")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".bashrc")),
+		}
+	: {};
+const homeEnv =
+	trustedEnvHome && path.resolve(trustedEnvHome) !== path.resolve(process.cwd())
+		? parseEnvFile(path.join(trustedEnvHome, ".env"))
+		: {};
+let piEnv: Record<string, string> = {};
+let agentEnv: Record<string, string> = {};
+try {
+	piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
+	agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
+} catch {
+	// Keep credential resolution fail-closed when trusted user state is unavailable.
+}
 const initialTrustedAgentEnv = readTrustedAgentEnv();
+const projectLoadedEnv: Record<string, string | undefined> = Object.fromEntries(
+	Object.keys(projectEnv).map(key => [key, Bun.env[key]]),
+);
 
 const inheritedEnv = filterCredentialInheritedEnv(Bun.env);
 const rotatingAgentEnvNames = new Set(Object.keys(agentEnv));
@@ -100,11 +165,12 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 	const trimmed = value.trim();
 	if (trimmed.length === 0) return undefined;
 
-	const projectValue = resolveFileEnvValue(projectEnv, name);
 	if (
-		projectValue !== undefined &&
-		projectValue === trimmed &&
-		resolveFileEnvValue(inheritedEnv, name) === undefined
+		Object.hasOwn(projectEnv, name) &&
+		resolveFileEnvValue(inheritedEnv, name) === undefined &&
+		(projectSnapshot.dynamic.has(name) ||
+			trimmed === resolveFileEnvValue(projectEnv, name) ||
+			trimmed === projectLoadedEnv[name])
 	) {
 		return undefined;
 	}

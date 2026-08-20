@@ -625,13 +625,21 @@ export function createReconciliationStore(options: {
 	let terminalMemory: DurableTerminalScopeRecord[] = [];
 	let terminalKeyMemory: EvictedTerminalKeyEntry[] = [];
 	let chain: Promise<void> = Promise.resolve();
+	// #4743: transaction tails neutralize rejection on the serialization chain and
+	// publications are enqueued fire-and-forget, so a failed write has no observer
+	// at all. Retain every persistence failure until a drain reports it, then clear
+	// it: surface-once means no failure is lost (even one that landed before
+	// teardown began) and no later drain is permanently poisoned by a failure an
+	// owner has already been told about.
+	let unreportedPersistFailures: unknown[] = [];
 
 	const writeAtomic = async (document: ReconciliationStoreDocument): Promise<void> => {
 		if (!filePath) return;
 		const directory = path.dirname(filePath);
-		await fileFs.mkdir(directory, { recursive: true, mode: 0o700 });
-		const temporary = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+		let temporary: string | undefined;
 		try {
+			await fileFs.mkdir(directory, { recursive: true, mode: 0o700 });
+			temporary = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
 			await fileFs.writeFile(temporary, `${JSON.stringify(document)}\n`, { mode: 0o600 });
 			try {
 				const handle = await fileFs.open(temporary, "r+");
@@ -645,10 +653,14 @@ export function createReconciliationStore(options: {
 			}
 			await fileFs.rename(temporary, filePath);
 		} catch (error) {
-			await fileFs.unlink(temporary).catch(() => {});
-			throw Object.assign(error instanceof Error ? error : new Error("reconciliation persist failed"), {
+			// Every persistence-path failure (mkdir included) is evidence a drained
+			// window must surface, never silently treat as quiescent (#4743).
+			if (temporary !== undefined) await fileFs.unlink(temporary).catch(() => {});
+			const coded = Object.assign(error instanceof Error ? error : new Error("reconciliation persist failed"), {
 				code: "reconciliation_persist_failed",
 			});
+			unreportedPersistFailures.push(coded);
+			throw coded;
 		}
 	};
 
@@ -834,7 +846,17 @@ export function createReconciliationStore(options: {
 				// a later microtask. Yield once and require the queue tail to remain
 				// stable before reporting durable quiescence.
 				await Bun.sleep(0);
-				if (chain === observed) return;
+				if (chain === observed) {
+					// Transaction tails neutralize rejections on `chain`, so a failed
+					// publication would otherwise be indistinguishable from a completed
+					// one. Claim the retained evidence (clearing it so exactly one drain
+					// reports each failure) and reject instead of claiming quiescence.
+					if (unreportedPersistFailures.length === 0) return;
+					const claimed = unreportedPersistFailures;
+					unreportedPersistFailures = [];
+					if (claimed.length === 1) throw claimed[0];
+					throw new AggregateError(claimed, "Reconciliation persistence failed during the drained window.");
+				}
 			}
 		},
 		loadTerminalScopes: async () => {

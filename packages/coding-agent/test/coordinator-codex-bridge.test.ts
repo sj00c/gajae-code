@@ -500,6 +500,22 @@ describe("Coordinator Codex resume bridge", () => {
 		);
 	});
 
+	it("does not let optional startup replay gate canonical question state", async () => {
+		const root = await tempRoot();
+		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+		const server = createServer(root, "idle", requests);
+		await fs.mkdir(path.join(namespaceDir(root), "codex-handoffs"), { recursive: true });
+		await fs.writeFile(path.join(namespaceDir(root), "codex-handoffs", "session-1.json"), "{invalid json");
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "session-1" }),
+		).resolves.toMatchObject({
+			ok: false,
+			reason: "resource_gone",
+		});
+		expect((await fs.readdir(path.join(root, ".gjc", "coordinator-state", "v1"))).length).toBeGreaterThan(0);
+	});
+
 	it("retries pending wakes when a later Codex wake finds the thread idle", async () => {
 		const root = await tempRoot();
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];

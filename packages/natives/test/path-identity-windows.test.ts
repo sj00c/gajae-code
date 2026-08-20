@@ -14,6 +14,7 @@ import {
 	exactUnlinkDirect,
 	renameNoReplacePath,
 	repairOwnerOnlyPathSecurityExpected,
+	retainBrokerPublication,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
@@ -69,6 +70,20 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "win32")("Windows native path identity", () => {
+	it("keeps retained publication refusal structured on Windows", async () => {
+		const root = await temporaryDirectory();
+		let refusal: unknown;
+		try {
+			retainBrokerPublication(root);
+		} catch (error) {
+			refusal = error;
+		}
+		expect(refusal).toMatchObject({ code: "GenericFailure" });
+		expect((refusal as Error).message).toContain(
+			"Retained broker publication authority is unavailable. [retained-publication object=sdk; reason=unsupported-platform]",
+		);
+	});
+
 	it("rejects final and ancestor reparse points for every owner-only ACL operation", async () => {
 		const root = await temporaryDirectory();
 		const target = path.join(root, "target");

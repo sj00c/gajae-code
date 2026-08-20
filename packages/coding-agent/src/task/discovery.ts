@@ -9,9 +9,8 @@
  * Agent files use markdown with YAML frontmatter.
  */
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
+import { getTrustedHomeDir, logger } from "@gajae-code/utils";
 import { isProviderEnabled } from "../capability";
 import { findAllNearestProjectConfigDirs, getConfigDirs } from "../config";
 import type { Settings } from "../config/settings";
@@ -62,7 +61,7 @@ async function loadAgentsFromDir(dir: string, source: AgentSource): Promise<Agen
  */
 export async function discoverAgents(
 	cwd: string,
-	home: string = os.homedir(),
+	home: string = getTrustedHomeDir(),
 	activeSettings?: Settings,
 ): Promise<DiscoveryResult> {
 	const resolvedCwd = path.resolve(cwd);

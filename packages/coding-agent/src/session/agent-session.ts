@@ -1042,6 +1042,8 @@ const PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = "Provider stream timed out while wait
 const WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = `Error: ${PROVIDER_FIRST_EVENT_TIMEOUT_ERROR}`;
 const PROVIDER_FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_ERROR = "Provider stream timed out while waiting for first event";
 const BARE_DEFAULT_CODEX_OVERLOAD_ERROR = /^Codex error event(?:: .*)? \(code=server_is_overloaded(?:, [^)]+)*\)$/;
+/** Anthropic's typed capacity-overload `error.type`, the only overload code admitted below. */
+const ANTHROPIC_OVERLOADED_ERROR_TYPE = "overloaded_error";
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
 	"anthropic-messages": new Set([
 		PROVIDER_FIRST_EVENT_TIMEOUT_ERROR,
@@ -1110,6 +1112,40 @@ function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
 		BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
+		!hasBareDefaultRetryDisqualifyingFacts(message) &&
+		!assistantMessageHasVisibleOrToolContent(message)
+	);
+}
+
+/**
+ * True when the whole error message is Anthropic's own typed capacity-overload
+ * envelope. The provider's `overloaded_error` can arrive as a statusless SSE
+ * error event, so the envelope is the only structured evidence available: it is
+ * parsed as JSON and both the outer `type` and the nested `error.type` must
+ * match exactly. Prose is never inspected, so a message that merely mentions
+ * being overloaded cannot authorize a replay.
+ */
+function isAnthropicOverloadedEnvelope(errorMessage: string | undefined): boolean {
+	if (!errorMessage) return false;
+	const trimmed = errorMessage.trim();
+	if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return false;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return false;
+	}
+	if (typeof parsed !== "object" || parsed === null) return false;
+	if ((parsed as { type?: unknown }).type !== "error") return false;
+	const error = (parsed as { error?: unknown }).error;
+	if (typeof error !== "object" || error === null) return false;
+	return (error as { type?: unknown }).type === ANTHROPIC_OVERLOADED_ERROR_TYPE;
+}
+
+function isBareDefaultAnthropicOverload(message: AssistantMessage): boolean {
+	return (
+		message.api === "anthropic-messages" &&
+		isAnthropicOverloadedEnvelope(message.errorMessage) &&
 		!hasBareDefaultRetryDisqualifyingFacts(message) &&
 		!assistantMessageHasVisibleOrToolContent(message)
 	);
@@ -10935,7 +10971,7 @@ export class AgentSession {
 		if (this.isRetrying) return false;
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
-		return last?.role === "assistant";
+		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
@@ -11544,6 +11580,21 @@ export class AgentSession {
 	/** Number of pending messages (includes steering, follow-up, and next-turn messages) */
 	get queuedMessageCount(): number {
 		return this.#steeringMessages.length + this.#followUpMessages.length + this.#pendingNextTurnMessages.length;
+	}
+	/**
+	 * Number of pending messages a user-facing drain can actually deliver back:
+	 * exactly the steering and follow-up queues that `clearQueue()`,
+	 * `popLastQueuedMessage()`, and `getQueuedMessageEntries()` operate on.
+	 *
+	 * Hidden next-turn context is deliberately excluded. Those entries are
+	 * authored by the agent (e.g. a `todo_write` failure reminder queued with
+	 * `deliverAs: "nextTurn"` and no `triggerTurn`), are never returned by the
+	 * drain handlers, and deliberately survive turn completion — so a UI gate
+	 * that counted them would report permanently pending work that no key press
+	 * can clear, locking the user out of their own input (#4741).
+	 */
+	get drainableQueuedMessageCount(): number {
+		return this.#steeringMessages.length + this.#followUpMessages.length;
 	}
 	/** Typed pending-message counts per queue (steering, follow-up, next-turn). */
 	get pendingMessageCounts(): { steering: number; followUp: number; nextTurn: number } {
@@ -18206,6 +18257,7 @@ export class AgentSession {
 		}
 		const firstEventTimeout = classification === "first_event_timeout";
 		const emptyResponse = classification === "empty_response";
+		const canReplayProviderOverload = isBareDefaultCodexOverload(message) || isBareDefaultAnthropicOverload(message);
 		const reportedRetryMaxAttempts = transportFailure?.retryMaxAttempts;
 		if (reportedRetryMaxAttempts !== undefined) {
 			this.#providerRetryMaxAttempts = Math.min(
@@ -18284,24 +18336,22 @@ export class AgentSession {
 		if (!managedFallback && assistantMessageHasVisibleOrToolContent(message)) {
 			return false;
 		}
-		// Bare defaults retain their narrow watchdog and Codex admissions. A
-		// first-event timeout adds the typed, content-free, current-clean-scope
-		// requirement above; other transient watchdogs preserve legacy behavior.
+		// Bare defaults retain their narrow watchdog and provider capacity-overload
+		// admissions. A first-event timeout adds the typed, content-free,
+		// current-clean-scope requirement above; other transient watchdogs preserve
+		// legacy behavior. A provider overload is admitted only from that provider's
+		// own typed overload code on a content-free attempt carrying no conflicting
+		// transport facts, so replaying it cannot duplicate observable work.
 		const canReplayEmptyResponse = emptyResponse && (this.#retryAttempt === 0 || this.#hasCleanRetryReplaySafety);
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
-			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
-			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
-				(!canReplayCodexOverload &&
+				(!canReplayProviderOverload &&
 					!this.#isTypedFirstEventTimeout(message) &&
 					!messageOnlyWatchdogTimeout &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
-				(!canReplayCodexOverload &&
-					!firstEventTimeout &&
-					!messageOnlyWatchdogTimeout &&
-					!this.#hasCleanRetryReplaySafety)
+				(!firstEventTimeout && !messageOnlyWatchdogTimeout && !this.#hasCleanRetryReplaySafety)
 			) {
 				return false;
 			}
@@ -18309,6 +18359,7 @@ export class AgentSession {
 		const legacyUnbounded =
 			!managedFallback &&
 			classification === "transient" &&
+			!canReplayProviderOverload &&
 			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
 
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;

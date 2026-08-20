@@ -19,6 +19,7 @@ import {
 	ptree,
 	readSseJson,
 	Snowflake,
+	sanitizeHeaderComponent,
 	untilAborted,
 } from "@gajae-code/utils";
 import * as z from "zod/v4";
@@ -1259,7 +1260,10 @@ function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string
 		headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
 		headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
 		headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
-		headers.set("User-Agent", `pi/${packageJson.version} (${os.platform()} ${os.release()}; ${os.arch()})`);
+		headers.set(
+			"User-Agent",
+			`pi/${packageJson.version} (${sanitizeHeaderComponent(os.platform())} ${sanitizeHeaderComponent(os.release())}; ${sanitizeHeaderComponent(os.arch())})`,
+		);
 		if (sessionId) {
 			headers.set(OPENAI_HEADERS.CONVERSATION_ID, sessionId);
 			headers.set(OPENAI_HEADERS.SESSION_ID, sessionId);

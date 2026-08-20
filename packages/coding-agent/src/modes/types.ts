@@ -302,6 +302,13 @@ export interface InteractiveModeContext {
 		options?: ComposerSubmissionOptions,
 	): SubmittedUserInput;
 	cancelPendingSubmission(): boolean;
+	/**
+	 * True while a submission is pending: not yet started, or started but still
+	 * awaiting prompt delivery (`session.prompt()` has not flipped streaming yet).
+	 * Interrupt handling uses this to keep a started-preflight submission
+	 * cancellable instead of misclassifying its loader as stale (#4741).
+	 */
+	hasPendingSubmission(): boolean;
 	markPendingSubmissionStarted(input: SubmittedUserInput): boolean;
 	finishPendingSubmission(input: SubmittedUserInput): void;
 	/**

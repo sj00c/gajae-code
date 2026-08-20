@@ -169,9 +169,30 @@ function sanitizeConfigDirName(value: string | undefined): string | undefined {
 	return trimmed;
 }
 
-/** Get the config directory name relative to home (e.g. ".gjc" or PI_CONFIG_DIR override). */
+function projectEnvSnapshot(cwd = process.cwd()): { values: Record<string, string>; dynamic: Set<string> } {
+	const nodeEnv = process.env.NODE_ENV;
+	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
+	const files = [
+		".env",
+		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
+		...(validNodeEnv !== "test" ? [".env.local"] : []),
+		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
+	];
+	const values: Record<string, string> = {};
+	const dynamic = new Set<string>();
+	for (const file of files) {
+		for (const [key, value] of Object.entries(parseEnvFile(path.join(cwd, file)))) {
+			values[key] = value;
+			if (/[$`]/.test(value)) dynamic.add(key);
+			else dynamic.delete(key);
+		}
+	}
+	return { values, dynamic };
+}
+
 /**
- * Config-directory name, rejected when it comes from the caller's project `.env`.
+ * Resolve an environment value only when it is not supplied by the caller's
+ * project dotenv (or when the inherited value is observably distinct).
  *
  * The name is joined with the home directory to build the config root, and that
  * root plus the agent directory beneath it supply two of the `.env` files
@@ -184,25 +205,33 @@ function sanitizeConfigDirName(value: string | undefined): string | undefined {
  * it applies the same conservative ambiguity rule directly, matching how
  * `GJC_CODING_AGENT_DIR` is treated.
  */
-function trustedConfigDirName(name: "GJC_CONFIG_DIR" | "PI_CONFIG_DIR"): string | undefined {
+function trustedValue(
+	name: string,
+	project: { values: Record<string, string>; dynamic: Set<string> },
+): string | undefined {
 	const value = process.env[name];
 	if (!value) return undefined;
-	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
+	const projectValue = project.values[name];
+	if (projectValue !== undefined && (project.dynamic.has(name) || projectValue === value)) return undefined;
 	return value;
 }
 
-export function getConfigDirName(): string {
-	// Both guards apply: the value must come from a trusted source (not the
-	// caller's project `.env`), and it must still be a single name that stays
-	// beneath home once joined.
-	return (
-		sanitizeConfigDirName(trustedConfigDirName("GJC_CONFIG_DIR")) ??
-		sanitizeConfigDirName(trustedConfigDirName("PI_CONFIG_DIR")) ??
-		CONFIG_DIR_NAME
-	);
+function accountHomeFromSystem(): string | undefined {
+	try {
+		const info = os.userInfo();
+		if (process.platform === "linux") {
+			const line = fs
+				.readFileSync("/etc/passwd", "utf8")
+				.split("\n")
+				.find(candidate => candidate.split(":")[2] === String(info.uid));
+			const home = line?.split(":")[5];
+			if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
+		}
+		const home = info.homedir;
+		if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
+	} catch {}
+	return undefined;
 }
-
-/** Get the config agent directory name relative to home (e.g. ".gjc/agent" or PI_CONFIG_DIR + "/agent"). */
 export function getConfigAgentDirName(): string {
 	return `${getConfigDirName()}/agent`;
 }
@@ -214,59 +243,99 @@ export function getConfigAgentDirName(): string {
 type XdgCategory = "data" | "state" | "cache";
 
 /**
+ * Resolve the home used for trusted agent state. Bun overlays a checkout's
+ * `.env` before module initialization, so `os.homedir()` can already reflect
+ * an attacker-controlled HOME. Prefer the OS account database, which is not
+ * affected by a hostile HOME/USERPROFILE overlay.
+ */
+/**
  * Resolves and caches all gajae-code directory paths. On Linux, when XDG environment
  * variables are set, paths are redirected under $XDG_*_HOME/gjc/. A new
  * instance is created whenever the agent directory changes, which naturally
  * invalidates all cached paths.
  */
 class DirResolver {
-	readonly configRoot: string;
-	readonly agentDir: string;
+	configRoot: string;
+	agentDir: string;
+	readonly #projectEnv: { values: Record<string, string>; dynamic: Set<string> };
+	#configDirName: string;
+	readonly #agentDirOverride: boolean;
+	readonly #trustedHome: string;
+	readonly #homeAvailable: boolean;
 
 	// Per-category base dirs. Without XDG, all three equal configRoot / agentDir.
 	// With XDG on Linux, they point to $XDG_*_HOME/gjc/.
-	readonly #rootDirs: Record<XdgCategory, string>;
-	readonly #agentDirs: Record<XdgCategory, string>;
+	#rootDirs: Record<XdgCategory, string>;
+	#agentDirs: Record<XdgCategory, string>;
 
 	readonly #rootCache = new Map<string, string>();
 	readonly #agentCache = new Map<string, string>();
 
-	constructor(agentDirOverride?: string) {
-		this.configRoot = path.join(os.homedir(), getConfigDirName());
+	constructor(agentDirOverride?: string, snapshot = projectEnvSnapshot()) {
+		this.#projectEnv = snapshot;
+		this.#configDirName =
+			sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", snapshot)) ??
+			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", snapshot)) ??
+			CONFIG_DIR_NAME;
+		const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+		const declaredHome = snapshot.values[authoritativeHomeKey];
+		// Only the platform-authoritative variable can select the trusted home.
+		// In particular, do not let the opposite platform variable (or a project
+		// dotenv value overlaid into it) redirect user state when this is absent.
+		const runtimeHome = process.env[authoritativeHomeKey];
+		const accountHome = accountHomeFromSystem();
+		const ambiguousHome =
+			declaredHome !== undefined && (snapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
+		this.#trustedHome = ambiguousHome
+			? (accountHome ??
+				(() => {
+					throw new Error("Unable to determine a trustworthy account home directory");
+				})())
+			: (runtimeHome ??
+				accountHome ??
+				(() => {
+					throw new Error("Unable to determine a trustworthy account home directory");
+				})());
+		this.#homeAvailable = this.#trustedHome !== path.parse(this.#trustedHome).root;
+		this.configRoot = path.join(this.#trustedHome, this.#configDirName);
 
 		const defaultAgent = path.join(this.configRoot, "agent");
+		this.#agentDirOverride = Boolean(agentDirOverride);
 		this.agentDir = agentDirOverride ? path.resolve(agentDirOverride) : defaultAgent;
 		const isDefault = this.agentDir === defaultAgent;
 
-		// XDG is a Linux convention. On other platforms, or for non-default
-		// profiles, all categories resolve to the legacy paths.
+		this.#rootDirs = { data: this.configRoot, state: this.configRoot, cache: this.configRoot };
+		this.#agentDirs = { data: this.agentDir, state: this.agentDir, cache: this.agentDir };
+		this.refreshCategoryDirs(snapshot, isDefault);
+	}
+
+	private refreshCategoryDirs(
+		snapshot: { values: Record<string, string>; dynamic: Set<string> },
+		isDefault = this.agentDir === path.join(this.configRoot, "agent"),
+	): void {
 		let xdgData: string | undefined;
 		let xdgState: string | undefined;
 		let xdgCache: string | undefined;
 		if ((process.platform === "linux" || process.platform === "darwin") && isDefault) {
 			const resolveIf = (envVar: string) => {
-				const value = process.env[envVar];
-				if (value) {
-					try {
-						const joined = path.join(value, APP_NAME);
-						if (fs.existsSync(joined)) {
-							return joined;
-						}
-					} catch {}
+				const value = trustedValue(envVar, snapshot);
+				if (!value) return undefined;
+				try {
+					const joined = path.join(value, APP_NAME);
+					return fs.existsSync(joined) ? joined : undefined;
+				} catch {
+					return undefined;
 				}
-				return undefined;
 			};
 			xdgData = resolveIf("XDG_DATA_HOME");
 			xdgState = resolveIf("XDG_STATE_HOME");
 			xdgCache = resolveIf("XDG_CACHE_HOME");
 		}
-
 		this.#rootDirs = {
 			data: xdgData ?? this.configRoot,
 			state: xdgState ?? this.configRoot,
 			cache: xdgCache ?? this.configRoot,
 		};
-		// XDG flattens the agent/ prefix: ~/.gjc/agent/sessions → $XDG_DATA_HOME/gjc/sessions
 		this.#agentDirs = {
 			data: xdgData ?? this.agentDir,
 			state: xdgState ?? this.agentDir,
@@ -274,8 +343,31 @@ class DirResolver {
 		};
 	}
 
+	/** Refresh caller-supplied config-dir overrides without replacing the trust snapshot. */
+	refreshConfigDirOverride(): void {
+		const next =
+			sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", this.#projectEnv)) ??
+			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", this.#projectEnv)) ??
+			CONFIG_DIR_NAME;
+		if (next === this.#configDirName) return;
+		const nextConfigRoot = path.join(this.#trustedHome, next);
+		const nextAgentDir = this.#agentDirOverride ? this.agentDir : path.join(nextConfigRoot, "agent");
+		this.#configDirName = next;
+		this.configRoot = nextConfigRoot;
+		this.agentDir = nextAgentDir;
+		this.refreshCategoryDirs(this.#projectEnv);
+		this.#rootCache.clear();
+		this.#agentCache.clear();
+	}
+
+	isProjectEnvDeclaration(name: string): boolean {
+		return Object.hasOwn(this.#projectEnv.values, name);
+	}
+
 	/** Config-root subdirectory, with optional XDG override. */
 	rootSubdir(subdir: string, xdg?: XdgCategory): string {
+		this.refreshConfigDirOverride();
+		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
 		const cached = this.#rootCache.get(subdir);
 		if (cached) return cached;
 		const base = xdg ? this.#rootDirs[xdg] : this.configRoot;
@@ -286,6 +378,8 @@ class DirResolver {
 
 	/** Agent subdirectory, with optional XDG override. */
 	agentSubdir(userAgentDir: string | undefined, subdir: string, xdg?: XdgCategory): string {
+		this.refreshConfigDirOverride();
+		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
 		if (!userAgentDir || userAgentDir === this.agentDir) {
 			const cached = this.#agentCache.get(subdir);
 			if (cached) return cached;
@@ -296,51 +390,32 @@ class DirResolver {
 		}
 		return path.join(userAgentDir, subdir);
 	}
+
+	get configDirName(): string {
+		return this.#configDirName;
+	}
+	get trustedHome(): string {
+		return this.#trustedHome;
+	}
+	assertHomeAvailable(): void {
+		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
+	}
+	get trustSnapshot(): { values: Record<string, string>; dynamic: Set<string> } {
+		return this.#projectEnv;
+	}
 }
 
-/**
- * Agent-directory override, rejected when it comes from the caller's project
- * `.env`.
- *
- * This directory selects the agent's own `.env`, which is one of the trusted
- * sources `$credentialEnv` consults. Bun loads `cwd/.env` into `process.env`
- * before any module runs, so a repository could otherwise point this at a
- * directory it ships and have its own `.env` treated as trusted — recovering
- * every redirect the credential boundary is meant to reject.
- *
- * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
- * it applies the same conservative ambiguity rule directly: a value that matches
- * what the project `.env` sets is not honoured. An operator whose environment
- * happens to carry the identical value loses the override, which is the same
- * trade-off `resolveLiveCredentialEnvValue` already makes.
- */
-function trustedAgentDirOverrideFor(name: "GJC_CODING_AGENT_DIR" | "PI_CODING_AGENT_DIR"): string | undefined {
-	const value = process.env[name];
-	if (!value) return undefined;
-	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
-	return value;
-}
-
-/**
- * Both spellings are honoured, mirroring `getConfigDirName`.
- *
- * `PI_CODING_AGENT_DIR` is the legacy alias this module's own header documents,
- * and parts of the product already resolve it (`gc-runtime.ts:370`,
- * `deep-interview-runtime.ts:384`). Reading only the `GJC_` spelling here split
- * the agent directory in two: `gjc gc` operated on the aliased directory while
- * everything reaching `getAgentDir()` stayed on the default.
- */
-function trustedAgentDirOverride(): string | undefined {
-	return trustedAgentDirOverrideFor("GJC_CODING_AGENT_DIR") ?? trustedAgentDirOverrideFor("PI_CODING_AGENT_DIR");
-}
-
-let dirs = new DirResolver(trustedAgentDirOverride());
+const INITIAL_PROJECT_SNAPSHOT = projectEnvSnapshot();
+const trustedAgentOverride =
+	trustedValue("GJC_CODING_AGENT_DIR", INITIAL_PROJECT_SNAPSHOT) ??
+	trustedValue("PI_CODING_AGENT_DIR", INITIAL_PROJECT_SNAPSHOT);
+let dirs = new DirResolver(trustedAgentOverride, INITIAL_PROJECT_SNAPSHOT);
 
 // Anchor home for the resolver. Captured at module load to stay stable across
 // test mocks of `os.homedir()`. `getPluginsDir(home)` compares against this so
 // production callers (`home === RESOLVER_HOME`) hit the XDG-aware resolver while
 // tests passing a temp HOME short-circuit to a deterministic path.
-const RESOLVER_HOME = os.homedir();
+const RESOLVER_HOME = dirs.trustedHome;
 
 // =============================================================================
 // Root directories
@@ -348,18 +423,40 @@ const RESOLVER_HOME = os.homedir();
 
 /** Get the config root directory (~/.gjc). */
 export function getConfigRootDir(): string {
+	dirs.refreshConfigDirOverride();
+	dirs.assertHomeAvailable();
+	return dirs.configRoot;
+}
+
+/** Stable, provenance-checked home captured by the resolver lifetime snapshot. */
+export function getTrustedHomeDir(): string {
+	dirs.assertHomeAvailable();
+	return dirs.trustedHome;
+}
+
+/** Stable trusted config root; preserves the configured nested config-dir name. */
+export function getTrustedConfigRootDir(): string {
+	dirs.refreshConfigDirOverride();
+	dirs.assertHomeAvailable();
 	return dirs.configRoot;
 }
 
 /** Set the coding agent directory. Creates a fresh resolver, invalidating all cached paths. */
 export function setAgentDir(dir: string): void {
-	dirs = new DirResolver(dir);
+	dirs = new DirResolver(dir, dirs.trustSnapshot);
 	process.env.GJC_CODING_AGENT_DIR = dir;
 }
 
 /** Get the agent config directory (~/.gjc/agent). */
 export function getAgentDir(): string {
+	dirs.refreshConfigDirOverride();
+	dirs.assertHomeAvailable();
 	return dirs.agentDir;
+}
+
+export function getConfigDirName(): string {
+	dirs.refreshConfigDirOverride();
+	return dirs.configDirName;
 }
 /**
  * Join a file under the provenance-checked agent directory, never the XDG
@@ -369,6 +466,11 @@ export function getAgentDir(): string {
  */
 export function getTrustedAgentFile(filename: string): string {
 	return path.join(getAgentDir(), filename);
+}
+
+/** Whether the current checkout declares an environment key in its `.env`. */
+export function isProjectEnvDeclaration(name: string): boolean {
+	return dirs.isProjectEnvDeclaration(name);
 }
 
 /** Get the project-local config directory (.gjc). */

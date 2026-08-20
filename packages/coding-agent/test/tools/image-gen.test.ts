@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import * as https from "node:https";
+import * as os from "node:os";
 import { Readable } from "node:stream";
 import type { Model } from "@gajae-code/ai";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -177,6 +178,75 @@ async function executeOpenRouter(signal?: AbortSignal) {
 }
 
 describe("imageGenTool", () => {
+	it("sanitizes non-ASCII OS components in the codex image User-Agent header", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		const platformSpy = vi.spyOn(os, "platform").mockReturnValue("linux" as NodeJS.Platform);
+		const releaseSpy = vi.spyOn(os, "release").mockReturnValue("4.4.302-Minimal™-EAS-QTI_Haptic-R26");
+		const archSpy = vi.spyOn(os, "arch").mockReturnValue("arm64" as NodeJS.Architecture);
+		let userAgent: string | undefined;
+
+		const codexModel = {
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			id: "gpt-5.5",
+			name: "GPT 5.5 Codex",
+			baseUrl: "",
+			output: ["text", "image"],
+		} as Model;
+		const jwtPayload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "codex-account-1" } }),
+		).toString("base64url");
+		const codexApiKey = `header.${jwtPayload}.signature`;
+
+		const fetchMock: typeof fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+			userAgent = new Headers(init?.headers).get("User-Agent") ?? undefined;
+			return new Response(
+				JSON.stringify({
+					output: [
+						{
+							type: "image_generation_call",
+							result: Buffer.from("fake-webp").toString("base64"),
+							revised_prompt: "A crisp tabby cat portrait.",
+							status: "completed",
+						},
+					],
+					usage: { input_tokens: 10, output_tokens: 20, total_tokens: 30 },
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry(
+				{
+					getApiKey: async () => codexApiKey,
+					getApiKeyForProvider: async () => undefined,
+				},
+				[codexModel],
+			),
+			model: codexModel,
+			settings: makeMockSettings("openai-codex/gpt-5.5"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		const result = await imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+
+		expect(userAgent).toMatch(/^pi\/[^\s]+ \(linux 4\.4\.302-Minimal-EAS-QTI_Haptic-R26; arm64\)$/);
+		expect(userAgent).toMatch(/^[\x20-\x7e]+$/);
+		platformSpy.mockRestore();
+		releaseSpy.mockRestore();
+		archSpy.mockRestore();
+	});
+
 	it("e2e writes OpenAI Responses image_generation WebP output to a temp file", async () => {
 		delete Bun.env.OPENAI_BASE_URL;
 		let requestUrl: string | undefined;

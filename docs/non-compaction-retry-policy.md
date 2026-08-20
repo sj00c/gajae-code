@@ -46,6 +46,16 @@ Current retryable inputs are regex/string-classified:
 
 Managed fallback uses structured transport facts and typed provider error codes when available. A structured classification of `other` becomes the bounded `unknown` fallback class; error prose cannot promote it to quota or transient. Regex classification is retained only as a legacy fallback.
 
+### Bare-default admissions
+
+A session with no explicit `retry.*` settings and a single-model default role (no managed fallback) does not use the classification list above on its own. It admits only these content-free failures:
+
+- canonical first-event and idle-stream watchdog aborts, recognized from the typed timeout fact or an exact canonical sentinel message
+- the OpenAI Codex `server_is_overloaded` event, recognized from that provider's typed overload code
+- Anthropic's typed `overloaded_error` envelope, recognized by parsing the error envelope and requiring both the outer `type` and the nested `error.type` to match
+
+Overload admissions therefore require a provider-specific typed signature, while watchdog admissions accept only their canonical sentinel messages. Every admission additionally requires that the attempt carry no assistant text, thinking, or tool call and no conflicting transport facts; a status-bearing or otherwise typed failure surfaces instead. Generic or noncanonical overload and timeout wording never authorizes a replay.
+
 ### Local snapshot failures (surface immediately, no retry)
 
 `local_snapshot_failure` is a local machinery fault, not provider evidence. The retained producer shape is deterministic, so re-streaming the same request only reproduces the same local defect; it is surfaced immediately instead of being amplified across identical retries:
@@ -225,7 +235,7 @@ Final failure surfacing:
 
 Retry stops and will not auto-continue when any of these occur:
 
-- `retry.enabled` is false, or legacy retry settings have not been explicitly configured (`legacyRetryConfigured` fail-closed gate)
+- `retry.enabled` is false, or legacy retry settings have not been explicitly configured (`legacyRetryConfigured` fail-closed gate) — except for the bare-default admissions listed above
 - error is not retry-classified
 - error is context overflow (delegated to compaction path)
 - max retries exceeded

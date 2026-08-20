@@ -43,17 +43,6 @@ function errnoError(code: string, message = code): NodeJS.ErrnoException {
 	return Object.assign(new Error(message), { code });
 }
 
-/** Asserts `error` is an AggregateError whose first cause is `primaryCode` and which also carries `secondaryCode`. */
-function expectAggregateCauses(error: unknown, primaryCode: string, secondaryCode: string): AggregateError {
-	expect(error).toBeDefined();
-	expect(error).toBeInstanceOf(AggregateError);
-	const aggregate = error as AggregateError;
-	const codes = aggregate.errors.map(cause => (cause as NodeJS.ErrnoException).code);
-	expect(codes[0]).toBe(primaryCode);
-	expect(codes).toContain(secondaryCode);
-	return aggregate;
-}
-
 const activeMocks: Array<{ mockRestore: () => void }> = [];
 
 function trackSpy<T extends { mockRestore: () => void }>(spy: T): T {
@@ -132,18 +121,15 @@ describe("codex wake finally/diagnostic error masking (#4545)", () => {
 			kind: "turn.completed",
 			sessionId: "session-1",
 			summary: "masking publication",
-		}).then(
-			() => undefined,
-			(error: unknown) => error,
-		);
+		});
 		armed = false;
 		await awaitCodexWakePublishesForTest(namespace).catch(() => undefined);
 
-		// #4459 semantics: the event append awaits the publish queue, so the
-		// publication failure reaches the caller with the EIO primary preserved and
-		// the EACCES diagnostic failure attached via AggregateError.
-		const aggregate = expectAggregateCauses(observed, "EIO", "EACCES");
-		expect(aggregate.message).toContain("Codex wake publication and diagnostic failed");
+		// The coordinator event is already durably committed before optional Codex
+		// publication runs. Wake/diagnostic failure must not re-report that event as
+		// failed; the committed event remains the caller's successful result.
+		expect(observed).toMatchObject({ kind: "turn.completed", session_id: "session-1" });
+		await expect(awaitCodexWakePublishesForTest(namespace)).resolves.toBeUndefined();
 	});
 
 	maskingIt("preserves the publication error when the failed-status event update also fails", async () => {
@@ -153,8 +139,8 @@ describe("codex wake finally/diagnostic error masking (#4545)", () => {
 		// `updateCodexWakeEvent` atomic write fails (EACCES on rename into
 		// codex-wake-events). Pre-fix, the publication error never escaped
 		// publishRecordedCodexWake at all ("failed" outcome, no rethrow).
-		// Post-#4459 the publication error is the primary cause with the
-		// persistence failure attached.
+		// The committed coordinator event remains successful; optional wake
+		// recovery is isolated from the canonical mutation result.
 		const realRename = fs.rename;
 		trackSpy(
 			spyOn(fs, "rename").mockImplementation(async (source, destination) => {
@@ -167,14 +153,15 @@ describe("codex wake finally/diagnostic error masking (#4545)", () => {
 			kind: "turn.completed",
 			sessionId: "session-1",
 			summary: "masking recovery",
-		}).then(
+		});
+		const wakeFailure = await awaitCodexWakePublishesForTest(namespace).then(
 			() => undefined,
 			(error: unknown) => error,
 		);
-		await awaitCodexWakePublishesForTest(namespace).catch(() => undefined);
 
-		const aggregate = expectAggregateCauses(observed, "EIO", "EACCES");
-		expect(aggregate.message).toContain("Codex wake publication recovery failed");
+		expect(observed).toMatchObject({ kind: "turn.completed", session_id: "session-1" });
+		expect(wakeFailure).toBeInstanceOf(AggregateError);
+		expect((wakeFailure as AggregateError).errors[0]).toMatchObject({ code: "EIO" });
 	});
 
 	maskingIt("does not relabel a non-ENOENT handoff directory read failure as state corruption", async () => {

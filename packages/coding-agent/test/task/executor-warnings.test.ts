@@ -136,6 +136,24 @@ describe("subagent warning injection", () => {
 		expect(result.rawOutput.includes("SYSTEM WARNING")).toBe(false);
 	});
 
+	it("preserves a public review payload but not success after a terminal stream failure", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: "private reasoning must not be promoted",
+			exitCode: 1,
+			stderr: "OpenAI completions stream stalled while waiting for the next event",
+			terminalFailure: true,
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: [{ status: "success", data: { overall_correctness: "incorrect", summary: "Public review" } }],
+			outputSchema: undefined,
+		});
+
+		expect(JSON.parse(result.rawOutput)).toEqual({ overall_correctness: "incorrect", summary: "Public review" });
+		expect(result.rawOutput).not.toContain("private reasoning");
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toBe("OpenAI completions stream stalled while waiting for the next event");
+	});
+
 	it("validates strict reviewer output without synthesizing findings", () => {
 		const result = finalizeSubprocessOutput({
 			rawOutput: "ignored",

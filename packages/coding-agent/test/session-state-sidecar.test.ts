@@ -2182,6 +2182,73 @@ describe("coordinator runtime state sidecar", () => {
 		},
 	);
 
+	it("barriers the parent before returning a same-authority EEXIST race marker", async () => {
+		const root = await tempRoot();
+		const readinessFile = path.join(root, "runtime-input-ready.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "barrier-race-session";
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "barrier-race-launch";
+		process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+		const marker = {
+			schema_version: 1,
+			session_id: "barrier-race-session",
+			launch_id: "barrier-race-launch",
+			state: "ready_for_input",
+			event: "interactive_input_ready",
+			source: "gjc_interactive_runtime",
+			ready_for_input: true,
+			created_at: "2026-07-11T12:00:00.000Z",
+		} as const;
+		const link = spyOn(fs, "link").mockImplementation(async () => {
+			await fs.writeFile(readinessFile, `${JSON.stringify(marker)}\n`);
+			throw Object.assign(new Error("exists"), { code: "EEXIST" });
+		});
+		const realOpen = fs.open;
+		let parentBarrierOpens = 0;
+		const open = spyOn(fs, "open").mockImplementation(async (...args) => {
+			if (args[0] === path.dirname(readinessFile)) parentBarrierOpens += 1;
+			return await realOpen(...args);
+		});
+		try {
+			await expect(persistCoordinatorRuntimeInputReady()).resolves.toEqual(marker);
+			expect(parentBarrierOpens).toBeGreaterThan(0);
+		} finally {
+			open.mockRestore();
+			link.mockRestore();
+		}
+	});
+
+	it("retries the parent barrier when an already-published marker reports uncertain durability", async () => {
+		const root = await tempRoot();
+		const readinessFile = path.join(root, "runtime-input-ready.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "retry-barrier-session";
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "retry-barrier-launch";
+		process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+		const realOpen = fs.open;
+		let parentBarrierOpens = 0;
+		const open = spyOn(fs, "open").mockImplementation(async (...args) => {
+			if (args[0] === path.dirname(readinessFile)) {
+				parentBarrierOpens += 1;
+				if (parentBarrierOpens === 1)
+					return {
+						async sync(): Promise<void> {
+							throw Object.assign(new Error("EIO"), { code: "EIO" });
+						},
+						async close(): Promise<void> {},
+					} as unknown as fs.FileHandle;
+			}
+			return await realOpen(...args);
+		});
+		try {
+			await expect(persistCoordinatorRuntimeInputReady()).rejects.toMatchObject({ code: "EIO" });
+			await expect(persistCoordinatorRuntimeInputReady()).resolves.toBeDefined();
+			expect(parentBarrierOpens).toBeGreaterThanOrEqual(3);
+		} finally {
+			open.mockRestore();
+		}
+	});
+
 	it("keeps the input readiness marker independent from subsequent mutable state writes", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");

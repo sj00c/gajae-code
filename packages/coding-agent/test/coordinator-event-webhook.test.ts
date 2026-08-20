@@ -278,6 +278,24 @@ describe("deliverEventWebhook", () => {
 		expect(record).toMatchObject({ status: "delivered", attempts: 2 });
 	});
 
+	it("recovers a partially published outbox record after a crash", async () => {
+		const namespaceDir = await tempRoot();
+		const event = journalRow();
+		const file = outboxPath(namespaceDir, event.id);
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(file, '{"schema_version":1,"event_id":"event-000000000007"', "utf8");
+		const { delivery, attempts } = recordingDelivery([{ ok: true }]);
+
+		await deliverEventWebhook(namespaceDir, minimalConfig(), event, () => JSON.stringify(event), delivery);
+
+		expect(attempts).toHaveLength(1);
+		expect(JSON.parse(await fs.readFile(file, "utf8"))).toMatchObject({
+			event_id: event.id,
+			status: "delivered",
+			attempts: 1,
+		});
+	});
+
 	it("delivers nothing for events outside the configured session scope", async () => {
 		const namespaceDir = await tempRoot();
 		const inScope = journalRow({ id: "event-000000000010", session_id: "session-a" });

@@ -25,7 +25,7 @@ import {
 	isCurrentComposerBashPolicyBlockedError,
 } from "@gajae-code/ai/providers/composer-discipline";
 import { extractHttpStatusFromError } from "@gajae-code/utils";
-import { agentLoop, agentLoopContinue } from "./agent-loop";
+import { agentLoop, agentLoopContinue, managedLocalErrorDiagnostic } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AttemptRunHandle, AttemptScope } from "./attempt-scope";
 import { createAttemptScopeAuthority } from "./attempt-scope";
@@ -2005,9 +2005,12 @@ export class Agent {
 				stopReason: abortController.signal.aborted ? "aborted" : "error",
 				errorMessage: err?.message || String(err),
 				errorStatus: extractHttpStatusFromError({ status: err?.errorStatus }) ?? extractHttpStatusFromError(err),
-				...(err?.errorKind === "local_snapshot_failure" || err?.errorKind === "local_buffer_overflow"
-					? { errorKind: err.errorKind as "local_snapshot_failure" | "local_buffer_overflow" }
-					: {}),
+				// Local-diagnostic authority (`errorKind` + structured
+				// `bufferOverflow`) comes from ONE identity check: a foreign error
+				// that self-declares a local kind gets neither field, so the parent
+				// receipt never misattributes a provider/stream failure to the local
+				// staging machinery (#4618).
+				...(managedLocalErrorDiagnostic(err) ?? {}),
 				timestamp: Date.now(),
 			} as AgentMessage;
 

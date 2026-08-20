@@ -4,6 +4,7 @@ import { Agent } from "@gajae-code/agent-core";
 import {
 	agentLoopContinue,
 	MANAGED_ATTEMPT_MAX_STAGED_BYTES,
+	MANAGED_ATTEMPT_MAX_STAGED_EVENTS,
 	managedAssistantEventSnapshot,
 	sanitizedDetachedClone,
 } from "@gajae-code/agent-core/agent-loop";
@@ -1500,6 +1501,41 @@ describe("managed attempt transaction", () => {
 		expect(diagnostics).toHaveLength(0);
 		expect(JSON.stringify(diagnostics)).not.toContain(marker);
 	});
+
+	it("attaches neither errorKind nor overflow shape when a foreign error self-labels a local kind (#4618)", async () => {
+		const marker = "PROMPT-MATERIAL-must-not-reach-parent";
+		for (const kind of ["local_buffer_overflow", "local_snapshot_failure"] as const) {
+			const mock = createMockModel();
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+				streamFn: () => {
+					// A foreign error with the right errorKind label but NOT the
+					// module-private identity. Both local-diagnostic fields come from
+					// one identity check, so a provider/custom-stream failure can never
+					// be attributed to the local staging machinery in a parent receipt.
+					const forged = Object.assign(new Error(`leak ${marker}`), {
+						errorKind: kind,
+						bufferOverflow: {
+							stage: "overflow.staged",
+							exceeded: "events",
+							stagedEventCount: 10_000,
+							stagedBytes: 1,
+							incomingEventBytes: 1,
+							maxStagedEvents: 10_000,
+							maxStagedBytes: 16 * 1024 * 1024,
+						},
+					});
+					throw forged;
+				},
+			});
+
+			await agent.prompt("run", { fallbackManaged: true });
+
+			const terminal = agent.state.messages.at(-1) as AssistantMessage;
+			expect(terminal.errorKind, kind).toBeUndefined();
+			expect(terminal.bufferOverflow, kind).toBeUndefined();
+		}
+	});
 	it("normalizes null and incomplete tool-call blocks before managed dispatch", async () => {
 		const mock = createMockModel();
 		const malformed = assistantMessage(mock.model) as unknown as { content: unknown[] };
@@ -2564,5 +2600,96 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		});
 		expect(outcomes).toBe(0);
 		expect(agent.state.error).toContain("local snapshot");
+	});
+
+	it("names the event cap, staged counts, and limits in the surfaced byte-overflow error (#4618)", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				partial.content.push({ type: "text", text: "x".repeat(MANAGED_ATTEMPT_MAX_STAGED_BYTES + 1) });
+				stream.push({ type: "start", partial });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+		await agent.waitForIdle();
+
+		// Byte-cap overflow while staging the first assistant payload: stage,
+		// exceeded-cap discriminator, counters, incoming size, and limits are
+		// all named, and the message stays actionable about what the failure
+		// is NOT (provider / context window).
+		const terminal = agent.state.messages.at(-1) as AssistantMessage;
+		expect(terminal.errorKind).toBe("local_buffer_overflow");
+		expect(terminal.errorMessage).toContain("provisional event buffer limit");
+		expect(terminal.errorMessage).toContain("stage=overflow.preMeasure");
+		// The single oversized event explains itself: the byte cap tripped on
+		// the incoming event's own projected size, and `exceeded` says so.
+		expect(terminal.errorMessage).toContain("exceeded=bytes");
+		expect(terminal.errorMessage).toMatch(/staged [1-9]\d*\/10000 events/);
+		// The incoming event is itself larger than the whole byte cap.
+		expect(terminal.bufferOverflow!.incomingEventBytes).toBeGreaterThan(MANAGED_ATTEMPT_MAX_STAGED_BYTES);
+		expect(terminal.errorMessage).toContain(`/${MANAGED_ATTEMPT_MAX_STAGED_BYTES} projected bytes`);
+		expect(terminal.errorMessage).toContain("local staging buffer limit, not a provider or context-window failure");
+		// The structured, identity-checked shape rides the terminal message so
+		// parent surfaces never have to trust errorMessage.
+		expect(terminal.bufferOverflow).toMatchObject({
+			stage: "overflow.preMeasure",
+			exceeded: "bytes",
+			incomingEventBytes: expect.any(Number),
+			maxStagedBytes: MANAGED_ATTEMPT_MAX_STAGED_BYTES,
+		});
+	});
+
+	it("names the event cap when staged events exceed the limit (#4618)", async () => {
+		const mock = createMockModel();
+		// One tiny update per push, well under the byte cap, so only the
+		// EVENT cap can trip. Each event must serialize compactly.
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				stream.push({ type: "start", partial });
+				for (let i = 0; i < MANAGED_ATTEMPT_MAX_STAGED_EVENTS + 1; i++) {
+					partial.content = [{ type: "text", text: `t${i}` }];
+					stream.push({ type: "text_start", contentIndex: 0, partial });
+				}
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+		await agent.waitForIdle();
+
+		const terminal = agent.state.messages.at(-1) as AssistantMessage;
+		expect(terminal.errorKind).toBe("local_buffer_overflow");
+		expect(terminal.errorMessage).toContain("provisional event buffer limit");
+		// The event cap is the one that tripped: `exceeded` names exactly
+		// `events` (never `both`), the staged counter reports the retained
+		// post-compaction batch, and the projected event count crosses the
+		// limit while projected bytes stay under the byte cap — so a
+		// regression that stopped distinguishing an event-only trip fails here.
+		expect(terminal.errorMessage).toMatch(/stage=overflow\.(preMeasure|staged)/);
+		expect(terminal.errorMessage).toMatch(/exceeded=events/);
+		expect(terminal.errorMessage).toContain(`/${MANAGED_ATTEMPT_MAX_STAGED_EVENTS} events`);
+		expect(terminal.bufferOverflow?.maxStagedEvents).toBe(MANAGED_ATTEMPT_MAX_STAGED_EVENTS);
+		expect(terminal.bufferOverflow?.exceeded).toBe("events");
+		// Projected events (staged + 1) genuinely exceeded the cap at throw time.
+		expect(terminal.bufferOverflow!.stagedEventCount + 1).toBeGreaterThan(terminal.bufferOverflow!.maxStagedEvents);
+		// Projected bytes stayed under the byte cap, proving an event-only trip.
+		expect(terminal.bufferOverflow!.stagedBytes + terminal.bufferOverflow!.incomingEventBytes).toBeLessThanOrEqual(
+			terminal.bufferOverflow!.maxStagedBytes,
+		);
+		expect(terminal.errorMessage).toContain("local staging buffer limit, not a provider or context-window failure");
 	});
 });

@@ -13,9 +13,8 @@
  */
 
 import { Buffer } from "node:buffer";
-import * as os from "node:os";
 import * as path from "node:path";
-import { $credentialEnv, $envpos, isEnoent, logger } from "@gajae-code/utils";
+import { $credentialEnv, $envpos, getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
 import type { FetchImpl } from "../types";
 
 const OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -58,7 +57,7 @@ function getRefreshSkewMs(): number {
 }
 
 function userAdcPath(): string {
-	return path.join(os.homedir(), ".config", "gcloud", "application_default_credentials.json");
+	return path.join(getTrustedHomeDir(), ".config", "gcloud", "application_default_credentials.json");
 }
 
 async function readJsonFile<T>(filePath: string): Promise<T | undefined> {

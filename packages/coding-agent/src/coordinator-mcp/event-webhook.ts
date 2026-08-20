@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $credentialEnv } from "@gajae-code/utils/env";
 import { withFileLock } from "../config/file-lock";
+import { writeCoordinatorAtomic } from "./durability";
 
 /**
  * Opt-in webhook delivery of existing coordinator `watch_events` journal rows
@@ -26,6 +27,22 @@ interface WebhookDeliveryRecord {
 	created_at: string;
 	updated_at: string;
 	last_error: string | null;
+}
+
+function isWebhookDeliveryRecord(value: unknown, eventId: string): value is WebhookDeliveryRecord {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	return (
+		record.schema_version === 1 &&
+		record.event_id === eventId &&
+		(record.status === "pending" || record.status === "delivered" || record.status === "failed") &&
+		typeof record.attempts === "number" &&
+		Number.isSafeInteger(record.attempts) &&
+		record.attempts >= 0 &&
+		typeof record.created_at === "string" &&
+		typeof record.updated_at === "string" &&
+		(record.last_error === null || typeof record.last_error === "string")
+	);
 }
 
 /** Result of one webhook POST attempt; 2xx is ok, anything else carries the reason. */
@@ -149,18 +166,25 @@ function recordPath(namespaceDir: string, eventId: string): string {
 	return path.join(namespaceDir, "webhook-outbox", `${eventId}.json`);
 }
 
-async function readRecord(file: string): Promise<WebhookDeliveryRecord | null> {
+async function readRecord(file: string, eventId: string): Promise<WebhookDeliveryRecord | null> {
+	let source: string;
 	try {
-		return JSON.parse(await fs.readFile(file, "utf8")) as WebhookDeliveryRecord;
+		source = await fs.readFile(file, "utf8");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+	try {
+		const parsed: unknown = JSON.parse(source);
+		return isWebhookDeliveryRecord(parsed, eventId) ? parsed : null;
+	} catch (error) {
+		if (error instanceof SyntaxError) return null;
 		throw error;
 	}
 }
 
 async function writeRecord(file: string, record: WebhookDeliveryRecord): Promise<void> {
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-	await fs.writeFile(file, JSON.stringify(record), { mode: 0o600 });
+	await writeCoordinatorAtomic(file, JSON.stringify(record));
 }
 
 function webhookErrorSummary(error: string | null): string | null {
@@ -199,7 +223,7 @@ export async function deliverEventWebhook(
 	const file = recordPath(namespaceDir, event.id);
 	return await withFileLock(file, async () => {
 		const now0 = delivery.now();
-		let record = await readRecord(file);
+		let record = await readRecord(file, event.id);
 		if (record === null) {
 			record = {
 				schema_version: 1,

@@ -2,8 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir, isKnownSinkPeerClosedError } from "@gajae-code/utils";
+import { getAgentDir, isKnownSinkPeerClosedError, logger } from "@gajae-code/utils";
 import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
+import { withFileLock } from "../config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
@@ -52,6 +53,13 @@ import {
 	createDefaultCodexTransportFactory,
 	publishCodexWake,
 } from "./codex-wake-publisher";
+import {
+	appendCoordinatorFile,
+	CoordinatorPublicationUncertainError,
+	ensureCoordinatorDirectory,
+	syncCoordinatorDirectory,
+	writeCoordinatorAtomic,
+} from "./durability";
 import {
 	createDefaultEventWebhookDelivery,
 	deliverEventWebhook,
@@ -315,6 +323,28 @@ type CoordinatorEventKind =
 	| "tmux.delivery_succeeded"
 	| "tmux.delivery_failed"
 	| "delegation.started";
+
+const COORDINATOR_EVENT_KINDS: ReadonlySet<string> = new Set<CoordinatorEventKind>([
+	"session.registered",
+	"session.started",
+	"session.reaped",
+	"session.state_changed",
+	"turn.queued",
+	"turn.delivering",
+	"turn.active",
+	"turn.acknowledged",
+	"turn.waiting_for_answer",
+	"turn.completed",
+	"turn.failed",
+	"turn.cancelled",
+	"turn.superseded",
+	"question.opened",
+	"question.answered",
+	"report.written",
+	"tmux.delivery_succeeded",
+	"tmux.delivery_failed",
+	"delegation.started",
+]);
 
 interface CoordinatorEvent {
 	schema_version: 1;
@@ -855,20 +885,46 @@ function coordinatorLifecycleTarget(sessionCommand: string | null, cwd: string):
 }
 
 async function ensureDir(dir: string): Promise<void> {
-	await fs.mkdir(dir, { recursive: true });
+	await ensureCoordinatorDirectory(dir);
 }
 
 async function readJsonFile(file: string): Promise<unknown | null> {
+	let source: string;
 	try {
-		return JSON.parse(await fs.readFile(file, "utf8"));
-	} catch {
+		source = await fs.readFile(file, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		return null;
+	}
+	try {
+		return JSON.parse(source);
+	} catch (error) {
+		throw new Error(
+			`invalid coordinator projection ${file}: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 }
 
+async function removeCoordinatorFile(file: string): Promise<void> {
+	try {
+		await fs.lstat(file);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		try {
+			await fs.stat(path.dirname(file));
+		} catch (parentError) {
+			if ((parentError as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw parentError;
+		}
+		await syncCoordinatorDirectory(path.dirname(file));
+		return;
+	}
+	await fs.rm(file, { force: true });
+	await syncCoordinatorDirectory(path.dirname(file));
+}
+
 async function writeJsonFile(file: string, value: unknown): Promise<void> {
-	await ensureDir(path.dirname(file));
-	await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
+	await writeCoordinatorAtomic(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 const COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP = 64 * 1024;
@@ -906,27 +962,7 @@ async function readCoordinatorIdempotencyFile(file: string): Promise<Coordinator
 }
 
 async function writeCoordinatorIdempotencyFile(file: string, value: CoordinatorToolIdempotencyRecord): Promise<void> {
-	await ensureDir(path.dirname(file));
-	const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-	try {
-		const handle = await fs.open(temporary, "wx", 0o600);
-		try {
-			await handle.writeFile(`${JSON.stringify(value)}\n`);
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
-		await fs.rename(temporary, file);
-		const directory = await fs.open(path.dirname(file), "r");
-		try {
-			await directory.sync();
-		} finally {
-			await directory.close();
-		}
-	} catch (error) {
-		await fs.rm(temporary, { force: true }).catch(() => undefined);
-		throw error;
-	}
+	await writeCoordinatorAtomic(file, `${JSON.stringify(value)}\n`);
 }
 
 function canonicalJson(value: unknown): string {
@@ -1141,11 +1177,22 @@ async function listJsonFiles(dir: string): Promise<unknown[]> {
 	try {
 		const entries = await fs.readdir(dir);
 		const values = await Promise.all(
-			entries.filter(entry => entry.endsWith(".json")).map(entry => readJsonFile(path.join(dir, entry))),
+			entries
+				.filter(entry => entry.endsWith(".json") && !entry.startsWith(".gjc-"))
+				.map(async entry => {
+					try {
+						return await readJsonFile(path.join(dir, entry));
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+						logger.warn("Coordinator projection read failed", { path: entry, error: String(error) });
+						throw error;
+					}
+				}),
 		);
 		return values.filter(value => value !== null);
-	} catch {
-		return [];
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
 	}
 }
 
@@ -1330,6 +1377,10 @@ function eventSequenceFile(namespaceDir: string): string {
 	return path.join(eventsDir(namespaceDir), "latest-seq.json");
 }
 
+function eventJournalLockFile(namespaceDir: string): string {
+	return path.join(eventsDir(namespaceDir), "event-journal.lock");
+}
+
 function boundSummary(value: string): string {
 	const normalized = value
 		.replace(/[\r\n\t]+/g, " ")
@@ -1339,12 +1390,18 @@ function boundSummary(value: string): string {
 }
 
 async function readLatestEventSeq(namespaceDir: string): Promise<number> {
-	const sequence = asRecord(await readJsonFile(eventSequenceFile(namespaceDir)));
+	let sequence: Record<string, unknown> | null = null;
+	try {
+		sequence = asRecord(await readJsonFile(eventSequenceFile(namespaceDir)));
+	} catch (error) {
+		logger.warn("Coordinator sequence cache unreadable; recovering from journal", { error: String(error) });
+	}
+	const events = await readCoordinatorEvents(namespaceDir);
+	const journalSeq = events.at(-1)?.seq ?? 0;
 	const seq = sequence?.seq;
-	if (typeof seq === "number" && Number.isInteger(seq) && seq >= 0) return seq;
-	let latestSeq = 0;
-	for (const event of await readCoordinatorEvents(namespaceDir)) latestSeq = Math.max(latestSeq, event.seq);
-	return latestSeq;
+	if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0 && seq > journalSeq)
+		throw new Error("state_corrupt");
+	return journalSeq;
 }
 
 const eventAppendQueues = new Map<string, Promise<unknown>>();
@@ -1409,13 +1466,15 @@ async function appendCodexWakeDiagnostic(
 ): Promise<void> {
 	const line = `${new Date().toISOString()} event=${event.id} error=${codexWakeErrorCode(error)}\n`;
 	try {
-		await fs.appendFile(path.join(namespaceDir, "codex-wake-errors.log"), line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP), {
-			mode: 0o600,
+		await appendCoordinatorFile(
+			path.join(namespaceDir, "codex-wake-errors.log"),
+			line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP),
+		);
+	} catch (diagnosticError) {
+		logger.warn("Coordinator Codex wake diagnostic persistence failed", {
+			eventId: event.id,
+			error: String(diagnosticError),
 		});
-	} catch {
-		try {
-			process.stderr.write("codex-wake-diagnostic-unwritable\n");
-		} catch {}
 	}
 }
 
@@ -1423,17 +1482,21 @@ async function appendCodexWakePublishDiagnostic(
 	namespaceDir: string,
 	event: CodexWakeEventV1,
 	error: unknown,
-): Promise<void> {
+): Promise<unknown | null> {
 	const line = `${new Date().toISOString()} wake=${event.key} error=${codexWakeErrorCode(error)}\n`;
 	try {
-		await fs.appendFile(path.join(namespaceDir, "codex-wake-errors.log"), line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP), {
-			mode: 0o600,
+		await appendCoordinatorFile(
+			path.join(namespaceDir, "codex-wake-errors.log"),
+			line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP),
+		);
+	} catch (diagnosticError) {
+		logger.warn("Coordinator Codex wake publish diagnostic persistence failed", {
+			wakeKey: event.key,
+			error: String(diagnosticError),
 		});
-	} catch {
-		try {
-			process.stderr.write("codex-wake-diagnostic-unwritable\n");
-		} catch {}
+		return diagnosticError;
 	}
+	return null;
 }
 
 async function autoBindDelegateCodexHandoff(
@@ -1457,13 +1520,13 @@ async function autoBindDelegateCodexHandoff(
 		let source: CodexHandoffRegistrationV1 | null;
 		try {
 			source = await readCodexHandoff(namespaceDir, explicitHostWorkUnit);
-		} catch {
+		} catch (error) {
 			await appendCodexWakeDiagnostic(
 				namespaceDir,
 				diagnosticEvent,
 				new Error("codex_handoff_explicit_source_missing"),
 			);
-			return { auto_bound: false };
+			throw error;
 		}
 		if (!source) {
 			await appendCodexWakeDiagnostic(
@@ -1491,7 +1554,7 @@ async function autoBindDelegateCodexHandoff(
 			return { auto_bound: true, thread_id: binding.handoff.thread_id };
 		} catch (error) {
 			await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, error);
-			return { auto_bound: false };
+			throw error;
 		}
 	}
 	try {
@@ -1548,7 +1611,7 @@ async function autoBindDelegateCodexHandoff(
 		return { auto_bound: true, thread_id: binding.handoff.thread_id };
 	} catch (error) {
 		await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, error);
-		return { auto_bound: false };
+		throw error;
 	}
 }
 
@@ -1583,27 +1646,31 @@ async function publishRecordedCodexWake(
 	if (event.status !== "pending" && event.status !== "failed") return "skipped";
 	const transportFactory = codexWakeTransportFactories.get(namespaceDir);
 	if (!transportFactory) return "skipped";
+	let published: { published: boolean };
 	try {
-		const published = await publishCodexWake({ handoff, event, transportFactory });
-		await updateCodexWakeEvent(namespaceDir, event.key, {
-			...(published.published ? { status: "published" as const } : {}),
-			attempts_delta: 1,
-			last_error: null,
-		});
-		return published.published ? "published" : "thread_active_pending";
+		published = await publishCodexWake({ handoff, event, transportFactory });
 	} catch (error) {
-		await appendCodexWakePublishDiagnostic(namespaceDir, event, error);
+		const diagnosticError = await appendCodexWakePublishDiagnostic(namespaceDir, event, error);
 		try {
 			await updateCodexWakeEvent(namespaceDir, event.key, {
 				status: "failed",
 				attempts_delta: 1,
 				last_error: codexWakeErrorCode(error),
 			});
-		} catch (updateError) {
-			await appendCodexWakePublishDiagnostic(namespaceDir, event, updateError);
+		} catch (stateError) {
+			throw new AggregateError(
+				[error, stateError, ...(diagnosticError ? [diagnosticError] : [])],
+				"Codex wake publication and failure-state persistence failed",
+			);
 		}
 		return "failed";
 	}
+	await updateCodexWakeEvent(namespaceDir, event.key, {
+		...(published.published ? { status: "published" as const } : {}),
+		attempts_delta: 1,
+		last_error: null,
+	});
+	return published.published ? "published" : "thread_active_pending";
 }
 
 async function publishPendingCodexWakes(namespaceDir: string, threadId: string): Promise<void> {
@@ -1629,18 +1696,20 @@ function enqueueCodexWakePublish(namespaceDir: string, handoff: CodexHandoffRegi
 	const tailKey = codexWakeTailKey(namespaceDir, handoff.thread_id);
 	const previous = codexWakePublishTails.get(tailKey) ?? Promise.resolve();
 	const next = previous
-		.then(() => publishPendingCodexWakes(namespaceDir, handoff.thread_id))
 		.catch(async error => {
 			await appendCodexWakeDiagnostic(
 				namespaceDir,
 				{ id: `wake-queue:${handoff.thread_id}` } as CoordinatorEvent,
 				error,
 			);
-		});
+		})
+		.then(() => publishPendingCodexWakes(namespaceDir, handoff.thread_id));
 	codexWakePublishTails.set(tailKey, next);
-	void next.finally(() => {
-		if (codexWakePublishTails.get(tailKey) === next) codexWakePublishTails.delete(tailKey);
-	});
+	void next
+		.catch(() => undefined)
+		.finally(() => {
+			if (codexWakePublishTails.get(tailKey) === next) codexWakePublishTails.delete(tailKey);
+		});
 }
 
 /** Test-only helper that waits for queued Codex wake publishes in a namespace. */
@@ -1666,30 +1735,46 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 
 	await previous.catch(() => undefined);
 	try {
-		const latestSeq = await readLatestEventSeq(namespaceDir);
-		const seq = latestSeq + 1;
-		const timestamp = new Date().toISOString();
-		const event: CoordinatorEvent = {
-			schema_version: 1,
-			seq,
-			id: `event-${seq.toString().padStart(12, "0")}`,
-			timestamp,
-			kind: input.kind,
-			summary: boundSummary(input.summary),
-			...(input.sessionId ? { session_id: input.sessionId } : {}),
-			...(input.turnId ? { turn_id: input.turnId } : {}),
-			...(input.questionId ? { question_id: input.questionId } : {}),
-			...(input.reportId ? { report_id: input.reportId } : {}),
-			...(input.payloadRef ? { payload_ref: input.payloadRef } : {}),
-			...(input.metadata ? { metadata: input.metadata } : {}),
-		};
-		await ensureDir(eventsDir(namespaceDir));
-		await fs.appendFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
-		await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
-		const codexWake = await maybeRecordCodexWake(namespaceDir, event).catch(async error => {
-			await appendCodexWakeDiagnostic(namespaceDir, event, error);
-			return null;
+		await ensureCoordinatorDirectory(eventsDir(namespaceDir));
+		const event = await withFileLock(eventJournalLockFile(namespaceDir), async () => {
+			const latestSeq = await readLatestEventSeq(namespaceDir);
+			if (!Number.isSafeInteger(latestSeq) || latestSeq >= Number.MAX_SAFE_INTEGER) throw new Error("state_corrupt");
+			const seq = latestSeq + 1;
+			const timestamp = new Date().toISOString();
+			const event: CoordinatorEvent = {
+				schema_version: 1,
+				seq,
+				id: `event-${seq.toString().padStart(12, "0")}`,
+				timestamp,
+				kind: input.kind,
+				summary: boundSummary(input.summary),
+				...(input.sessionId ? { session_id: input.sessionId } : {}),
+				...(input.turnId ? { turn_id: input.turnId } : {}),
+				...(input.questionId ? { question_id: input.questionId } : {}),
+				...(input.reportId ? { report_id: input.reportId } : {}),
+				...(input.payloadRef ? { payload_ref: input.payloadRef } : {}),
+				...(input.metadata ? { metadata: input.metadata } : {}),
+			};
+			await appendCoordinatorFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
+			await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
+			return event;
 		});
+		let codexWake: { handoff: CodexHandoffRegistrationV1; event: CodexWakeEventV1 | null } | null;
+		try {
+			codexWake = await maybeRecordCodexWake(namespaceDir, event);
+		} catch (error) {
+			try {
+				await appendCodexWakeDiagnostic(namespaceDir, event, error);
+			} catch (diagnosticError) {
+				// The canonical event is already durable. Preserve that committed
+				// result even when the optional diagnostic cannot be persisted.
+				logger.warn("Coordinator Codex wake diagnostic persistence failed", {
+					eventId: event.id,
+					error: String(diagnosticError),
+				});
+			}
+			codexWake = null;
+		}
 		if (codexWake) enqueueCodexWakePublish(namespaceDir, codexWake.handoff);
 		if (eventWebhookConfigs.has(namespaceDir)) enqueueEventWebhook(namespaceDir, event);
 		return event;
@@ -1708,9 +1793,22 @@ export async function appendCoordinatorEventForTest(
 
 function parseCoordinatorEvent(line: string): CoordinatorEvent | null {
 	try {
-		const event = JSON.parse(line) as CoordinatorEvent;
-		if (typeof event.seq !== "number" || typeof event.kind !== "string") return null;
-		return event;
+		const event = JSON.parse(line) as Partial<CoordinatorEvent>;
+		if (
+			event.schema_version !== 1 ||
+			typeof event.seq !== "number" ||
+			!Number.isSafeInteger(event.seq) ||
+			event.seq < 0 ||
+			typeof event.id !== "string" ||
+			event.id.length === 0 ||
+			typeof event.timestamp !== "string" ||
+			typeof event.summary !== "string" ||
+			typeof event.kind !== "string" ||
+			!COORDINATOR_EVENT_KINDS.has(event.kind) ||
+			event.id !== `event-${event.seq.toString().padStart(12, "0")}`
+		)
+			return null;
+		return event as CoordinatorEvent;
 	} catch {
 		return null;
 	}
@@ -1719,13 +1817,23 @@ function parseCoordinatorEvent(line: string): CoordinatorEvent | null {
 async function readCoordinatorEvents(namespaceDir: string): Promise<CoordinatorEvent[]> {
 	try {
 		const content = await fs.readFile(eventJournalFile(namespaceDir), "utf8");
-		return content
-			.split("\n")
-			.map(line => line.trim())
-			.filter(Boolean)
-			.map(parseCoordinatorEvent)
-			.filter((event): event is CoordinatorEvent => event !== null)
-			.sort((left, right) => left.seq - right.seq);
+		const events: CoordinatorEvent[] = [];
+		const seenIds = new Set<string>();
+		const seenSeqs = new Set<number>();
+		for (const rawLine of content.split("\n")) {
+			const line = rawLine.trim();
+			if (!line) continue;
+			const event = parseCoordinatorEvent(line);
+			if (!event) throw new Error("state_corrupt");
+			if (seenIds.has(event.id) || seenSeqs.has(event.seq)) throw new Error("state_corrupt");
+			seenIds.add(event.id);
+			seenSeqs.add(event.seq);
+			events.push(event);
+		}
+		events.sort((left, right) => left.seq - right.seq);
+		for (let index = 0; index < events.length; index += 1)
+			if (events[index]!.seq !== index + 1) throw new Error("state_corrupt");
+		return events;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
 		throw error;
@@ -1881,7 +1989,7 @@ async function writeActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<
 
 async function clearActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<void> {
 	const active = asRecord(await readJsonFile(activeTurnFile(namespaceDir, turn.session_id)));
-	if (active?.turn_id === turn.turn_id) await fs.rm(activeTurnFile(namespaceDir, turn.session_id), { force: true });
+	if (active?.turn_id === turn.turn_id) await removeCoordinatorFile(activeTurnFile(namespaceDir, turn.session_id));
 }
 
 async function readSessionState(namespaceDir: string, sessionId: string): Promise<CoordinatorSessionState | null> {
@@ -2458,13 +2566,31 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 	eventWebhookConfigs.set(namespaceDir, eventWebhookConfig);
 	eventWebhookDeliveries.set(namespaceDir, services.eventWebhookDelivery ?? createDefaultEventWebhookDelivery());
-	void (async () => {
+	const startupEventWebhookReplay = (async () => {
+		if (eventWebhookConfig === null) return;
 		try {
-			for (const handoff of await listCodexHandoffs(namespaceDir)) enqueueCodexWakePublish(namespaceDir, handoff);
+			for (const event of await readCoordinatorEvents(namespaceDir)) enqueueEventWebhook(namespaceDir, event);
+			await awaitEventWebhookDeliveriesForTest(namespaceDir);
 		} catch (error) {
-			await appendCodexWakeDiagnostic(namespaceDir, { id: "startup-drain" }, error);
+			await appendEventWebhookDiagnostic(namespaceDir, "startup-replay", error);
 		}
 	})();
+	void startupEventWebhookReplay;
+	const startupCodexWakeReplay = (async () => {
+		try {
+			for (const handoff of await listCodexHandoffs(namespaceDir)) {
+				enqueueCodexWakePublish(namespaceDir, handoff);
+				await awaitCodexWakePublishesForTest(namespaceDir);
+			}
+		} catch (error) {
+			await appendCodexWakeDiagnostic(namespaceDir, { id: "startup-drain" }, error);
+			throw error;
+		}
+	})();
+	// Startup replay is optional. Keep its rejection observable to callers that
+	// explicitly await the replay, but never let an unhandled replay rejection
+	// gate canonical question-state initialization.
+	void startupCodexWakeReplay.catch(() => undefined);
 	let questionStateReady: Promise<void> | null = null;
 
 	function ensureQuestionStateReady(): Promise<void> {
@@ -3168,6 +3294,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 	function sdkError(error: unknown): Record<string, unknown> {
 		if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
+		if (error instanceof CoordinatorPublicationUncertainError)
+			return { ok: false, error: { code: "ambiguous", message: error.message } };
 		return {
 			ok: false,
 			error: { code: "unavailable", message: error instanceof Error ? error.message : String(error) },
@@ -3361,6 +3489,32 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return result;
 	}
 
+	async function withRemoteSessionCompensation<T>(
+		cwd: string,
+		remoteSession: { value: string | null },
+		operation: () => Promise<T>,
+	): Promise<T> {
+		try {
+			return await operation();
+		} catch (error) {
+			const sessionId = remoteSession.value;
+			if (!sessionId) throw error;
+			try {
+				strictBrokerSessionClose(
+					await brokerSession(cwd, "session.close", { sessionId }, `${sessionId}:compensate-create`),
+					sessionId,
+				);
+			} catch (closeError) {
+				throw new SdkClientError(
+					UNOBSERVED_COMPENSATION_CODE,
+					`Coordinator creation failed after remote session ${sessionId} was created, and compensation failed.`,
+					{ primary: error, compensation: closeError, session_id: sessionId },
+				);
+			}
+			throw error;
+		}
+	}
+
 	function brokerResult(value: unknown): Record<string, unknown> {
 		const response = asRecord(value);
 		if (response?.ok === false) {
@@ -3371,6 +3525,37 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			);
 		}
 		return asRecord(response?.result) ?? response ?? {};
+	}
+
+	function strictBrokerResult(value: unknown, operation: string): Record<string, unknown> {
+		const response = asRecord(value);
+		if (response?.ok === false) brokerResult(response);
+		if (response?.ok !== true || !Object.hasOwn(response, "result"))
+			throw new SdkClientError(
+				UNOBSERVED_COMPENSATION_CODE,
+				`SDK broker returned a malformed ${operation} response; the lifecycle outcome is unobserved.`,
+				{ response },
+			);
+		const result = asRecord(response.result);
+		if (!result)
+			throw new SdkClientError(
+				UNOBSERVED_COMPENSATION_CODE,
+				`SDK broker returned a malformed ${operation} result; the lifecycle outcome is unobserved.`,
+				{ response },
+			);
+		return result;
+	}
+
+	function strictBrokerSessionClose(value: unknown, expectedSessionId: string): Record<string, unknown> {
+		const result = strictBrokerResult(value, "session.close");
+		const sessionId = optionalString(result.sessionId ?? result.session_id);
+		if (sessionId !== expectedSessionId)
+			throw new SdkClientError(
+				UNOBSERVED_COMPENSATION_CODE,
+				"SDK broker returned no proof that the expected session was closed.",
+				{ expected_session_id: expectedSessionId, result },
+			);
+		return result;
 	}
 
 	async function paginatedBrokerSessionList(
@@ -3405,8 +3590,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	async function canonicalBrokerWorkspace(cwd: string): Promise<string> {
 		try {
 			return await (services.canonicalizePath ?? (value => fs.realpath(value)))(cwd);
-		} catch {
-			throw new SdkClientError("not_found", "Coordinator workspace cannot be resolved.");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT")
+				throw new SdkClientError("not_found", "Coordinator workspace cannot be resolved.");
+			throw error;
 		}
 	}
 
@@ -3528,10 +3715,39 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					questionPaths,
 					async registry =>
 						Object.values(registry.deletions).find(
-							entry => entry.session_id === id && entry.phase === "completed",
+							entry => entry.session_id === id && entry.phase !== "completed",
 						) ?? null,
 				);
-				if (deletion?.safe_response) return deletion.safe_response as { ok: boolean; closed: boolean };
+				if (deletion?.phase === "broker_closed" || deletion?.phase === "cleanup_pending") {
+					await removeCoordinatorFile(sessionFile(id));
+					await removeCoordinatorFile(sessionStateFile(namespaceDir, id));
+					await removeCoordinatorFile(activeTurnFile(namespaceDir, id));
+					await appendCoordinatorEvent(namespaceDir, {
+						kind: "session.reaped",
+						sessionId: id,
+						summary: `Session ${id} cleanup resumed`,
+						metadata: { recovered: true, closed: true },
+					});
+					await advanceDeletion(
+						questionPaths,
+						deletion.deletion_id,
+						"completed",
+						{ wal: true, turns: true, reports: false, session: true, events: true },
+						{ ok: true, closed: true },
+					);
+					return { ok: true, closed: true };
+				}
+				if (deletion?.safe_response) {
+					const safeResponse = asRecord(deletion.safe_response);
+					const safeSessionId = optionalString(safeResponse?.session_id ?? safeResponse?.sessionId);
+					if (
+						safeResponse?.ok === true &&
+						safeResponse.closed === true &&
+						(safeSessionId === null || safeSessionId === id)
+					)
+						return deletion.safe_response as { ok: boolean; closed: boolean };
+					throw new SdkClientError("state_corrupt", "Persisted reap response does not prove completed cleanup.");
+				}
 				return { ok: false, reason: "unknown_session", closed: false };
 			}
 
@@ -3552,59 +3768,75 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return { ok: false, reason: "endpoint_stale", closed: false };
 			const deletionId = `delete:${id}:${persistedIncarnation}`;
 			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
-			await ensureQuestionStateReady();
-			await ensureQuestionTransaction(id);
-			await withSessionTransaction(questionPaths, id, async transaction => {
-				const now = new Date().toISOString();
-				transaction.requests.operations[deletionId] = {
-					operation_id: deletionId,
-					tool: "gjc_coordinator_stop_session",
-					key_digest: deletionKey,
-					request_digest: deletionKey,
-					local_id: id,
-					phase: "remote_started",
-					intent: { kind: "reap", endpoint_incarnation: persistedIncarnation },
-					created_at: now,
-					updated_at: now,
-				};
-			});
-			await recordDeletionIntent(questionPaths, {
-				deletion_id: deletionId,
-				session_id: id,
-				endpoint_incarnation: persistedIncarnation,
-				operation_id: deletionId,
-				key_digest: deletionKey,
-				request_digest: deletionKey,
-				close_key: deletionId,
-				phase: "intent",
-				cleanup: { wal: false, turns: false, reports: false, session: false, events: false },
-				authority_digest: deletionKey,
-				created_at: new Date().toISOString(),
-				updated_at: new Date().toISOString(),
-			});
-
+			const deletionPhase = await withNamespaceRegistry(
+				questionPaths,
+				async registry => registry.deletions[deletionId]?.phase,
+			);
+			const closeAlreadyProven = deletionPhase === "broker_closed" || deletionPhase === "cleanup_pending";
 			let workspace = "";
 			try {
 				workspace = await canonicalBrokerWorkspace(cwd);
-				const authority = await exactBrokerSessionAuthority(id, workspace);
-				if (
-					!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
-					authority.endpointGeneration !== persistedGeneration ||
-					authority.endpointIncarnation !== persistedIncarnation
-				)
-					return { ok: false, reason: "endpoint_stale", closed: false };
-				brokerResult(
-					await brokerSession(
-						cwd,
-						"session.close",
-						{
-							sessionId: id,
-							endpointGeneration: authority.endpointGeneration,
-							endpointIncarnation: authority.endpointIncarnation,
-						},
-						`coordinator-reap:${id}:${authority.endpointIncarnation}`,
-					),
-				);
+				let authority: BrokerSessionAuthority | null = null;
+				if (!closeAlreadyProven) {
+					authority = await exactBrokerSessionAuthority(id, workspace);
+					if (
+						!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
+						authority.endpointGeneration !== persistedGeneration ||
+						authority.endpointIncarnation !== persistedIncarnation
+					)
+						return { ok: false, reason: "endpoint_stale", closed: false };
+				}
+				await ensureQuestionStateReady();
+				await ensureQuestionTransaction(id);
+				await withSessionTransaction(questionPaths, id, async transaction => {
+					const now = new Date().toISOString();
+					transaction.requests.operations[deletionId] = {
+						operation_id: deletionId,
+						tool: "gjc_coordinator_stop_session",
+						key_digest: deletionKey,
+						request_digest: deletionKey,
+						local_id: id,
+						phase: "remote_started",
+						intent: { kind: "reap", endpoint_incarnation: persistedIncarnation },
+						created_at: now,
+						updated_at: now,
+					};
+				});
+				await recordDeletionIntent(questionPaths, {
+					deletion_id: deletionId,
+					session_id: id,
+					endpoint_incarnation: persistedIncarnation,
+					operation_id: deletionId,
+					key_digest: deletionKey,
+					request_digest: deletionKey,
+					close_key: deletionId,
+					phase: "intent",
+					cleanup: { wal: false, turns: false, reports: false, session: false, events: false },
+					authority_digest: deletionKey,
+					created_at: new Date().toISOString(),
+					updated_at: new Date().toISOString(),
+				});
+				if (!closeAlreadyProven) {
+					if (!authority) throw new Error("state_corrupt");
+					strictBrokerSessionClose(
+						await brokerSession(
+							cwd,
+							"session.close",
+							{
+								sessionId: id,
+								endpointGeneration: authority.endpointGeneration,
+								endpointIncarnation: authority.endpointIncarnation,
+							},
+							`coordinator-reap:${id}:${authority.endpointIncarnation}`,
+						),
+						id,
+					);
+					await advanceDeletion(questionPaths, deletionId, "broker_closed", undefined, {
+						ok: true,
+						closed: true,
+						session_id: id,
+					});
+				}
 			} catch (error) {
 				return {
 					ok: false,
@@ -3613,8 +3845,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					closed: false,
 				};
 			}
-			await advanceDeletion(questionPaths, deletionId, "broker_closed");
-
 			try {
 				const listing = await paginatedBrokerSessionList(workspace, { cwd: workspace });
 				const rows = jsonRecords(
@@ -3660,9 +3890,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					return { ok: false, reason: "close_failed", detail: error.code, closed: false };
 				return { ok: false, reason: "close_failed", detail: "unavailable", closed: false };
 			}
-			await fs.rm(sessionFile(id), { force: true });
-			await fs.rm(sessionStateFile(namespaceDir, id), { force: true });
-			await fs.rm(activeTurnFile(namespaceDir, id), { force: true });
+			await removeCoordinatorFile(sessionFile(id));
+			await removeCoordinatorFile(sessionStateFile(namespaceDir, id));
+			await removeCoordinatorFile(activeTurnFile(namespaceDir, id));
 			await appendCoordinatorEvent(namespaceDir, {
 				kind: "session.reaped",
 				sessionId: id,
@@ -4060,22 +4290,30 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			for (const report of Object.values(canonical.reports))
 				await writeJsonFile(path.join(namespaceDir, "reports", `${report.report_id}.json`), report);
 			const canonicalTurnIds = new Set(Object.keys(canonical.turns));
-			for (const entry of await fs.readdir(turnsDir(namespaceDir)).catch(() => [])) {
+			const turnEntries = await fs.readdir(turnsDir(namespaceDir)).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+				throw error;
+			});
+			for (const entry of turnEntries) {
 				if (!entry.endsWith(".json")) continue;
 				const turnId = entry.slice(0, -5);
 				if (canonicalTurnIds.has(turnId)) continue;
 				const projected = asRecord(await readJsonFile(path.join(turnsDir(namespaceDir), entry)));
 				if (projected?.session_id === sessionId)
-					await fs.rm(path.join(turnsDir(namespaceDir), entry), { force: true });
+					await removeCoordinatorFile(path.join(turnsDir(namespaceDir), entry));
 			}
 			const reportsDirectory = path.join(namespaceDir, "reports");
 			const canonicalReportIds = new Set(Object.keys(canonical.reports));
-			for (const entry of await fs.readdir(reportsDirectory).catch(() => [])) {
+			const reportEntries = await fs.readdir(reportsDirectory).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+				throw error;
+			});
+			for (const entry of reportEntries) {
 				if (!entry.endsWith(".json")) continue;
 				const reportId = entry.slice(0, -5);
 				if (canonicalReportIds.has(reportId)) continue;
 				const projected = asRecord(await readJsonFile(path.join(reportsDirectory, entry)));
-				if (projected?.session_id === sessionId) await fs.rm(path.join(reportsDirectory, entry), { force: true });
+				if (projected?.session_id === sessionId) await removeCoordinatorFile(path.join(reportsDirectory, entry));
 			}
 			const activeId = canonical.queue.selected_promotion?.to_turn_id ?? canonical.queue.active_turn_id;
 			const active = activeId ? canonical.turns[activeId] : null;
@@ -4644,215 +4882,232 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					idempotencyKey,
 					canonicalArgs,
 					async () => {
-						const delegate = async () => {
-							let sessionId: string;
-							let session: Record<string, unknown>;
-							let reusedSession = false;
-							let creationKey: string | null = null;
-							if (reusedSessionId) {
-								sessionId = reusedSessionId;
-								const existing = asRecord(await readJsonFile(sessionFile(sessionId)));
-								if (!existing)
-									return {
-										ok: false,
-										error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
-									};
-								const sessionMpreset = optionalString(existing.mpreset);
-								if (mpresetResolution.mpreset !== null && sessionMpreset !== mpresetResolution.mpreset) {
-									return {
-										ok: false,
-										reason: "mpreset_conflict",
-										session_id: sessionId,
-										session_mpreset: sessionMpreset,
-										requested_mpreset: mpresetResolution.mpreset,
-									};
-								}
-								const existingCwd = optionalString(existing.cwd);
-								if (
-									!existingCwd ||
-									!sameCanonicalPath(await canonicalBrokerWorkspace(existingCwd), canonicalCwd, platform)
-								)
-									return {
-										ok: false,
-										error: {
-											code: "workspace_mismatch",
-											message: "Coordinator session is bound to another workspace.",
-										},
-									};
-								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
-								if (
-									!sameCanonicalPath(
-										optionalString(existing.broker_workspace) ?? "",
-										canonicalCwd,
-										platform,
-									) ||
-									existing.endpoint_generation !== binding.endpointGeneration ||
-									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
-								)
-									return {
-										ok: false,
-										error: {
-											code: "endpoint_stale",
-											message: "Coordinator session endpoint incarnation binding is stale.",
-										},
-									};
-								session = normalizeSession({
-									...existing,
-									session_id: sessionId,
-									cwd: canonicalCwd,
-									broker_workspace: binding.workspace,
-									endpoint_generation: binding.endpointGeneration,
-									endpoint_incarnation: binding.endpointIncarnation,
-								});
-								reusedSession = true;
-							} else {
-								const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
-								if (creation.request.phase === "completed" && creation.request.safe_response)
-									return creation.request.safe_response;
-								creationKey = creation.keyDigest;
-								if (creation.request.canonical_create_intent) {
-									session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
-									await bindCreationRequest(
-										questionPaths,
-										creation.keyDigest,
-										creation.request.canonical_create_intent,
-									);
-									await commitCreationWal(
-										questionPaths,
-										creation.keyDigest,
-										creation.request.canonical_create_intent,
-									);
-									sessionId = creation.request.canonical_create_intent.session.session_id;
-								} else {
-									const created = brokerResult(
-										await brokerSession(
-											canonicalCwd,
-											"session.create",
-											{
-												cwd: canonicalCwd,
-												target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
-												...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
-												// Thread the coordinator state dir so the broker-spawned runtime
-												// writes terminal state to the coordinator-shared file (#2549).
-												coordinatorStateDir: namespaceDir,
+						const remoteSession = { value: null as string | null };
+						const delegate = async () =>
+							withRemoteSessionCompensation(canonicalCwd, remoteSession, async () => {
+								let sessionId: string;
+								let session: Record<string, unknown>;
+								let reusedSession = false;
+								let creationKey: string | null = null;
+								if (reusedSessionId) {
+									sessionId = reusedSessionId;
+									const existing = asRecord(await readJsonFile(sessionFile(sessionId)));
+									if (!existing)
+										return {
+											ok: false,
+											error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
+										};
+									const sessionMpreset = optionalString(existing.mpreset);
+									if (mpresetResolution.mpreset !== null && sessionMpreset !== mpresetResolution.mpreset) {
+										return {
+											ok: false,
+											reason: "mpreset_conflict",
+											session_id: sessionId,
+											session_mpreset: sessionMpreset,
+											requested_mpreset: mpresetResolution.mpreset,
+										};
+									}
+									const existingCwd = optionalString(existing.cwd);
+									if (
+										!existingCwd ||
+										!sameCanonicalPath(await canonicalBrokerWorkspace(existingCwd), canonicalCwd, platform)
+									)
+										return {
+											ok: false,
+											error: {
+												code: "workspace_mismatch",
+												message: "Coordinator session is bound to another workspace.",
 											},
-											idempotencyKey,
-										),
-									);
-									sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
-									const createdCwd = await canonicalBrokerWorkspace(
-										optionalString(created.cwd) ?? canonicalCwd,
-									);
-									const binding = await exactBrokerSessionBinding(sessionId, createdCwd);
+										};
+									const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
+									if (
+										!sameCanonicalPath(
+											optionalString(existing.broker_workspace) ?? "",
+											canonicalCwd,
+											platform,
+										) ||
+										existing.endpoint_generation !== binding.endpointGeneration ||
+										optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
+									)
+										return {
+											ok: false,
+											error: {
+												code: "endpoint_stale",
+												message: "Coordinator session endpoint incarnation binding is stale.",
+											},
+										};
 									session = normalizeSession({
+										...existing,
 										session_id: sessionId,
-										cwd: createdCwd,
-										ephemeral: true,
-										created_at: new Date().toISOString(),
-										...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+										cwd: canonicalCwd,
 										broker_workspace: binding.workspace,
 										endpoint_generation: binding.endpointGeneration,
 										endpoint_incarnation: binding.endpointIncarnation,
 									});
-									const intent: CanonicalCreateIntentV1 = {
-										kind: "delegate",
-										workflow: delegateWorkflow,
-										session: canonicalCreationSnapshot(session),
-										remote_create_key: creation.request.remote_create_key,
-										initial_state: "running",
-										initial_prompt: {
-											text: taggedPrompt,
-											caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
-										},
-										initial_events: [],
-									};
-									await bindCreationRequest(questionPaths, creation.keyDigest, intent);
-									await commitCreationWal(questionPaths, creation.keyDigest, intent);
+									reusedSession = true;
+								} else {
+									const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
+									if (creation.request.phase === "completed" && creation.request.safe_response)
+										return creation.request.safe_response;
+									creationKey = creation.keyDigest;
+									if (creation.request.canonical_create_intent) {
+										session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
+										await bindCreationRequest(
+											questionPaths,
+											creation.keyDigest,
+											creation.request.canonical_create_intent,
+										);
+										await commitCreationWal(
+											questionPaths,
+											creation.keyDigest,
+											creation.request.canonical_create_intent,
+										);
+										sessionId = creation.request.canonical_create_intent.session.session_id;
+									} else {
+										const created = brokerResult(
+											await brokerSession(
+												canonicalCwd,
+												"session.create",
+												{
+													cwd: canonicalCwd,
+													target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
+													...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+													// Thread the coordinator state dir so the broker-spawned runtime
+													// writes terminal state to the coordinator-shared file (#2549).
+													coordinatorStateDir: namespaceDir,
+												},
+												idempotencyKey,
+											),
+										);
+										const createdSessionId = optionalString(created.sessionId ?? created.session_id);
+										if (!createdSessionId)
+											throw new SdkClientError(
+												UNOBSERVED_COMPENSATION_CODE,
+												"SDK broker created a session but returned no usable session identity; the outcome is unobserved.",
+												{ creation_response: created },
+											);
+										remoteSession.value = createdSessionId;
+										sessionId = safeExternalId("session", createdSessionId);
+										const createdCwd = await canonicalBrokerWorkspace(
+											optionalString(created.cwd) ?? canonicalCwd,
+										);
+										const binding = await exactBrokerSessionBinding(sessionId, createdCwd);
+										session = normalizeSession({
+											session_id: sessionId,
+											cwd: createdCwd,
+											ephemeral: true,
+											created_at: new Date().toISOString(),
+											...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+											broker_workspace: binding.workspace,
+											endpoint_generation: binding.endpointGeneration,
+											endpoint_incarnation: binding.endpointIncarnation,
+										});
+										const intent: CanonicalCreateIntentV1 = {
+											kind: "delegate",
+											workflow: delegateWorkflow,
+											session: canonicalCreationSnapshot(session),
+											remote_create_key: creation.request.remote_create_key,
+											initial_state: "running",
+											initial_prompt: {
+												text: taggedPrompt,
+												caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
+											},
+											initial_events: [],
+										};
+										await bindCreationRequest(questionPaths, creation.keyDigest, intent);
+										await commitCreationWal(questionPaths, creation.keyDigest, intent);
+									}
 								}
-							}
-							await writeJsonFile(sessionFile(sessionId), session);
-							const previousActiveTurn = await readActiveTurn(namespaceDir, sessionId);
-							if (previousActiveTurn && args.queue !== true && args.force !== true) {
-								return {
-									ok: false,
-									error: {
-										code: "active_turn_exists",
-										message: `Session ${sessionId} already has active turn ${previousActiveTurn.turn_id}.`,
+								await writeJsonFile(sessionFile(sessionId), session);
+								const previousActiveTurn = await readActiveTurn(namespaceDir, sessionId);
+								if (previousActiveTurn && args.queue !== true && args.force !== true) {
+									return {
+										ok: false,
+										error: {
+											code: "active_turn_exists",
+											message: `Session ${sessionId} already has active turn ${previousActiveTurn.turn_id}.`,
+										},
+										turn_id: previousActiveTurn.turn_id,
+									};
+								}
+								const operation =
+									args.force === true
+										? "turn.abort_and_prompt"
+										: args.queue === true
+											? "turn.follow_up"
+											: "turn.prompt";
+								const promptKey = await claimCanonicalPrompt(
+									sessionId,
+									taggedPrompt,
+									operation,
+									idempotencyKey,
+								);
+								const result = await controlSession(session, operation, { text: taggedPrompt }, idempotencyKey);
+								const acknowledgement = requirePromptAcknowledgement(result);
+								const turn = await recordAcceptedPrompt(
+									sessionId,
+									taggedPrompt,
+									operation,
+									previousActiveTurn,
+									acknowledgement,
+									promptKey,
+								);
+								const codexHandoff = await autoBindDelegateCodexHandoff(
+									namespaceDir,
+									canonicalCwd,
+									sessionId,
+									turn.turn_id,
+									delegateWorkflow,
+									explicitHostWorkUnit,
+								);
+								await appendCoordinatorEvent(namespaceDir, {
+									kind: "delegation.started",
+									sessionId,
+									turnId: turn.turn_id,
+									summary: `Delegated ${delegateWorkflow} via ${name} on session ${sessionId}`,
+									metadata: {
+										workflow: delegateWorkflow,
+										tool_name: name,
+										reused_session: reusedSession,
+										sdk_operation: operation,
 									},
-									turn_id: previousActiveTurn.turn_id,
-								};
-							}
-							const operation =
-								args.force === true
-									? "turn.abort_and_prompt"
-									: args.queue === true
-										? "turn.follow_up"
-										: "turn.prompt";
-							const promptKey = await claimCanonicalPrompt(sessionId, taggedPrompt, operation, idempotencyKey);
-							const result = await controlSession(session, operation, { text: taggedPrompt }, idempotencyKey);
-							const acknowledgement = requirePromptAcknowledgement(result);
-							const turn = await recordAcceptedPrompt(
-								sessionId,
-								taggedPrompt,
-								operation,
-								previousActiveTurn,
-								acknowledgement,
-								promptKey,
-							);
-							const codexHandoff = await autoBindDelegateCodexHandoff(
-								namespaceDir,
-								canonicalCwd,
-								sessionId,
-								turn.turn_id,
-								delegateWorkflow,
-								explicitHostWorkUnit,
-							);
-							await appendCoordinatorEvent(namespaceDir, {
-								kind: "delegation.started",
-								sessionId,
-								turnId: turn.turn_id,
-								summary: `Delegated ${delegateWorkflow} via ${name} on session ${sessionId}`,
-								metadata: {
+								});
+								const response = {
+									ok: true,
 									workflow: delegateWorkflow,
 									tool_name: name,
-									reused_session: reusedSession,
-									sdk_operation: operation,
-								},
+									session_id: sessionId,
+									turn_id: turn.turn_id,
+									active_turn_id: turn.delivery.queued ? (previousActiveTurn?.turn_id ?? null) : turn.turn_id,
+									status: turn.status,
+									queued: turn.delivery.queued,
+									delivered: turn.delivery.delivered,
+									delivery: turn.delivery,
+									session: publicCoordinatorSession(session),
+									session_state: publicCoordinatorSessionState(
+										await readSessionState(namespaceDir, sessionId),
+									),
+									turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+									result: publicSdkAcknowledgement(acknowledgement),
+									codex_handoff: codexHandoff,
+									...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
+								};
+								if (creationKey) {
+									await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
+									await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
+								}
+								return args.await_completion === true
+									? {
+											...response,
+											completion: await awaitTurnPayload(
+												turn.turn_id,
+												sessionId,
+												args.timeout_ms,
+												args.poll_interval_ms,
+											),
+										}
+									: response;
 							});
-							const response = {
-								ok: true,
-								workflow: delegateWorkflow,
-								tool_name: name,
-								session_id: sessionId,
-								turn_id: turn.turn_id,
-								active_turn_id: turn.delivery.queued ? (previousActiveTurn?.turn_id ?? null) : turn.turn_id,
-								status: turn.status,
-								queued: turn.delivery.queued,
-								delivered: turn.delivery.delivered,
-								delivery: turn.delivery,
-								session: publicCoordinatorSession(session),
-								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
-								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
-								result: publicSdkAcknowledgement(acknowledgement),
-								codex_handoff: codexHandoff,
-								...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
-							};
-							if (creationKey) {
-								await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
-								await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
-							}
-							return args.await_completion === true
-								? {
-										...response,
-										completion: await awaitTurnPayload(
-											turn.turn_id,
-											sessionId,
-											args.timeout_ms,
-											args.poll_interval_ms,
-										),
-									}
-								: response;
-						};
 						return reusedSessionId ? await withSessionTransition(reusedSessionId, delegate) : await delegate();
 					},
 					true,
@@ -4936,148 +5191,176 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					idempotencyKey,
 					canonicalArgs,
 					async () => {
-						const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
-						if (creation.request.phase === "completed" && creation.request.safe_response)
-							return creation.request.safe_response;
-						let created: Record<string, unknown>;
-						let session: Record<string, unknown>;
-						let sessionId: string;
-						if (creation.request.canonical_create_intent) {
-							session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
-							sessionId = creation.request.canonical_create_intent.session.session_id;
-							created = { session_id: sessionId };
-						} else {
-							created = brokerResult(
-								await brokerSession(
-									cwd,
-									"session.create",
-									{
+						const remoteSession = { value: null as string | null };
+						return await withRemoteSessionCompensation(cwd, remoteSession, async () => {
+							const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
+							if (creation.request.phase === "completed" && creation.request.safe_response)
+								return creation.request.safe_response;
+							let created: Record<string, unknown>;
+							let session: Record<string, unknown>;
+							let sessionId: string;
+							if (creation.request.canonical_create_intent) {
+								session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
+								sessionId = creation.request.canonical_create_intent.session.session_id;
+								created = { session_id: sessionId };
+							} else {
+								created = brokerResult(
+									await brokerSession(
 										cwd,
-										target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
-										...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
-										...(preparesExistingThread ? { readiness: "deferred" } : {}),
-										// Thread the coordinator state dir so the broker-spawned runtime
-										// writes terminal state to the coordinator-shared file (#2549).
-										coordinatorStateDir: namespaceDir,
-									},
-									idempotencyKey,
-								),
-							);
-							/**
-							 * Preparation is only real when the broker proves it. A create that
-							 * silently published readiness would leave a live session whose root
-							 * is already claimed, so the session is closed rather than reported
-							 * as prepared.
-							 */
-							if (preparesExistingThread && created.readiness !== "prepared") {
-								const unpreparedId = optionalString(created.sessionId ?? created.session_id);
-								let compensated = true;
-								if (unpreparedId) {
-									compensated = await brokerSession(
-										cwd,
-										"session.close",
-										{ sessionId: unpreparedId },
-										`${idempotencyKey}:unprepared-close`,
-									).then(
-										() => true,
-										() => false,
+										"session.create",
+										{
+											cwd,
+											target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
+											...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+											...(preparesExistingThread ? { readiness: "deferred" } : {}),
+											// Thread the coordinator state dir so the broker-spawned runtime
+											// writes terminal state to the coordinator-shared file (#2549).
+											coordinatorStateDir: namespaceDir,
+										},
+										idempotencyKey,
+									),
+								);
+								const createdSessionId = optionalString(created.sessionId ?? created.session_id);
+								/**
+								 * Preparation is only real when the broker proves it. A create that
+								 * silently published readiness would leave a live session whose root
+								 * is already claimed, so the session is closed rather than reported
+								 * what the schema promises. Reject a non-boolean before any mutation.
+								 */
+								if (preparesExistingThread && created.readiness !== "prepared") {
+									if (!createdSessionId)
+										throw new SdkClientError(
+											UNOBSERVED_COMPENSATION_CODE,
+											"SDK broker did not prepare the requested session and returned no usable session identity.",
+											{ creation_response: created },
+										);
+									remoteSession.value = createdSessionId;
+									const unpreparedId = safeExternalId("session", createdSessionId);
+									let compensated = true;
+									if (unpreparedId) {
+										try {
+											strictBrokerSessionClose(
+												await brokerSession(
+													cwd,
+													"session.close",
+													{ sessionId: unpreparedId },
+													`${idempotencyKey}:unprepared-close`,
+												),
+												unpreparedId,
+											);
+										} catch {
+											compensated = false;
+										}
+									}
+									// A swallowed compensation leaves a live, untracked session while
+									// idempotency seals the failure, so exact retries only replay the
+									// cached error and never reach the session again. Name the session
+									// and mark the outcome unobserved so the key is not sealed.
+									if (!compensated)
+										throw new SdkClientError(
+											UNOBSERVED_COMPENSATION_CODE,
+											`SDK broker did not prepare the requested session, and closing the unprepared session ${unpreparedId} failed; it may still be running.`,
+										);
+									remoteSession.value = null;
+									throw new SdkClientError(
+										"broker_request_unavailable",
+										"SDK broker did not prepare the requested session.",
 									);
 								}
-								// A swallowed compensation leaves a live, untracked session while
-								// idempotency seals the failure, so exact retries only replay the
-								// cached error and never reach the session again. Name the session
-								// and mark the outcome unobserved so the key is not sealed.
-								if (!compensated)
+								if (!createdSessionId)
 									throw new SdkClientError(
 										UNOBSERVED_COMPENSATION_CODE,
-										`SDK broker did not prepare the requested session, and closing the unprepared session ${unpreparedId} failed; it may still be running.`,
+										"SDK broker created a session but returned no usable session identity; the outcome is unobserved.",
+										{ creation_response: created },
 									);
-								throw new SdkClientError(
-									"broker_request_unavailable",
-									"SDK broker did not prepare the requested session.",
-								);
+								remoteSession.value = createdSessionId;
+								sessionId = safeExternalId("session", createdSessionId);
+								const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
+								const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
+								session = normalizeSession({
+									session_id: sessionId,
+									cwd: sessionCwd,
+									...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+									broker_workspace: binding.workspace,
+									endpoint_generation: binding.endpointGeneration,
+									endpoint_incarnation: binding.endpointIncarnation,
+								});
 							}
-							sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
-							const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
-							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
-							session = normalizeSession({
-								session_id: sessionId,
-								cwd: sessionCwd,
-								...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
-								broker_workspace: binding.workspace,
-								endpoint_generation: binding.endpointGeneration,
-								endpoint_incarnation: binding.endpointIncarnation,
-							});
-						}
-						const intent: CanonicalCreateIntentV1 = {
-							kind: "start",
-							session: canonicalCreationSnapshot(session),
-							remote_create_key: creation.request.remote_create_key,
-							initial_state: prompt ? "running" : preparesExistingThread ? "prepared" : "ready_for_input",
-							initial_prompt: prompt
-								? { text: prompt, caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex") }
-								: null,
-							initial_events: [],
-						};
-						await bindCreationRequest(questionPaths, creation.keyDigest, intent);
-						await commitCreationWal(questionPaths, creation.keyDigest, intent);
-						await writeJsonFile(sessionFile(sessionId), session);
-						const lifecycle = publicLifecycleReceipt(created, sessionId);
-						if (prompt) {
-							const promptKey = await claimCanonicalPrompt(sessionId, prompt, "turn.prompt", idempotencyKey);
-							const result = await controlSession(session, "turn.prompt", { text: prompt }, idempotencyKey);
-							const acknowledgement = requirePromptAcknowledgement(result);
-							const turn = await recordAcceptedPrompt(
+							const intent: CanonicalCreateIntentV1 = {
+								kind: "start",
+								session: canonicalCreationSnapshot(session),
+								remote_create_key: creation.request.remote_create_key,
+								initial_state: prompt ? "running" : preparesExistingThread ? "prepared" : "ready_for_input",
+								initial_prompt: prompt
+									? {
+											text: prompt,
+											caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
+										}
+									: null,
+								initial_events: [],
+							};
+							await bindCreationRequest(questionPaths, creation.keyDigest, intent);
+							await commitCreationWal(questionPaths, creation.keyDigest, intent);
+							await writeJsonFile(sessionFile(sessionId), session);
+							const lifecycle = publicLifecycleReceipt(created, sessionId);
+							if (prompt) {
+								const promptKey = await claimCanonicalPrompt(sessionId, prompt, "turn.prompt", idempotencyKey);
+								const result = await controlSession(session, "turn.prompt", { text: prompt }, idempotencyKey);
+								const acknowledgement = requirePromptAcknowledgement(result);
+								const turn = await recordAcceptedPrompt(
+									sessionId,
+									prompt,
+									"turn.prompt",
+									null,
+									acknowledgement,
+									promptKey,
+								);
+								const response = {
+									ok: true,
+									session: publicCoordinatorSession(session),
+									session_id: sessionId,
+									lifecycle,
+									turn_id: turn.turn_id,
+									active_turn_id: turn.turn_id,
+									status: turn.status,
+									queued: turn.delivery.queued,
+									delivered: turn.delivery.delivered,
+									operation: "turn.prompt",
+									turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+									result: publicSdkAcknowledgement(acknowledgement),
+									session_state: publicCoordinatorSessionState(
+										await readSessionState(namespaceDir, sessionId),
+									),
+								};
+								await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
+								await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
+								return response;
+							}
+							const sessionState = await writeSessionState(
+								namespaceDir,
 								sessionId,
-								prompt,
-								"turn.prompt",
-								null,
-								acknowledgement,
-								promptKey,
+								preparesExistingThread ? "prepared" : "ready_for_input",
+								{ live: null, reason: null },
 							);
+							await appendCoordinatorEvent(namespaceDir, {
+								kind: "session.started",
+								sessionId,
+								summary: preparesExistingThread
+									? `Session ${sessionId} prepared through SDK lifecycle control`
+									: `Session ${sessionId} started through SDK lifecycle control`,
+								payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
+							});
 							const response = {
 								ok: true,
 								session: publicCoordinatorSession(session),
-								session_id: sessionId,
+								session_state: publicCoordinatorSessionState(sessionState),
 								lifecycle,
-								turn_id: turn.turn_id,
-								active_turn_id: turn.turn_id,
-								status: turn.status,
-								queued: turn.delivery.queued,
-								delivered: turn.delivery.delivered,
-								operation: "turn.prompt",
-								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
-								result: publicSdkAcknowledgement(acknowledgement),
-								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
+								...(preparesExistingThread ? { session_id: sessionId, state: "prepared" as const } : {}),
 							};
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
 							return response;
-						}
-						const sessionState = await writeSessionState(
-							namespaceDir,
-							sessionId,
-							preparesExistingThread ? "prepared" : "ready_for_input",
-							{ live: null, reason: null },
-						);
-						await appendCoordinatorEvent(namespaceDir, {
-							kind: "session.started",
-							sessionId,
-							summary: preparesExistingThread
-								? `Session ${sessionId} prepared through SDK lifecycle control`
-								: `Session ${sessionId} started through SDK lifecycle control`,
-							payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
 						});
-						const response = {
-							ok: true,
-							session: publicCoordinatorSession(session),
-							session_state: publicCoordinatorSessionState(sessionState),
-							lifecycle,
-							...(preparesExistingThread ? { session_id: sessionId, state: "prepared" as const } : {}),
-						};
-						await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
-						await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
-						return response;
 					},
 					true,
 					response => isUnobservedCompensation(response) || isRouterRequestAmbiguous(response),

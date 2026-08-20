@@ -1,6 +1,5 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import { getProjectDir } from "@gajae-code/utils";
+import { getProjectDir, getTrustedHomeDir } from "@gajae-code/utils";
 import { skillCapability } from "../capability/skill";
 import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
@@ -77,11 +76,12 @@ export interface LoadSkillsFromDirOptions {
 }
 
 export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Promise<LoadSkillsResult> {
+	const home = getTrustedHomeDir();
 	const [rawProviderId, rawLevel] = options.source.split(":", 2);
 	const providerId = rawProviderId || "custom";
 	const level: "user" | "project" = rawLevel === "project" ? "project" : "user";
 	const result = await scanSkillsFromDir(
-		{ cwd: getProjectDir(), home: os.homedir(), repoRoot: null },
+		{ cwd: getProjectDir(), home, repoRoot: null },
 		{
 			dir: options.dir,
 			providerId,
@@ -250,9 +250,9 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	const customDirectoryResults = await Promise.all(
 		customDirectories.map(async dir => {
-			const expandedDir = expandTilde(dir);
+			const expandedDir = expandTilde(dir, getTrustedHomeDir());
 			const scanResult = await scanSkillsFromDir(
-				{ cwd, home: os.homedir(), repoRoot: null },
+				{ cwd, home: getTrustedHomeDir(), repoRoot: null },
 				{
 					dir: expandedDir,
 					providerId: "custom",

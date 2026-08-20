@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -37,19 +37,28 @@ function createTestUi(): NonNullable<AgentToolContext["ui"]> {
 }
 
 describe("interactive Bash PTY tail retention", () => {
-	let tempDir: string;
+	let settingsTail = Promise.resolve();
 
-	beforeEach(() => {
-		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bash-pty-tail-"));
-		resetSettingsForTest();
-	});
+	function itWithTempDir(name: string, run: (tempDir: string) => Promise<void>): void {
+		it(name, async () => {
+			const previous = settingsTail;
+			const next = Promise.withResolvers<void>();
+			settingsTail = next.promise;
+			await previous;
+			let tempDir: string | undefined;
+			try {
+				tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bash-pty-tail-"));
+				resetSettingsForTest();
+				await run(tempDir);
+			} finally {
+				resetSettingsForTest();
+				if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+				next.resolve();
+			}
+		});
+	}
 
-	afterEach(() => {
-		resetSettingsForTest();
-		fs.rmSync(tempDir, { recursive: true, force: true });
-	});
-
-	it("keeps a 1 KiB tail and writes the complete PTY artifact by default", async () => {
+	itWithTempDir("keeps a 1 KiB tail and writes the complete PTY artifact by default", async tempDir => {
 		await Settings.init({ inMemory: true, cwd: tempDir });
 		const artifactPath = path.join(tempDir, "pty-default.log");
 		const result = await runInteractiveBashPty(createTestUi(), {
@@ -71,7 +80,7 @@ describe("interactive Bash PTY tail retention", () => {
 		expect(artifact).toContain("TAIL");
 	});
 
-	it("keeps both ends when PTY head retention is explicitly configured", async () => {
+	itWithTempDir("keeps both ends when PTY head retention is explicitly configured", async tempDir => {
 		await Settings.init({
 			inMemory: true,
 			cwd: tempDir,

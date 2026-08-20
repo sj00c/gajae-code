@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-### Added
+### Fixed
+- A foreign error that self-declares a local failure kind no longer gets one either (#4618). `errorKind` and the structured `bufferOverflow` shape now come from a single identity-checked extractor (`managedLocalErrorDiagnostic`) used by both terminal-message producers — `managedFailureMessage` and the `Agent` run catch. Previously the shape was identity-gated but the label was not, so a provider or custom-stream failure carrying `errorKind: "local_buffer_overflow"` reached the parent receipt preview as `Local staging-buffer overflow; structured diagnostic unavailable.` and pointed whoever read it at the wrong subsystem.
+- Local diagnostic authority fields are no longer foreign-settable through the managed snapshot shell (#4618). `managedAssistantShell` spreads the provider/stream message snapshot into the rebuilt assistant message; a payload that smuggled `errorKind` or `bufferOverflow` through that spread could masquerade as the runtime's own identity-checked diagnostic at the parent boundary. Both fields are now stripped from the snapshot spread — they are attached only by the module's own runtime-error paths (`managedFailureMessage` and the Agent catch), which never route through the shell.
 
 - `Agent.waitForSteeringArrival(signal)` resolves when steering is queued without consuming it, so wait-style tools can end their observation early.
 
@@ -16,6 +18,7 @@
 ### Added
 
 - `toolFailureEnvelope` / `isToolFailureEnvelope` / `ToolFailureEnvelope` name the result details the loop attaches when a tool call fails without the tool returning details of its own. The guard matches only that envelope, so a consumer can tell it apart from a tool that reports a `failureKind` alongside its own details before dereferencing a tool-owned detail shape.
+- `ManagedAttemptBufferOverflowError` (`local_buffer_overflow`) now reports its full shape everywhere it can reach: the rejecting `stage`, which cap tripped (`exceeded: events|bytes|both`), the retained post-compaction staged event/byte counts, the rejected event's own serialized size, and both caps. The typed error carries this as a structured object, the terminal `AssistantMessage` carries an identity-checked `bufferOverflow` copy (only the module-private error class can attach it, so a foreign self-labeled error cannot), and the surfaced message keeps its stable prefix and appends the same shape-only values stating this is a local staging-buffer limit that reproduces on re-issue, not a provider or context-window failure. Previously every overflow surfaced as one static sentence with no way to tell an event-cap from a byte-cap trip or to distinguish it from a model-context problem (#4618).
 
 ## [0.14.0] - 2026-08-17
 

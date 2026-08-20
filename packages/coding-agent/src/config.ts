@@ -1,7 +1,6 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { CONFIG_DIR_NAME, getConfigAgentDirName, getProjectDir } from "@gajae-code/utils";
+import { CONFIG_DIR_NAME, getConfigAgentDirName, getProjectDir, getTrustedHomeDir } from "@gajae-code/utils";
 import { expandTilde } from "./tools/path-utils";
 
 export * from "./config/config-file";
@@ -51,7 +50,7 @@ export function getChangelogPath(): string {
  * Project-level: .gjc, .gemini
  */
 const USER_CONFIG_BASES = USER_CONFIG_PRIORITY.map(({ dir, globalAgentDir }) => ({
-	base: () => path.join(os.homedir(), globalAgentDir ? globalAgentDir() : dir),
+	base: () => path.join(getTrustedHomeDir(), globalAgentDir ? globalAgentDir() : dir),
 	name: dir,
 }));
 

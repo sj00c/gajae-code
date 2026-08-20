@@ -78,6 +78,47 @@ describe("iterateWithIdleTimeout transport facts", () => {
 		expect(transportFailureFacts(error)).toBeUndefined();
 	});
 
+	it("keeps a reasoning stream alive past the shared 120-second default until the xAI window expires", async () => {
+		vi.useFakeTimers();
+		let yielded = false;
+		let iteratorClosed = false;
+		const source: AsyncIterable<{ type: "thinking" }> = {
+			[Symbol.asyncIterator]() {
+				return {
+					async next() {
+						if (!yielded) {
+							yielded = true;
+							return { done: false as const, value: { type: "thinking" as const } };
+						}
+						return await new Promise<never>(() => {});
+					},
+					async return() {
+						iteratorClosed = true;
+						return { done: true as const, value: undefined };
+					},
+				};
+			},
+		};
+		const iterator = iterateWithIdleTimeout(source, {
+			firstItemTimeoutMs: 300_000,
+			idleTimeoutMs: 300_000,
+			errorMessage: "stream idle",
+		});
+
+		expect((await iterator.next()).value).toEqual({ type: "thinking" });
+		const pending = iterator.next();
+		await waitForTimerRegistration();
+		vi.advanceTimersByTime(120_001);
+		await Promise.resolve();
+		expect(iteratorClosed).toBe(false);
+
+		vi.advanceTimersByTime(179_999);
+		const error = await pending.catch(error => error);
+		expect(error).toBeInstanceOf(Error);
+		expect(error).not.toBeInstanceOf(FirstEventTimeoutError);
+		expect(iteratorClosed).toBe(true);
+	});
+
 	it("stamps first-item expiry as FirstEventTimeoutError with transport facts", async () => {
 		vi.useFakeTimers();
 		const source = (async function* () {

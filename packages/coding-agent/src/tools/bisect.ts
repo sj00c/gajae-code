@@ -89,7 +89,7 @@ export interface BisectToolDetails {
 	reason?: string;
 }
 
-const FIRST_BAD_RE = /^([0-9a-f]{7,40}) is the first bad commit$/m;
+const FIRST_BAD_RE = /^\s*([0-9a-f]{7,40})\s+is the first (?:bad|'bad') commit\b/m;
 const ONLY_SKIPPED_RE = /only '?skip'?ped commits left to test/i;
 
 /** Parse the culprit SHA from `git bisect good|bad` output, or null when not yet converged. */
@@ -266,7 +266,7 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 			);
 		}
 
-		let outcome: BisectOutcome;
+		let outcome: BisectOutcome | undefined;
 		// Defensive reset in case a previous aborted bisect left state behind; a
 		// no-op when not bisecting (reset never throws).
 		await git.bisect.reset(cwd, signal);
@@ -318,6 +318,7 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 			await git.reset(cwd, { hard: true }).catch(() => {});
 			await git.bisect.reset(cwd);
 		}
+		if (!outcome) throw new ToolError("git bisect ended without producing a result.");
 
 		// Never claim a clean restore we did not actually achieve.
 		const restoreLine = await describeRestore(cwd);

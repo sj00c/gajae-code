@@ -1,6 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -974,4 +975,150 @@ test("empty-store reload clears retained evicted-terminal keys on every empty-lo
 	await pathless.load();
 	expect(pathless.snapshotTerminalKeys()).toEqual([]);
 	await fs.rm(root, { recursive: true, force: true });
+});
+
+test("drain resolves only after an in-flight publication's atomic rename settles (#4743)", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-drain-"));
+	const sessionFile = path.join(root, "session.jsonl");
+	const sessionId = "drain-race";
+	const store = createReconciliationStore({ sessionFile, sessionId });
+	await store.load();
+	const target = reconciliationStorePath(sessionFile, sessionId);
+	const gate = Promise.withResolvers<void>();
+	const realRename = fsPromises.rename.bind(fsPromises);
+	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from: unknown, to: unknown) => {
+		if (String(to) === target) await gate.promise;
+		return await realRename(from as string, to as string);
+	});
+	try {
+		const publication = store.transact(() => [
+			{
+				kind: "prompt",
+				commandId: "command-drain",
+				turnId: "turn-drain",
+				createdAt: 1,
+				acceptedAt: 1,
+				status: "terminal_ok",
+				terminalAt: 2,
+				terminalOutcome: { kind: "success" },
+			},
+		]);
+		// The publication's rename is held by the gate; drain must observe it.
+		await Bun.sleep(50);
+		let drained = false;
+		const drain = (store.drain?.() ?? Promise.resolve()).then(() => {
+			drained = true;
+		});
+		await Bun.sleep(100);
+		expect(drained).toBe(false);
+		gate.resolve();
+		await publication;
+		await drain;
+		expect(drained).toBe(true);
+		expect(await fs.readFile(target, "utf8")).toContain("command-drain");
+	} finally {
+		rename.mockRestore();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+test("drain surfaces a failed publication in its awaited window instead of reporting drained (#4743)", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-drain-failure-"));
+	try {
+		const sessionFile = path.join(root, "session.jsonl");
+		const sessionId = "drain-failure";
+		const store = createReconciliationStore({ sessionFile, sessionId });
+		await store.load();
+		// Block persistence exactly like the wiring failure harness: a FILE sits at
+		// the .sdk-reconciliation directory path, so mkdir/write/rename cannot
+		// succeed.
+		const storeDirectory = path.dirname(reconciliationStorePath(sessionFile, sessionId));
+		await fs.writeFile(storeDirectory, "block reconciliation persistence");
+		// A first drain with NO failure in its window must still resolve cleanly.
+		await store.drain?.();
+		const transactionFailure = store
+			.transact(() => [
+				{
+					kind: "prompt",
+					commandId: "command-drain-failure",
+					turnId: "turn-drain-failure",
+					createdAt: 1,
+					acceptedAt: 1,
+					status: "terminal_ok",
+					terminalAt: 2,
+					terminalOutcome: { kind: "success" },
+				},
+			])
+			.then(
+				() => undefined,
+				(error: NodeJS.ErrnoException) => error,
+			);
+		// Drain while the failing transaction is still in its window (teardown
+		// shape): the neutralized chain tail must not hide the failure evidence.
+		const drainedFailure = await store.drain?.().then(
+			() => undefined,
+			(error: NodeJS.ErrnoException) => error,
+		);
+		expect(drainedFailure?.code).toBe("reconciliation_persist_failed");
+		expect((await transactionFailure)?.code).toBe("reconciliation_persist_failed");
+		// A later clean window is not poisoned by the already-surfaced failure.
+		await store.drain?.();
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+test("concurrent drains report every publication failure exactly once (#4743)", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-drain-concurrent-"));
+	try {
+		const sessionFile = path.join(root, "session.jsonl");
+		const sessionId = "drain-concurrent";
+		const store = createReconciliationStore({ sessionFile, sessionId });
+		await store.load();
+		const storeDirectory = path.dirname(reconciliationStorePath(sessionFile, sessionId));
+		await fs.writeFile(storeDirectory, "block reconciliation persistence");
+		const record = (suffix: string) => ({
+			kind: "prompt" as const,
+			commandId: `command-${suffix}`,
+			turnId: `turn-${suffix}`,
+			createdAt: 1,
+			acceptedAt: 1,
+			status: "terminal_ok" as const,
+			terminalAt: 2,
+			terminalOutcome: { kind: "success" as const },
+		});
+		const failures = [
+			store.transact(() => [record("concurrent-a")]).catch((error: NodeJS.ErrnoException) => error),
+			store.transact(() => [record("concurrent-b")]).catch((error: NodeJS.ErrnoException) => error),
+		];
+		// Two teardown owners drain the same store at once. Evidence is retained
+		// until claimed, so neither drain can be starved into reporting quiescence
+		// while a failure is still unreported, exactly one of them carries each
+		// failure, and the serialized chain deadlocks neither.
+		const reported = await Promise.all([
+			store.drain?.().then(
+				() => undefined,
+				(error: unknown) => error,
+			),
+			store.drain?.().then(
+				() => undefined,
+				(error: unknown) => error,
+			),
+		]);
+		const reportedCodes = reported.flatMap(error =>
+			error instanceof AggregateError
+				? error.errors.map(member => (member as NodeJS.ErrnoException).code)
+				: error === undefined
+					? []
+					: [(error as NodeJS.ErrnoException).code],
+		);
+		expect(reportedCodes).toEqual(["reconciliation_persist_failed", "reconciliation_persist_failed"]);
+		expect((await Promise.all(failures)).map(error => (error as NodeJS.ErrnoException).code)).toEqual([
+			"reconciliation_persist_failed",
+			"reconciliation_persist_failed",
+		]);
+		// Both failures have been claimed, so a drain opened after them is clean:
+		// reported evidence never permanently poisons the store.
+		await store.drain?.();
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
 });

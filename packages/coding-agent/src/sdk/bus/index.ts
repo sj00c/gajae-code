@@ -209,6 +209,39 @@ const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
  * provider error cannot flood the log file.
  */
 const PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX = 512;
+/**
+ * #4743: bounded wait for durable reconciliation quiescence during session
+ * teardown. Expiry is OBSERVABLE (owner-release failure), never silently
+ * treated as drained. Read per drain so the env override is effective for
+ * deterministic tests.
+ */
+const sdkReconciliationDrainTimeoutMs = (): number => {
+	const override = Number(process.env.GJC_SDK_RECONCILIATION_DRAIN_TIMEOUT_MS);
+	return override > 0 ? override : 5_000;
+};
+/**
+ * #4743: the two reconciliation failure codes that mean durable state may be
+ * lost. Both must reach the teardown owner; every other owner-release failure
+ * stays retryable through the retained `cleanupRetries` entry.
+ */
+const RECONCILIATION_DURABILITY_FAILURE_CODES: ReadonlySet<string> = new Set([
+	"reconciliation_persist_failed",
+	"reconciliation_drain_timeout",
+]);
+function reconciliationFailureCode(value: unknown): string | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const code = (value as { code?: unknown }).code;
+	return typeof code === "string" && RECONCILIATION_DURABILITY_FAILURE_CODES.has(code) ? code : undefined;
+}
+/**
+ * Flatten an owner-release failure to its durability-failure members. Aggregates
+ * nest (the store batches a drained window's failures, and owner release batches
+ * every release failure), so recursion is required to reach the coded leaves.
+ */
+function reconciliationDurabilityFailures(error: unknown): unknown[] {
+	if (error instanceof AggregateError) return error.errors.flatMap(member => reconciliationDurabilityFailures(member));
+	return reconciliationFailureCode(error) === undefined ? [] : [error];
+}
 type PromptTerminalDiagnostic = {
 	reason?: unknown;
 	loopStopReason?: string;
@@ -1186,6 +1219,11 @@ interface SessionRuntime {
 	/** Aborts and fences side turns while notification delivery is disabled. */
 	disableEphemeralTurns: () => void;
 	waitForGateResolutionQuiescence: () => Promise<void>;
+	/** Awaits durable quiescence of every reconciliation transaction this runtime
+	 *  admitted, joining their producers first. Never swallows evidence: producer
+	 *  and store rejections are returned in `failures`, and a bounded-deadline
+	 *  expiry is returned as `timedOut` (#4743). */
+	drainDurableReconciliation: () => Promise<{ timedOut: boolean; failures: unknown[] }>;
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>;
 	workflowGate?: WorkflowGateEmitter;
 	gatePresentations?: PresentationArbiter;
@@ -2476,6 +2514,10 @@ function sdkControlSurface(
 		discardTerminalAbortSteeringSnapshot?: (token: number) => void;
 		rebindTerminalAbortSteeringSnapshot?: (token: number) => void;
 	},
+	// #4743: registers fire-and-forget reconciliation producers (accepted
+	// executions and post-response publications) so session teardown can join
+	// them before reporting durable quiescence.
+	trackReconciliationProducer?: (producer: Promise<unknown>) => void,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2750,6 +2792,10 @@ function sdkControlSurface(
 			}
 			accepting = false;
 			accepted = true;
+			// #4743: an accepted run owns a durable terminal publication when it
+			// settles; teardown joins it via this latch (never-accepted preflights
+			// produce no durable write and stay unjoined by design).
+			trackReconciliationProducer?.(submissionSettled.promise);
 			pendingPreflightCancellations.delete(key);
 			settlePreflight({ status: "accepted" });
 			if (preflightController.signal.aborted) throw cancellationError;
@@ -2775,10 +2821,14 @@ function sdkControlSurface(
 			);
 		} catch (error) {
 			submissionSettled.resolve();
-			if (accepted && !preflightController.signal.aborted) void onPromptFailed(correlation, error);
+			if (accepted && !preflightController.signal.aborted)
+				trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 			else settlePreflight({ status: "rejected", error });
 		}
 		if (submission) {
+			// #4743: the continuation may settle long after teardown (a cancelled
+			// preflight stays pending forever by design), so the EXECUTION is never
+			// joined — only its reconciliation publications are tracked below.
 			void submission.then(
 				() => {
 					if (!accepted)
@@ -2791,7 +2841,8 @@ function sdkControlSurface(
 					submissionSettled.resolve();
 				},
 				error => {
-					if (accepted && !preflightController.signal.aborted) void onPromptFailed(correlation, error);
+					if (accepted && !preflightController.signal.aborted)
+						trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 					else settlePreflight({ status: "rejected", error });
 					submissionSettled.resolve();
 				},
@@ -3287,6 +3338,10 @@ function sdkControlSurface(
 								if (skillRecon) {
 									await skillRecon.noteAccepted(correlation, trimmedClientRef, { skillName: meta.name });
 									durableSkillAccepted = true;
+									// #4743: a durably accepted skill owns a terminal
+									// publication; teardown joins this latch (bounded by the
+									// drain deadline).
+									trackReconciliationProducer?.(executionSettled.promise);
 								}
 							} catch (error) {
 								onPromptAcceptFailed(correlation);
@@ -3305,6 +3360,11 @@ function sdkControlSurface(
 				settleReject(error);
 				run = Promise.reject(error);
 			}
+			// #4743: the skill execution itself may outlive teardown (a cancelled
+			// preflight never settles by design), so only its reconciliation
+			// PUBLICATIONS are tracked — created synchronously the moment the
+			// execution settles, so a publication fired during teardown is always
+			// joined before the drain reports quiescence.
 			void run.then(
 				result => {
 					if (phase === "pending") {
@@ -3317,12 +3377,14 @@ function sdkControlSurface(
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
 					} else if (durableSkillAccepted && skillRecon) {
-						void skillRecon.noteTransition(correlation, {
-							type: "agent_end",
-							...(typeof result === "string"
-								? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
-								: {}),
-						});
+						trackReconciliationProducer?.(
+							skillRecon.noteTransition(correlation, {
+								type: "agent_end",
+								...(typeof result === "string"
+									? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
+									: {}),
+							}),
+						);
 					}
 					executionSettled.resolve();
 				},
@@ -3331,10 +3393,12 @@ function sdkControlSurface(
 						releaseAdmission();
 						settleReject(error);
 					} else if (phase === "accepted" && promptOwned && !preflightController.signal.aborted) {
-						void onPromptFailed(correlation, error);
+						trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 					}
 					if (durableSkillAccepted && skillRecon && !preflightController.signal.aborted)
-						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
+						trackReconciliationProducer?.(
+							skillRecon.noteTransition(correlation, { type: "agent_failed", error }),
+						);
 					executionSettled.resolve();
 				},
 			);
@@ -4343,6 +4407,34 @@ export function createNotificationsExtension(
 				logger.warn(`notifications: stop failed: ${String(e)}`);
 			}
 		}
+		// #4743: terminal release must not be reported while a reconciliation
+		// publication this runtime admitted — or the execution that will produce it —
+		// is still in flight. Observe durable quiescence AFTER the endpoint stopped
+		// serving (no new admissions) and BEFORE the terminal release is recorded.
+		// Both failure shapes stay observable as owner-release failures: a drained
+		// window containing a failed write (reconciliation_persist_failed evidence
+		// preserved through the store drain) and a deadline expiry (non-quiescent,
+		// never silently treated as drained).
+		try {
+			const drained = await rt.drainDurableReconciliation();
+			for (const failure of drained.failures) {
+				ownerReleaseFailures.push(failure);
+				logger.warn(`sdk reconciliation publication failed during teardown: ${String(failure)}`);
+			}
+			if (drained.timedOut) {
+				const timeoutError = Object.assign(
+					new Error(
+						`SDK reconciliation drain timed out after ${sdkReconciliationDrainTimeoutMs()}ms; reconciliation state may be non-quiescent.`,
+					),
+					{ code: "reconciliation_drain_timeout" },
+				);
+				ownerReleaseFailures.push(timeoutError);
+				logger.warn("sdk reconciliation drain timed out; proceeding with non-quiescent state");
+			}
+		} catch (e) {
+			ownerReleaseFailures.push(e);
+			logger.warn(`sdk reconciliation drain failed: ${String(e)}`);
+		}
 		lifecycleStartupCapability?.rollback?.recordStop(rt.host.generation, {
 			runtimeRemoved: true,
 			hostStopped: rt.hostStopped && rt.serverStopped,
@@ -4687,6 +4779,26 @@ export function createNotificationsExtension(
 				? createReconciliationStore({ sessionFile, sessionId: String(reconciliationSessionId) })
 				: null;
 		const kindReconciliation = createKindAwareReconciliation({ store: durableStore });
+		// #4743: reconciliation publications and the executions that produce them
+		// are fire-and-forget at their call sites; without joining the PRODUCERS a
+		// drain can observe an empty queue and return just before a still-running
+		// skill enqueues its terminal publication — the teardown race again, by
+		// another route. Every void-ed producer registers here and the teardown
+		// drain joins the set before awaiting store quiescence.
+		const reconciliationProducers = new Set<Promise<unknown>>();
+		const trackReconciliationProducer = (producer: Promise<unknown>): void => {
+			reconciliationProducers.add(producer);
+			// Deliberately a two-arm handler, NOT `finally`: `finally` returns a derived
+			// promise that re-rejects when the producer rejects, and nothing observes
+			// that derived promise — a failed durable write would become an unhandled
+			// rejection and kill the resident process. The two-arm form always resolves,
+			// while the ORIGINAL producer keeps its rejection for the teardown drain to
+			// inspect (#4743).
+			const forget = (): void => {
+				reconciliationProducers.delete(producer);
+			};
+			void producer.then(forget, forget);
+		};
 		// Restart recovery must commit before any prompt is admitted; otherwise a new
 		// admission can race the hydrated full-state replacement.
 		let reconciliationReady: Promise<void> = durableStore ? kindReconciliation.hydrateFromStore() : Promise.resolve();
@@ -6316,6 +6428,8 @@ export function createNotificationsExtension(
 				settleSteer: kindReconciliation.settleSteer,
 			},
 			terminalAbortSeams,
+			// #4743: join fire-and-forget reconciliation producers at teardown.
+			trackReconciliationProducer,
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
@@ -6742,6 +6856,66 @@ export function createNotificationsExtension(
 			enableNotifications: () => {},
 			disposeGateTerminalController: () => {},
 			disposeAckRecoveryParticipant: () => {},
+			// #4743: session teardown must observe durable quiescence of every
+			// reconciliation transaction this runtime admitted, INCLUDING the ones
+			// whose producers (accepted skill/prompt executions and their post-
+			// response publications) are still running when teardown starts — an
+			// empty queue proves nothing about work that has not been enqueued yet.
+			// Order: join producers → join kind-aware mutations → join the store
+			// chain (which also surfaces persistence-failure evidence). All under a
+			// finite deadline whose expiry is reported as a NON-QUIESCENT result so
+			// the caller records an owner-release failure instead of silently
+			// treating a hung write as drained.
+			drainDurableReconciliation: async (): Promise<{ timedOut: boolean; failures: unknown[] }> => {
+				// One failed write surfaces twice by design — once as the producer's
+				// rejection and once through the store's failure window — and both carry
+				// the same coded error object, so identity dedupe keeps the reported
+				// evidence at one entry per real failure without dropping distinct ones.
+				const seen = new Set<unknown>();
+				const failures: unknown[] = [];
+				const record = (failure: unknown): void => {
+					if (seen.has(failure)) return;
+					seen.add(failure);
+					failures.push(failure);
+				};
+				const quiescent = (async () => {
+					while (true) {
+						const producers = [...reconciliationProducers];
+						// `allSettled` joins ALL producers even when one rejects, but its
+						// results are INSPECTED: a rejected terminal publication is evidence
+						// the caller must see, not something the join consumes before the
+						// store's own failure window opens (#4743).
+						for (const settled of await Promise.allSettled(producers))
+							if (settled.status === "rejected") record(settled.reason);
+						// Both drains below surface store-recorded persistence failures by
+						// rejecting; collect and keep draining so one failed write cannot
+						// hide a later producer's work from the join.
+						try {
+							await kindReconciliation.drain();
+						} catch (e) {
+							record(e);
+						}
+						// Direct store writes (terminal-scope response-state advance) bypass
+						// the kind-aware chain; join them too.
+						try {
+							await durableStore?.drain?.();
+						} catch (e) {
+							record(e);
+						}
+						await Bun.sleep(0);
+						if ([...reconciliationProducers].every(producer => producers.includes(producer))) {
+							return { timedOut: false, failures };
+						}
+					}
+				})();
+				return await Promise.race([
+					quiescent,
+					// A deadline expiry reports the failures observed SO FAR alongside the
+					// timeout: evidence already collected must not be dropped because the
+					// remaining wait ran out.
+					Bun.sleep(sdkReconciliationDrainTimeoutMs()).then(() => ({ timedOut: true, failures })),
+				]);
+			},
 			disposeGateEmitterListener: () => {},
 			trackGateResolution,
 			waitForGateResolutionQuiescence: async () => {
@@ -8889,6 +9063,11 @@ export function createNotificationsExtension(
 			return false;
 		});
 		if (startupWasPending) void settledControllerStop;
+		// #4743: a durability failure has no later retry cycle at terminal quit, so it
+		// must reach the teardown owner instead of being logged into silence. Held
+		// until the controller queue below is joined so the failure never truncates
+		// the rest of teardown.
+		let reconciliationTeardownFailure: Error | undefined;
 		try {
 			await stopSession(id);
 		} catch (error) {
@@ -8898,11 +9077,27 @@ export function createNotificationsExtension(
 			// shutdown. On terminal quit there is no later retry cycle, so log at
 			// error severity (matching the postmortem cleanup precedent).
 			logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+			// Endpoint-release failures (host/server stop) stay swallowed: they are
+			// retryable through the retained cleanupRetries entry and observable in
+			// lifecycle rollback proof. Reconciliation durability failures are not —
+			// a committed publication that never reached disk, or a drain whose
+			// deadline expired, is state loss the owner must be told about.
+			const durable = reconciliationDurabilityFailures(error);
+			if (durable.length > 0)
+				reconciliationTeardownFailure = Object.assign(
+					new Error(
+						`SDK reconciliation teardown failed for session ${id}: ${durable
+							.map(failure => reconciliationFailureCode(failure) ?? "unknown")
+							.join(", ")}.`,
+					),
+					{ code: "sdk_reconciliation_teardown_failed", failures: durable },
+				);
 		}
 		// Keep shutdown nonblocking only while native startup is genuinely
 		// pending (the `/notify on` path); otherwise await the controller queue so
 		// completed-start reconciliation and its replacement-token cleanup are
 		// joined before lifecycle shutdown returns.
 		if (!startupWasPending) await settledControllerStop;
+		if (reconciliationTeardownFailure) throw reconciliationTeardownFailure;
 	});
 }

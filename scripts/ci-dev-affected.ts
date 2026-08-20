@@ -64,6 +64,10 @@ const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-
 // not follow the source-file basename convention. They supplement, rather than
 // replace, direct-basename test selection and owner fallback tasks.
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
+	"packages/ai/src/providers/anthropic.ts": [
+		"packages/ai/test/anthropic-truncated-toolcall.test.ts",
+		"packages/ai/test/anthropic-stream-envelope.test.ts",
+	],
 	"packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],

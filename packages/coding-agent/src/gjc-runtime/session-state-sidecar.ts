@@ -5,6 +5,12 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai/core";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
+import {
+	ensureCoordinatorDirectory,
+	syncCoordinatorDirectory,
+	syncCoordinatorFile,
+	writeCoordinatorAtomic,
+} from "../coordinator-mcp/durability";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
@@ -648,6 +654,7 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 		if (existing.session_id !== expected.sessionId || existing.launch_id !== expected.launchId) {
 			throw runtimeReadinessMarkerConflict();
 		}
+		await syncCoordinatorDirectory(path.dirname(readinessFile));
 		return existing;
 	}
 
@@ -665,21 +672,64 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 		path.dirname(readinessFile),
 		`.${path.basename(readinessFile)}.${process.pid}.${randomUUID()}.tmp`,
 	);
+	let result: RuntimeInputReadyMarker | null = null;
+	let primaryError: unknown;
 	try {
-		await fs.mkdir(path.dirname(readinessFile), { recursive: true });
-		await fs.writeFile(tempFile, `${JSON.stringify(marker)}\n`, { flag: "wx" });
+		await ensureCoordinatorDirectory(path.dirname(readinessFile));
+		const handle = await fs.open(tempFile, "wx", 0o600);
+		let writeError: unknown;
+		try {
+			await handle.writeFile(`${JSON.stringify(marker)}\n`);
+			await syncCoordinatorFile(handle);
+		} catch (error) {
+			writeError = error;
+		}
+		try {
+			await handle.close();
+		} catch (closeError) {
+			if (writeError) throw new AggregateError([writeError, closeError], "readiness write and close failed");
+			throw closeError;
+		}
+		if (writeError) throw writeError;
 		try {
 			await fs.link(tempFile, readinessFile);
 		} catch (error) {
-			if ((error as { code?: unknown }).code !== "EEXIST") throw runtimeReadinessMarkerConflict();
+			if ((error as { code?: unknown }).code !== "EEXIST") throw error;
 			const raced = await readRuntimeInputReadyMarker(readinessFile);
-			if (raced && raced.session_id === expected.sessionId && raced.launch_id === expected.launchId) return raced;
-			throw runtimeReadinessMarkerConflict();
+			if (raced && raced.session_id === expected.sessionId && raced.launch_id === expected.launchId) {
+				await syncCoordinatorDirectory(path.dirname(readinessFile));
+				result = raced;
+			} else {
+				throw runtimeReadinessMarkerConflict();
+			}
 		}
-		return marker;
-	} finally {
-		await fs.rm(tempFile, { force: true });
+		if (result === null) {
+			await syncCoordinatorDirectory(path.dirname(readinessFile));
+			result = marker;
+		}
+	} catch (error) {
+		primaryError = error;
 	}
+	let cleanupError: unknown;
+	try {
+		await fs.rm(tempFile, { force: true });
+	} catch (error) {
+		cleanupError = error;
+	}
+	let cleanupBarrierError: unknown;
+	if (!cleanupError) {
+		try {
+			await syncCoordinatorDirectory(path.dirname(readinessFile));
+		} catch (error) {
+			cleanupBarrierError = error;
+		}
+	}
+	const failures = [primaryError, cleanupError, cleanupBarrierError].filter(
+		(error): error is unknown => error !== undefined,
+	);
+	if (failures.length > 1) throw new AggregateError(failures, "readiness publication and cleanup failed");
+	if (failures.length === 1) throw failures[0];
+	return result;
 }
 
 function sameResolvedPath(left: string, right: string, platform: NodeJS.Platform = process.platform): boolean {
@@ -1268,8 +1318,7 @@ async function withCoordinatorTransactionLock<T>(stateFile: string, operation: (
 }
 
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
-	await fs.mkdir(path.dirname(stateFile), { recursive: true });
-	await Bun.write(stateFile, `${JSON.stringify(payload)}\n`);
+	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload)}\n`);
 }
 
 function contextWithManagedOwnerGeneration(context: RuntimeStateContext): RuntimeStateContext {

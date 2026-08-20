@@ -132,6 +132,54 @@ function pauseNextReconciliationCommit(
 	};
 }
 
+/**
+ * Fail the next durable reconciliation commit to `sessionFile`/`sessionId` at its
+ * atomic rename, i.e. after the temp write succeeded. This is the shape of a real
+ * persistence failure (#4743): the publication's promise rejects and the store
+ * records the failure, so a teardown drain that consumes either one silently
+ * reports a lost write as cleanly drained.
+ */
+function failNextReconciliationCommit(
+	sessionFile: string,
+	sessionId: string,
+): { failed: Promise<void>; restore: () => void; arm: () => void } {
+	const target = reconciliationStorePath(sessionFile, sessionId);
+	const failed = Promise.withResolvers<void>();
+	const realRename = fsPromises.rename.bind(fsPromises);
+	let armed = false;
+	let thrown = false;
+	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (armed && !thrown && String(to) === target) {
+			thrown = true;
+			failed.resolve();
+			throw Object.assign(new Error("injected reconciliation rename failure"), { code: "EACCES" });
+		}
+		await realRename(from, to);
+	});
+	return {
+		failed: failed.promise,
+		restore: () => rename.mockRestore(),
+		arm: () => {
+			armed = true;
+		},
+	};
+}
+
+/**
+ * Capture process-level unhandled rejections for the duration of a teardown
+ * assertion. The repo treats an unhandled rejection as process-killing
+ * (`src/modes/components/session-selector.ts`), so a durable-write failure must
+ * never produce one.
+ */
+function captureUnhandledRejections(): { seen: unknown[]; restore: () => void } {
+	const seen: unknown[] = [];
+	const listener = (reason: unknown): void => {
+		seen.push(reason);
+	};
+	process.on("unhandledRejection", listener);
+	return { seen, restore: () => void process.off("unhandledRejection", listener) };
+}
+
 async function closeSocket(socket: WebSocket): Promise<void> {
 	if (socket.readyState === WebSocket.CLOSED) return;
 	const { promise, resolve } = Promise.withResolvers<void>();
@@ -2930,7 +2978,473 @@ test("SDK host rolls back canonical skill ownership when durable acceptance fail
 	expect(executionCount).toBe(1);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+test("session_shutdown awaits a late reconciliation publication before teardown can remove it", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-late-publication-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-late-publication-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	// Hold the skill run open after its durable acceptance: the harness controls
+	// exactly when the fire-and-forget agent_end reconciliation publication is
+	// enqueued, so the paused rename below is provably that late publication.
+	const resumeExecution = Promise.withResolvers<void>();
+	let executionCount = 0;
+	sessionContext.invokeSkill = async (
+		_name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name: "fixture-skill", path: "/fixture/SKILL.md", cleanedArgs: args });
+		await options?.onPreflightAcceptCommit?.();
+		await resumeExecution.promise;
+		executionCount++;
+		return { name: "fixture-skill", path: "/fixture/SKILL.md", args };
+	};
+	const storePath = reconciliationStorePath(sessionFile, sessionId);
+	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
+	const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "skill-late-publication",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill", args: "hold", clientRef: "skill-late-publication-ref" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-late-publication"),
+		"accepted skill response",
+	);
+	expect(
+		frames.find(frame => frame.type === "control_response" && frame.id === "skill-late-publication"),
+	).toMatchObject({ ok: true, result: { accepted: true } });
+	// The acceptance publication has settled; the next commit to this store file
+	// is the late fire-and-forget agent_end transition. Arm the pause, then let
+	// the run resolve so that publication starts and is held mid-rename.
+	pausedCommit.arm();
+	resumeExecution.resolve();
+	await pausedCommit.started;
+	// Teardown must not report the session stopped while a durable publication it
+	// admitted is still between its temp write and atomic rename: an external
+	// cleanup owner removing the state tree at that instant fails the rename with
+	// ENOENT (#4743).
+	let shutdownSettled = false;
+	const shutdown = Promise.resolve(
+		handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+	).then(
+		() => {
+			shutdownSettled = true;
+		},
+		() => {
+			shutdownSettled = true;
+		},
+	);
+	await Bun.sleep(300);
+	expect(shutdownSettled).toBe(false);
+	pausedCommit.release();
+	await shutdown;
+	expect(shutdownSettled).toBe(true);
+	expect(executionCount).toBe(1);
+	const persisted = JSON.parse(fs.readFileSync(storePath, "utf8")) as {
+		records: Array<{ kind: string; status?: string }>;
+	};
+	expect(persisted.records.some(record => record.kind === "skill")).toBe(true);
+	pausedCommit.restore();
+}, 60_000);
+test("session_shutdown joins a still-executing skill before teardown can race its publication (#4743)", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-teardown-join-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-teardown-join-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	// The skill is ACCEPTED and still executing when shutdown begins; nothing has
+	// been resolved yet, so an empty-queue drain would return immediately and the
+	// late agent_end publication would race teardown (#4743 major 1).
+	const resumeExecution = Promise.withResolvers<void>();
+	sessionContext.invokeSkill = async (
+		_name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name: "fixture-skill", path: "/fixture/SKILL.md", cleanedArgs: args });
+		await options?.onPreflightAcceptCommit?.();
+		await resumeExecution.promise;
+		return { name: "fixture-skill", path: "/fixture/SKILL.md", args };
+	};
+	const storePath = reconciliationStorePath(sessionFile, sessionId);
+	const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "skill-teardown-join",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill", args: "hold", clientRef: "skill-teardown-join-ref" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-teardown-join"),
+		"accepted skill response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "skill-teardown-join")).toMatchObject({
+		ok: true,
+		result: { accepted: true },
+	});
+	// Shutdown begins while the execution is still pending: it must NOT settle
+	// before the skill (and its terminal publication) settles.
+	let shutdownSettled = false;
+	const shutdown = Promise.resolve(
+		handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+	).finally(() => {
+		shutdownSettled = true;
+	});
+	await Bun.sleep(500);
+	expect(shutdownSettled).toBe(false);
+	resumeExecution.resolve();
+	await shutdown;
+	expect(shutdownSettled).toBe(true);
+	// The terminal publication won the race: the durable document carries the
+	// skill record, and teardown never removed the publication's destination.
+	const persisted = JSON.parse(fs.readFileSync(storePath, "utf8")) as {
+		records: Array<{ kind: string; status?: string }>;
+	};
+	expect(persisted.records.some(record => record.kind === "skill")).toBe(true);
+}, 60_000);
+test("session_shutdown bounds a hung reconciliation publication and reports the drain timeout (#4743)", async () => {
+	process.env.GJC_SDK_RECONCILIATION_DRAIN_TIMEOUT_MS = "250";
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-drain-deadline-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-drain-deadline-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	const resumeExecution = Promise.withResolvers<void>();
+	sessionContext.invokeSkill = async (
+		_name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name: "fixture-skill", path: "/fixture/SKILL.md", cleanedArgs: args });
+		await options?.onPreflightAcceptCommit?.();
+		await resumeExecution.promise;
+		return { name: "fixture-skill", path: "/fixture/SKILL.md", args };
+	};
+	// Hold the terminal publication's rename FOREVER: an unbounded drain would
+	// hang session_shutdown indefinitely (#4743 major 2).
+	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "skill-drain-deadline",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "hold", clientRef: "skill-drain-deadline-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-drain-deadline"),
+			"accepted skill response",
+		);
+		// The publication is armed and held mid-rename; shutdown begins with the
+		// rename still never released.
+		pausedCommit.arm();
+		resumeExecution.resolve();
+		await pausedCommit.started;
+		const shutdownStarted = Date.now();
+		// The deadline expiry is CALLER-VISIBLE, not merely logged: teardown rejects
+		// with the coded reconciliation failure so the lifecycle owner is never told
+		// the session shut down cleanly over a non-quiescent store (#4743).
+		const shutdownFailure = await Promise.resolve(
+			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+		).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		const elapsed = Date.now() - shutdownStarted;
+		// Bounded: the 250ms deadline (not an infinite hang) released teardown.
+		expect(elapsed).toBeLessThan(5_000);
+		expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+		expect(
+			((shutdownFailure as { failures?: unknown[] } | undefined)?.failures ?? []).map(
+				failure => (failure as { code?: string }).code,
+			),
+		).toContain("reconciliation_drain_timeout");
+		// Observable: the expiry surfaced as a drain-timeout warning rather than a
+		// silent pretend-drain.
+		expect(warnSpy.mock.calls.some(call => String(call[0]).includes("reconciliation drain timed out"))).toBe(true);
+	} finally {
+		warnSpy.mockRestore();
+		pausedCommit.release();
+		pausedCommit.restore();
+		delete process.env.GJC_SDK_RECONCILIATION_DRAIN_TIMEOUT_MS;
+	}
+}, 60_000);
 
+test("session_shutdown propagates a rejected reconciliation publication without an unhandled rejection (#4743)", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-drain-publish-failure-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-drain-publish-failure-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = { ...sessionManager, getSessionFile: () => sessionFile };
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	const resumeExecution = Promise.withResolvers<void>();
+	sessionContext.invokeSkill = async (
+		_name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name: "fixture-skill", path: "/fixture/SKILL.md", cleanedArgs: args });
+		await options?.onPreflightAcceptCommit?.();
+		await resumeExecution.promise;
+		return { name: "fixture-skill", path: "/fixture/SKILL.md", args };
+	};
+	const failedCommit = failNextReconciliationCommit(sessionFile, sessionId);
+	const unhandled = captureUnhandledRejections();
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "skill-publish-failure",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "hold", clientRef: "skill-publish-failure-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-publish-failure"),
+			"accepted skill response",
+		);
+		// The acceptance write has committed; the NEXT commit is the terminal
+		// agent_end publication, and it is made to fail at its atomic rename.
+		failedCommit.arm();
+		resumeExecution.resolve();
+		await failedCommit.failed;
+		const shutdownFailure = await Promise.resolve(
+			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+		).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		// A committed publication that never reached disk is state loss: teardown
+		// must report it instead of resolving as cleanly drained.
+		expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+		expect(
+			((shutdownFailure as { failures?: unknown[] } | undefined)?.failures ?? []).map(
+				failure => (failure as { code?: string }).code,
+			),
+		).toContain("reconciliation_persist_failed");
+		// The producer rejection is reported exactly once even though the store's
+		// failure window observes the same coded error.
+		expect(
+			((shutdownFailure as { failures?: unknown[] } | undefined)?.failures ?? []).filter(
+				failure => (failure as { code?: string }).code === "reconciliation_persist_failed",
+			),
+		).toHaveLength(1);
+		// The tracking handler must not leave a derived rejected promise behind: an
+		// unhandled rejection is process-killing in this repo.
+		await Bun.sleep(50);
+		expect(unhandled.seen).toEqual([]);
+	} finally {
+		errorSpy.mockRestore();
+		warnSpy.mockRestore();
+		unhandled.restore();
+		failedCommit.restore();
+	}
+}, 60_000);
+test("a recovered reconciliation publication lets a later teardown drain report success (#4743)", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-drain-recovery-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-drain-recovery-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = { ...sessionManager, getSessionFile: () => sessionFile };
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	const resumeFirst = Promise.withResolvers<void>();
+	let invocations = 0;
+	sessionContext.invokeSkill = async (
+		_name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		invocations++;
+		options?.onSkillPrepared?.({ name: "fixture-skill", path: "/fixture/SKILL.md", cleanedArgs: args });
+		await options?.onPreflightAcceptCommit?.();
+		if (invocations === 1) await resumeFirst.promise;
+		return { name: "fixture-skill", path: "/fixture/SKILL.md", args };
+	};
+	const failedCommit = failNextReconciliationCommit(sessionFile, sessionId);
+	const unhandled = captureUnhandledRejections();
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "skill-recovery-first",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "first", clientRef: "skill-recovery-first-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-recovery-first"),
+			"first accepted skill response",
+		);
+		failedCommit.arm();
+		resumeFirst.resolve();
+		await failedCommit.failed;
+		// The failure window closes with the failing publication; the store is
+		// writable again, so a subsequent publication persists and the teardown
+		// drain reports quiescence rather than staying poisoned by the past failure.
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "skill-recovery-second",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "second", clientRef: "skill-recovery-second-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-recovery-second"),
+			"second accepted skill response",
+		);
+		// The first teardown still reports the earlier lost write: a publication that
+		// never reached disk is state loss even though a later one succeeded, and
+		// evidence is retained until an owner is actually told about it.
+		const firstShutdown = await Promise.resolve(
+			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+		).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect((firstShutdown as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+		// Recovery: the store kept working after the failure, so the later
+		// publication is durably on disk.
+		const persisted = JSON.parse(fs.readFileSync(reconciliationStorePath(sessionFile, sessionId), "utf8")) as {
+			records: Array<{ kind: string; clientRef?: string; status?: string }>;
+		};
+		expect(
+			persisted.records.some(
+				record => record.clientRef === "skill-recovery-second-ref" && record.status === "terminal_ok",
+			),
+		).toBe(true);
+		// The retained-runtime retry drains clean: reported evidence is not replayed,
+		// so teardown converges instead of failing forever.
+		await expect(
+			Promise.resolve(handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext)),
+		).resolves.toBeUndefined();
+		await Bun.sleep(50);
+		expect(unhandled.seen).toEqual([]);
+	} finally {
+		errorSpy.mockRestore();
+		warnSpy.mockRestore();
+		unhandled.restore();
+		failedCommit.restore();
+	}
+}, 60_000);
 test("SDK host terminalizes a never-resolving preflight on abort and fences late acceptance", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-preflight-never-"));
 	dirs.push(cwd);

@@ -559,7 +559,7 @@ describe("anthropic stream envelope handling", () => {
 			{ type: "toolCall", id: "tool_streamed", name: "bash", arguments: { command: "echo later" } },
 		]);
 	});
-	it("finalizes an orphaned block when a duplicate content_block_start reuses an active index", async () => {
+	it("rejects a duplicate active content_block index before the replacement can end", async () => {
 		vi.spyOn(Messages.prototype, "create").mockImplementation(
 			() =>
 				createMockRequest([
@@ -602,13 +602,19 @@ describe("anthropic stream envelope handling", () => {
 		);
 
 		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
-		for await (const _ of stream) {
-			// drain stream
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
 		}
 		const result = await stream.result();
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage ?? "").toMatch(/reused an active content block index/i);
+		expect(countEvents(events, "toolcall_start")).toBe(1);
+		expect(countEvents(events, "toolcall_delta")).toBe(1);
+		expect(countEvents(events, "toolcall_end")).toBe(0);
+		expect(countEvents(events, "error")).toBe(1);
+		expect(countEvents(events, "done")).toBe(0);
 	});
 
 	it("round-trips OAuth tool prefixes without stripping original tool names that contain the prefix", () => {

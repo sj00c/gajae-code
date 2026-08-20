@@ -13,9 +13,8 @@
  * preview/apply transaction and the UI itself are owned by #4291.
  */
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
-import { parseFrontmatter } from "@gajae-code/utils";
+import { getTrustedHomeDir, parseFrontmatter } from "@gajae-code/utils";
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
@@ -97,7 +96,7 @@ export class SkillFrontmatterError extends Error {
 const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 
 function getRuntimeHome(): string {
-	return process.env.HOME || os.homedir();
+	return getTrustedHomeDir();
 }
 
 /** Ancestor directories from `cwd` (inclusive) up to `stop` (inclusive), excluding `home`. */

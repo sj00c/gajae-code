@@ -2,6 +2,12 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withFileLock } from "../config/file-lock";
+import {
+	appendCoordinatorFile,
+	ensureCoordinatorDirectory,
+	syncCoordinatorDirectory,
+	writeCoordinatorAtomic,
+} from "./durability";
 import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec";
 
 export type CoordinatorSessionState =
@@ -183,6 +189,9 @@ export interface OutboxEventV1 {
 	payload: Record<string, string | number | boolean | null>;
 	emitted: boolean;
 }
+function isOutboxEntity(value: unknown): value is OutboxEventV1["entity"] {
+	return value === "turn" || value === "question" || value === "report" || value === "session" || value === "deletion";
+}
 export interface CoordinatorSessionTransactionV1 {
 	schema_version: 1;
 	namespace_id: string;
@@ -310,30 +319,30 @@ export function transactionPath(paths: CoordinatorStatePaths, sessionId: string)
 export function transactionLockPath(paths: CoordinatorStatePaths, sessionId: string): string {
 	return path.join(paths.sessions, safeSessionId(sessionId), "transaction.lock");
 }
-async function fsyncDirectory(directory: string): Promise<void> {
-	const handle = await fs.open(directory, "r");
-	try {
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-}
 async function ensureNamespaceParents(paths: CoordinatorStatePaths): Promise<void> {
-	await fs.mkdir(paths.root, { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(paths.root);
+}
+
+async function removeCoordinatorStateFile(file: string): Promise<void> {
+	try {
+		await fs.lstat(file);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		try {
+			await fs.stat(path.dirname(file));
+		} catch (parentError) {
+			if ((parentError as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw parentError;
+		}
+		await syncCoordinatorDirectory(path.dirname(file));
+		return;
+	}
+	await fs.rm(file);
+	await syncCoordinatorDirectory(path.dirname(file));
 }
 
 async function writeAtomic(file: string, value: unknown): Promise<void> {
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-	const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-	const handle = await fs.open(temp, "wx", 0o600);
-	try {
-		await handle.writeFile(JSON.stringify(value));
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	await fs.rename(temp, file);
-	await fsyncDirectory(path.dirname(file));
+	await writeCoordinatorAtomic(file, JSON.stringify(value));
 }
 async function readJson<T>(file: string): Promise<T | null> {
 	try {
@@ -356,8 +365,8 @@ function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespa
 }
 export async function initializeCoordinatorNamespace(paths: CoordinatorStatePaths): Promise<void> {
 	await ensureNamespaceParents(paths);
-	await fs.mkdir(paths.sessions, { recursive: true, mode: 0o700 });
-	await fs.mkdir(path.dirname(paths.journal), { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(paths.sessions);
+	await ensureCoordinatorDirectory(path.dirname(paths.journal));
 	await withFileLock(paths.registryLock, async () => {
 		const existing = await readJson<NamespaceRegistryV1>(paths.registry);
 		if (existing === null)
@@ -391,7 +400,7 @@ export async function withSessionTransaction<T>(
 	operation: (transaction: CoordinatorSessionTransactionV1) => Promise<T>,
 ): Promise<T> {
 	const file = transactionPath(paths, sessionId);
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(path.dirname(file));
 	return await withFileLock(transactionLockPath(paths, sessionId), async () => {
 		const transaction = await readJson<CoordinatorSessionTransactionV1>(file);
 		if (!transaction) throw new Error("resource_gone");
@@ -504,7 +513,7 @@ export async function commitCreationWal(
 						entry.phase === "completed",
 				);
 				if (!priorDeleted) throw new Error("session_closing");
-				await fs.rm(transactionPath(paths, session.session_id), { force: true });
+				await removeCoordinatorStateFile(transactionPath(paths, session.session_id));
 				existing = null;
 			}
 			if (existing) {
@@ -648,34 +657,87 @@ export async function appendOutboxEvents(
 	paths: CoordinatorStatePaths,
 	transaction: CoordinatorSessionTransactionV1,
 ): Promise<void> {
-	await fs.mkdir(path.dirname(paths.journal), { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(path.dirname(paths.journal));
 	await withFileLock(paths.journalLock, async () => {
 		const existing = await fs.readFile(paths.journal, "utf8").catch(error => {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
 			throw error;
 		});
-		const ids = new Set(
-			existing
-				.split("\n")
-				.filter(Boolean)
-				.map(line => {
-					try {
-						return (JSON.parse(line) as { id?: unknown }).id;
-					} catch {
-						return null;
-					}
-				})
-				.filter((id): id is string => typeof id === "string"),
-		);
-		const events = Object.values(transaction.outbox).filter(event => !event.emitted && !ids.has(event.id));
-		if (events.length > 0) {
-			const handle = await fs.open(paths.journal, "a", 0o600);
+		const existingEvents = new Map<string, OutboxEventV1>();
+		for (const rawLine of existing.split("\n")) {
+			const line = rawLine.trim();
+			if (!line) continue;
+			let parsed: unknown;
 			try {
-				await handle.writeFile(`${events.map(event => JSON.stringify(event)).join("\n")}\n`);
-				await handle.sync();
-			} finally {
-				await handle.close();
+				parsed = JSON.parse(line);
+			} catch {
+				throw new Error("state_corrupt");
 			}
+			const candidate = parsed as Partial<OutboxEventV1>;
+			const identity = typeof candidate.id === "string" ? candidate.id.split(":") : [];
+			const identityRevision = identity.length >= 6 ? Number(identity[2]) : Number.NaN;
+			const identityEntity = identity.length >= 6 ? identity[4] : undefined;
+			const identityEntityId = identity.length >= 6 ? identity.slice(5).join(":") : "";
+			const identitySession = identity.length >= 6 ? identity[1] : "";
+			const identityKind = identity.length >= 6 ? identity[3] : "";
+			const canonicalIdentity =
+				identity.length >= 6 &&
+				identity[0] === "txn" &&
+				identitySession &&
+				Number.isSafeInteger(identityRevision) &&
+				identityRevision > 0 &&
+				identityKind &&
+				isOutboxEntity(identityEntity) &&
+				identityEntityId &&
+				candidate.id ===
+					deterministicOutboxId(identitySession, identityRevision, identityKind, identityEntity, identityEntityId);
+			if (
+				typeof parsed !== "object" ||
+				parsed === null ||
+				Array.isArray(parsed) ||
+				typeof candidate.id !== "string" ||
+				candidate.id.length === 0 ||
+				typeof candidate.transaction_revision !== "number" ||
+				!Number.isSafeInteger(candidate.transaction_revision) ||
+				candidate.transaction_revision <= 0 ||
+				typeof candidate.kind !== "string" ||
+				!candidate.kind ||
+				!isOutboxEntity(candidate.entity) ||
+				typeof candidate.entity_id !== "string" ||
+				!candidate.entity_id ||
+				typeof candidate.payload !== "object" ||
+				candidate.payload === null ||
+				Array.isArray(candidate.payload) ||
+				typeof candidate.emitted !== "boolean" ||
+				!canonicalIdentity ||
+				candidate.transaction_revision !== identityRevision ||
+				existingEvents.has(candidate.id)
+			)
+				throw new Error("state_corrupt");
+			existingEvents.set(candidate.id, candidate as OutboxEventV1);
+		}
+		for (const event of Object.values(transaction.outbox)) {
+			if (
+				event.id !==
+				deterministicOutboxId(
+					transaction.session_id,
+					event.transaction_revision,
+					event.kind,
+					event.entity,
+					event.entity_id,
+				)
+			)
+				throw new Error("state_corrupt");
+		}
+		const events = Object.values(transaction.outbox).filter(event => {
+			if (event.emitted) return false;
+			const existing = existingEvents.get(event.id);
+			if (!existing) return true;
+			if (JSON.stringify(existing) !== JSON.stringify(event)) throw new Error("state_corrupt");
+			return false;
+		});
+		if (events.length > 0) {
+			await appendCoordinatorFile(paths.journal, `${events.map(event => JSON.stringify(event)).join("\n")}\n`);
 		}
 		for (const event of Object.values(transaction.outbox)) event.emitted = true;
 		transaction.projection.applied_events_revision = transaction.revision;

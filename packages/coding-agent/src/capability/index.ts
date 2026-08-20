@@ -6,9 +6,8 @@
  * - Registering providers (where to find it)
  * - Loading items for a capability across all providers
  */
-import * as os from "node:os";
 import * as path from "node:path";
-import { getProjectDir, logger } from "@gajae-code/utils";
+import { getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
@@ -237,7 +236,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	}
 
 	const cwd = options.cwd ?? getProjectDir();
-	const home = os.homedir();
+	const home = getTrustedHomeDir();
 	const repoRoot = await findRepoRoot(cwd);
 	const ctx: LoadContext = { cwd, home, repoRoot };
 	const providers = filterProviders(capability, options);

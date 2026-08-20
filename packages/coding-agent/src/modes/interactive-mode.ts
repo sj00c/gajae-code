@@ -1255,6 +1255,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.requestRender();
 		return true;
 	}
+	hasPendingSubmission(): boolean {
+		return this.#pendingSubmittedInput !== undefined;
+	}
 
 	markPendingSubmissionStarted(input: SubmittedUserInput): boolean {
 		if (this.#pendingSubmittedInput !== input || input.cancelled) {

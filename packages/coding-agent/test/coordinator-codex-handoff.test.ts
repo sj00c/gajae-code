@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -174,6 +174,36 @@ console.log(JSON.stringify(await recordCodexWakeEvent(${JSON.stringify(root)}, {
 			await fs.readFile(path.join(root, "codex-wake-events", "session-atomic__7.json"), "utf8"),
 		) as Record<string, unknown>;
 		expect(persisted).toMatchObject(winner.event);
+	});
+	it("cleans a staged wake and preserves write/close failures", async () => {
+		const root = await tempRoot();
+		const realOpen = fs.open;
+		const open = spyOn(fs, "open").mockImplementation(async (...args) => {
+			if (String(args[0]).endsWith(".tmp"))
+				return {
+					async writeFile(): Promise<void> {
+						throw Object.assign(new Error("EIO"), { code: "EIO" });
+					},
+					async sync(): Promise<void> {},
+					async close(): Promise<void> {
+						throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+					},
+				} as unknown as fs.FileHandle;
+			return await realOpen(...args);
+		});
+		try {
+			await expect(
+				recordCodexWakeEvent(root, {
+					work_unit: "session-staged-failure",
+					event_seq: 1,
+					event_kind: "turn.completed",
+					summary: "failure",
+				}),
+			).rejects.toBeInstanceOf(AggregateError);
+			expect((await fs.readdir(root)).some(entry => entry.endsWith(".tmp"))).toBe(false);
+		} finally {
+			open.mockRestore();
+		}
 	});
 	it("never exposes a partial delegate binding to concurrent binders", async () => {
 		const root = await tempRoot();

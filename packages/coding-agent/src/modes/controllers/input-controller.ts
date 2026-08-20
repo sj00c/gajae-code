@@ -15,6 +15,7 @@ import {
 	type ComposerSubmissionOptions,
 	canApplyComposerSubmission,
 	type InteractiveModeContext,
+	stopInteractiveActivityIndicator,
 } from "../../modes/types";
 import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
@@ -219,9 +220,13 @@ export class InputController {
 			case "app.queue.togglePane":
 				return true;
 			case "app.message.sendNow":
+				// `sendNow()` falls back to `getQueuedMessageEntries()[0]`, which returns
+				// only visible steering/follow-up entries, so advertising the action for
+				// hidden next-turn context enabled a keybinding whose only outcome is
+				// "No visible queued message to send".
 				return (
 					this.ctx.session.isStreaming &&
-					(this.ctx.editor.getText().trim().length > 0 || this.ctx.session.queuedMessageCount > 0)
+					(this.ctx.editor.getText().trim().length > 0 || this.ctx.session.drainableQueuedMessageCount > 0)
 				);
 			default:
 				return true;
@@ -356,8 +361,29 @@ export class InputController {
 			if (this.ctx.cancelPendingSubmission()) {
 				return true;
 			}
-			this.restoreQueuedMessagesToEditor({ abort: true });
-			return true;
+			// Only count queues this handler can actually drain. The aggregate
+			// `queuedMessageCount` also counts hidden next-turn context, which
+			// `restoreQueuedMessagesToEditor()` never returns and which survives turn
+			// completion by design, so gating on the aggregate left a permanently
+			// nonzero count that made every press a no-op abort — the #4741 lockout.
+			const hasCancellableWork =
+				this.ctx.hasPendingSubmission() ||
+				this.ctx.session.drainableQueuedMessageCount > 0 ||
+				(this.ctx.compactionQueuedMessages?.length ?? 0) > 0 ||
+				this.ctx.session.isStreaming ||
+				this.ctx.session.isCompacting;
+			if (hasCancellableWork) {
+				this.restoreQueuedMessagesToEditor({ abort: true });
+				return true;
+			}
+			// The loader outlived its turn and no submission is pending (a started
+			// submission still inside prompt preflight stays cancellable above, so
+			// Esc aborts it instead of letting it start later), so nothing is
+			// cancellable even though the busy indicator is still mounted (#4741).
+			// Stop the stale indicator so completed work clears the busy state and
+			// keep evaluating the remaining states; when none match, the key falls
+			// through to idle semantics instead of a no-op abort that swallows it.
+			stopInteractiveActivityIndicator(this.ctx);
 		}
 		if (options.processes && this.ctx.session.isBashRunning) {
 			this.ctx.session.abortBash();
@@ -440,7 +466,7 @@ export class InputController {
 			if (isClearKey && !isInterruptKey) {
 				if (this.#handlePendingSteerInterrupt()) return { consume: true };
 				if (
-					!this.#handleCancellableWorkEscape({
+					this.#handleCancellableWorkEscape({
 						loading: true,
 						processes: true,
 						modes: true,
@@ -449,10 +475,12 @@ export class InputController {
 						streaming: true,
 					})
 				) {
-					return undefined;
+					this.#resetEscapeGestures();
+					return { consume: true };
 				}
-				this.#resetEscapeGestures();
-				return { consume: true };
+				// A stale loader was stopped and nothing else consumed the clear key:
+				// release it to the editor so the idle clear path still runs (#4741).
+				return undefined;
 			}
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
 				this.#resetEscapeGestures();
@@ -861,8 +889,11 @@ export class InputController {
 			}
 		}
 
-		// Empty submit while streaming with queued messages: flush queues immediately
-		if (!text && this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount > 0) {
+		// Empty submit while streaming with queued messages: flush queues immediately.
+		// Only drainable queues justify the abort — aborting for hidden next-turn
+		// context would kill the live turn without flushing anything, since that
+		// context is not delivered by the resume path this abort relies on.
+		if (!text && this.ctx.session.isStreaming && this.ctx.session.drainableQueuedMessageCount > 0) {
 			// Abort current stream and let queued messages be processed
 			await this.#abortInteractive();
 			return;

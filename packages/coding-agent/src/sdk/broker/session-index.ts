@@ -723,35 +723,60 @@ async function syncDirectory(file: string): Promise<void> {
 		if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) return;
 		throw error;
 	}
+	let syncError: unknown;
 	try {
 		await handle.sync();
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
-		if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES")) throw error;
-	} finally {
-		await handle.close();
+		if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES")) syncError = error;
 	}
+	try {
+		await handle.close();
+	} catch (closeError) {
+		if (syncError) throw new AggregateError([syncError, closeError], "session-index directory sync and close failed");
+		throw closeError;
+	}
+	if (syncError) throw syncError;
 }
 
 async function writeAndSync(file: string, contents: Buffer | string): Promise<void> {
 	const handle = await fs.open(file, "w", 0o600);
+	let writeError: unknown;
 	try {
 		await handle.writeFile(contents);
 		await handle.sync();
-	} finally {
-		await handle.close();
+	} catch (error) {
+		writeError = error;
 	}
+	try {
+		await handle.close();
+	} catch (closeError) {
+		if (writeError) throw new AggregateError([writeError, closeError], "session-index write and close failed");
+		throw closeError;
+	}
+	if (writeError) throw writeError;
 }
 
 async function replaceAtomically(file: string, contents: Buffer | string): Promise<void> {
 	const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+	let primaryError: unknown;
 	try {
 		await writeAndSync(temporary, contents);
 		await fs.rename(temporary, file);
 		await syncDirectory(file);
-	} finally {
-		await fs.rm(temporary, { force: true });
+	} catch (error) {
+		primaryError = error;
 	}
+	let cleanupError: unknown;
+	try {
+		await fs.rm(temporary, { force: true });
+	} catch (error) {
+		cleanupError = error;
+	}
+	if (primaryError && cleanupError)
+		throw new AggregateError([primaryError, cleanupError], "session-index replace and cleanup failed");
+	if (primaryError) throw primaryError;
+	if (cleanupError) throw cleanupError;
 }
 
 function alive(pid: number): boolean {
@@ -1325,10 +1350,7 @@ export class SessionIndex {
 	async #rotate(): Promise<void> {
 		await this.#snapshotUnderLock();
 		const file = logFor(this.#agentDir);
-		const temporary = `${file}.${process.pid}.tmp`;
-		await fs.writeFile(temporary, "", { mode: 0o600 });
-		await fs.rename(temporary, file);
-		await syncDirectory(file);
+		await replaceAtomically(file, "");
 		this.#logOffset = 0;
 	}
 

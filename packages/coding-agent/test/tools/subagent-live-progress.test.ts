@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { GenAIAttr, resolveTelemetry, startChatSpan } from "@gajae-code/agent-core/telemetry";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { AsyncJobManager, type SubagentRecord } from "../../src/async";
 import { Settings } from "../../src/config/settings";
+import { mapAgentSessionEventToAcpSessionUpdates } from "../../src/modes/acp/acp-event-mapper";
+import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
 import type { AgentProgress } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
 import { SubagentTool } from "../../src/tools/implementations";
@@ -9,6 +14,7 @@ import {
 	type SubagentToolDetails,
 	subagentAwaitRenderedStateSignature,
 } from "../../src/tools/subagent";
+import { subagentToolRenderer } from "../../src/tools/subagent-render";
 
 function createSession(agentId = "0-Main"): ToolSession {
 	return {
@@ -90,7 +96,7 @@ describe("subagent await live progress", () => {
 		expect(snap?.status).toBe("running");
 		expect(snap?.liveProgressAvailable).toBe(true);
 		expect(snap?.progress?.currentTool).toBe("read");
-		expect(snap?.progress?.recentOutput).toContain("scanning files");
+		expect(snap?.progress?.recentOutputSummary).toEqual({ lineCount: 1 });
 
 		manager.cancelSubagent("0-Live", { ownerId: "0-Main" });
 		await manager.dispose({ timeoutMs: 100 });
@@ -414,12 +420,17 @@ describe("subagentAwaitRenderedStateSignature", () => {
 	it("is value-based: equal values from independent clones produce identical signatures", () => {
 		const a = makeSnapshot({
 			id: "0-A",
-			progress: makeProgress({ id: "0-A", currentTool: "read", recentOutput: ["x"] }),
+			progress: {
+				id: "0-A",
+				status: "running",
+				currentTool: "read",
+				recentOutputSummary: { lineCount: 1 },
+			},
 		});
 		const b = makeSnapshot({
 			id: "0-A",
 			// structuredClone yields a different object reference with equal values.
-			progress: structuredClone(makeProgress({ id: "0-A", currentTool: "read", recentOutput: ["x"] })),
+			progress: structuredClone(a.progress),
 		});
 		expect(subagentAwaitRenderedStateSignature([a])).toBe(subagentAwaitRenderedStateSignature([b]));
 	});
@@ -428,52 +439,46 @@ describe("subagentAwaitRenderedStateSignature", () => {
 		const early = makeSnapshot({
 			id: "0-A",
 			durationMs: 1_000,
-			progress: makeProgress({
+			progress: {
 				id: "0-A",
-				durationMs: 1_000,
+				status: "running",
 				currentTool: "read",
-				currentToolStartMs: 1_000,
 				retryState: {
 					attempt: 1,
 					maxAttempts: 3,
 					kind: "provider_error",
 					delayMs: 5_000,
-					errorMessage: "429",
 					startedAtMs: 1_000,
 				},
-			}),
+			},
 		});
 		const later = makeSnapshot({
 			id: "0-A",
 			durationMs: 999_999,
-			progress: makeProgress({
+			progress: {
 				id: "0-A",
-				durationMs: 999_999,
+				status: "running",
 				currentTool: "read",
-				currentToolStartMs: 2_000,
 				retryState: {
 					attempt: 1,
 					maxAttempts: 3,
 					kind: "provider_error",
 					delayMs: 5_000,
-					errorMessage: "429",
 					startedAtMs: 2_000,
 				},
-			}),
+			},
 		});
 		expect(subagentAwaitRenderedStateSignature([later])).toBe(subagentAwaitRenderedStateSignature([early]));
 	});
 
 	it("changes when any rendered field changes", () => {
-		const baseProgress = makeProgress({
+		const baseProgress = {
 			id: "0-A",
 			status: "running",
 			currentTool: "read",
-			recentOutput: ["x"],
-			toolCount: 1,
-			tokens: 10,
-			cost: 0.1,
-		});
+			recentOutputSummary: { lineCount: 1 },
+			fastMode: false,
+		} as const;
 		const base = makeSnapshot({ id: "0-A", status: "running", progress: baseProgress });
 		const baseSig = subagentAwaitRenderedStateSignature([base]);
 
@@ -492,23 +497,10 @@ describe("subagentAwaitRenderedStateSignature", () => {
 			s => ({ ...s, description: "new description" }),
 			s => ({ ...s, assignment: "new assignment" }),
 			s => ({ ...s, progress: { ...baseProgress, currentTool: "bash" } }),
-			s => ({ ...s, progress: { ...baseProgress, currentToolArgs: "ls -la" } }),
-			s => ({ ...s, progress: { ...baseProgress, lastIntent: "thinking" } }),
-			s => ({ ...s, progress: { ...baseProgress, recentOutput: ["y"] } }),
-			s => ({ ...s, progress: { ...baseProgress, recentTools: [{ tool: "read", args: "f", endMs: 0 }] } }),
-			s => ({ ...s, progress: { ...baseProgress, toolCount: 2 } }),
-			s => ({ ...s, progress: { ...baseProgress, tokens: 20 } }),
-			s => ({ ...s, progress: { ...baseProgress, contextTokens: 100 } }),
-			s => ({ ...s, progress: { ...baseProgress, contextWindow: 200_000 } }),
-			s => ({ ...s, progress: { ...baseProgress, cost: 0.2 } }),
+			s => ({ ...s, progress: { ...baseProgress, recentTool: "read", currentTool: undefined } }),
+			s => ({ ...s, progress: { ...baseProgress, recentOutputSummary: { lineCount: 2 } } }),
+			s => ({ ...s, progress: { ...baseProgress, fastMode: true } }),
 			s => ({ ...s, progress: { ...baseProgress, status: "completed" } }),
-			s => ({
-				...s,
-				progress: {
-					...baseProgress,
-					modelSubstitutionWarning: { requested: "a", effective: "b", reason: "auth_unavailable" },
-				},
-			}),
 			s => ({
 				...s,
 				progress: {
@@ -518,20 +510,11 @@ describe("subagentAwaitRenderedStateSignature", () => {
 						maxAttempts: 3,
 						kind: "provider_error",
 						delayMs: 1_000,
-						errorMessage: "429",
 						startedAtMs: 0,
 					},
 				},
 			}),
-			s => ({ ...s, progress: { ...baseProgress, retryFailure: { attempt: 3, errorMessage: "gave up" } } }),
-			s => ({ ...s, progress: { ...baseProgress, extractedToolData: { task: [{ id: "n1", status: "running" }] } } }),
-			s => ({
-				...s,
-				progress: {
-					...baseProgress,
-					inflightTaskDetails: { id: "t1" } as unknown as NonNullable<AgentProgress["inflightTaskDetails"]>,
-				},
-			}),
+			s => ({ ...s, progress: { ...baseProgress, retryFailure: { attempt: 3 } } }),
 		];
 
 		for (const mutate of mutations) {
@@ -539,86 +522,32 @@ describe("subagentAwaitRenderedStateSignature", () => {
 		}
 	});
 
-	it("recentOutput tail changes are reflected (producer never drops real output progress)", () => {
-		const a = makeSnapshot({ id: "0-A", progress: makeProgress({ id: "0-A", recentOutput: ["a", "b"] }) });
-		const b = makeSnapshot({ id: "0-A", progress: makeProgress({ id: "0-A", recentOutput: ["a", "b", "c"] }) });
+	it("recent-output summary count changes are reflected without exposing output", () => {
+		const a = makeSnapshot({
+			id: "0-A",
+			progress: { id: "0-A", status: "running", recentOutputSummary: { lineCount: 2 } },
+		});
+		const b = makeSnapshot({
+			id: "0-A",
+			progress: { id: "0-A", status: "running", recentOutputSummary: { lineCount: 3 } },
+		});
 		expect(subagentAwaitRenderedStateSignature([a])).not.toBe(subagentAwaitRenderedStateSignature([b]));
 	});
 
-	it("ignores nested task time churn but reflects nested status changes", () => {
-		const makeInflight = (
-			durationMs: number,
-			nestedStatus: AgentProgress["status"],
-		): NonNullable<AgentProgress["inflightTaskDetails"]> =>
-			({
-				projectAgentsDir: null,
-				results: [],
-				totalDurationMs: durationMs,
-				progress: [makeProgress({ id: "child", status: nestedStatus, durationMs, currentToolStartMs: durationMs })],
-			}) as unknown as NonNullable<AgentProgress["inflightTaskDetails"]>;
-
-		const early = makeSnapshot({
+	it("does not include nested task payloads in the signature", () => {
+		const safe = makeSnapshot({ id: "0-A", progress: { id: "0-A", status: "running", currentTool: "task" } });
+		const withRawNested = makeSnapshot({
 			id: "0-A",
-			progress: makeProgress({ id: "0-A", inflightTaskDetails: makeInflight(1_000, "running") }),
+			progress: { id: "0-A", status: "running", currentTool: "task" },
 		});
-		const later = makeSnapshot({
-			id: "0-A",
-			progress: makeProgress({ id: "0-A", inflightTaskDetails: makeInflight(999_999, "running") }),
-		});
-		const statusChanged = makeSnapshot({
-			id: "0-A",
-			progress: makeProgress({ id: "0-A", inflightTaskDetails: makeInflight(1_000, "completed") }),
-		});
-
-		// Nested task time churn (totalDurationMs + nested progress duration/elapsed) is ignored.
-		expect(subagentAwaitRenderedStateSignature([later])).toBe(subagentAwaitRenderedStateSignature([early]));
-		// A real nested status change still emits.
-		expect(subagentAwaitRenderedStateSignature([statusChanged])).not.toBe(
-			subagentAwaitRenderedStateSignature([early]),
-		);
+		expect(subagentAwaitRenderedStateSignature([withRawNested])).toBe(subagentAwaitRenderedStateSignature([safe]));
 	});
 
-	it("changes when only fastMode flips, at every rendered progress route", () => {
-		// The nested task panel renders `AgentProgress.fastMode`, and the producer's
-		// await gating plus the body cache both key off this signature. If the shared
-		// progress canonicalizer omits fastMode, the one update that introduces the
-		// glyph compares byte-identical and is suppressed, leaving a stale body.
-		const nestedTask = (fastMode: boolean) =>
-			[{ id: "n1", progress: [makeProgress({ id: "n1", fastMode })] }] as unknown as NonNullable<
-				AgentProgress["extractedToolData"]
-			>["task"];
-		const inflight = (fastMode: boolean) =>
-			({ id: "t1", progress: [makeProgress({ id: "t1", fastMode })] }) as unknown as NonNullable<
-				AgentProgress["inflightTaskDetails"]
-			>;
-
-		const routes: Array<[string, (fastMode: boolean) => SubagentSnapshot]> = [
-			["root progress", fastMode => makeSnapshot({ id: "0-A", progress: makeProgress({ id: "0-A", fastMode }) })],
-			[
-				"inflightTaskDetails.progress",
-				fastMode =>
-					makeSnapshot({
-						id: "0-A",
-						progress: makeProgress({ id: "0-A", inflightTaskDetails: inflight(fastMode) }),
-					}),
-			],
-			[
-				"extractedToolData.task[].progress",
-				fastMode =>
-					makeSnapshot({
-						id: "0-A",
-						progress: makeProgress({ id: "0-A", extractedToolData: { task: nestedTask(fastMode) } }),
-					}),
-			],
-		];
-
-		for (const [route, build] of routes) {
-			const slow = subagentAwaitRenderedStateSignature([build(false)]);
-			const fast = subagentAwaitRenderedStateSignature([build(true)]);
-			expect(fast, `fastMode must reach the signature via ${route}`).not.toBe(slow);
-			// Same value twice stays stable, so the difference is fastMode and not churn.
-			expect(subagentAwaitRenderedStateSignature([build(true)])).toBe(fast);
-		}
+	it("changes when only approved fastMode flips", () => {
+		const slow = makeSnapshot({ id: "0-A", progress: { id: "0-A", status: "running", fastMode: false } });
+		const fast = makeSnapshot({ id: "0-A", progress: { id: "0-A", status: "running", fastMode: true } });
+		expect(subagentAwaitRenderedStateSignature([fast])).not.toBe(subagentAwaitRenderedStateSignature([slow]));
+		expect(subagentAwaitRenderedStateSignature([fast])).toBe(subagentAwaitRenderedStateSignature([fast]));
 	});
 });
 
@@ -679,7 +608,7 @@ describe("subagent await emit gating", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
-	it("emits exactly once when only a nested task's fastMode flips, and not for an unchanged poll", async () => {
+	it("emits exactly once when only approved fastMode flips, and not for an unchanged poll", async () => {
 		vi.useFakeTimers();
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());
@@ -699,15 +628,7 @@ describe("subagent await emit gating", () => {
 		);
 		manager.registerSubagentRecord(runningRecord("0-Nested", jobId));
 
-		const nested = (fastMode: boolean) =>
-			makeProgress({
-				id: "0-Nested",
-				currentTool: "task",
-				inflightTaskDetails: {
-					id: "t1",
-					progress: [makeProgress({ id: "n1", fastMode })],
-				} as unknown as NonNullable<AgentProgress["inflightTaskDetails"]>,
-			});
+		const nested = (fastMode: boolean) => makeProgress({ id: "0-Nested", currentTool: "read", fastMode });
 
 		manager.recordSubagentProgress("0-Nested", nested(false));
 		const ac = new AbortController();
@@ -721,17 +642,17 @@ describe("subagent await emit gating", () => {
 		await Promise.resolve();
 		expect(spy).toHaveBeenCalledTimes(1);
 
-		// Re-recording the identical nested progress is not a rendered-state change.
+		// Re-recording the identical approved progress is not a rendered-state change.
 		manager.recordSubagentProgress("0-Nested", nested(false));
 		vi.advanceTimersByTime(500);
 		expect(spy).toHaveBeenCalledTimes(1);
 
-		// Flipping only the nested fastMode changes what renders, so it must emit once.
+		// Flipping only the approved fastMode changes what renders, so it must emit once.
 		manager.recordSubagentProgress("0-Nested", nested(true));
 		vi.advanceTimersByTime(500);
 		expect(spy).toHaveBeenCalledTimes(2);
 		const emitted = spy.mock.calls.at(-1)?.[0] as { details?: SubagentToolDetails } | undefined;
-		expect(emitted?.details?.subagents?.[0]?.progress?.inflightTaskDetails?.progress?.[0]?.fastMode).toBe(true);
+		expect(emitted?.details?.subagents?.[0]?.progress?.fastMode).toBe(true);
 
 		// And the new value is then stable: another identical poll stays quiet.
 		manager.recordSubagentProgress("0-Nested", nested(true));
@@ -741,6 +662,199 @@ describe("subagent await emit gating", () => {
 		ac.abort();
 		control.resolve();
 		await exec;
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("emits retry start and recovery but suppresses countdown-only churn", async () => {
+		vi.useFakeTimers();
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const control = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"task",
+			"retrying subagent",
+			async () => {
+				await control.promise;
+				return "done";
+			},
+			{
+				id: "job-retry",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-Retry", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord(runningRecord("0-Retry", jobId));
+		const retry = (attempt: number, startedAtMs: number, lastProviderProgressAtMs?: number) =>
+			makeProgress({
+				id: "0-Retry",
+				status: "running",
+				retryState: {
+					attempt,
+					maxAttempts: 3,
+					kind: "provider_error",
+					provider: "anthropic",
+					delayMs: 5_000,
+					errorMessage: "provider unavailable",
+					startedAtMs,
+					...(lastProviderProgressAtMs === undefined ? {} : { lastProviderProgressAtMs }),
+				},
+			});
+
+		manager.recordSubagentProgress("0-Retry", retry(1, 0));
+		const ac = new AbortController();
+		const spy = vi.fn();
+		const pending = tool.execute(
+			"await-retry",
+			{ action: "await", ids: ["0-Retry"], timeout_ms: 3_600_000 },
+			ac.signal,
+			spy,
+		);
+		await Promise.resolve();
+		expect(spy).toHaveBeenCalledTimes(1);
+
+		// Only retry timing changed; the approved signature must stay stable.
+		manager.recordSubagentProgress("0-Retry", retry(1, 1_000, 900));
+		vi.advanceTimersByTime(500);
+		expect(spy).toHaveBeenCalledTimes(1);
+
+		// A new attempt is a real rendered-state transition.
+		manager.recordSubagentProgress("0-Retry", retry(2, 1_000, 900));
+		vi.advanceTimersByTime(500);
+		expect(spy).toHaveBeenCalledTimes(2);
+
+		// Recovery clears retry state and emits once.
+		manager.recordSubagentProgress("0-Retry", makeProgress({ id: "0-Retry", currentTool: "read" }));
+		vi.advanceTimersByTime(500);
+		expect(spy).toHaveBeenCalledTimes(3);
+
+		ac.abort();
+		control.resolve();
+		await pending;
+		await manager.dispose({ timeoutMs: 100 });
+	});
+});
+
+describe("subagent await progress visibility boundary", () => {
+	afterEach(() => {
+		AsyncJobManager.resetForTests();
+	});
+
+	it("carries live progress in details for the renderer and never in model-visible content", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const jobId = manager.register(
+			"task",
+			"visibility subagent",
+			async () => {
+				await Bun.sleep(150);
+				return "done";
+			},
+			{
+				id: "job-vis",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-Vis", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord(runningRecord("0-Vis", jobId));
+		manager.recordSubagentProgress(
+			"0-Vis",
+			makeProgress({ id: "0-Vis", currentTool: "read", recentOutput: ["secret-marker-text"] }),
+		);
+
+		const result = await tool.execute("await", { action: "await", ids: ["0-Vis"], timeout_ms: 5 });
+
+		const snap = result.details?.subagents.find(s => s.id === "0-Vis");
+		expect(snap?.progress?.currentTool).toBe("read");
+		expect(snap?.progress?.recentOutputSummary).toEqual({ lineCount: 1 });
+
+		const modelText = result.content.map(part => ("text" in part ? part.text : "")).join("\n");
+		expect(modelText).not.toContain("secret-marker-text");
+		expect(modelText).toContain("0-Vis");
+
+		// Tool-result serialization is a public boundary: the approved DTO carries
+		// only a count, never the raw marker or any other recent output text.
+		const serializedToolResult = JSON.stringify({
+			role: "toolResult",
+			toolName: "subagent",
+			content: result.content,
+			details: result.details,
+		});
+		expect(serializedToolResult).not.toContain("secret-marker-text");
+
+		const acpNotifications = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "call-vis",
+				toolName: "subagent",
+				result,
+				isError: false,
+			},
+			"session-vis",
+		);
+		expect(JSON.stringify(acpNotifications)).not.toContain("secret-marker-text");
+
+		const exporter = new InMemorySpanExporter();
+		const tracerProvider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+		const telemetry = resolveTelemetry(
+			{ tracer: tracerProvider.getTracer("subagent-live-progress-test"), captureMessageContent: true },
+			"session-vis",
+		);
+		const mockModel = createMockModel({ id: "mock-model", provider: "mock-provider", responses: [] }).model;
+		const telemetrySpan = startChatSpan(telemetry, mockModel, {
+			stepNumber: 0,
+			request: {
+				messages: [
+					{
+						role: "toolResult",
+						toolCallId: "call-vis",
+						toolName: "subagent",
+						content: result.content,
+						details: result.details,
+						isError: false,
+						timestamp: Date.now(),
+					},
+				],
+			},
+		});
+		telemetrySpan?.end();
+		await tracerProvider.forceFlush();
+		const telemetryInput = exporter.getFinishedSpans()[0]?.attributes[GenAIAttr.InputMessages];
+		expect(telemetryInput).toBeDefined();
+		expect(String(telemetryInput)).not.toContain("secret-marker-text");
+		await tracerProvider.shutdown();
+
+		const theme = (await getThemeByName("red-claw"))!;
+		setThemeInstance(theme);
+		const rendered = Bun.stripANSI(
+			subagentToolRenderer
+				.renderResult(result, { expanded: true, isPartial: true, spinnerFrame: 0 }, theme)
+				.render(160)
+				.join("\n"),
+		);
+		expect(rendered).toContain("read");
+		expect(rendered).toContain("recent output available (1 line)");
+		expect(rendered).not.toContain("secret-marker-text");
+
+		const staleResult = {
+			...result,
+			details: {
+				...result.details,
+				subagents: result.details!.subagents.map(snapshot => ({
+					...snapshot,
+					liveProgressAvailable: false,
+				})),
+			},
+		};
+		const staleRendered = Bun.stripANSI(
+			subagentToolRenderer
+				.renderResult(staleResult, { expanded: true, isPartial: true, spinnerFrame: 0 }, theme)
+				.render(160)
+				.join("\n"),
+		);
+		expect(staleRendered).not.toContain("recent output available");
+		expect(staleRendered).not.toContain("read");
+
+		manager.cancelSubagent("0-Vis", { ownerId: "0-Main" });
 		await manager.dispose({ timeoutMs: 100 });
 	});
 });

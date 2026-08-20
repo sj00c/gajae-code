@@ -10,6 +10,8 @@ import {
 	type AuthStorage,
 	type CredentialInventoryRecord,
 	type CredentialRemovalTarget,
+	OAuthCredentialSelectorError,
+	type OAuthPinTarget,
 	resolveOAuthStorageProvider,
 } from "@gajae-code/ai/core";
 import { getAgentDir } from "@gajae-code/utils";
@@ -44,6 +46,10 @@ class AccountsCommandError extends Error {
 		super(message);
 		this.name = "AccountsCommandError";
 	}
+}
+export function toAccountsCommandError(error: unknown): AccountsCommandError | undefined {
+	if (error instanceof OAuthCredentialSelectorError) return new AccountsCommandError(error.message);
+	return undefined;
 }
 
 function writeJson(value: unknown): void {
@@ -264,7 +270,12 @@ async function runPin(
 		) {
 			throw new AccountsCommandError(`Provider ${provider} is not configured; no pin was written.`);
 		}
-		const target = storage.resolveOAuthPinTarget(provider, selector);
+		let target: OAuthPinTarget;
+		try {
+			target = storage.resolveOAuthPinTarget(provider, selector);
+		} catch (error) {
+			throw toAccountsCommandError(error) ?? error;
+		}
 		const canonicalSelector = `${target.canonicalSelector.kind}:${target.canonicalSelector.value}`;
 		await writePersistentPin(provider, canonicalSelector, false, startupAuth.credentialStoreIdentity);
 		if (flags.json) writeJson({ ok: true, provider, selector: canonicalSelector });
@@ -386,6 +397,11 @@ export async function runAccountsCommand(cmd: AccountsCommandArgs): Promise<void
 			}
 			process.exitCode = 1;
 			writeJsonFailure(error);
+			return;
+		}
+		if (error instanceof AccountsCommandError) {
+			process.stderr.write(`${error.message}\n`);
+			process.exitCode = 1;
 			return;
 		}
 		throw error;

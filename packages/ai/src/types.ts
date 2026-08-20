@@ -669,6 +669,26 @@ export interface Usage {
 
 export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
 export type AssistantErrorKind = "provider_safety_stop" | "local_snapshot_failure" | "local_buffer_overflow";
+/**
+ * Structured, shape-only staging-buffer overflow diagnostic carried on the
+ * terminal `AssistantMessage`. Attached only by the agent runtime from its own
+ * identity-checked overflow error; every field is a closed vocabulary literal
+ * or a locally synthesized number.
+ */
+export interface AssistantBufferOverflowDiagnostic {
+	/** Rejecting stage from the closed managed-local-failure vocabulary. */
+	stage: string;
+	/** Which provisional cap tripped. */
+	exceeded: "events" | "bytes" | "both";
+	/** Events retained in the batch at rejection (post-compaction). */
+	stagedEventCount: number;
+	/** Bytes retained in the batch at rejection (post-compaction). */
+	stagedBytes: number;
+	/** Serialized size of the event that was rejected. */
+	incomingEventBytes: number;
+	maxStagedEvents: number;
+	maxStagedBytes: number;
+}
 
 export interface OpenAIResponsesHistoryPayload {
 	type: "openaiResponsesHistory";
@@ -712,6 +732,15 @@ export interface AssistantMessage {
 	stopReason: StopReason;
 	errorMessage?: string;
 	errorKind?: AssistantErrorKind;
+	/**
+	 * Structured, shape-only diagnostic for a terminal local staging-buffer
+	 * overflow (`errorKind: "local_buffer_overflow"`). Attached only by the
+	 * agent runtime from its own identity-checked overflow error, so a
+	 * foreign, self-labeled error cannot populate it. Every field is a closed
+	 * vocabulary literal or a locally synthesized number — parent surfaces
+	 * render this instead of trusting the free-form `errorMessage`.
+	 */
+	bufferOverflow?: AssistantBufferOverflowDiagnostic;
 	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
 	errorStatus?: number;
 	/** Typed upstream failure facts retained for retry classification without parsing errorMessage. */

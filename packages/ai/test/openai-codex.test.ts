@@ -5,6 +5,7 @@ import {
 	codexToolCanonicalName,
 	codexToolWireName,
 	convertOpenAICodexResponsesTools,
+	formatCodexUserAgent,
 	normalizeCodexToolChoice,
 } from "@gajae-code/ai/providers/openai-codex-responses";
 import type { Tool } from "@gajae-code/ai/types";
@@ -12,6 +13,21 @@ import { createCodexModel } from "./helpers";
 
 const DEFAULT_PROMPT_PREFIX =
 	"You are an expert coding assistant. You help users with coding tasks by reading files, executing commands";
+
+describe("openai-codex user agent", () => {
+	it("removes non-ASCII kernel release characters before constructing the header", () => {
+		const userAgent = formatCodexUserAgent("linux", "4.4.302-Minimal™-EAS-QTI_Haptic-R26", "arm64");
+
+		expect(userAgent).toMatch(/^pi\/[^ ]+ \(linux 4\.4\.302-Minimal-EAS-QTI_Haptic-R26; arm64\)$/);
+		expect(() => new Headers({ "User-Agent": userAgent })).not.toThrow();
+	});
+
+	it("removes control characters from dynamic platform values", () => {
+		const userAgent = formatCodexUserAgent("linux\n", "6.8.0\t-generic", "arm64\r");
+
+		expect(userAgent).toMatch(/^pi\/[^ ]+ \(linux 6\.8\.0-generic; arm64\)$/);
+	});
+});
 
 describe("openai-codex tool schemas", () => {
 	it("adds empty properties to no-argument object parameter schemas", () => {

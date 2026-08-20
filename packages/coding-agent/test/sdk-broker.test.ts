@@ -9,7 +9,7 @@ import * as native from "@gajae-code/natives";
 import { getSessionsDir } from "@gajae-code/utils";
 
 import { lifecycleArgs } from "../src/commands/sdk";
-import { Broker, type BrokerResponse } from "../src/sdk/broker/broker";
+import { Broker, type BrokerResponse, setPublicationObservationForTest } from "../src/sdk/broker/broker";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
 	type BrokerDiscovery,
@@ -36,6 +36,7 @@ import {
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
+import { readBrokerStartupFailureMarker, writeBrokerStartupFailureMarker } from "../src/sdk/broker/startup-failure";
 import { prepareManagedSessionScopeForWrite, resolveManagedScope } from "../src/session/internal/managed-session-scope";
 import { SessionManager } from "../src/session/session-manager";
 import {
@@ -661,6 +662,7 @@ describe("SDK broker identity and discovery", () => {
 		await fs.rm(dir, { recursive: true, force: true });
 	});
 	it("rolls back its publication when retained authority acquisition fails", async () => {
+		if (process.platform === "win32") return;
 		const dir = await temp();
 		const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
 			throw new Error("retain failed");
@@ -682,6 +684,506 @@ describe("SDK broker identity and discovery", () => {
 				}),
 			).rejects.toThrow("retain failed");
 			expect(await fs.stat(brokerDiscoveryPath(dir)).catch(() => null)).toBeNull();
+		} finally {
+			retain.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("names the redirected publication object when authority is withheld", async () => {
+		// A shared multi-account layout that symlinks the agent directory's `sdk`
+		// entry is refused by the no-follow open, and the native layer reports only
+		// one opaque failure. The broker must still fail closed, but the operator
+		// needs the responsible object named.
+		// win32 takes the legacy publication path and never reaches native retention;
+		// creating the symlink there also needs a privilege the runner may not hold.
+		if (process.platform === "win32") return;
+		const host = await temp();
+		const dir = await temp();
+		try {
+			await fs.mkdir(path.join(host, "sdk"), { recursive: true, mode: 0o700 });
+			await fs.symlink(path.join(host, "sdk"), path.join(dir, "sdk"));
+			const refusal = await publishBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "redirected-owner",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "redirected-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			}).then(
+				() => undefined,
+				(error: unknown) => error as Error,
+			);
+			expect(refusal?.message).toMatch(/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/);
+			// The native refusal stays authoritative and is retained verbatim as cause.
+			expect((refusal?.cause as Error | undefined)?.message).toContain(
+				"Retained broker publication authority is unavailable.",
+			);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+			await fs.rm(host, { recursive: true, force: true });
+		}
+	});
+	it("names a missing publication object when authority is withheld", async () => {
+		// Exercises the real native refusal (no mock) for an object other than the
+		// redirected-directory case, so the naming path is pinned end to end.
+		if (process.platform === "win32") return;
+		const dir = await temp();
+		try {
+			await fs.mkdir(path.join(dir, "sdk", "broker.lock"), { recursive: true, mode: 0o700 });
+			await expect(
+				publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "test",
+					ownerId: "recordless-owner",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "recordless-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}),
+			).rejects.toThrow(/owner\.json is missing/);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("names an unreadable publication object when authority is withheld", async () => {
+		// Root bypasses the permission bits this fixture depends on, and so does any
+		// runner holding DAC_OVERRIDE or a permissive ACL, so the fixture proves it
+		// is actually denied before asserting on the denial.
+		if (process.platform === "win32" || process.getuid?.() === 0) return;
+		const dir = await temp();
+		const owner = path.join(dir, "sdk", "broker.lock", "owner.json");
+		const discovery = {
+			version: 1 as const,
+			protocolVersion: 3 as const,
+			packageGeneration: "unreadable-owner",
+			ownerId: "unreadable-owner",
+			pid: process.pid,
+			host: "127.0.0.1" as const,
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "unreadable-token",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+			incarnation: "unreadable-incarnation",
+		};
+		try {
+			await fs.mkdir(path.dirname(owner), { recursive: true, mode: 0o700 });
+			await fs.writeFile(owner, "owner", { mode: 0o600 });
+			await writeBrokerDiscovery(dir, discovery);
+			await fs.chmod(owner, 0o000);
+			const denial = await fs.open(owner, "r").then(
+				async handle => {
+					await handle.close();
+					return undefined;
+				},
+				(error: NodeJS.ErrnoException) => error.code,
+			);
+			if (!denial) return;
+			await expect(publishBrokerDiscovery(dir, discovery)).rejects.toThrow(
+				new RegExp(`owner\\.json could not be opened \\(${denial}\\)`),
+			);
+		} finally {
+			await fs.chmod(owner, 0o600).catch(() => {});
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("leaves a withheld-authority failure unexplained when every precondition holds", async () => {
+		// Naming a condition must never invent one: with all four publication
+		// objects intact the native message is surfaced verbatim.
+		if (process.platform === "win32") return;
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(lock, "owner.json"), JSON.stringify({ version: 1, pid: process.pid }), {
+			mode: 0o600,
+		});
+		const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
+			throw new Error("retain failed");
+		});
+		try {
+			await expect(
+				publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "test",
+					ownerId: "intact-owner",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "intact-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}),
+			).rejects.toThrow(/^retain failed$/);
+		} finally {
+			retain.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("names a published record whose heartbeat field cannot be edited in place", async () => {
+		// The native layer's last precondition is a fixed-width heartbeat it can
+		// overwrite in place. A record replaced between publication and retention
+		// (the race the precondition exists for) must be named, the foreign record
+		// must survive the exact rollback, and the native error must stay the cause.
+		if (process.platform === "win32") return;
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const foreign = '{"heartbeatAt":12}\n';
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(lock, "owner.json"), JSON.stringify({ version: 1, pid: process.pid }), {
+			mode: 0o600,
+		});
+		const nativeRefusal = new Error("Retained broker publication authority is unavailable.");
+		const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
+			syncFs.writeFileSync(brokerDiscoveryPath(dir), foreign);
+			throw nativeRefusal;
+		});
+		try {
+			const refusal = await publishBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "malformed-heartbeat-owner",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "malformed-heartbeat-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			}).then(
+				() => undefined,
+				(error: unknown) => error as Error,
+			);
+			expect(refusal?.message).toMatch(/broker\.json heartbeatAt is not a fixed-width 13-digit timestamp/);
+			expect(refusal?.cause).toBe(nativeRefusal);
+			// Rollback is exact: a record this publication does not own is left alone.
+			expect(await fs.readFile(brokerDiscoveryPath(dir), "utf8")).toBe(foreign);
+
+			retain.mockImplementation(() => {
+				syncFs.writeFileSync(brokerDiscoveryPath(dir), '{"ownerId":"foreign"}\n');
+				throw nativeRefusal;
+			});
+			await expect(
+				publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "test",
+					ownerId: "fieldless-owner",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "fieldless-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}),
+			).rejects.toThrow(/broker\.json has no heartbeatAt field/);
+
+			const emptyHeartbeatRecord = JSON.stringify({ ownerId: "foreign", padding: "" });
+			const exactFillRecord = JSON.stringify({
+				ownerId: "foreign",
+				padding: "x".repeat(4096 - Buffer.byteLength(emptyHeartbeatRecord)),
+			});
+			expect(Buffer.byteLength(exactFillRecord)).toBe(4096);
+			retain.mockImplementation(() => {
+				syncFs.writeFileSync(brokerDiscoveryPath(dir), exactFillRecord);
+				throw nativeRefusal;
+			});
+			await expect(
+				publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "exact-fill-owner",
+					ownerId: "exact-fill-owner",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "exact-fill-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}),
+			).rejects.toThrow(/broker\.json has no heartbeatAt field/);
+		} finally {
+			retain.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("does not blame a lock record the native layer only opens read-only", async () => {
+		// `RetainedPublication::open` opens `owner.json` read-only and only
+		// `broker.json` read/write. A readable-but-unwritable lock record is
+		// therefore not an obstruction, and must not mask the real later one.
+		if (process.platform === "win32") return;
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const owner = path.join(lock, "owner.json");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(owner, JSON.stringify({ version: 1, pid: process.pid }), { mode: 0o600 });
+		await fs.chmod(owner, 0o400);
+		const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
+			syncFs.writeFileSync(brokerDiscoveryPath(dir), '{"heartbeatAt":12}\n');
+			throw new Error("Retained broker publication authority is unavailable.");
+		});
+		try {
+			const refusal = await publishBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "read-only-owner-record",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "read-only-owner-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			}).then(
+				() => undefined,
+				(error: unknown) => error as Error,
+			);
+			expect(refusal?.message).toMatch(/broker\.json heartbeatAt is not a fixed-width 13-digit timestamp/);
+			expect(refusal?.message).not.toMatch(/owner\.json/);
+		} finally {
+			retain.mockRestore();
+			await fs.chmod(owner, 0o600).catch(() => {});
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("rejects a non-regular owner record before granting publication authority", async () => {
+		// Retained publication acquisition validates the owner descriptor kind before
+		// returning authority, preventing a special-file admission window.
+		if (process.platform === "win32") return;
+		const dir = await temp();
+		await fs.mkdir(path.join(dir, "sdk", "broker.lock", "owner.json"), { recursive: true, mode: 0o700 });
+		const discovery = {
+			version: 1 as const,
+			protocolVersion: 3 as const,
+			packageGeneration: "test",
+			ownerId: "directory-owner-record",
+			pid: process.pid,
+			host: "127.0.0.1" as const,
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "directory-owner-token",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		};
+		try {
+			// The unmocked native accepts this layout, which is what makes a kind
+			// complaint about it an invented condition.
+			const refusal = await publishBrokerDiscovery(dir, discovery).then(
+				() => undefined,
+				(error: unknown) => error as Error,
+			);
+			expect(refusal?.message).toMatch(/owner\.json is not a regular file/);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("names a native-rejected wrong-kind publication object", async () => {
+		if (process.platform === "win32") return;
+		const dir = await temp();
+		const nativeRefusal = new Error("Retained broker publication authority is unavailable.");
+		try {
+			await fs.mkdir(path.join(dir, "sdk"), { recursive: true, mode: 0o700 });
+			await fs.writeFile(path.join(dir, "sdk", "broker.lock"), "not a directory", { mode: 0o600 });
+			const refusal = await publishBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "wrong-kind-owner",
+				ownerId: "wrong-kind-owner",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "wrong-kind-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			}).then(
+				() => undefined,
+				(error: unknown) => error as Error,
+			);
+			expect(refusal?.message).toMatch(/sdk\/broker\.lock could not be opened \(ENOTDIR\)/);
+			expect((refusal?.cause as Error | undefined)?.message).toContain(nativeRefusal.message);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("escapes control and bidi characters in the diagnostic agent directory", async () => {
+		if (process.platform === "win32") return;
+		const root = await temp();
+		const host = await temp();
+		const dir = path.join(root, "agent\n\u001b[31m\u202e");
+		try {
+			await fs.mkdir(dir, { recursive: true });
+			await fs.mkdir(path.join(host, "sdk"), { recursive: true, mode: 0o700 });
+			await fs.symlink(path.join(host, "sdk"), path.join(dir, "sdk"));
+			const refusal = await publishBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "sanitized-agent-dir",
+				ownerId: "sanitized-agent-dir",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "sanitized-agent-dir-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			}).then(
+				() => undefined,
+				(error: unknown) => error as Error,
+			);
+			expect(refusal?.message).toMatch(/agent directory .*\\u000a.*\\u001b.*\\u202e/);
+			expect(refusal?.message).not.toContain("\n");
+			expect(refusal?.message).not.toContain("\u001b");
+			expect(refusal?.message).not.toContain("\u202e");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+			await fs.rm(host, { recursive: true, force: true });
+		}
+	});
+	it("keeps the named object inside the persisted startup-failure reason bound", async () => {
+		// Broker startup persists a 512-character reason. An unbounded agent
+		// directory ahead of the obstruction would truncate away the very object
+		// this diagnostic exists to report.
+		if (process.platform === "win32") return;
+		const host = await temp();
+		const root = await temp();
+		let dir = root;
+		for (let depth = 0; depth < 4; depth += 1) dir = path.join(dir, `d${"e".repeat(198)}p`);
+		try {
+			expect(dir.length).toBeGreaterThan(512);
+			await fs.mkdir(dir, { recursive: true });
+			await fs.mkdir(path.join(host, "sdk"), { recursive: true, mode: 0o700 });
+			await fs.symlink(path.join(host, "sdk"), path.join(dir, "sdk"));
+			const refusal = await publishBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "long-path-owner",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "long-path-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			}).then(
+				() => undefined,
+				(error: unknown) => error as Error,
+			);
+			expect(refusal?.message.slice(0, 512)).toMatch(/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/);
+			// The bound only matters because this message is what the durable startup
+			// marker persists, so assert through the marker rather than the throw.
+			await writeBrokerStartupFailureMarker(root, {
+				reason: refusal?.message ?? "",
+				exitCode: 1,
+				signal: null,
+				pid: process.pid,
+			});
+			expect((await readBrokerStartupFailureMarker(root))?.reason).toMatch(
+				/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/,
+			);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+			await fs.rm(host, { recursive: true, force: true });
+		}
+	});
+	it("keeps the named object in the persisted reason when rollback also fails", async () => {
+		// A failed rollback replaces the thrown error with an AggregateError, and
+		// the startup marker persists only `message` -- `AggregateError.errors` is
+		// not serialized -- so the named object has to survive into that message.
+		if (process.platform === "win32") return;
+		const host = await temp();
+		const dir = await temp();
+		const readFile = fs.readFile;
+		const rollbackFailure = Object.assign(new Error("EIO rollback read"), { code: "EIO" });
+		const spy = vi.spyOn(fs, "readFile").mockImplementation((async (file: string, ...rest: unknown[]) => {
+			if (String(file).endsWith("broker.json")) throw rollbackFailure;
+			return (readFile as (f: string, ...r: unknown[]) => Promise<unknown>)(file, ...rest);
+		}) as typeof fs.readFile);
+		try {
+			await fs.mkdir(path.join(host, "sdk"), { recursive: true, mode: 0o700 });
+			await fs.symlink(path.join(host, "sdk"), path.join(dir, "sdk"));
+			const refusal = await publishBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "rollback-failure-owner",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "rollback-failure-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			}).then(
+				() => undefined,
+				(error: unknown) => error as AggregateError,
+			);
+			expect(refusal).toBeInstanceOf(AggregateError);
+			expect(refusal?.errors?.[1]).toBe(rollbackFailure);
+			spy.mockRestore();
+			await writeBrokerStartupFailureMarker(dir, {
+				reason: refusal?.message ?? "",
+				exitCode: 1,
+				signal: null,
+				pid: process.pid,
+			});
+			expect((await readBrokerStartupFailureMarker(dir))?.reason).toMatch(
+				/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/,
+			);
+		} finally {
+			spy.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+			await fs.rm(host, { recursive: true, force: true });
+		}
+	});
+	it("names the heartbeat, not the file kind, for a published record the native only refuses on read", async () => {
+		// `RetainedPublication::open` puts no kind constraint on a successfully
+		// opened published record: it reads the descriptor and refuses for the
+		// missing heartbeat. A directory is refused earlier, by the read/write open
+		// itself (EISDIR), and only that stage may be named as a kind.
+		if (process.platform === "win32") return;
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(lock, "owner.json"), JSON.stringify({ version: 1, pid: process.pid }), {
+			mode: 0o600,
+		});
+		const record = {
+			version: 1 as const,
+			protocolVersion: 3 as const,
+			packageGeneration: "test",
+			ownerId: "published-kind-owner",
+			pid: process.pid,
+			host: "127.0.0.1" as const,
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "published-kind-token",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		};
+		const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
+			syncFs.rmSync(brokerDiscoveryPath(dir), { force: true });
+			syncFs.mkdirSync(brokerDiscoveryPath(dir));
+			throw new Error("Retained broker publication authority is unavailable.");
+		});
+		try {
+			// A directory is the one kind the native's own read/write open rejects.
+			await expect(publishBrokerDiscovery(dir, record)).rejects.toThrow(/broker\.json is not a regular file/);
 		} finally {
 			retain.mockRestore();
 			await fs.rm(dir, { recursive: true, force: true });
@@ -879,20 +1381,24 @@ describe("SDK broker identity and discovery", () => {
 
 			const retainedRoot = path.join(dir, "retained-sdk");
 			await fs.rename(path.join(dir, "sdk"), retainedRoot);
+			// The filesystem rename is real; force the native-equivalent observation so
+			// this test does not race the blocking-pool descriptor check on a loaded CI
+			// runner. The fail-closed admission transition remains the behavior under test.
+			setPublicationObservationForTest(broker, "absent");
 			watchdog!();
-			// The watchdog observes on the blocking pool; admission sees the fence after
-			// that observation settles, before request normalization or IO.
-			await new Promise(resolve => setTimeout(resolve, 0));
+			await Bun.sleep(0);
 			expect(await broker.handleRequest("session.list", {})).toEqual({
 				ok: false,
 				error: { code: "unavailable", message: "broker publication is unavailable" },
 			});
 
 			await fs.rename(retainedRoot, path.join(dir, "sdk"));
+			setPublicationObservationForTest(broker, "owned");
 			watchdog!();
-			await new Promise(resolve => setTimeout(resolve, 0));
+			await Bun.sleep(0);
 			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
 		} finally {
+			setPublicationObservationForTest(broker, undefined);
 			interval.mockRestore();
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
