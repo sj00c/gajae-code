@@ -4,6 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { getSessionSlashCommands } from "@gajae-code/coding-agent/extensibility/extensions/get-commands-handler";
+import {
+	discoverRuntimeSkills,
+	findRuntimeSkillByName,
+} from "@gajae-code/coding-agent/extensibility/runtime-skill-discovery";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { buildSystemPrompt } from "@gajae-code/coding-agent/system-prompt";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
@@ -126,6 +130,49 @@ describe("SkillDiscoveryTool", () => {
 		} finally {
 			if (originalHome === undefined) delete process.env.HOME;
 			else process.env.HOME = originalHome;
+		}
+	});
+
+	it("derives the default agent directory from an injected home", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-injected-home-cwd-"));
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-injected-home-"));
+		try {
+			const skillPath = await makeSkill(
+				path.join(home, ".gjc", "agent", "skills"),
+				"injected-home",
+				"Injected home skill",
+			);
+			const policy = runtimeSkillSettings().getGroup("skills");
+			const discovered = await discoverRuntimeSkills({ cwd, home, policy });
+			const found = await findRuntimeSkillByName(cwd, "injected-home", policy, home);
+
+			expect(discovered.candidates.map(candidate => candidate.name)).toContain("injected-home");
+			expect(found?.filePath).toBe(skillPath);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps concurrent injected profiles isolated when agentDir is omitted", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-concurrent-profile-cwd-"));
+		const homeA = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-concurrent-profile-a-"));
+		const homeB = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-concurrent-profile-b-"));
+		try {
+			await makeSkill(path.join(homeA, ".gjc", "agent", "skills"), "profile-a", "Profile A skill");
+			await makeSkill(path.join(homeB, ".gjc", "agent", "skills"), "profile-b", "Profile B skill");
+			const policy = runtimeSkillSettings().getGroup("skills");
+			const [resultA, resultB] = await Promise.all([
+				discoverRuntimeSkills({ cwd, home: homeA, policy }),
+				discoverRuntimeSkills({ cwd, home: homeB, policy }),
+			]);
+
+			expect(resultA.candidates.map(candidate => candidate.name)).toEqual(["profile-a"]);
+			expect(resultB.candidates.map(candidate => candidate.name)).toEqual(["profile-b"]);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+			await fs.rm(homeA, { recursive: true, force: true });
+			await fs.rm(homeB, { recursive: true, force: true });
 		}
 	});
 
