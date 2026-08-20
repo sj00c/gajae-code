@@ -100,12 +100,12 @@ function mapParts(input: AutoroutingGeneratorMap): AutoroutingCuratedTierMap {
 	return { labels: input, skips: {}, version: 1 };
 }
 
-function catalogKey(model: Pick<Model<Api>, "provider" | "id">): string {
-	return `${model.provider}/${model.id}`;
-}
-
 function lowercaseKey(value: string): string {
 	return value.toLowerCase();
+}
+
+function catalogKey(model: Pick<Model<Api>, "provider" | "id">): string {
+	return lowercaseKey(`${model.provider}/${model.id}`);
 }
 
 function compareLex(left: string, right: string): number {
@@ -130,7 +130,7 @@ function splitAllowlistSelector(selector: string): string {
 
 function buildAllowlist(setup: AutoroutingSetup): Set<string> | undefined {
 	if (setup.models === undefined) return undefined;
-	return new Set(setup.models.map(splitAllowlistSelector));
+	return new Set(setup.models.map(selector => lowercaseKey(splitAllowlistSelector(selector))));
 }
 
 function selectorWithEffort(model: Model<Api>, effort: TierEffort | undefined): string {
@@ -143,7 +143,15 @@ function selectorWithEffort(model: Model<Api>, effort: TierEffort | undefined): 
 }
 
 function providerOrder(setup: AutoroutingSetup): readonly string[] {
-	return [...new Set(setup.providers)];
+	const seen = new Set<string>();
+	const ordered: string[] = [];
+	for (const provider of setup.providers) {
+		const normalized = lowercaseKey(provider);
+		if (seen.has(normalized)) continue;
+		seen.add(normalized);
+		ordered.push(provider);
+	}
+	return ordered;
 }
 
 function assignmentsForProvider(
@@ -154,11 +162,12 @@ function assignmentsForProvider(
 	allowlist: Set<string> | undefined,
 ): Map<AutoroutingTier, Candidate[]> {
 	const byTier = new Map<AutoroutingTier, Candidate[]>();
+	const providerPrefix = lowercaseKey(provider);
 	for (const [key, assignments] of Object.entries(labels)) {
-		if (!key.startsWith(`${provider}/`)) continue;
-		const model = catalogByKey.get(key);
+		if (!lowercaseKey(key).startsWith(`${providerPrefix}/`)) continue;
+		const model = catalogByKey.get(lowercaseKey(key));
 		if (!model) continue;
-		if (allowlist !== undefined && !allowlist.has(key)) continue;
+		if (allowlist !== undefined && !allowlist.has(lowercaseKey(key))) continue;
 		for (const assignment of assignments as readonly TierAssignment[]) {
 			const selector = selectorWithEffort(model, assignment.effort);
 			const candidates = byTier.get(assignment.tier) ?? [];

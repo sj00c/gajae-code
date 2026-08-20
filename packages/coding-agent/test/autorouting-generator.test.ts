@@ -80,6 +80,40 @@ describe("autorouting generator", () => {
 		expect(result.tiers.fast).toEqual(["alpha/fast", "alpha/slow", "beta/fast"]);
 	});
 
+	it("matches setup provider casing against catalog keys case-insensitively", () => {
+		const catalog = [model("OpenAI", "gpt-test"), model("openai", "gpt-other")];
+		const result = generateTierChains(
+			{ schema: 1, providers: ["OpenAI"] },
+			{
+				labels: {
+					"openai/gpt-test": [{ tier: "fast", rank: 1 }],
+					"openai/gpt-other": [{ tier: "fast", rank: 2 }],
+				},
+				skips: {},
+				version: 1,
+			},
+			catalog,
+		);
+		// Selectors keep catalog spelling; only matching is case-insensitive.
+		expect(result.tiers.fast).toEqual(["OpenAI/gpt-test", "openai/gpt-other"]);
+	});
+
+	it("de-duplicates setup providers that differ only by case", () => {
+		const catalog = [model("alpha", "fast"), model("alpha", "strong")];
+		const result = generateTierChains({ schema: 1, providers: ["Alpha", "alpha", "ALPHA"] }, syntheticMap, catalog);
+		expect(result.tiers.fast).toEqual(["alpha/fast"]);
+	});
+
+	it("matches allowlist selectors case-insensitively", () => {
+		const catalog = [model("alpha", "fast"), model("alpha", "slow"), model("alpha", "strong")];
+		const result = generateTierChains(
+			{ schema: 1, providers: ["alpha"], models: ["ALPHA/slow"] },
+			syntheticMap,
+			catalog,
+		);
+		expect(result.tiers.fast).toEqual(["alpha/slow"]);
+	});
+
 	it("deduplicates duplicate catalog overlays without inventing tier membership", () => {
 		const catalog = [model("alpha", "fast"), model("alpha", "fast"), model("alpha", "strong")];
 		const result = generateTierChains({ schema: 1, providers: ["alpha", "alpha"] }, syntheticMap, catalog);
