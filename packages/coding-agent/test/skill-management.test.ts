@@ -83,6 +83,37 @@ describe("skill-management", () => {
 			});
 		});
 
+		it("derives the user profile from an injected home when agentDir is omitted", async () => {
+			await withTempDirs(async (cwd, home) => {
+				await makeSkill(path.join(home, ".gjc", "agent", "skills"), "injected-user", "Injected user");
+				const records = await listNativeSkillsForManagement({ cwd, home });
+
+				expect(records.map(record => record.name)).toContain("injected-user");
+				expect(records.find(record => record.name === "injected-user")?.path).toBe(
+					path.join(home, ".gjc", "agent", "skills", "injected-user", "SKILL.md"),
+				);
+			});
+		});
+
+		it("keeps concurrent injected homes isolated when agentDir is omitted", async () => {
+			await withTempDirs(async (cwd, homeA) => {
+				const homeB = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-mgmt-home-b-"));
+				try {
+					await makeSkill(path.join(homeA, ".gjc", "agent", "skills"), "profile-a", "Profile A");
+					await makeSkill(path.join(homeB, ".gjc", "agent", "skills"), "profile-b", "Profile B");
+					const [recordsA, recordsB] = await Promise.all([
+						listNativeSkillsForManagement({ cwd, home: homeA }),
+						listNativeSkillsForManagement({ cwd, home: homeB }),
+					]);
+
+					expect(recordsA.map(record => record.name)).toEqual(["profile-a"]);
+					expect(recordsB.map(record => record.name)).toEqual(["profile-b"]);
+				} finally {
+					await fs.rm(homeB, { recursive: true, force: true });
+				}
+			});
+		});
+
 		it("does not scan an untrusted scope at all", async () => {
 			await withTempDirs(async (cwd, home) => {
 				await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper");
@@ -130,6 +161,19 @@ describe("skill-management", () => {
 					home,
 					scope: "user",
 					agentDir: path.join(home, ".gjc", "agent"),
+					name: "my-skill",
+					content: validContent,
+				});
+				expect(receipt.path).toBe(path.join(home, ".gjc", "agent", "skills", "my-skill", "SKILL.md"));
+			});
+		});
+
+		it("derives the user write root from injected home when agentDir is omitted", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const receipt = await writeNativeSkill({
+					cwd,
+					home,
+					scope: "user",
 					name: "my-skill",
 					content: validContent,
 				});

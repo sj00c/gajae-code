@@ -122,9 +122,14 @@ export function getUserPath(ctx: LoadContext, source: SourceId, subpath: string)
  * profile the agent directory is `<home>/<configDir>/agent` and the configured
  * legacy roots below it are still honored, exactly as before.
  */
-export function getUserSkillScanDirs(home: string, userAgentDir: string): string[] {
-	if (path.resolve(userAgentDir) !== path.resolve(path.join(home, SOURCE_PATHS.native.userAgent))) {
-		return [path.join(userAgentDir, "skills")];
+export function resolveUserAgentDir(home: string, userAgentDir?: string): string {
+	return path.resolve(userAgentDir ?? path.join(home, SOURCE_PATHS.native.userAgent));
+}
+
+export function getUserSkillScanDirs(home: string, userAgentDir?: string): string[] {
+	const resolvedAgentDir = resolveUserAgentDir(home, userAgentDir);
+	if (resolvedAgentDir !== path.resolve(path.join(home, SOURCE_PATHS.native.userAgent))) {
+		return [path.join(resolvedAgentDir, "skills")];
 	}
 	return [
 		...new Set([

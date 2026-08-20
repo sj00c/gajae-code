@@ -9,6 +9,7 @@ import type { Rule } from "../../src/capability/rule";
 import { ruleCapability } from "../../src/capability/rule";
 import type { Settings } from "../../src/capability/settings";
 import { settingsCapability } from "../../src/capability/settings";
+import { slashCommandCapability } from "../../src/capability/slash-command";
 import type { Skill } from "../../src/capability/skill";
 import { skillCapability } from "../../src/capability/skill";
 import type { SystemPrompt } from "../../src/capability/system-prompt";
@@ -105,5 +106,30 @@ describe("native user scope under GJC_CODING_AGENT_DIR", () => {
 			true,
 		);
 		expect(result.warnings.some(warning => warning.includes(path.join(cwd, ".gjc", "config.yml")))).toBe(true);
+	});
+
+	it("keeps explicit profile config, AGENTS, and shared config-dir consumers off decoy roots", async () => {
+		const decoyAgentDir = path.join(root, "global-decoy-agent");
+		await writeFile(path.join(decoyAgentDir, "config.yml"), "skills:\n  enabled: false\n");
+		await writeFile(path.join(decoyAgentDir, "AGENTS.md"), "decoy agents\n");
+		await writeFile(path.join(decoyAgentDir, "commands", "decoy.md"), "decoy command\n");
+		await writeFile(path.join(agentDir, "config.yml"), "skills:\n  enabled: true\n");
+		await writeFile(path.join(agentDir, "AGENTS.md"), "profile agents\n");
+		await writeFile(path.join(agentDir, "commands", "profile.md"), "profile command\n");
+
+		setAgentDir(decoyAgentDir);
+		const loadExplicit = async <T>(capabilityId: string) =>
+			await loadCapability<T>(capabilityId, { cwd, agentDir, providers: ["native"] });
+		const [settings, context, commands] = await Promise.all([
+			loadExplicit<Settings>(settingsCapability.id),
+			loadExplicit<ContextFile>(contextFileCapability.id),
+			loadExplicit<{ name: string; content: string }>(slashCommandCapability.id),
+		]);
+
+		expect(settings.items.some(item => item.level === "user" && item.path === path.join(agentDir, "config.yml"))).toBe(
+			true,
+		);
+		expect(context.items.map(item => item.content)).toEqual(["profile agents\n"]);
+		expect(commands.items.map(item => item.name)).toEqual(["profile"]);
 	});
 });
