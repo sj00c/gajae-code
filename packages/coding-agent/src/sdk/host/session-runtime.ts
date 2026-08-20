@@ -650,11 +650,39 @@ export function createInvocationReconciliation(
 					// so a real lifecycle event is never swallowed.
 				}
 				const current = records.get(recordKey);
-				if (frame.type === "agent_end" && current === pending.finalizedRecord) return;
+				if (frame.type === "agent_end" && current === pending.finalizedRecord) {
+					// A real lifecycle end that arrived during deadline finalization is
+					// stronger evidence than the synthetic deadline outcome. Upgrade the
+					// durable terminal instead of treating the event as a duplicate.
+					const upgraded = {
+						...current,
+						revision: ++mutationRevision,
+						status: "terminal_ok" as const,
+					};
+					records.set(recordKey, upgraded);
+					try {
+						await persist();
+					} catch {
+						// The already durable terminal remains authoritative; the event
+						// was not swallowed and can be retried by the lifecycle caller.
+					}
+					return;
+				}
 				record = current;
 				if (!record) return;
 			}
 			if (record.terminalAt !== undefined) {
+				if (frame.type === "agent_end" && record.error?.code === "prompt_deadline_exceeded") {
+					const upgraded = { ...record, revision: ++mutationRevision, status: "terminal_ok" as const };
+					records.set(recordKey, upgraded);
+					try {
+						await persist();
+					} catch {
+						// Keep the existing durable terminal; the end event remains
+						// retryable and is never converted into a nonterminal record.
+					}
+					return;
+				}
 				// Same late agent_failed enrichment as the kind-aware bus reconciler: a
 				// failure reason may arrive on a different delivery path than the one that
 				// claimed the terminal. Enrich the settled record instead of dropping it;

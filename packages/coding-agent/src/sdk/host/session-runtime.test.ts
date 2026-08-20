@@ -215,6 +215,29 @@ test("agent_end is not swallowed when deadline persistence fails", async () => {
 	});
 });
 
+test("agent_end upgrades a durable deadline terminal when it races a successful finalize", async () => {
+	let records: unknown[] = [];
+	const store = {
+		path: null,
+		load: async () => records,
+		transact: async (mutator: (current: never[]) => never[]) => {
+			records = mutator(records as never);
+		},
+	} as never;
+	const reconciliation = createInvocationReconciliation({ store });
+	const correlation = { commandId: "upgrade-race-command", turnId: "upgrade-race-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "upgrade-race-ref");
+	await reconciliation.finalizeOutcome("prompt", correlation, {
+		kind: "failed",
+		code: "prompt_deadline_exceeded",
+		message: "deadline",
+	});
+	await reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+	const reloaded = createInvocationReconciliation({ store });
+	await reloaded.hydrate();
+	expect(reloaded.lookup("prompt", { clientRef: "upgrade-race-ref" })).toMatchObject({ status: "terminal_ok" });
+});
+
 test("a reason attached after a prompt settled is never replaced by a later failure", async () => {
 	const reconciliation = createInvocationReconciliation();
 	const correlation = { commandId: "late-reason-command", turnId: "late-reason-turn" };
