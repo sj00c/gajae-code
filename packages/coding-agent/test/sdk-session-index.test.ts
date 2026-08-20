@@ -1474,6 +1474,7 @@ describe("SDK session index", () => {
 		// post-replacement stat is indistinguishable from the pre-replacement
 		// stat on size+mtimeMs+ctimeMs, leaving the inode as the only signal.
 		let collided = false;
+		let detectedOnCollision = false;
 		let expected = "";
 		for (let attempt = 0; attempt < 200 && !collided; attempt++) {
 			const before = await fs.stat(snapPath);
@@ -1487,12 +1488,11 @@ describe("SDK session index", () => {
 				after.size === before.size &&
 				after.mtimeMs === before.mtimeMs &&
 				after.ctimeMs === before.ctimeMs &&
-				Number(after.ino) !== Number(before.ino);
-			if (!collided) {
-				// Not a collision this round; resynchronize the reader so the next
-				// attempt starts from a clean stamp baseline.
-				await reader.refreshIfChanged();
-			}
+				after.ino !== before.ino;
+			// Always consume the poll from THIS iteration and keep its result:
+			// asserting a later refresh would test a call that sees no change.
+			const detected = await reader.refreshIfChanged();
+			if (collided) detectedOnCollision = detected;
 		}
 		// Deterministic evidence (#4730 review): the inode-difference branch must
 		// actually have been the only distinguishing signal. If this filesystem
@@ -1500,10 +1500,74 @@ describe("SDK session index", () => {
 		// is never metadata-identical, say so explicitly instead of silently
 		// passing through a generic path that proves nothing.
 		expect(collided).toBe(true);
-		// Only the inode changed. The cheap path must still report a change and
-		// fully replay the replacement snapshot.
-		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(detectedOnCollision).toBe(true);
+		// Only the inode changed, and the poll from that exact iteration reported
+		// a change and fully replayed the replacement snapshot.
 		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual([expected]);
+	});
+	it("log growth plus an inode-only snapshot replacement replays instead of tailing (#4730 review)", async () => {
+		// The locked classifier may only tail when this is the SAME log grown in
+		// place AND the SAME snapshot file. A rename-over installs a new inode
+		// while size and timestamps can still match, so the combination -- log
+		// grew, snapshot swapped for a same-size/same-timestamp file -- must
+		// replay; tailing would cache a stale compacted projection and serve it as
+		// current. Each half is covered separately elsewhere; this pins the
+		// combination, and it is asserted through the real reader so a
+		// misclassification shows up as a divergent projection.
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-tail-ino-"));
+		const writer = new SessionIndex(dir);
+		const first = await writer.append(event("combo-a"));
+		await writer.snapshot();
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["combo-a"]);
+
+		const snapPath = path.join(dir, "sdk", "sessions", "index.snapshot.json");
+		const before = await fs.stat(snapPath);
+		// Build a VALID signed snapshot of identical byte length naming a
+		// different session, so only a real replay can observe it.
+		const target = Number(before.size);
+		let swapped = "";
+		for (let pad = 0; pad < 500 && !swapped; pad++) {
+			const replacement = {
+				version: SDK_STATE_VERSION,
+				indexSeq: first.indexSeq,
+				type: "host_registered" as const,
+				sessionId: "combo-z",
+				locator: { repo: "r".repeat(1 + pad), stateRoot: "q" },
+				endpointGeneration: 1,
+				pid: process.pid,
+				ts: first.ts,
+			};
+			const candidate = JSON.stringify({
+				version: 3,
+				indexSeq: first.indexSeq,
+				events: [
+					{
+						...replacement,
+						checksum: sessionIndexChecksum(replacement as Parameters<typeof sessionIndexChecksum>[0]),
+					},
+				],
+			});
+			if (Buffer.byteLength(candidate) === target) swapped = candidate;
+		}
+		expect(swapped.length).toBeGreaterThan(0);
+
+		// Grow the log through the real writer so the log side looks append-only,
+		// then rename-replace the snapshot: same size, new inode.
+		await writer.append(event("combo-b"));
+		const staging = `${snapPath}.combo.tmp`;
+		await fs.writeFile(staging, swapped);
+		await fs.rename(staging, snapPath);
+		const after = await fs.stat(snapPath);
+		expect(Number(after.size)).toBe(target);
+		expect(after.ino).not.toBe(before.ino);
+
+		// The reader must converge on the writer's durable sequence and observe the
+		// replaced snapshot, not a tail-cached prefix of the old one.
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.indexSeq).toBe(writer.indexSeq);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toContain("combo-z");
 	});
 	it("refreshIfChanged fully replays same-size rewrites and snapshot-only changes (#4689 QA)", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-rewrite-"));

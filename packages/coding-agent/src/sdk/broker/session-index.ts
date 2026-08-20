@@ -981,12 +981,21 @@ export class SessionIndex {
 		const prior = this.#changeStamp;
 		// Append-only growth with an untouched snapshot tails from the last
 		// offset; anything else replays in full.
+		// The inode is load-bearing on BOTH files here (#4730 review): tailing is
+		// only sound if this is the SAME log file grown in place and the SAME
+		// snapshot file. A rename-over installs a new inode while size and
+		// timestamps can all still match, so without these two comparisons a log
+		// that grew while the snapshot was replaced by a same-size, same-timestamp
+		// file would be misclassified as append-only, and the reader would tail
+		// from its last offset while caching a stale compacted projection.
 		if (
 			prior &&
 			prior.log.exists &&
 			stamp.log.exists &&
+			stamp.log.ino === prior.log.ino &&
 			stamp.log.size > prior.log.size &&
 			stamp.snapshot.exists === prior.snapshot.exists &&
+			stamp.snapshot.ino === prior.snapshot.ino &&
 			stamp.snapshot.size === prior.snapshot.size &&
 			stamp.snapshot.mtimeMs === prior.snapshot.mtimeMs &&
 			stamp.snapshot.ctimeMs === prior.snapshot.ctimeMs
