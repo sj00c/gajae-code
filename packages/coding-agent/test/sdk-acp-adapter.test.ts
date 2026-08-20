@@ -195,6 +195,9 @@ test("a capability-less attachment is rejected on the handoff paths too (#4730 r
 			router: harness.router as never,
 			attachment: legacy,
 			sessionId: legacy.sessionId,
+			// A provider MUST be configured, or a zero register_provider count is
+			// zero either way and proves nothing (#4730 review).
+			providers: [{ capability: "ui", definitions: [] }],
 		});
 		const registeredBefore = harness.requests.filter(frame => frame.type === "register_provider").length;
 		await expect(sameObject.attachmentReady(legacy)).rejects.toThrow(/sendMaintenance/);

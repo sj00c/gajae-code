@@ -1906,6 +1906,90 @@ describe("SessionRouter dispatch authority", () => {
 			await router.stop();
 		}
 	});
+	test("an identical-byte rename during the pre-publication hook is refused at the commit (#4730 review)", async () => {
+		// onAttachment runs BEFORE #publishAttachment commits. Replacing the
+		// endpoint with identical bytes in that window matches url/token/pid at the
+		// commit point, so only the proven inode can reject it. This exercises the
+		// validation-to-publication window specifically.
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4730-publishwin-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const sessionId = "publish-window";
+		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+		const body = JSON.stringify({ sessionId, url: "ws://publishwin.test", token: "v1", pid: 42 });
+		await Bun.write(endpointFile, body);
+		let indexedMtimeMs = fs.statSync(endpointFile).mtimeMs;
+		let replaceInHook = false;
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			refreshIfChanged: async () => true,
+			get indexSeq() {
+				return 1;
+			},
+			listSessions: () => ({
+				indexSeq: 1,
+				sessions: [
+					{
+						sessionId,
+						locator: { repo, stateRoot },
+						endpointGeneration: 1,
+						pid: 42,
+						endpointMtimeMs: indexedMtimeMs,
+						live: true,
+						indexSeq: 1,
+						ambiguous: false,
+						terminal: false,
+					},
+				],
+				warnings: [],
+			}),
+		} as unknown as SessionIndex;
+		let closedClients = 0;
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => ({
+					onFrame: () => () => {},
+					request: async () => ({ events: [] }),
+					close: async () => {
+						closedClients++;
+					},
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+				onAttachment: async () => {
+					if (!replaceInHook) return;
+					// Identical bytes, and the replacement's own mtime becomes the
+					// indexed authority, so every field the commit compares still
+					// matches and ONLY the inode differs.
+					const staging = `${endpointFile}.pubwin.tmp`;
+					await Bun.write(staging, body);
+					await fsPromises.rename(staging, endpointFile);
+					indexedMtimeMs = fs.statSync(endpointFile).mtimeMs;
+				},
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+		try {
+			// Control: without the in-hook replacement this setup publishes.
+			await router.start();
+			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
+			await router.stop();
+
+			replaceInHook = true;
+			await router.start();
+			// The replacement is refused at the commit point, so nothing is published.
+			expect(router.attachment(sessionId) ?? undefined).toBeUndefined();
+		} finally {
+			await router.stop();
+		}
+	});
 	test("sendMaintenance fails closed when the endpoint file is replaced under it (#4730 review)", async () => {
 		// A replacement that preserves sessionId/pid/url/token and even mtime must
 		// not keep the old attachment authorized: mtime is not a replacement-safe

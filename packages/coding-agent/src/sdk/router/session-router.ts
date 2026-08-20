@@ -386,8 +386,6 @@ export class SessionRouter {
 	 * preserves size, mtime and body cannot keep a superseded endpoint authorized.
 	 */
 	readonly #endpointInodes = new Map<string, bigint>();
-	/** Inode proven inside the last successful #readEndpoint authority read, keyed by endpoint path. */
-	readonly #provenEndpointInodes = new Map<string, bigint>();
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
@@ -1001,7 +999,13 @@ export class SessionRouter {
 		);
 	}
 
-	async #readEndpoint(indexed: IndexedSession): Promise<SdkSessionEndpoint | null> {
+	/**
+	 * Returns the endpoint together with the inode this read PROVED (#4730
+	 * review). The identity travels with the value instead of living in a side
+	 * map, so every consumer decision compares the same proof and the two cannot
+	 * drift apart.
+	 */
+	async #readProvenEndpoint(indexed: IndexedSession): Promise<{ endpoint: SdkSessionEndpoint; ino: bigint } | null> {
 		if (!isSessionAuthorityEligible(indexed)) return null;
 		const repo = path.resolve(indexed.locator.repo);
 		const defaultStateRoot = path.join(repo, ".gjc", "state");
@@ -1066,10 +1070,12 @@ export class SessionRouter {
 		if (listing.warnings.length > 0) return null;
 		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
 		if (!current || !sameIndexedAuthority(indexed, current)) return null;
-		// Record the proven identity for this exact path so callers that publish an
-		// attachment bind to what authority validated, never to a later re-stat.
-		this.#provenEndpointInodes.set(endpoint.path, provenIno);
-		return endpoint;
+		return { endpoint, ino: provenIno };
+	}
+
+	/** Endpoint-only view for callers that do not make an authority decision. */
+	async #readEndpoint(indexed: IndexedSession): Promise<SdkSessionEndpoint | null> {
+		return (await this.#readProvenEndpoint(indexed))?.endpoint ?? null;
 	}
 
 	async #createAttachedClient(
@@ -1132,16 +1138,15 @@ export class SessionRouter {
 		if (retirement) await retirement;
 		if (!this.#running(runEpoch)) return false;
 		if (indexed.endpointMtimeMs === undefined) return false;
-		const endpoint = resolvedEndpoint ?? (await this.#readEndpoint(indexed));
-		// The identity proven INSIDE the authority read above; never re-stat here,
-		// because a rename in this window would be captured as trusted (#4730
-		// review). A pre-resolved endpoint (adoption/lifecycle handoff) carries no
-		// such proof, so it samples once here -- that path never had an authority
-		// read of its own to bind to.
-		let provenIno = endpoint === null ? undefined : this.#provenEndpointInodes.get(endpoint.path);
-		if (endpoint !== null && provenIno === undefined)
+		// The identity travels with the endpoint from its authority read (#4730
+		// review). A pre-resolved endpoint (adoption/lifecycle handoff) had no
+		// authority read of its own, so it samples once here.
+		const proven = resolvedEndpoint === undefined ? await this.#readProvenEndpoint(indexed) : null;
+		const endpoint = resolvedEndpoint ?? proven?.endpoint ?? null;
+		let provenIno = proven?.ino;
+		if (resolvedEndpoint !== undefined)
 			provenIno = await fs
-				.stat(endpoint.path, { bigint: true })
+				.stat(resolvedEndpoint.path, { bigint: true })
 				.then(value => value.ino)
 				.catch(() => undefined);
 		const retirementAfterValidation = this.#retirements.get(indexed.sessionId);
@@ -1352,15 +1357,20 @@ export class SessionRouter {
 		// Re-check at publication (#4730 review): the endpoint must STILL be the
 		// file authority validated. Fail closed on stat error or any identity
 		// change instead of publishing an attachment bound to a successor.
-		if (provenIno === undefined) return false;
+		// Every rejection here must roll the connected client back fully (#4730
+		// review): the transport is already open at this point, so returning without
+		// closing it leaks an unowned connection.
+		const rollback = async (): Promise<false> => {
+			attached.dispose();
+			await client.close().catch(() => undefined);
+			return false;
+		};
+		if (provenIno === undefined) return await rollback();
 		const publishIno = await fs
 			.stat(endpoint.path, { bigint: true })
 			.then(value => value.ino)
 			.catch(() => undefined);
-		if (publishIno === undefined || publishIno !== provenIno) {
-			attached.dispose();
-			return false;
-		}
+		if (publishIno === undefined || publishIno !== provenIno) return await rollback();
 		this.#sessions.set(indexed.sessionId, attached);
 		this.#endpointInodes.set(attached.id, provenIno);
 		if (deferPublication)
@@ -1400,17 +1410,26 @@ export class SessionRouter {
 	async #publishAttachment(attached: AttachedSession, skipReplay: boolean, deferReplay = false): Promise<boolean> {
 		if (attached.published) return this.#attachmentPublished(attached);
 		if (!this.#attachmentLive(attached)) return false;
-		const endpoint = await this.#readEndpoint(attached.indexed).catch(() => null);
+		const proven = await this.#readProvenEndpoint(attached.indexed).catch(() => null);
 		if (!this.#attachmentLive(attached)) return false;
+		// The commit point compares the PROVEN inode alongside url/token/pid
+		// (#4730 review): an identical-byte rename during the pre-publication
+		// hooks matches every other field, so identity is what rejects it. The
+		// value compared here is the one the authority read proved, not a later
+		// observation, so the proof and its consumer cannot drift apart.
+		const publishedIno = this.#endpointInodes.get(attached.id);
 		if (
-			!endpoint ||
-			endpoint.url !== attached.endpoint.url ||
-			endpoint.token !== attached.endpoint.token ||
-			endpoint.pid !== attached.pid
+			!proven ||
+			proven.endpoint.url !== attached.endpoint.url ||
+			proven.endpoint.token !== attached.endpoint.token ||
+			proven.endpoint.pid !== attached.pid ||
+			publishedIno === undefined ||
+			proven.ino !== publishedIno
 		) {
-			await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
+			await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
 			return false;
 		}
+		const endpoint = proven.endpoint;
 		if (!skipReplay) attached.barrier.held ??= [];
 		attached.published = true;
 		attached.publication.resolve();
