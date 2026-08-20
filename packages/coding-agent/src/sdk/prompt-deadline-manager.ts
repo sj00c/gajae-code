@@ -31,6 +31,7 @@ export class PromptDeadlineManager {
 	readonly #reconciliation: DeadlineReconciliation;
 	readonly #expiryRetries = new Map<string, number>();
 	readonly #expiring = new Set<string>();
+	readonly #pendingTerminalTransitions = new Set<string>();
 	readonly #getLeaseMs: () => number;
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
@@ -79,6 +80,17 @@ export class PromptDeadlineManager {
 		// Re-check deadline still due (monotonic, but handle clock skew).
 		if (this.#now() < promptDeadlineAt(lease)) {
 			this.#schedule(key);
+			return;
+		}
+		if (this.#pendingTerminalTransitions.has(key)) {
+			try {
+				await this.#reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+				this.#expiryRetries.delete(key);
+				this.#onExpired?.(correlation);
+				this.clear(correlation);
+			} catch {
+				this.#retry(key);
+			}
 			return;
 		}
 		// Fence ownership synchronously before the first await. A late agent_start
@@ -195,6 +207,15 @@ export class PromptDeadlineManager {
 		this.onProgress(correlation, now);
 	}
 
+	/** Mark a real agent_end before durable reconciliation begins. If its upgrade
+	 * write fails, deadline retry replays this event instead of reasserting the
+	 * synthetic prompt_deadline_exceeded outcome. */
+	noteTerminalTransition(correlation: InvocationCorrelation): void {
+		const key = leaseKey(correlation);
+		if (!this.#leases.has(key)) return;
+		this.#pendingTerminalTransitions.add(key);
+	}
+
 	clear(correlation: InvocationCorrelation): void {
 		const key = leaseKey(correlation);
 		this.#clearTimer(key);
@@ -202,6 +223,7 @@ export class PromptDeadlineManager {
 		this.#correlations.delete(key);
 		this.#expiryRetries.delete(key);
 		this.#expiring.delete(key);
+		this.#pendingTerminalTransitions.delete(key);
 	}
 
 	clearAll(): void {
@@ -210,6 +232,7 @@ export class PromptDeadlineManager {
 		this.#correlations.clear();
 		this.#expiryRetries.clear();
 		this.#expiring.clear();
+		this.#pendingTerminalTransitions.clear();
 	}
 
 	/** For tests: current deadline or undefined if no lease. */

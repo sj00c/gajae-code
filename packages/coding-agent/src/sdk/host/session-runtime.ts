@@ -2850,6 +2850,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		try {
 			for (const invocation of transitions) {
 				try {
+					if (type === "agent_end" && invocation.kind === "prompt")
+						current.deadlineManager.noteTerminalTransition(invocation.correlation);
 					// agent_failed is additive diagnostic state; agent_end remains the
 					// lifecycle boundary that terminalizes ownership and deadlines.
 					const frame =

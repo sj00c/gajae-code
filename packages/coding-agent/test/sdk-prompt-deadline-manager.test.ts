@@ -16,6 +16,8 @@ interface FakeReconciliation {
 	claimRelease?: Promise<void>;
 	finalizeStarted?: () => void;
 	finalizeRelease?: Promise<void>;
+	noteTransitionCalls: number;
+	noteTransitionFailures: number;
 
 	/** When set, a failing finalize still leaves the durable record terminal (lost race). */
 	terminalOnFailure?: boolean;
@@ -25,6 +27,7 @@ function fakeReconciliation(): {
 	reconciliation: {
 		lookup: () => { status: string };
 		claimPendingOutcome: () => Promise<void>;
+		noteTransition: () => Promise<void>;
 		finalizeOutcome: (
 			_kind: string,
 			_correlation: unknown,
@@ -34,11 +37,22 @@ function fakeReconciliation(): {
 	};
 	state: FakeReconciliation;
 } {
-	const state: FakeReconciliation = { status: "running", finalizeFailures: 0, finalizeCalls: 0 };
+	const state: FakeReconciliation = {
+		status: "running",
+		finalizeFailures: 0,
+		finalizeCalls: 0,
+		noteTransitionCalls: 0,
+		noteTransitionFailures: 0,
+	};
 	return {
 		state,
 		reconciliation: {
 			lookup: () => ({ status: state.status }),
+			noteTransition: async () => {
+				state.noteTransitionCalls += 1;
+				if (state.noteTransitionCalls <= state.noteTransitionFailures) throw new Error("terminal replay failed");
+				state.status = "terminal_ok";
+			},
 			claimPendingOutcome: async () => {
 				state.claimStarted?.();
 				if (state.claimRelease) await state.claimRelease;
@@ -248,4 +262,35 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		expect(manager.deadlineAt(correlation)).toBe(2_020);
 		manager.clearAll();
 	});
+
+	test("retries a real agent_end instead of reasserting deadline failure", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		const finalizeStarted = Promise.withResolvers<void>();
+		const finalizeRelease = Promise.withResolvers<void>();
+		state.finalizeStarted = () => finalizeStarted.resolve();
+		state.finalizeRelease = finalizeRelease.promise;
+		state.finalizeFailures = 1;
+		state.noteTransitionFailures = 1;
+		let expired = 0;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "cmd-real-end-retry", turnId: "turn-real-end-retry" };
+		manager.onAccepted(correlation);
+		await finalizeStarted.promise;
+		// The real terminal arrives while the synthetic deadline write is held.
+		manager.noteTerminalTransition(correlation);
+		finalizeRelease.resolve();
+		await Bun.sleep(2_300);
+		expect(state.noteTransitionCalls).toBeGreaterThanOrEqual(2);
+		expect(state.status).toBe("terminal_ok");
+		expect(expired).toBe(1);
+		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
+	}, 5_000);
 });
