@@ -110,6 +110,21 @@ describe("sdk broker package generation", () => {
 		}
 	}, 15_000);
 
+	it("does not satisfy a concurrent caller with a different generation", async () => {
+		const dir = await temp();
+		const stale = new Broker({ agentDir: dir, packageGeneration: "stale-gen" });
+		try {
+			await stale.start();
+			const expected = resolveSdkPackageGeneration();
+			const first = ensureBroker({ agentDir: dir, expectedPackageGeneration: expected });
+			const second = ensureBroker({ agentDir: dir, expectedPackageGeneration: "different-generation" });
+			expect((await first).packageGeneration).toBe(expected);
+			await expect(second).rejects.toThrow("does not match expected generation different-generation");
+		} finally {
+			await cleanup(dir, stale);
+		}
+	}, 30_000);
+
 	it("serializes concurrent stale-broker retirements into one replacement", async () => {
 		const dir = await temp();
 		const stale = new Broker({ agentDir: dir, packageGeneration: "stale-gen" });
