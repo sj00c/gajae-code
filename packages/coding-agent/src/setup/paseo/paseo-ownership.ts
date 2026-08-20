@@ -26,6 +26,19 @@ export interface ProvenanceLedger {
 	readonly version: number;
 	/** `agents.providers` keys GJC created, mapped to the value hash it wrote. */
 	readonly providerKeys: Record<string, string>;
+	/**
+	 * `agents.providers` keys that already existed when GJC ran and whose value
+	 * equaled GJC's desired entry. GJC wrote nothing at those keys, so it never
+	 * owns them; the marker keeps a convergence re-run from adopting them.
+	 * Optional because ledgers written before this field existed never carry it.
+	 */
+	readonly providerPreexistingKeys?: Record<string, true>;
+	/**
+	 * For `--force` overwrites, the exact provider entry GJC replaced. `--remove`
+	 * restores it instead of deleting the key, because that content was never
+	 * GJC's to take. Optional for the same legacy-ledger reason.
+	 */
+	readonly providerReplacedEntries?: Record<string, unknown>;
 	/** Orchestration role keys GJC actually seeded, mapped to the value it wrote. */
 	readonly seededOrchestrationKeys: Record<string, string>;
 	/** Bridge directory path GJC created, when it created it. */
@@ -41,6 +54,8 @@ export interface ProvenanceLedger {
 export const EMPTY_LEDGER: ProvenanceLedger = {
 	version: PROVENANCE_VERSION,
 	providerKeys: {},
+	providerPreexistingKeys: {},
+	providerReplacedEntries: {},
 	seededOrchestrationKeys: {},
 };
 
@@ -66,6 +81,8 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 		return {
 			version: typeof parsed.version === "number" ? parsed.version : PROVENANCE_VERSION,
 			providerKeys: isStringRecord(parsed.providerKeys) ? parsed.providerKeys : {},
+			providerPreexistingKeys: isTrueRecord(parsed.providerPreexistingKeys) ? parsed.providerPreexistingKeys : {},
+			providerReplacedEntries: isRecord(parsed.providerReplacedEntries) ? parsed.providerReplacedEntries : {},
 			seededOrchestrationKeys: isStringRecord(parsed.seededOrchestrationKeys) ? parsed.seededOrchestrationKeys : {},
 			...(typeof parsed.bridgePath === "string" ? { bridgePath: parsed.bridgePath } : {}),
 			...(typeof parsed.bridgeSourceDir === "string" ? { bridgeSourceDir: parsed.bridgeSourceDir } : {}),
@@ -84,6 +101,14 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function isTrueRecord(value: unknown): value is Record<string, true> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	return Object.values(value).every(entry => entry === true);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 

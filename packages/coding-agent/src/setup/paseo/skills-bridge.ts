@@ -13,6 +13,7 @@
  */
 
 import * as nodeCrypto from "node:crypto";
+import type { Dirent, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
@@ -155,10 +156,18 @@ async function quarantineUnlinkVerified(linkPath: string, expectedTarget: string
  * `context-search` fails the prefix test on its own.
  */
 export async function sourceBridgeEntries(sourceDir: string): Promise<readonly string[]> {
-	const entries = await fs.readdir(sourceDir, { withFileTypes: true }).catch(error => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+	let entries: readonly Dirent[];
+	try {
+		entries = await fs.readdir(sourceDir, { withFileTypes: true });
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		// Only a genuinely absent source is an empty source. An unreadable one
+		// (EACCES, EIO, a dangling parent during an app update) must never be
+		// read as "no skills", because every recorded entry would then look
+		// stale and get pruned while the bridge is actually fine.
+		if (code === "ENOENT" || code === "ENOTDIR") return [];
 		throw error;
-	});
+	}
 	const names: string[] = [];
 	for (const entry of entries) {
 		if (!entry.name.startsWith(PASEO_SKILL_PREFIX)) continue;
@@ -167,9 +176,18 @@ export async function sourceBridgeEntries(sourceDir: string): Promise<readonly s
 			continue;
 		}
 		// A directory symlink (or Windows junction) is a valid source shape:
-		// resolve it and keep it only when it really is a directory.
+		// resolve it and keep it only when it really is a directory. A dangling
+		// symlink (ENOENT from stat) is absent, not foreign; any other stat
+		// failure (EACCES and friends) is propagated rather than collapsed into
+		// "not a directory", so an unreadable source cannot silently prune the
+		// bridge entries it backs.
 		if (entry.isSymbolicLink()) {
-			const resolved = await fs.stat(path.join(sourceDir, entry.name)).catch(() => undefined);
+			let resolved: Stats | undefined;
+			try {
+				resolved = await fs.stat(path.join(sourceDir, entry.name));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
 			if (resolved?.isDirectory()) names.push(entry.name);
 		}
 	}
@@ -288,7 +306,24 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 		return { bridgeDir: deps.paths.bridgeDir, bridgeDirCreated: directory === "absent", entries, prunes, adopts };
 	}
 	const sourceDir = source.dir;
-	const names = await sourceBridgeEntries(sourceDir);
+	// The resolver only returns directories it verified as present, so a source
+	// that is gone again by enumeration time was removed underneath this run
+	// (an app update or uninstall race). That is never "an empty source": an
+	// empty read here would classify every recorded entry as stale and prune a
+	// healthy bridge. Fail closed and change nothing.
+	try {
+		await fs.stat(sourceDir);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		throw new SkillsBridgeError(
+			`Refusing to converge Paseo skills bridge: the resolved skills directory (${sourceDir}) became unreadable (${code ?? "unknown"}); the existing bridge is left untouched`,
+		);
+	}
+	const names = await sourceBridgeEntries(sourceDir).catch(error => {
+		throw new SkillsBridgeError(
+			`Refusing to converge Paseo skills bridge: the resolved skills directory (${sourceDir}) could not be read (${error instanceof Error ? error.message : String(error)}); the existing bridge is left untouched`,
+		);
+	});
 	const wanted = new Set(names);
 
 	for (const name of names) {

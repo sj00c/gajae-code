@@ -57,13 +57,15 @@ async function lstatAllowingAbsent(destination: string): Promise<Stats | undefin
  *
  * A malformed, tampered, or path-replaced provenance record must never
  * redirect `--remove` at an unrelated directory: the recorded path has to be
- * absolute, stay inside the trusted agent root (the parent of the current
- * bridge directory), and resolve -- without following a final symlink -- to
- * the expected bridge directory shape. Anything else fails the removal closed.
+ * absolute, stay inside the agent directory the ledger itself lives in (the
+ * parent of the ledger's `paseo/` directory -- which is also where a recorded
+ * bridge path always lived, including an old path during a migration), and
+ * resolve -- without following a final symlink -- to the expected bridge
+ * directory shape. Anything else fails the removal closed.
  */
-async function validatedBridgeDir(ledger: ProvenanceLedger, deps: PaseoSetupDependencies): Promise<string> {
+export async function validatedBridgeDir(ledger: ProvenanceLedger, deps: PaseoSetupDependencies): Promise<string> {
 	const recorded = ledger.bridgePath ?? deps.paths.bridgeDir;
-	const trustedRoot = path.resolve(deps.paths.bridgeDir, "..");
+	const trustedRoot = path.resolve(path.dirname(deps.paths.provenanceLedger), "..");
 	const resolved = path.resolve(recorded);
 	if (!path.isAbsolute(recorded) || resolved !== recorded) {
 		throw new SkillsBridgeError(
@@ -97,6 +99,23 @@ async function validatedBridgeDir(ledger: ProvenanceLedger, deps: PaseoSetupDepe
 		throw error;
 	}
 	return recorded;
+}
+/**
+ * Ledger entry names that are safe to compose cleanup paths from.
+ *
+ * Every recorded entry must be a single plain basename. A tampered ledger can
+ * carry `../`-style traversal or path separators; such a name is never handed
+ * to a path join, it is reported as a refusal instead.
+ */
+export function safeBridgeEntryNames(entries: readonly string[]): readonly string[] {
+	for (const name of entries) {
+		if (path.basename(name) !== name || name.includes("/") || name === "." || name === "..") {
+			throw new SkillsBridgeError(
+				`Refusing to remove Paseo skills bridge entry with an unsafe recorded name (${name}); restore or delete the provenance ledger after confirming no Paseo bridge links are live`,
+			);
+		}
+	}
+	return entries;
 }
 
 /**
@@ -152,8 +171,7 @@ export async function removePaseoSetup(
 			// handed to the inverse, which reports it as a divergence instead of
 			// being silently skipped and reported as success.
 			const presentEntries: string[] = [];
-			for (const name of ledger.bridgeEntries ?? []) {
-				if (path.basename(name) !== name || name.includes("/")) continue;
+			for (const name of safeBridgeEntryNames(ledger.bridgeEntries ?? [])) {
 				const destination = path.join(bridgeDir, name);
 				const stat = await lstatAllowingAbsent(destination);
 				if (stat !== undefined) presentEntries.push(name);
@@ -217,6 +235,11 @@ export async function removePaseoSetup(
 	}
 
 	// Step 1 inverse: provider entries, including every earlier `--mpreset` run.
+	//
+	// A `--force` overwrite recorded the entry it replaced; removal restores
+	// that entry instead of deleting the key, because the replaced content was
+	// never GJC's to take. Keys marked pre-existing (a matching entry that
+	// existed before any GJC run) are not in providerKeys and are untouched.
 	const providerKeys = provenancedProviderKeys(nextLedger);
 	if (providerKeys.length > 0) {
 		const survivors: Record<string, string> = {};
@@ -227,8 +250,13 @@ export async function removePaseoSetup(
 				const entry = providers[key];
 				if (entry === undefined) continue;
 				const hash = providerEntryHash(entry as PaseoProviderEntry);
-				if (isProvenancedProvider(nextLedger, key, hash)) delete providers[key];
-				else survivors[key] = nextLedger.providerKeys[key] ?? hash;
+				if (!isProvenancedProvider(nextLedger, key, hash)) {
+					survivors[key] = nextLedger.providerKeys[key] ?? hash;
+					continue;
+				}
+				const replaced = nextLedger.providerReplacedEntries?.[key];
+				if (replaced !== undefined) providers[key] = replaced;
+				else delete providers[key];
 			}
 		});
 		if (!outcome.ok) {

@@ -56,7 +56,8 @@ still matches what GJC wrote, so a hand-edited entry always survives. Paseo's sk
 treated as read-only: GJC bridges `~/.agents/skills` when a CLI install materialized it, the Paseo.app
 bundle's `Contents/Resources/skills` on a desktop install, or an explicit `PASEO_SKILLS_DIR` — and
 derives the bridged skill names from whichever directory actually exists. When a Paseo release swaps
-skills, `--check` converges on re-run instead of reporting permanent drift. A source that disappears
+skills, re-running `gjc setup paseo` converges the bridge and a follow-up `gjc setup paseo --check`
+verifies it — `--check` itself is read-only and never repairs. A source that disappears
 entirely is still reported as `missing-skills-directory` drift (exit 1) until Paseo is reinstalled or
 a trusted `PASEO_SKILLS_DIR` is supplied — the bridge is never faked with dangling links.
 
