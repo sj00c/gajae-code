@@ -15,6 +15,15 @@
 - `getTrustedAgentFile()` joins a filename under the provenance-checked agent directory and never follows `XDG_STATE_HOME`, so automatic crash relay cannot read a checkout-controlled XDG state root.
 - New `sanitizeHeaderComponent()` helper strips everything outside printable ASCII from a value destined for an HTTP header, so runtime-derived components (Android kernel release names embed non-ASCII like `Minimal™`) can never make `Headers`/`fetch` throw.
 
+## [0.14.2] - 2026-08-20
+
+### Added
+- Crash journal and postmortem support for the opt-in upstream relay: relayed-upstream transitions are journaled and indexed, with bounded queues and LRU-bounded handled-error dedupe.
+
+### Fixed
+- Postmortem tests no longer write into the real crash store; they isolate into a fresh store per run.
+- Rotating agent environment credentials reload correctly and rotation writes are hardened against partial reads.
+
 ## [0.14.1] - 2026-08-18
 
 ## [0.14.0] - 2026-08-17

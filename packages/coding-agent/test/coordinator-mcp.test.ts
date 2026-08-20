@@ -20,8 +20,10 @@ import {
 	coordinatorStatePaths,
 	createSessionTransaction,
 	initializeCoordinatorNamespace,
+	readSessionTransaction,
 	reconcileCreationRemoteVerifier,
 	rotateClaimedCreationVerifier,
+	transactionPath,
 	startCreationRemote,
 	withNamespaceRegistry,
 } from "../src/coordinator-mcp/question-state";
@@ -433,6 +435,21 @@ describe("coordinator question-state direct contracts", () => {
 				initial_events: [],
 			});
 			expect(transaction.canonical.session).toEqual(session);
+			const file = transactionPath(paths, session.session_id);
+			const legacy = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+			delete legacy.creation_intent_digest;
+			delete (legacy.canonical as { session: { broker: Record<string, unknown> } }).session.broker.sidecar_verifier;
+			for (const event of Object.values(legacy.outbox as Record<string, Record<string, unknown>>)) {
+				delete event.public_event_id;
+				delete event.public_delivery;
+			}
+			await fs.writeFile(file, JSON.stringify(legacy));
+			const migrated = await readSessionTransaction(paths, session.session_id);
+			expect(migrated).toMatchObject({
+				creation_intent_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+				canonical: { session: { broker: { sidecar_verifier: { key_id: expect.stringMatching(/^[a-f0-9]{64}$/) } } } },
+			});
+			expect(Object.values(migrated!.outbox).every(event => event.public_delivery.state === "pending")).toBe(true);
 			await withNamespaceRegistry(paths, async registry => {
 				registry.deletions["close-2550"] = {
 					deletion_id: "close-2550",

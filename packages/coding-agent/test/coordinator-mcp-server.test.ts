@@ -2366,6 +2366,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		await expect(server.callTool("gjc_coordinator_read_coordination_status")).resolves.toMatchObject({
 			summary: { reports: 1 },
 		});
+		const events = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0 });
+		expect(
+			(events.events as Array<Record<string, unknown>>).filter(event => event.kind === "report.written"),
+		).toHaveLength(1);
 	});
 	it("fails closed when a same-generation successor has a different endpoint incarnation", async () => {
 		const root = await tempRoot();
@@ -6481,13 +6485,24 @@ describe("Coordinator MCP deep-audit regressions", () => {
 			sessionId: "visible-session",
 			summary: "durable before sidecar",
 		});
-		for (let index = 0; index < 600; index++)
-			await appendCoordinatorEventForTest(namespace, {
-				stableId: `later-journal-event-${index.toString().padStart(3, "0")}`,
+		// Simulate a burst after the fsync/sidecar crash without spending hundreds
+		// of lock acquisitions. The missing sidecar must still recover its older row.
+		const trailingRows = Array.from({ length: 600 }, (_, index) =>
+			JSON.stringify({
+				schema_version: 1,
+				seq: first.seq + index + 1,
+				id: `later-journal-event-${index.toString().padStart(3, "0")}`,
+				timestamp: "2026-08-20T00:00:00.000Z",
 				kind: "turn.completed",
-				sessionId: "visible-session",
+				session_id: "visible-session",
 				summary: "x".repeat(512),
-			});
+			}),
+		).join("\n");
+		await fs.appendFile(path.join(events, "event-journal.jsonl"), `\n${trailingRows}\n`);
+		await fs.writeFile(
+			path.join(events, "event-seq.json"),
+			JSON.stringify({ seq: first.seq + 600, updated_at: "2026-08-20T00:00:00.000Z" }),
+		);
 		await fs.rm(path.join(events, "event-index", `${createHash("sha256").update(stableId).digest("hex")}.json`), {
 			force: true,
 		});

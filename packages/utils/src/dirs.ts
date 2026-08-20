@@ -202,8 +202,10 @@ function projectEnvSnapshot(cwd = process.cwd()): { values: Record<string, strin
  * recovering every endpoint and credential redirect the boundary rejects.
  *
  * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
- * it applies the same conservative ambiguity rule directly, matching how
- * `GJC_CODING_AGENT_DIR` is treated.
+ * it applies the same conservative ambiguity rule directly: a value that matches
+ * what the project `.env` sets is not honoured. An operator whose environment
+ * happens to carry the identical value loses the override, which is the same
+ * trade-off `resolveLiveCredentialEnvValue` already makes.
  */
 function trustedValue(
 	name: string,

@@ -9140,7 +9140,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						}
 						const reportPath = reportProjectionFile(namespaceDir, reportId);
 						await writeJsonFile(reportPath, report);
-						await exportRetainedDeliveries();
+						if (ledgerSessionId) {
+							await exportRetainedDeliveries();
+						} else {
+							await appendCoordinatorEvent(namespaceDir, {
+								stableId: `report-written:${reportId}`,
+								kind: "report.written",
+								reportId,
+								summary:
+									typeof args.summary === "string"
+										? args.summary
+										: `Report ${String(args.status ?? "unknown")} written`,
+								payloadRef: path.relative(namespaceDir, reportPath),
+								metadata: { status: typeof args.status === "string" ? args.status : null },
+							});
+						}
 						return response;
 					},
 					true,
