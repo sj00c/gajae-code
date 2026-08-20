@@ -132,6 +132,22 @@ describe("SDK prompt terminal arbiter", () => {
 		}
 	});
 
+	test("recordError and content positional arguments remain compatible", async () => {
+		const { reconciliation } = await accepted();
+		await reconciliation.claimPendingOutcome("prompt", correlation, failed("prompt_failed"));
+		await reconciliation.finalizeOutcome(
+			"prompt",
+			correlation,
+			undefined,
+			{ code: "legacy_error", message: "legacy message" },
+			{ text: "legacy content" },
+		);
+		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
+			status: "failed",
+			error: { code: "legacy_error", message: "legacy message" },
+		});
+	});
+
 	test("maps failure claims to their code unless an error override is supplied", async () => {
 		for (const code of ["prompt_failed", "prompt_deadline_exceeded"] as const) {
 			const { reconciliation } = await accepted();

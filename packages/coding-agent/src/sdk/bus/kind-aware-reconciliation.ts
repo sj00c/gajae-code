@@ -64,6 +64,13 @@ export interface KindAwareReconciliation {
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
 		outcome?: SdkPromptTerminalOutcome,
+		recordError?: { code: string; message: string },
+		content?: unknown,
+	): Promise<void>;
+	finalizeOutcome(
+		kind: ReconciliationKind,
+		correlation: PromptCorrelation,
+		outcome?: SdkPromptTerminalOutcome,
 		isCurrent?: () => boolean,
 		recordError?: { code: string; message: string },
 		content?: unknown,
@@ -394,10 +401,19 @@ export function createKindAwareReconciliation(
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
 		outcome?: SdkPromptTerminalOutcome,
-		isCurrent?: () => boolean,
-		recordError?: { code: string; message: string },
-		content?: unknown,
+		arg4?: (() => boolean) | { code: string; message: string },
+		arg5?: { code: string; message: string } | unknown,
+		arg6?: unknown,
 	) => {
+		const isCurrent = typeof arg4 === "function" ? arg4 : typeof arg6 === "function" ? arg6 : undefined;
+		const recordError =
+			typeof arg4 === "object" && arg4 !== null && "code" in arg4
+				? arg4
+				: typeof arg5 === "object" && arg5 !== null && "code" in arg5
+					? (arg5 as { code: string; message: string })
+					: undefined;
+		const content =
+			typeof arg4 === "function" ? arg6 : typeof arg5 === "object" && arg5 !== null && "code" in arg5 ? arg6 : arg5;
 		await queueMutation(candidate => {
 			if (isCurrent !== undefined && !isCurrent()) return { value: undefined, changed: false };
 			const record = candidate.get(keyOf(kind, correlation));

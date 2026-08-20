@@ -181,7 +181,8 @@ describe("Agent.forceAbort", () => {
 		expect(maintenanceEnded).toBe(true);
 
 		const promotions: boolean[] = [];
-		agent.onFollowUpConsumed = (_messages, promotion) => promotions.push(promotion.startsOwnRun);
+		agent.onFollowUpConsumed = (_messages, promotion = { startsOwnRun: false }) =>
+			promotions.push(promotion.startsOwnRun);
 		agent.followUp({
 			role: "user",
 			content: "queued follow-up",

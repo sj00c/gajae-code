@@ -354,14 +354,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * when the batch owns a new agent run; maintenance and in-run consumption
 	 * report false so callers attach to the existing lifecycle.
 	 */
-	onFollowUpConsumed?: (messages: AgentMessage[], promotion: { startsOwnRun: boolean }) => void;
+	onFollowUpConsumed?: (messages: AgentMessage[], promotion?: { startsOwnRun: boolean }) => void;
 	/**
 	 * Invoked with the steering messages the loop dequeues mid-run for the
 	 * CURRENT turn (right after getSteeringMessages). `promotion.startsOwnRun`
 	 * is false for in-run consumption and true when the batch starts a new run.
 	 */
 	/** Invoked when steering is consumed; see `startsOwnRun` on the promotion disposition. */
-	onSteeringConsumed?: (messages: AgentMessage[], promotion: { startsOwnRun: boolean }) => void;
+	onSteeringConsumed?: (messages: AgentMessage[], promotion?: { startsOwnRun: boolean }) => void;
 	/**
 	 * Supplies one bounded synthetic recovery instruction before the loop would
 	 * otherwise yield. Unlike a follow-up, it is sent only to the provider and

@@ -2805,7 +2805,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			activePromptOwnerHolder.connectionIds = owners;
 		};
 		let transitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
-		if (type === "agent_start") {
+		if (type === "agent_failed") {
+			const active = current.activeInvocation;
+			const candidates = current.openLifecycleBatches[0]?.invocations ?? current.pending;
+			const fallback = active ? [active] : candidates;
+			transitions = fallback.map(({ kind, correlation }) => ({ kind, correlation }));
+		} else if (type === "agent_start") {
 			current.lifecycleEpoch += 1;
 			// Mark lifecycle active even when the drain is empty: a monitor/cron
 			// run started by the session has no SDK pending entry but is still a
@@ -2856,6 +2861,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			];
 		}
 		const eventLifecycleEpoch = current.lifecycleEpoch;
+		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") {
+			try {
+				current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
+			} catch {
+				// Maintenance checkpoints are non-terminal lifecycle observations.
+			}
+			const resolvers = terminalPublicationCapture.resolvers;
+			terminalPublicationCapture.resolvers = undefined;
+			for (const resolve of resolvers ?? []) resolve(true);
+			return;
+		}
 		// Observe whether the lifecycle publication actually landed: a terminal
 		// abort awaits this result so its durable row only claims
 		// terminalPublished when the correlated agent_end event reached the

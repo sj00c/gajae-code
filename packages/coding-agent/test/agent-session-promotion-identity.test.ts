@@ -196,7 +196,8 @@ describe("queued promotion run identity (#4668)", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: mock.stream,
 		});
-		agent.onFollowUpConsumed = (_messages, promotion) => promotions.push(promotion.startsOwnRun);
+		agent.onFollowUpConsumed = (_messages, promotion = { startsOwnRun: false }) =>
+			promotions.push(promotion.startsOwnRun);
 		const followUpMessage = {
 			role: "user",
 			content: "queued follow-up",

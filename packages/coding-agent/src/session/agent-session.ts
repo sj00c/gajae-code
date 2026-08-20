@@ -3732,7 +3732,7 @@ export class AgentSession {
 		// actual resume admission — when the loop dequeues the follow-up for the
 		// next turn, the previously streaming turn has ended, so mutating the
 		// session-wide epoch/lineage is safe and its tools bind the fresh lineage.
-		this.agent.onFollowUpConsumed = (messages, promotion) => {
+		this.agent.onFollowUpConsumed = (messages, promotion = { startsOwnRun: false }) => {
 			// A follow-up whose owned-completion origin is DENIED — an owned
 			// scope landed after the result was queued, or the tuple is
 			// forged/vanished-disabled — must NOT resume the agent: remove it
@@ -3772,7 +3772,7 @@ export class AgentSession {
 		// promotion hook at the REAL dequeue boundary so the SDK attaches the
 		// submitter to the in-flight run instead of parking the correlation for
 		// an unrelated later agent_start (#4668).
-		this.agent.onSteeringConsumed = (messages, promotion) => {
+		this.agent.onSteeringConsumed = (messages, promotion = { startsOwnRun: false }) => {
 			this.#fireQueuedPromotionHooks(messages, promotion);
 		};
 		this.agent.providerSessionState = this.#providerSessionState;
