@@ -1120,14 +1120,21 @@ function shouldPreserveTerminalPayload(previous: RuntimeStateSidecarPayload, inp
 
 function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, input: RuntimeStateIdentity): void {
 	if (Object.keys(previous).length === 0) return;
-	// A coordinator-seeded payload (#2549) carries session_id and current_turn_id
-	// but not cwd/workdir/session_file (those are runtime identity fields). When
-	// the runtime writes to the coordinator-shared file, the seed is from the
-	// same session — the session_id match plus the broker-scoped file path is
-	// sufficient identity. Only refuse a genuinely foreign session_id.
 	if (previous.session_id !== input.sessionId) throw new PreviousRuntimeStateReadError();
-	// An explicit shared file requires a signature made by this launch's bootstrap key.
-	if (input.sidecarKeyId !== null && Object.keys(previous).length > 0 && previous.sidecar_key_id !== undefined) {
+	// Signed coordinator mode never trusts an unsigned predecessor. The sole exception
+	// is the narrow, coordinator-authenticated bootstrap seed: it has no runtime identity
+	// fields, is explicitly sourced by the coordinator, and carries the turn fence.
+	const coordinatorSeed =
+		previous.source === "coordinator" &&
+		typeof previous.current_turn_id === "string" &&
+		previous.current_turn_id.trim().length > 0 &&
+		previous.cwd === undefined &&
+		previous.workdir === undefined &&
+		previous.session_file === undefined &&
+		previous.sidecar_key_id === undefined &&
+		previous.sidecar_signature === undefined;
+	if (input.sidecarKeyId !== null) {
+		if (coordinatorSeed) return;
 		if (
 			previous.sidecar_key_id !== input.sidecarKeyId ||
 			typeof previous.sidecar_signature !== "string" ||
@@ -1145,6 +1152,7 @@ function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, i
 		)
 			throw new PreviousRuntimeStateReadError();
 	}
+	if (coordinatorSeed) return;
 	// If the previous payload has runtime identity fields, verify them fully.
 	if (typeof previous.cwd === "string" && typeof previous.workdir === "string") {
 		if (
