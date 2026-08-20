@@ -59,6 +59,12 @@ export interface UltragoalValidationApplicability {
 	selection: string[];
 }
 
+export interface UltragoalValidationLaneSelection {
+	riskClass: "low" | "high";
+	reasons: string[];
+	omittedLanes: UltragoalValidationLane[];
+}
+
 /**
  * Substring markers for security-sensitive surfaces. A hand-maintained prefix
  * list cannot be fail-closed: any new credential/auth file added anywhere in
@@ -81,6 +87,9 @@ const SECURITY_SENSITIVE_PATH_MARKERS = [
 	"permission",
 ] as const;
 
+const GENERIC_SECURITY_PATH_PATTERN =
+	/(^|\/)(auth|authentication|authorization|security|permission|permissions)(?:[._-]|\/|$)/i;
+
 const HIGH_RISK_PATH_PREFIXES = [
 	// Security/auth surfaces
 	"packages/coding-agent/src/session/auth-storage.ts",
@@ -90,6 +99,7 @@ const HIGH_RISK_PATH_PREFIXES = [
 	"packages/coding-agent/src/runtime-credential-selector.ts",
 	"packages/coding-agent/src/secrets",
 	"packages/ai/src/auth-storage.ts",
+	"packages/natives",
 	"packages/coding-agent/src/runtime-mcp/oauth-flow.ts",
 	"packages/coding-agent/src/commands/auth-broker.ts",
 	"crates/pi-natives/src",
@@ -123,6 +133,8 @@ export function isHighRiskChangePath(row: UltragoalChangeSetPath): boolean {
 		.filter((value): value is string => typeof value === "string")
 		.map(normalizeRepoPath);
 	for (const candidate of candidates) {
+		if (GENERIC_SECURITY_PATH_PATTERN.test(candidate)) return true;
+		if (/^packages\/natives(?:-|\/|$)/.test(candidate)) return true;
 		for (const prefix of HIGH_RISK_PATH_PREFIXES) {
 			if (candidate === prefix || candidate.startsWith(`${prefix}/`)) return true;
 		}
@@ -132,6 +144,18 @@ export function isHighRiskChangePath(row: UltragoalChangeSetPath): boolean {
 		}
 	}
 	return false;
+}
+
+export function validationLaneSelectionFor(
+	applicability: UltragoalValidationApplicability,
+): UltragoalValidationLaneSelection {
+	return {
+		riskClass: applicability.riskClass,
+		reasons: [...applicability.selection],
+		omittedLanes: (Object.keys(applicability.lanes) as UltragoalValidationLane[])
+			.filter(lane => !applicability.lanes[lane].applicable)
+			.sort(),
+	};
 }
 
 export function isMigrationChangePath(row: UltragoalChangeSetPath): boolean {

@@ -188,6 +188,28 @@ describe("#4560 forced-compaction comparative matrix", () => {
 		expect(highRisk.lanes["terminal-critic"].applicable).toBe(true);
 	});
 
+	it("classifies generic auth/security and generated native surfaces as high risk", () => {
+		for (const pathValue of [
+			"packages/example/src/auth.ts",
+			"packages/example/test/auth.test.ts",
+			"packages/example/src/security/headers.ts",
+			"packages/natives/native/index.js",
+			"packages/natives-linux-x64/native/index.js",
+		]) {
+			const applicability = resolveUltragoalValidationApplicability({
+				changeSet: {
+					source: "checkpoint-git",
+					trusted: true,
+					paths: [{ path: pathValue, status: "modified" }],
+				},
+				requiredGoals: 1,
+				authoritativeSourceHash: "sha256:frozen",
+			});
+			expect(applicability.riskClass).toBe("high");
+			expect(applicability.lanes.architect.applicable).toBe(true);
+		}
+	});
+
 	it("reduces reviewer invocations only on the small fixture", () => {
 		const lanesFor = (requiredGoals: number, changePath: string): number => {
 			const applicability = resolveUltragoalValidationApplicability({

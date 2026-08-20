@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	__setRepositoryStateWitnessTestHookForTests,
 	computeCheckpointChangeSet,
 	computeUltragoalReviewSourceHash,
 	mergeChangeSetPaths,
@@ -185,5 +186,46 @@ describe("ultragoal change-set extraction", () => {
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
+	});
+
+	it("fails closed on a concurrent same-status content mutation", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-witness-race-"));
+		try {
+			expect(await Bun.spawn(["git", "init"], { cwd: root, stdout: "ignore", stderr: "ignore" }).exited).toBe(0);
+			await Bun.write(path.join(root, "tracked.txt"), "baseline\n");
+			expect(
+				await Bun.spawn(["git", "add", "tracked.txt"], { cwd: root, stdout: "ignore", stderr: "ignore" }).exited,
+			).toBe(0);
+			expect(
+				await Bun.spawn(
+					["git", "-c", "user.name=GJC Test", "-c", "user.email=test@example.invalid", "commit", "-m", "baseline"],
+					{ cwd: root, stdout: "ignore", stderr: "ignore" },
+				).exited,
+			).toBe(0);
+			expect(
+				await Bun.spawn(["git", "branch", "dev"], { cwd: root, stdout: "ignore", stderr: "ignore" }).exited,
+			).toBe(0);
+			await Bun.write(path.join(root, "tracked.txt"), "reviewed\n");
+			__setRepositoryStateWitnessTestHookForTests(async (_phase, cwd) => {
+				await Bun.write(path.join(cwd, "tracked.txt"), "raced\n");
+			});
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.captureIncomplete).toBe(true);
+			expect(computeUltragoalReviewSourceHash(changeSet)).toBeUndefined();
+		} finally {
+			__setRepositoryStateWitnessTestHookForTests(undefined);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects trusted added paths without a verified untracked content hash", () => {
+		expect(
+			computeUltragoalReviewSourceHash({
+				source: "checkpoint-git",
+				paths: [{ path: "new.ts", status: "added" }],
+				rawDiff: "diff --git a/new.ts b/new.ts\n",
+				trusted: true,
+			}),
+		).toBeUndefined();
 	});
 });

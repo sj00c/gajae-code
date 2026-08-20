@@ -151,6 +151,50 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		expect(cliHash).toBe(internalHash);
 	});
 
+	it("round-trips the real low-risk lane-selection CLI payload through validation", async () => {
+		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
+		const frozen = await sourceHash();
+		await seedPriorCohort(frozen);
+		const selectionResult = await runNativeUltragoalCommand(["quality-gate", "lane-selection", "--json"], root);
+		expect(selectionResult.status).toBe(0);
+		const selection = JSON.parse(selectionResult.stdout ?? "{}");
+		const gate = baseGate(frozen, { qa: lane(frozen) });
+		gate.validationLaneSelection = selection.validationLaneSelection;
+		const result = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			qualityGateJson: JSON.stringify(gate),
+			goalId: "G001",
+		});
+		expect(result.errors).toEqual([]);
+		expect(result.valid).toBe(true);
+	});
+
+	it("round-trips the real high-risk native-binding lane-selection CLI payload through validation", async () => {
+		await seedPlan(1, { "packages/natives/native/index.js": "export const native = true;\n" });
+		const frozen = await sourceHash();
+		const selectionResult = await runNativeUltragoalCommand(["quality-gate", "lane-selection", "--json"], root);
+		expect(selectionResult.status).toBe(0);
+		const selection = JSON.parse(selectionResult.stdout ?? "{}");
+		const gate = baseGate(frozen, {
+			cleaner: lane(frozen, "CLEAR"),
+			architect: lane(frozen, "CLEAR"),
+			qa: lane(frozen),
+		});
+		gate.criticReview = {
+			verdict: "OKAY",
+			evidence: "terminal critic approved the high-risk boundary",
+			blockers: [],
+		};
+		gate.validationLaneSelection = selection.validationLaneSelection;
+		const result = await validateUltragoalQualityGateReadOnly({
+			cwd: root,
+			qualityGateJson: JSON.stringify(gate),
+			goalId: "G001",
+		});
+		expect(result.errors).toEqual([]);
+		expect(result.valid).toBe(true);
+	});
+
 	it("hashes an untracked symlink by link identity without reading its external target", async () => {
 		if (process.platform === "win32") return;
 		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
@@ -185,7 +229,11 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		const frozen = await sourceHash();
 		await seedPriorCohort(frozen);
 		const gate = baseGate(frozen, { qa: lane(frozen) });
-		gate.validationLaneSelection = { riskClass: "low", reasons: [], omittedLanes: ["cleaner", "architect"] };
+		gate.validationLaneSelection = {
+			riskClass: "low",
+			reasons: ["riskClass=low", "basisUnchanged=true"],
+			omittedLanes: ["cleaner", "architect", "terminal-critic"],
+		};
 		const result = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
 			qualityGateJson: JSON.stringify(gate),
@@ -199,14 +247,18 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		await seedPlan(1, { "packages/coding-agent/src/sdk/session.ts": "export const y = 2;\n" });
 		const frozen = await sourceHash();
 		const gate = baseGate(frozen, { qa: lane(frozen) });
-		gate.validationLaneSelection = { riskClass: "low", reasons: [], omittedLanes: ["cleaner", "architect"] };
+		gate.validationLaneSelection = {
+			riskClass: "low",
+			reasons: ["riskClass=high", "basisUnchanged=false", "heavyweightReasons=high-risk-paths"],
+			omittedLanes: ["cleaner", "architect", "terminal-critic"],
+		};
 		const result = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
 			qualityGateJson: JSON.stringify(gate),
 			goalId: "G001",
 		});
 		expect(result.valid).toBe(false);
-		expect(result.errors.some(e => e.code === "reduction_not_applicable")).toBe(true);
+		expect(result.errors.some(e => e.code === "selection_mismatch")).toBe(true);
 		// And the cohort validation still demands the full lanes.
 		expect(result.errors.some(e => e.code === "review_cohort_invalid")).toBe(true);
 	});
@@ -227,7 +279,11 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 	it("rejects a selection proof that tries to omit the QA lane", async () => {
 		await seedPlan(1, { "packages/utils/src/helper.ts": "export const x = 1;\n" });
 		const gate = baseGate(await sourceHash(), {});
-		gate.validationLaneSelection = { riskClass: "low", reasons: [], omittedLanes: ["cleaner", "architect", "qa"] };
+		gate.validationLaneSelection = {
+			riskClass: "low",
+			reasons: ["riskClass=low", "basisUnchanged=false"],
+			omittedLanes: ["cleaner", "architect", "qa"],
+		};
 		const result = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
 			qualityGateJson: JSON.stringify(gate),
@@ -253,14 +309,18 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		// Full cohort on a multi-goal run validates (structural pass expected).
 		expect(full.errors.filter(e => e.code === "review_cohort_invalid")).toEqual([]);
 		const reduced = baseGate(frozen, { qa: lane(frozen) });
-		reduced.validationLaneSelection = { riskClass: "low", reasons: [], omittedLanes: ["cleaner", "architect"] };
+		reduced.validationLaneSelection = {
+			riskClass: "low",
+			reasons: ["riskClass=high", "basisUnchanged=false", "heavyweightReasons=multiple-outstanding-goals"],
+			omittedLanes: ["cleaner", "architect", "terminal-critic"],
+		};
 		const rejected = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
 			qualityGateJson: JSON.stringify(reduced),
 			goalId: "G001",
 		});
 		expect(rejected.valid).toBe(false);
-		expect(rejected.errors.some(e => e.code === "reduction_not_applicable")).toBe(true);
+		expect(rejected.errors.some(e => e.code === "selection_mismatch")).toBe(true);
 	});
 
 	it("rejects a reused self-declared cohort hash after the source changes", async () => {
@@ -269,7 +329,11 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		await seedPriorCohort(frozen);
 		await Bun.write(path.join(root, "packages/utils/src/helper.ts"), "export const x = 2;\n");
 		const gate = baseGate(frozen, { qa: lane(frozen) });
-		gate.validationLaneSelection = { riskClass: "low", reasons: [], omittedLanes: ["cleaner", "architect"] };
+		gate.validationLaneSelection = {
+			riskClass: "low",
+			reasons: ["riskClass=low", "basisUnchanged=false"],
+			omittedLanes: ["cleaner", "architect", "terminal-critic"],
+		};
 		const result = await validateUltragoalQualityGateReadOnly({
 			cwd: root,
 			qualityGateJson: JSON.stringify(gate),
@@ -287,7 +351,7 @@ describe("ultragoal validation lane selection gate (#4560)", () => {
 		gate.validationLaneSelection = {
 			riskClass: "low",
 			reasons: ["model-says-safe"],
-			omittedLanes: ["cleaner", "architect"],
+			omittedLanes: ["cleaner", "architect", "terminal-critic"],
 		};
 		const result = await validateUltragoalQualityGateReadOnly({
 			cwd: root,

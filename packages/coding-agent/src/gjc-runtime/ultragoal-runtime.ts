@@ -83,6 +83,8 @@ import {
 	resolveUltragoalValidationApplicability,
 	type UltragoalValidationApplicability,
 	type UltragoalValidationLane,
+	type UltragoalValidationLaneSelection,
+	validationLaneSelectionFor,
 } from "./ultragoal-validation-policy";
 import { resolveWorkflowSetting } from "./workflow-settings";
 
@@ -2481,11 +2483,7 @@ function validateDeferredCompletionQualityGate(
 		);
 }
 /** #4560: declared lane-selection proof shape on the quality gate. */
-interface DeclaredValidationLaneSelection {
-	riskClass: string;
-	reasons: string[];
-	omittedLanes: string[];
-}
+type DeclaredValidationLaneSelection = UltragoalValidationLaneSelection;
 
 function readDeclaredValidationLaneSelection(gate: JsonObject): DeclaredValidationLaneSelection | undefined {
 	const declared = qualityGateObject(gate.validationLaneSelection);
@@ -2498,7 +2496,11 @@ function readDeclaredValidationLaneSelection(gate: JsonObject): DeclaredValidati
 			"validationLaneSelection must carry riskClass, reasons, and omittedLanes string arrays mirroring the runtime selection",
 		);
 	}
-	return { riskClass, reasons, omittedLanes };
+	if (riskClass !== "low" && riskClass !== "high")
+		throw new Error('validationLaneSelection.riskClass must be "low" or "high"');
+	if (omittedLanes.some(lane => !["cleaner", "architect", "qa", "terminal-critic"].includes(lane)))
+		throw new Error("validationLaneSelection.omittedLanes contains an unsupported lane");
+	return { riskClass, reasons, omittedLanes: omittedLanes as UltragoalValidationLane[] };
 }
 
 /**
@@ -2512,14 +2514,6 @@ function validateDeclaredValidationLaneSelection(
 	applicability: UltragoalValidationApplicability,
 	found: QualityGateDiagnostics,
 ): boolean {
-	if (applicability.riskClass !== "low") {
-		found.add(
-			"validationLaneSelection",
-			"reduction_not_applicable",
-			"validationLaneSelection lane reduction is not applicable: the runtime computed a high-risk boundary; the full cohort is mandatory",
-		);
-		return false;
-	}
 	if (declared.riskClass !== applicability.riskClass) {
 		found.add(
 			"validationLaneSelection",
@@ -2528,15 +2522,19 @@ function validateDeclaredValidationLaneSelection(
 		);
 		return false;
 	}
-	if (declared.reasons.length !== 0) {
+	const expected = validationLaneSelectionFor(applicability);
+	if (
+		declared.reasons.length !== expected.reasons.length ||
+		declared.reasons.some((reason, index) => reason !== expected.reasons[index])
+	) {
 		found.add(
 			"validationLaneSelection.reasons",
 			"reasons_mismatch",
-			"declared validationLaneSelection reasons must exactly mirror the runtime-computed low-risk reason set",
+			"declared validationLaneSelection reasons must exactly mirror the runtime-computed selection basis",
 		);
 		return false;
 	}
-	const expectedOmitted = (["cleaner", "architect"] as const).filter(lane => !applicability.lanes[lane].applicable);
+	const expectedOmitted = expected.omittedLanes;
 	const declaredOmitted = new Set(declared.omittedLanes);
 	if (declaredOmitted.has("qa")) {
 		found.add(
@@ -2554,7 +2552,7 @@ function validateDeclaredValidationLaneSelection(
 		);
 		return false;
 	}
-	return true;
+	return applicability.riskClass === "low";
 }
 
 /** #4560: newest joined cohort (generation + frozen sourceHash) in the ledger. */
@@ -5307,15 +5305,9 @@ async function dispatchUltragoalCommand(
 						currentSourceHash: authoritativeSourceHash ?? undefined,
 						authoritativeSourceHash,
 					});
-					const omittedLanes = (Object.keys(applicability.lanes) as UltragoalValidationLane[])
-						.filter(lane => !applicability.lanes[lane].applicable)
-						.sort();
+					const laneSelection = validationLaneSelectionFor(applicability);
 					const payload = {
-						validationLaneSelection: {
-							riskClass: applicability.riskClass,
-							reasons: applicability.selection,
-							omittedLanes,
-						},
+						validationLaneSelection: laneSelection,
 						basisUnchanged: applicability.basisUnchanged,
 						sourceHash: authoritativeSourceHash,
 					};
@@ -5323,7 +5315,7 @@ async function dispatchUltragoalCommand(
 						? { status: 0, stdout: `${JSON.stringify(payload, null, 2)}\n` }
 						: {
 								status: 0,
-								stdout: `riskClass=${applicability.riskClass} omittedLanes=${omittedLanes.join(",") || "(none)"}\n`,
+								stdout: `riskClass=${applicability.riskClass} omittedLanes=${laneSelection.omittedLanes.join(",") || "(none)"}\n`,
 							};
 				}
 				if (subcommand === "init") {
