@@ -8585,6 +8585,25 @@ export function createNotificationsExtension(
 		rt.pendingInbound.clear();
 	});
 
+	// `agent_failed` is an additive correlated diagnostic. The terminal
+	// `agent_end` handler below remains the sole owner of prompt terminalization;
+	// publishing this frame here lets clients surface the real failure while they
+	// continue waiting for the durable terminal boundary.
+	api.on("agent_failed", async (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt) return;
+		const correlation = rt.activePromptCorrelation;
+		if (!correlation) return;
+		const error = sanitizePromptFailure(event.error);
+		rt.emitPromptLifecycle(correlation, {
+			type: "agent_failed",
+			sessionId: id,
+			...correlation,
+			error,
+		});
+	});
+
 	// Idle fires on `agent_end` (the agent loop settling to await the user), NOT
 	// per `turn_end`. turn_end fires once per turn iteration, so a single
 	// user-visible idle previously produced many idle pings (the flood); agent_end
