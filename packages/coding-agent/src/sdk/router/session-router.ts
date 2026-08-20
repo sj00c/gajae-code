@@ -930,6 +930,41 @@ export class SessionRouter {
 		this.#retryPending = attachThrew && live.some(session => !attachedIds.has(session.sessionId));
 	}
 
+	/**
+	 * Bounded, lock-free endpoint-authority read for maintenance heartbeats
+	 * (#4730 review). `#readEndpoint` finishes with a locked `#index.refresh()`,
+	 * which on the 5s lease heartbeat would restore exactly the locked full index
+	 * scan this work removes. The heartbeat does not need index re-projection: it
+	 * only needs to know that THIS endpoint record still carries the authority
+	 * the attachment was published with, which the endpoint file itself proves.
+	 * Returns true only when the durable record still matches.
+	 */
+	async #endpointAuthorityUnchanged(attached: AttachedSession): Promise<boolean> {
+		const indexed = attached.indexed;
+		if (!isSessionAuthorityEligible(indexed)) return false;
+		if (indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return false;
+		const statBefore = await fs.stat(attached.endpoint.path).catch(() => undefined);
+		if (!statBefore || statBefore.mtimeMs !== indexed.endpointMtimeMs) return false;
+		let raw: Record<string, unknown>;
+		try {
+			const parsed = JSON.parse(await Bun.file(attached.endpoint.path).text());
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+			raw = parsed as Record<string, unknown>;
+		} catch {
+			return false;
+		}
+		if (
+			raw.sessionId !== indexed.sessionId ||
+			raw.pid !== attached.pid ||
+			raw.stale === true ||
+			raw.url !== attached.endpoint.url ||
+			raw.token !== attached.endpoint.token
+		)
+			return false;
+		const statAfter = await fs.stat(attached.endpoint.path).catch(() => undefined);
+		return statAfter !== undefined && statAfter.mtimeMs === indexed.endpointMtimeMs;
+	}
+
 	async #readEndpoint(indexed: IndexedSession): Promise<SdkSessionEndpoint | null> {
 		if (!isSessionAuthorityEligible(indexed)) return null;
 		const repo = path.resolve(indexed.locator.repo);
@@ -1156,16 +1191,11 @@ export class SessionRouter {
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				// Renewal must fail closed against durable authority (#4730 review):
 				// the idle path can defer full projection to the 30s sweep, so an
-				// endpoint replaced in that window would otherwise keep receiving
-				// lease renewals. This reads the endpoint record only -- it never
-				// re-enters the locked index rescan the 5s heartbeat existed to avoid.
-				const endpoint = await this.#readEndpoint(attached.indexed);
-				if (
-					!endpoint ||
-					endpoint.url !== attached.endpoint.url ||
-					endpoint.token !== attached.endpoint.token ||
-					endpoint.pid !== attached.pid
-				)
+				// endpoint replaced in that window would otherwise keep receiving lease
+				// renewals. This is the bounded LOCK-FREE check: it reads only this
+				// endpoint record and never re-enters the locked index rescan, which on
+				// a 5s heartbeat would restore the very cost #4689 removes.
+				if (!(await this.#endpointAuthorityUnchanged(attached)))
 					throw new SessionRouterError("pre_send", "SDK session endpoint authority changed before lease renewal.");
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
