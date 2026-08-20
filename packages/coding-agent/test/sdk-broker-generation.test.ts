@@ -230,6 +230,20 @@ describe("sdk broker package generation", () => {
 				authority,
 			),
 		).toBe(false);
+		const betaAuthority = { ...authority, packageVersion: "1.0.0-beta.10" };
+		expect(canRetireStaleBrokerForTest({ ...base, packageVersion: "1.0.0-beta.2" }, betaAuthority)).toBe(true);
+		expect(
+			canRetireStaleBrokerForTest(
+				{ ...base, packageVersion: "1.0.0-beta.10" },
+				{ ...authority, packageVersion: "1.0.0" },
+			),
+		).toBe(true);
+		expect(
+			canRetireStaleBrokerForTest(
+				{ ...base, packageVersion: "1.0.0" },
+				{ ...authority, packageVersion: "1.0.0-beta.10" },
+			),
+		).toBe(false);
 	});
 
 	it("does not signal a newer broker when the caller generation is stale", async () => {

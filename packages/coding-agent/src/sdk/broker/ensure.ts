@@ -329,10 +329,13 @@ function signalExactBroker(pid: number, incarnation: string): boolean {
 }
 
 function comparePackageVersions(left: string, right: string): number | undefined {
-	const parse = (value: string): { numbers: [number, number, number]; prerelease: string | undefined } | undefined => {
-		const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(value);
+	const parse = (value: string): { numbers: [number, number, number]; prerelease: string[] } | undefined => {
+		const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(value);
 		if (!match) return undefined;
-		return { numbers: [Number(match[1]), Number(match[2]), Number(match[3])], prerelease: match[4] };
+		return {
+			numbers: [Number(match[1]), Number(match[2]), Number(match[3])],
+			prerelease: match[4] ? match[4].split(".") : [],
+		};
 	};
 	const leftParsed = parse(left);
 	const rightParsed = parse(right);
@@ -341,10 +344,27 @@ function comparePackageVersions(left: string, right: string): number | undefined
 		if (leftParsed.numbers[index] !== rightParsed.numbers[index])
 			return leftParsed.numbers[index] < rightParsed.numbers[index] ? -1 : 1;
 	}
-	if (leftParsed.prerelease === rightParsed.prerelease) return 0;
-	if (leftParsed.prerelease === undefined) return 1;
-	if (rightParsed.prerelease === undefined) return -1;
-	return leftParsed.prerelease < rightParsed.prerelease ? -1 : 1;
+	if (leftParsed.prerelease.length === 0 || rightParsed.prerelease.length === 0) {
+		if (leftParsed.prerelease.length === rightParsed.prerelease.length) return 0;
+		return leftParsed.prerelease.length === 0 ? 1 : -1;
+	}
+	for (let index = 0; index < Math.max(leftParsed.prerelease.length, rightParsed.prerelease.length); index++) {
+		const leftIdentifier = leftParsed.prerelease[index];
+		const rightIdentifier = rightParsed.prerelease[index];
+		if (leftIdentifier === undefined || rightIdentifier === undefined) return leftIdentifier === undefined ? -1 : 1;
+		const leftNumeric = /^\d+$/.test(leftIdentifier);
+		const rightNumeric = /^\d+$/.test(rightIdentifier);
+		if (leftNumeric && rightNumeric) {
+			const leftNumber = Number(leftIdentifier);
+			const rightNumber = Number(rightIdentifier);
+			if (leftNumber !== rightNumber) return leftNumber < rightNumber ? -1 : 1;
+		} else if (leftNumeric !== rightNumeric) {
+			return leftNumeric ? -1 : 1;
+		} else if (leftIdentifier !== rightIdentifier) {
+			return leftIdentifier < rightIdentifier ? -1 : 1;
+		}
+	}
+	return 0;
 }
 
 function canRetireStaleBroker(stale: BrokerDiscovery, authority: SdkPackageAuthority): boolean {
