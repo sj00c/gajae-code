@@ -1,4 +1,5 @@
 import * as childProcess from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -56,6 +57,10 @@ function addonBytesMatch(left, right) {
 	} catch {
 		return false;
 	}
+}
+
+function addonContentDigest(file) {
+	return createHash("sha256").update(fs.readFileSync(file)).digest("hex").slice(0, 24);
 }
 
 // =========================================================================
@@ -477,9 +482,8 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 				errors.push(`staged addon drift (${filename}): cached bytes differ from the current package artifact`);
 				rejectCandidates([targetPath, sourcePath]);
 				try {
-					const refreshDir = fs.mkdtempSync(path.join(ctx.versionedDir, `.refresh-${process.pid}-`));
-					const refreshPath = path.join(refreshDir, filename);
-					fs.copyFileSync(sourcePath, refreshPath);
+					const refreshPath = path.join(ctx.versionedDir, `.refresh-${addonContentDigest(sourcePath)}-${filename}`);
+					if (!fs.existsSync(refreshPath)) fs.copyFileSync(sourcePath, refreshPath);
 					if (!addonBytesMatch(refreshPath, sourcePath)) {
 						throw new Error("restaged addon bytes do not match the current package artifact");
 					}

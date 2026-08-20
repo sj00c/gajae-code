@@ -2054,4 +2054,22 @@ mod tests {
 			 broken `proc_listchildpids`",
 		);
 	}
+
+	/// Darwin's stable process reference must deliver the fallback signal
+	/// through its start-time identity check rather than requiring callers to
+	/// use raw kill.
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn signal_root_terminates_the_pinned_child() {
+		use std::process::Command;
+
+		let mut child = Command::new("sleep")
+			.arg("10")
+			.spawn()
+			.expect("spawn sleep");
+		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let process = Process::from_pid(pid).expect("child process reference");
+		assert!(process.signal_root(TERM_SIGNAL));
+		assert!(!child.wait().expect("wait child").success());
+	}
 }
