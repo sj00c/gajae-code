@@ -38,6 +38,7 @@ describe("SYSTEM.md prompt assembly", () => {
 
 	afterEach(() => {
 		setAgentDir(originalAgentDir);
+		vi.restoreAllMocks();
 		cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome }))();
 	});
 
