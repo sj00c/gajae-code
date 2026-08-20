@@ -48,6 +48,16 @@ function getNativesDir() {
 	return path.join(os.homedir(), ".gjc", "natives");
 }
 
+function addonBytesMatch(left, right) {
+	try {
+		const leftStat = fs.statSync(left);
+		const rightStat = fs.statSync(right);
+		return leftStat.size === rightStat.size && Buffer.compare(fs.readFileSync(left), fs.readFileSync(right)) === 0;
+	} catch {
+		return false;
+	}
+}
+
 // =========================================================================
 // Pure helpers — re-exported for unit tests in `packages/natives/test/`.
 // =========================================================================
@@ -444,19 +454,23 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
  * `node_modules` copy that bun must overwrite on update. No-op on non-Windows,
  * in workspace dev, and for compiled binaries — see `shouldStageNodeModulesAddon`.
  */
-function maybeStageNodeModulesAddon(ctx, errors) {
+export function maybeStageNodeModulesAddon(ctx, errors) {
 	if (!ctx.stageFromNodeModules) return null;
 
 	let stagedPath = null;
 	const sourceDirs = [...ctx.optionalPackageNativeDirs, ctx.nativeDir];
 	for (const filename of ctx.addonFilenames) {
 		const targetPath = path.join(ctx.versionedDir, filename);
+		const sourcePath = sourceDirs.map(sourceDir => path.join(sourceDir, filename)).find(candidate => fs.existsSync(candidate));
 
 		if (fs.existsSync(targetPath)) {
+			if (sourcePath && !addonBytesMatch(targetPath, sourcePath)) {
+				errors.push(`staged addon drift (${filename}): cached bytes differ from the current package artifact`);
+				continue;
+			}
 			stagedPath = stagedPath || targetPath;
 			continue;
 		}
-		const sourcePath = sourceDirs.map(sourceDir => path.join(sourceDir, filename)).find(candidate => fs.existsSync(candidate));
 		if (!sourcePath) continue;
 
 		try {

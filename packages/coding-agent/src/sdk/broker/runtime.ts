@@ -110,7 +110,10 @@ function regularFilesUnder(directory: string): string[] {
 				const canonical = fs.realpathSync(candidate);
 				if (!containedPath(directory, canonical))
 					throw new Error("SDK internal launch refused: source dependency escapes its trusted directory.");
-				if (fs.statSync(canonical).isFile()) files.push(canonical);
+				const stat = fs.statSync(canonical);
+				if (stat.isDirectory())
+					throw new Error("SDK internal launch refused: symlinked source directories are unsupported.");
+				if (stat.isFile()) files.push(canonical);
 			}
 		}
 	};
@@ -120,7 +123,12 @@ function regularFilesUnder(directory: string): string[] {
 
 function stagedNativeFiles(packageVersion: string): string[] {
 	if (process.platform !== "win32") return [];
-	const directory = path.join(os.homedir(), ".gjc", "natives", packageVersion);
+	const xdgDataHome = process.env.XDG_DATA_HOME;
+	const baseDirectory =
+		xdgDataHome && fs.existsSync(path.join(xdgDataHome, "gjc"))
+			? path.join(xdgDataHome, "gjc", "natives")
+			: path.join(os.homedir(), ".gjc", "natives");
+	const directory = path.join(baseDirectory, packageVersion);
 	return fs.existsSync(directory) ? regularFilesUnder(directory) : [];
 }
 

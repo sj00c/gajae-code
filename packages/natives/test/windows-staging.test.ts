@@ -20,8 +20,14 @@
  * build`) and on non-Windows so the regular path is unchanged.
  */
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAddonFilenames, resolveLoaderCandidates, shouldStageNodeModulesAddon } from "../native/loader-state.js";
+import {
+	getAddonFilenames,
+	maybeStageNodeModulesAddon,
+	resolveLoaderCandidates,
+	shouldStageNodeModulesAddon,
+} from "../native/loader-state.js";
 import packageJson from "../package.json" with { type: "json" };
 
 const winNodeModulesNativeDir = "C:\\Users\\Admin\\node_modules\\@gajae-code\\pi-natives\\native";
@@ -125,6 +131,34 @@ describe("windows native addon staging", () => {
 		const nodeModulesBaseline = path.join(posixNodeModulesNativeDir, "pi_natives.linux-x64-baseline.node");
 		expect(candidates).not.toContain(versionedBaseline);
 		expect(candidates).toContain(nodeModulesBaseline);
+	});
+
+	it("does not reuse a staged addon whose bytes drifted from the package artifact", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-drift-"));
+		const nativeDir = path.join(root, "native");
+		const versionedDir = path.join(root, "versioned");
+		const filename = "pi_natives.win32-x64.node";
+		await fs.mkdir(nativeDir, { recursive: true });
+		await fs.mkdir(versionedDir, { recursive: true });
+		await fs.writeFile(path.join(nativeDir, filename), "new-addon");
+		await fs.writeFile(path.join(versionedDir, filename), "old-addon");
+		try {
+			const errors: string[] = [];
+			const staged = maybeStageNodeModulesAddon(
+				{
+					stageFromNodeModules: true,
+					versionedDir,
+					addonFilenames: [filename],
+					optionalPackageNativeDirs: [],
+					nativeDir,
+				},
+				errors,
+			);
+			expect(staged).toBeNull();
+			expect(errors).toEqual([expect.stringContaining("staged addon drift")]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });
 
