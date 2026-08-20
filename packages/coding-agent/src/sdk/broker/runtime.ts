@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import internalSourceMarker from "./internal-source-marker-2178.txt" with { type: "file" };
 
@@ -105,14 +106,29 @@ function regularFilesUnder(directory: string): string[] {
 			.sort((left, right) => left.name.localeCompare(right.name))) {
 			const candidate = path.join(current, entry.name);
 			if (entry.isDirectory()) visit(candidate);
-			else if (entry.isFile()) files.push(candidate);
+			else if (entry.isFile() || entry.isSymbolicLink()) {
+				const canonical = fs.realpathSync(candidate);
+				if (!containedPath(directory, canonical))
+					throw new Error("SDK internal launch refused: source dependency escapes its trusted directory.");
+				if (fs.statSync(canonical).isFile()) files.push(canonical);
+			}
 		}
 	};
 	visit(directory);
-	return files;
+	return [...new Set(files)].sort((left, right) => left.localeCompare(right));
 }
 
-/** Include source trees for local workspace dependencies resolved by source Bun launches. */
+function stagedNativeFiles(packageVersion: string): string[] {
+	if (process.platform !== "win32") return [];
+	const directory = path.join(os.homedir(), ".gjc", "natives", packageVersion);
+	return fs.existsSync(directory) ? regularFilesUnder(directory) : [];
+}
+
+/**
+ * Include local workspace runtime inputs resolved by source Bun launches. External npm bytes are
+ * package-manager inputs represented by the root lockfile; mutable application and native bytes
+ * remain inside this content-bound trust boundary.
+ */
 function workspaceDependencyFiles(packageDirectory: string): string[] {
 	const workspaceRoot = path.dirname(packageDirectory);
 	const files: string[] = [];
@@ -194,7 +210,7 @@ function sdkPackageGeneration(kind: SdkInternalSpawnCommand["kind"], version: st
 	hash.update(kind);
 	hash.update("\0");
 	hash.update(version);
-	for (const file of files) {
+	for (const file of [...new Set(files)].sort((left, right) => left.localeCompare(right))) {
 		hash.update("\0");
 		hash.update(file);
 		const contents = fs.readFileSync(file);
@@ -240,6 +256,7 @@ function sourceDescriptor(
 		path.join(canonicalPackageDirectory, "package.json"),
 		...regularFilesUnder(canonicalSourceDirectory),
 		...workspaceDependencyFiles(canonicalPackageDirectory),
+		...stagedNativeFiles(packageVersion),
 		config,
 	];
 	const lockfile = path.resolve(canonicalPackageDirectory, "../../bun.lock");
