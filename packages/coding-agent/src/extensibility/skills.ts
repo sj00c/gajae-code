@@ -108,6 +108,8 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 export interface LoadSkillsOptions extends SkillsSettings {
 	/** Working directory for project-local skills. Default: getProjectDir() */
 	cwd?: string;
+	/** Agent directory backing native user-scope skills. Default: getAgentDir() */
+	agentDir?: string;
 }
 
 /**
@@ -126,6 +128,7 @@ const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadSkillsResult> {
 	const {
 		cwd = getProjectDir(),
+		agentDir,
 		enabled = true,
 		customDirectories = [],
 		ignoredSkills = [],
@@ -157,7 +160,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// Use capability API to load all skills. `all` (rather than `items`) keeps
 	// shadowed duplicates so this function can apply the documented precedence
 	// itself: project scope beats user scope.
-	const result = await loadCapability<CapabilitySkill>(skillCapability.id, { cwd, disabledExtensions });
+	const result = await loadCapability<CapabilitySkill>(skillCapability.id, { cwd, agentDir, disabledExtensions });
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();

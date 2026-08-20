@@ -785,6 +785,7 @@ export interface BuildSystemPromptOptions {
 	skills?: Skill[];
 	contextFiles?: Array<{ path: string; content: string }>;
 	cwd?: string;
+	agentDir?: string;
 	appendPrompt?: string;
 	repeatToolDescriptions?: boolean;
 }
@@ -798,6 +799,7 @@ export interface BuildSystemPromptOptions {
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
 	return await buildSystemPromptInternal({
 		cwd: options.cwd,
+		agentDir: options.agentDir,
 		skills: options.skills,
 		contextFiles: options.contextFiles,
 		appendSystemPrompt: options.appendPrompt,
@@ -1407,7 +1409,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session-context build, tool creation, MCP discovery, and extension discovery.
 		const contextFilesResultPromise = options.contextFiles
 			? Promise.resolve({ contextFiles: options.contextFiles, warnings: [] })
-			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd });
+			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd, agentDir });
 		contextFilesResultPromise.catch(() => {});
 		const promptTemplatesPromise = options.promptTemplates
 			? Promise.resolve(options.promptTemplates)
@@ -1801,6 +1803,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const skillsResult = await logger.time("loadSkills", loadSkills, {
 				...settings.getGroup("skills"),
 				cwd,
+				agentDir,
 				disabledExtensions: settings.get("disabledExtensions"),
 			});
 			skills = withEmbeddedDefaultGjcSkills(skillsResult.skills);
@@ -1821,7 +1824,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulesResult =
 				options.rules !== undefined
 					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd });
+					: await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir });
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
@@ -3097,6 +3100,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot(), gjcPassEpoch);
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd,
+				agentDir,
 				skills,
 				contextFiles,
 				tools: promptTools,

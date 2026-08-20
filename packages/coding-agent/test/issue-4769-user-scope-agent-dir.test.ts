@@ -9,6 +9,7 @@ import { type Skill, skillCapability } from "@gajae-code/coding-agent/capability
 import { type SystemPrompt, systemPromptCapability } from "@gajae-code/coding-agent/capability/system-prompt";
 import type { LoadContext } from "@gajae-code/coding-agent/capability/types";
 import { runMigrate } from "@gajae-code/coding-agent/cli/migrate-cli";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	discoverRuntimeSkills,
 	findRuntimeSkillByName,
@@ -18,6 +19,8 @@ import {
 	writeNativeSkill,
 } from "@gajae-code/coding-agent/extensibility/skill-management";
 import { loadSkills } from "@gajae-code/coding-agent/extensibility/skills";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 // Register all discovery providers as a side effect.
 import "@gajae-code/coding-agent/discovery";
@@ -132,6 +135,43 @@ describe("issue #4769: user scope follows the agent directory", () => {
 });
 
 describe("issue #4769: every writer is discovered by every reader", () => {
+	test("session startup threads its explicit profile to every native reader", async () => {
+		const decoy = path.join(tempDir, "decoy-agent-dir");
+		await makeSkill(path.join(profile, "skills"), "session-profile-skill", "Session profile skill");
+		await makeSkill(path.join(decoy, "skills"), "session-decoy-skill", "Process-global decoy skill");
+		await writeFile(path.join(profile, "SYSTEM.md"), "# session profile system");
+		await writeFile(path.join(decoy, "SYSTEM.md"), "# process-global decoy system");
+		await writeFile(path.join(profile, "RULES.md"), "session profile rules");
+		await writeFile(path.join(decoy, "RULES.md"), "process-global decoy rules");
+		await writeFile(path.join(profile, "AGENTS.md"), "session profile agents");
+		await writeFile(path.join(decoy, "AGENTS.md"), "process-global decoy agents");
+
+		setAgentDir(decoy);
+		const { session } = await createAgentSession({
+			cwd: project,
+			agentDir: profile,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({
+				"skills.enabled": true,
+				"skills.trustProjectSkills": true,
+				"skills.trustUserSkills": true,
+			}),
+			enableMCP: false,
+			enableLsp: false,
+		});
+		try {
+			expect(session.skills.map(skill => skill.name)).toContain("session-profile-skill");
+			expect(session.skills.map(skill => skill.name)).not.toContain("session-decoy-skill");
+			const prompt = session.systemPrompt.join("\n");
+			expect(prompt).toContain("session profile system");
+			expect(prompt).toContain("session profile agents");
+			expect(prompt).not.toContain("process-global decoy system");
+			expect(prompt).not.toContain("process-global decoy agents");
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("writeNativeSkill(user) targets the agent dir and is listed, discovered, and loaded", async () => {
 		const receipt = await writeNativeSkill({
 			cwd: project,
