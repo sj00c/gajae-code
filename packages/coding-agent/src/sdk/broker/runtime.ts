@@ -139,7 +139,9 @@ function workspaceDependencyFiles(packageDirectory: string): string[] {
 	};
 	const visit = (dependencyDirectory: string): void => {
 		const canonicalDirectory = fs.realpathSync(dependencyDirectory);
-		if (!containedPath(workspaceRoot, canonicalDirectory) || visited.has(canonicalDirectory)) return;
+		if (!containedPath(workspaceRoot, canonicalDirectory))
+			throw new Error("SDK internal launch refused: resolved workspace dependency escapes its trusted root.");
+		if (visited.has(canonicalDirectory)) return;
 		visited.add(canonicalDirectory);
 		const manifestPath = path.join(canonicalDirectory, "package.json");
 		let manifest: {
