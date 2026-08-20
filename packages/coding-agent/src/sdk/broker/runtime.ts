@@ -212,6 +212,29 @@ function workspaceDependencyFiles(packageDirectory: string): string[] {
 	return files;
 }
 
+function trustedProjectLockfile(packageDirectory: string): string | undefined {
+	let current = packageDirectory;
+	for (let depth = 0; depth < 8; depth++) {
+		const lockfile = path.join(current, "bun.lock");
+		const manifestPath = path.join(current, "package.json");
+		if (fs.existsSync(lockfile) && fs.existsSync(manifestPath)) {
+			try {
+				const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
+					name?: unknown;
+					workspaces?: unknown;
+				};
+				if (manifest.name === "gajae-code" || manifest.workspaces !== undefined) return lockfile;
+			} catch {
+				throw new Error("SDK internal launch refused: project lockfile metadata is unreadable.");
+			}
+		}
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return undefined;
+}
+
 /** Digest the actual bytes of the trusted launch inputs, not only filesystem metadata. */
 function sdkPackageGeneration(kind: SdkInternalSpawnCommand["kind"], version: string, files: string[]): string {
 	const hash = createHash("sha256");
@@ -266,8 +289,8 @@ function sourceDescriptor(
 		...workspaceDependencyFiles(canonicalPackageDirectory),
 		config,
 	];
-	const lockfile = path.resolve(canonicalPackageDirectory, "../../bun.lock");
-	if (fs.existsSync(lockfile)) generationFiles.push(lockfile);
+	const lockfile = trustedProjectLockfile(canonicalPackageDirectory);
+	if (lockfile) generationFiles.push(lockfile);
 	return {
 		kind: "bun-source",
 		file: runtime,
