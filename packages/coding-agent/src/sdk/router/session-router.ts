@@ -1109,6 +1109,17 @@ export class SessionRouter {
 		if (!this.#running(runEpoch)) return false;
 		if (indexed.endpointMtimeMs === undefined) return false;
 		const endpoint = resolvedEndpoint ?? (await this.#readEndpoint(indexed));
+		// Capture the endpoint inode HERE, adjacent to the authority proof above,
+		// not at registration (#4730 review). Capturing it later would let a
+		// rename-replace landing in that window be recorded as the trusted identity,
+		// which is exactly the replacement this identity exists to detect.
+		const provenIno =
+			endpoint === null
+				? undefined
+				: await fs
+						.stat(endpoint.path, { bigint: true })
+						.then(value => value.ino)
+						.catch(() => undefined);
 		const retirementAfterValidation = this.#retirements.get(indexed.sessionId);
 		if (retirementAfterValidation) await retirementAfterValidation;
 		if ((this.#retirementVersions.get(indexed.sessionId) ?? 0) !== retirementVersion)
@@ -1315,13 +1326,9 @@ export class SessionRouter {
 			},
 		};
 		this.#sessions.set(indexed.sessionId, attached);
-		this.#endpointInodes.set(
-			attached.id,
-			await fs
-				.stat(endpoint.path, { bigint: true })
-				.then(value => value.ino)
-				.catch(() => 0n),
-		);
+		// The identity proven alongside the endpoint authority read above; a later
+		// re-stat here could observe a replacement and trust it.
+		if (provenIno !== undefined) this.#endpointInodes.set(attached.id, provenIno);
 		if (deferPublication)
 			this.#adopted.set(indexed.sessionId, {
 				generation: indexed.endpointGeneration,

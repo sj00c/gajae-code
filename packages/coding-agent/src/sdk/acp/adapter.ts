@@ -127,6 +127,21 @@ function isLifecycleOperation(operation: string): boolean {
  * Pure ACP-to-SDK adapter. It deliberately owns neither an AgentSession nor an
  * ACP bridge: all session work is performed through authenticated v3 frames.
  */
+/**
+ * Provider leases are renewed only through the maintenance capability (#4689).
+ * An attachment without it must be rejected at the admission boundary with an
+ * explicit migration error: falling back to `send()` would restore the 5s
+ * heartbeat-forced locked index rescan, and accepting it silently would leave
+ * live leases quietly un-renewed until they expire.
+ */
+function assertMaintenanceCapability(attachment: SessionAttachment): void {
+	if (typeof attachment.sendMaintenance === "function") return;
+	throw new AcpSdkAdapterError(
+		"operation_prohibited",
+		"SDK session attachment does not implement sendMaintenance(leaseId); provider leases cannot be renewed. Update the attachment implementation to the current SessionAttachment capability.",
+	);
+}
+
 export class AcpSdkAdapter {
 	readonly #client?: SdkClient;
 	readonly #router?: SessionRouter;
@@ -184,6 +199,11 @@ export class AcpSdkAdapter {
 	acceptAttachment(attachment: SessionAttachment): void {
 		if (!this.#router || attachment.sessionId !== this.#sessionId)
 			throw new AcpSdkAdapterError("invalid_input", "ACP attachment does not match this session adapter.");
+		// Reject an attachment that cannot renew provider leases at the handoff
+		// boundary (#4730 review), not just at start(): acceptAttachment is the
+		// single admission point for the replacement/ready paths too, so a
+		// capability-less replacement can never silently take over live leases.
+		assertMaintenanceCapability(attachment);
 		this.#abortActiveReverseRequests();
 		this.#attachment = attachment;
 		this.#connectionId = undefined;
@@ -256,15 +276,8 @@ export class AcpSdkAdapter {
 			await this.#activateProviders();
 		}
 		// Reject an unsupported attachment at SETUP rather than letting leases
-		// silently stop renewing later (#4730 review). Provider leases depend on the
-		// maintenance capability, so an attachment without it is a migration error
-		// the caller must see, not a quiet degradation discovered when a lease
-		// expires.
-		if (this.#router && this.#leases.size > 0 && typeof this.#attachment?.sendMaintenance !== "function")
-			throw new AcpSdkAdapterError(
-				"operation_prohibited",
-				"SDK session attachment does not implement sendMaintenance(leaseId); provider leases cannot be renewed. Update the attachment implementation to the current SessionAttachment capability.",
-			);
+		// silently stop renewing later (#4730 review).
+		if (this.#router && this.#attachment) assertMaintenanceCapability(this.#attachment);
 		this.#heartbeat ??= setInterval(
 			() => void this.#heartbeatLeases().catch(error => this.#reportReconnectFailure(error)),
 			this.#heartbeatMs,

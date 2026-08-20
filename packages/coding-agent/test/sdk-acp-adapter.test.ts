@@ -165,6 +165,36 @@ test("an attachment without sendMaintenance is rejected at setup, leaving no lea
 	}
 });
 
+test("a capability-less attachment is rejected on the handoff paths too (#4730 review)", async () => {
+	// acceptAttachment/attachmentReady are the replacement and ready handoffs. A
+	// capability-less attachment arriving there must be refused as well, or a
+	// replacement could silently take over live leases and stop renewing them.
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [] }],
+		heartbeatMs: 5,
+	});
+	await adapter.start();
+	try {
+		const legacy: SessionAttachment = {
+			sessionId: harness.attachment.sessionId,
+			connectionId: "router-connection-2",
+			generation: 2,
+			isCurrent: () => true,
+			send: async () => {},
+		};
+		expect(() => adapter.acceptAttachment(legacy)).toThrow(/sendMaintenance/);
+		await expect(adapter.attachmentReady(legacy)).rejects.toThrow(/sendMaintenance/);
+		// The supported attachment keeps renewing; the refusal did not wedge it.
+		await waitFor(() => harness.maintenance.length >= 1, "heartbeat still renewing after refusal");
+	} finally {
+		await adapter.close();
+	}
+});
+
 test("ACP lease heartbeats take the maintenance route, never the reconciling send path (#4689)", async () => {
 	// The 5s lease heartbeat was one of the two timers that forced a locked
 	// authority reconcile per attached session. A regression back to send() (or
