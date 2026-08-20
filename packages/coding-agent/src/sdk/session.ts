@@ -1367,7 +1367,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector);
 		};
 		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
-		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd });
+		// Cwd-derived runtime state must follow a rescope (`move_session`, `/move`),
+		// so services resolve the LIVE session cwd per activation instead of
+		// capturing the launch root. Before the manager exists the launch cwd is the
+		// only truth available, and it is also the manager's initial cwd.
+		let liveSessionManager: SessionManager | undefined;
+		const getLiveCwd = (): string => liveSessionManager?.getCwd() ?? cwd;
+		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd: getLiveCwd });
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
 		if (!options.modelRegistry) {
@@ -1429,6 +1435,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			(await logger.time("sessionManager", async () => {
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));
+		liveSessionManager = sessionManager;
 		const logicalSessionId = sessionManager.getSessionId();
 		// Fork-context seeds carry conversation content only, never provider identity:
 		// a shared continuity id would make concurrent subagents present the same
@@ -1870,7 +1877,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			contextFilesResultPromise,
 			raceWithDeadline("buildWorkspaceTree", workspaceTreePromise),
 		]);
-		const contextFiles = contextFilesResult.contextFiles;
+		// Mutable: a rescope re-discovers cwd-derived project instructions so the
+		// model is never shown the launcher root's AGENTS.md alongside the new cwd.
+		let contextFiles = contextFilesResult.contextFiles;
+		let liveWorkspaceTree: WorkspaceTree | undefined = resolvedWorkspaceTree;
 		const discoveredContextFileWarnings = contextFilesResult.warnings;
 
 		const backgroundJobsEnabled = isBackgroundJobSupportEnabled(settings);
@@ -2046,11 +2056,54 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 		};
 
+		/**
+		 * Re-discover the cwd-derived read-only state the model is shown after a
+		 * committed rescope: project instructions, skills, and the workspace tree.
+		 * Without this the volatile message pairs the NEW cwd with the launch
+		 * root's AGENTS.md and tree, and subagents inherit the same mismatch.
+		 */
+		const applyRescopedReadState = async (to: string): Promise<void> => {
+			try {
+				const rediscovered = await loadContextFilesResultInternal({ cwd: to });
+				contextFiles = rediscovered.contextFiles;
+			} catch (error) {
+				logger.warn("Failed to re-discover context files after session rescope", {
+					error: safeErrorForLog(error),
+				});
+			}
+			if (options.skills === undefined && settings.get("skills.enabled")) {
+				try {
+					const reloaded = await loadSkills({
+						...settings.getGroup("skills"),
+						cwd: to,
+						disabledExtensions: settings.get("disabledExtensions"),
+					});
+					skills = withEmbeddedDefaultGjcSkills(reloaded.skills);
+					if (!options.parentTaskPrefix) setActiveSkills(skills);
+					await session?.replaceSkills(skills);
+				} catch (error) {
+					logger.warn("Failed to reload skills after session rescope", { error: safeErrorForLog(error) });
+				}
+			}
+			// The launch-bound tree is retired immediately: a stale root-scoped tree is
+			// worse than none, and the next turn re-scans at the new cwd.
+			liveWorkspaceTree = undefined;
+			workspaceTreePromise = Promise.resolve({
+				rootPath: to,
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			});
+			workspaceTreePromise.catch(() => {});
+			session?.retireWorkspaceTreeForRescope();
+			await session?.refreshBaseSystemPrompt();
+		};
+
 		const toolSession: ToolSession = {
 			get cwd() {
 				return sessionManager.getCwd();
 			},
-			awaitCwdTransition: () => sessionManager.joinCwdTransition(),
 			hasUI: options.hasUI ?? false,
 			workflowGateEligible: true,
 			enableLsp,
@@ -2061,9 +2114,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return !requestedToolNames || requestedToolNames.includes("edit");
 			},
 			skipPythonPreflight: options.skipPythonPreflight,
-			contextFiles,
-			workspaceTree: resolvedWorkspaceTree,
-			skills,
+			// Getters, not snapshots: subagents launched after a rescope inherit the
+			// CURRENT cwd's context files, skills, and tree rather than the launch
+			// root's, which would otherwise pair the new cwd with retired instructions.
+			get contextFiles() {
+				return contextFiles;
+			},
+			get workspaceTree() {
+				return liveWorkspaceTree;
+			},
+			get skills() {
+				return skills;
+			},
 			eventBus,
 			outputSchema: options.outputSchema,
 			requireYieldTool: options.requireYieldTool,
@@ -2158,27 +2220,75 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											}`,
 										);
 									}
-									const processCwd = await fs.realpath(process.cwd()).catch(() => process.cwd());
-									const ownsProcessCwd = processCwd === canonicalFrom;
+									// Process-cwd authority is an explicit claim, never inferred from
+									// `process.cwd() === from`: sibling sessions launched at the same
+									// root both satisfy that, so acting on it would chdir the process
+									// and clear process-global caches underneath the sibling.
+									const ownsProcessCwd = SessionManager.isProcessCwdOwner(sessionManager);
 									try {
+										// Every fallible step that the moved session depends on runs
+										// BEFORE the session-file commit, so a failure here leaves the
+										// session exactly where it was and the tool call is a clean
+										// rejection rather than a half-moved session.
+										if (ownsProcessCwd) {
+											setProjectDir(canonicalTarget);
+											try {
+												// `setProjectDir` chdirs a NAME. Confirm the process actually
+												// landed on the pinned directory, so a path replaced after
+												// the name checks cannot escape the validated descendant.
+												await SessionManager.assertProcessCwdIdentity(expectedIdentity);
+											} catch (error) {
+												setProjectDir(canonicalFrom);
+												throw error;
+											}
+										}
+										let rescopeFailure: unknown;
+										try {
+											resetCapabilities();
+											await shutdownAllLspClients();
+											const projectRegistry = await resolveActiveProjectRegistryPath(canonicalTarget);
+											clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
+											// Plugin/MCP/Python authority must be rebound successfully
+											// before committing; swallowing a failure here is what leaves
+											// a moved session holding launch-root tool authority.
+											await rebindCwdCapturingAuthority(canonicalTarget);
+										} catch (error) {
+											rescopeFailure = error;
+										}
+										if (rescopeFailure !== undefined) {
+											// Restore the launch root's authority so the still-unmoved
+											// session keeps working tools instead of a torn-down set.
+											if (ownsProcessCwd) setProjectDir(canonicalFrom);
+											resetCapabilities();
+											const restoreRegistry = await resolveActiveProjectRegistryPath(canonicalFrom).catch(
+												() => undefined,
+											);
+											clearPluginRootsAndCaches(restoreRegistry ? [restoreRegistry] : undefined);
+											await rebindCwdCapturingAuthority(canonicalFrom).catch(restoreError => {
+												logger.warn("Failed to restore launch-root tool authority after a rejected rescope", {
+													error: safeErrorForLog(restoreError),
+												});
+											});
+											throw rescopeFailure;
+										}
 										await sessionManager.flush();
+										// Commit last: `moveTo` re-validates the pinned identity through
+										// the still-open handle at the state-changing boundary.
 										await sessionManager.moveTo(canonicalTarget, {
 											expectedIdentity,
 											targetHandle,
 										});
 										moveConsumed = true;
-										if (ownsProcessCwd) setProjectDir(canonicalTarget);
-										resetCapabilities();
-										await shutdownAllLspClients();
-										const projectRegistry = await resolveActiveProjectRegistryPath(sessionManager.getCwd());
-										clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
+										// Cwd-derived read-only state the prompt and subagents consume.
+										// Best-effort by design: the move is committed, and a failed
+										// re-discovery must not present a committed move as a failure.
+										await applyRescopedReadState(sessionManager.getCwd());
 										try {
 											await session?.refreshSshTool({ activateIfAvailable: true });
 										} catch {
 											// Non-fatal: the session has moved; the SSH tool refreshes
 											// on its next activation attempt.
 										}
-										await rebindCwdCapturingAuthority(sessionManager.getCwd());
 										return { from, to: sessionManager.getCwd() };
 									} finally {
 										await targetHandle.close().catch(() => {});
@@ -2315,6 +2425,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
 			setActiveRules([...rulebookRules, ...alwaysApplyRules]);
+			// Claim process-cwd authority for the FIRST top-level session launched at
+			// the process cwd. A later sibling launched at the same root does not get
+			// the claim, so its rescope leaves process-global state (chdir,
+			// capabilities, plugin caches, browser tab cwd) untouched.
+			if (!isCanonicalSubSession && path.resolve(process.cwd()) === path.resolve(sessionManager.getCwd())) {
+				SessionManager.claimProcessCwdOwnership(sessionManager);
+			}
 			if (asyncJobManager) {
 				// Register under the session endpoint so concurrent sessions'
 				// owned work settles in the correct manager (review thread P1).
@@ -3252,7 +3369,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const appendPrompt: string | undefined = memoryInstructions ?? undefined;
 			let pluginSystemAppendices = "";
 			try {
-				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd });
+				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd: getLiveCwd() });
 			} catch (error) {
 				gjcProducersComplete = false;
 				logger.warn("Failed to render GJC plugin system appendices", { error: safeErrorForLog(error) });
@@ -3266,7 +3383,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// `unavailable` rather than a stale generation.
 			if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot(), gjcPassEpoch);
 			const defaultPrompt = await buildSystemPromptInternal({
-				cwd,
+				// Live cwd: the prompt is rebuilt after a rescope, and describing the
+				// retired launcher root there is what makes the model pick wrong paths.
+				cwd: getLiveCwd(),
 				skills,
 				contextFiles,
 				tools: promptTools,

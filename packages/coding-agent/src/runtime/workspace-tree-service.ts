@@ -15,8 +15,16 @@ export interface WorkspaceTreeRuntime {
  * Build the workspace-tree service without importing the native scanner until
  * the service is activated. The scan itself remains the single authority for
  * both eager startup and the lazy first-turn barrier.
+ *
+ * `cwd` is resolved per scan rather than captured once: a session that rescopes
+ * (`move_session`, `/move`) must have its refreshes re-root at the new cwd,
+ * otherwise every later tree describes the abandoned launcher root.
  */
-export function createWorkspaceTreeService(settings: Settings, cwd: string): LazyService<WorkspaceTreeRuntime> {
+export function createWorkspaceTreeService(
+	settings: Settings,
+	cwd: string | (() => string),
+): LazyService<WorkspaceTreeRuntime> {
+	const resolveCwd = typeof cwd === "function" ? cwd : () => cwd;
 	return createLazyService({
 		id: "workspaceTree",
 		enabled: () => settings.get("workspaceTree.mode") === "eager" || settings.get("workspaceTree.mode") === "lazy",
@@ -24,7 +32,7 @@ export function createWorkspaceTreeService(settings: Settings, cwd: string): Laz
 			const scan = async (): Promise<WorkspaceTree> => {
 				if (signal.aborted) throw new Error("Workspace-tree scan was aborted before it started.");
 				const { buildWorkspaceTree } = await import("../workspace-tree");
-				const tree = await buildWorkspaceTree(cwd, { timeoutMs: WORKSPACE_TREE_SCAN_TIMEOUT_MS });
+				const tree = await buildWorkspaceTree(resolveCwd(), { timeoutMs: WORKSPACE_TREE_SCAN_TIMEOUT_MS });
 				if (signal.aborted) throw new Error("Workspace-tree scan was aborted before it completed.");
 				return tree;
 			};
@@ -34,7 +42,7 @@ export function createWorkspaceTreeService(settings: Settings, cwd: string): Laz
 					snapshot,
 					refresh: async () => {
 						const { buildWorkspaceTree } = await import("../workspace-tree");
-						return buildWorkspaceTree(cwd, { timeoutMs: WORKSPACE_TREE_SCAN_TIMEOUT_MS });
+						return buildWorkspaceTree(resolveCwd(), { timeoutMs: WORKSPACE_TREE_SCAN_TIMEOUT_MS });
 					},
 				},
 			};

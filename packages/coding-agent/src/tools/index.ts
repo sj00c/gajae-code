@@ -168,8 +168,6 @@ export interface AskAnswerSource {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
-	/** Wait until any in-flight session cwd transition has committed. */
-	awaitCwdTransition?: () => Promise<void>;
 	/** Whether UI is available */
 	hasUI: boolean;
 	/** Whether this session will bind a workflow-gate emitter after tool construction. */

@@ -20,7 +20,8 @@ export type OptionalRuntimeServicesOverrides = Partial<OptionalRuntimeServices>;
 
 /** Context needed by services whose identity is scoped to the session cwd. */
 export interface OptionalRuntimeServicesContext {
-	cwd?: string;
+	/** Session cwd. Pass a getter when the session can rescope (`move_session`). */
+	cwd?: string | (() => string);
 }
 
 /**
@@ -32,7 +33,7 @@ export function createOptionalRuntimeServices(
 	overrides: OptionalRuntimeServicesOverrides = {},
 	context: OptionalRuntimeServicesContext = {},
 ): OptionalRuntimeServices {
-	const cwd = context.cwd ?? process.cwd();
+	const cwd = context.cwd ?? (() => process.cwd());
 	return {
 		memoryBackend: overrides.memoryBackend ?? createMemoryBackendService(settings),
 		workspaceTree: overrides.workspaceTree ?? createWorkspaceTreeService(settings, cwd),

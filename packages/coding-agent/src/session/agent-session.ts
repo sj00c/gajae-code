@@ -2404,6 +2404,8 @@ export class AgentSession {
 	#workspaceTreeService: LazyService<WorkspaceTreeRuntime> | undefined;
 	#onWorkspaceTreeReady: ((tree: WorkspaceTree) => void | Promise<void>) | undefined;
 	#networkPrewarmService: LazyService<NetworkPrewarmRuntime> | undefined;
+	/** Set by `applyRescopedCwdState`: forces the next turn to re-scan at the new cwd. */
+	#pendingWorkspaceTreeRescope = false;
 	/** Throttle cache for the per-turn volatile workspace-tree scan (see #buildVolatileProjectContextMessage). */
 	#cachedWorkspaceTree: WorkspaceTree | undefined;
 	#cachedWorkspaceTreeAt = 0;
@@ -8270,14 +8272,19 @@ export class AgentSession {
 					onUpdate: never,
 					ctx: never,
 				) => {
-					const admittedGeneration = this.sessionManager.getCwdGeneration();
-					await this.sessionManager.joinCwdTransition();
-					if (this.sessionManager.getCwdGeneration() !== admittedGeneration) {
-						throw new Error(
-							"Session working directory changed before this tool executed; retry against the new cwd.",
-						);
-					}
-					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+					return await this.sessionManager.runWithCwdReadLease(async () => {
+						const admittedGeneration = this.sessionManager.getCwdGeneration();
+						const result = await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+						// The lease keeps writers out for the whole execution, so this can
+						// only trip if a caller bypassed the lease; surface it rather than
+						// returning a result computed against a retired cwd.
+						if (this.sessionManager.getCwdGeneration() !== admittedGeneration) {
+							throw new Error(
+								"Session working directory changed while this tool executed; retry against the new cwd.",
+							);
+						}
+						return result;
+					});
 				};
 			},
 		}) as T;
@@ -9851,18 +9858,23 @@ export class AgentSession {
 			this.#cachedWorkspaceTreeAt = Date.now();
 			this.#initialWorkspaceTree = undefined;
 			includeTree = this.#cachedWorkspaceTree;
-		} else if (Date.now() - this.#cachedWorkspaceTreeAt >= VOLATILE_TREE_TTL_MS) {
+		} else if (this.#pendingWorkspaceTreeRescope || Date.now() - this.#cachedWorkspaceTreeAt >= VOLATILE_TREE_TTL_MS) {
+			// A rescope retires the cached tree regardless of TTL, and must re-scan
+			// rather than reuse the launch-root snapshot the service already holds.
+			const rescoped = this.#pendingWorkspaceTreeRescope;
+			this.#pendingWorkspaceTreeRescope = false;
 			if (this.#workspaceTreeService) {
-				const firstWorkspaceTree = this.#cachedWorkspaceTreeAt === 0;
+				const firstWorkspaceTree = this.#cachedWorkspaceTreeAt === 0 && !rescoped;
 				const runtime = await this.#workspaceTreeService.get("first-turn-barrier");
 				this.#cachedWorkspaceTree = firstWorkspaceTree ? runtime.snapshot : await runtime.refresh();
-				publishStableWorkspaceTree = firstWorkspaceTree;
+				publishStableWorkspaceTree = firstWorkspaceTree || rescoped;
 			} else {
 				try {
 					this.#cachedWorkspaceTree = await buildWorkspaceTree(cwd, { timeoutMs: 5000 });
 				} catch {
 					this.#cachedWorkspaceTree = undefined;
 				}
+				publishStableWorkspaceTree = rescoped;
 			}
 			this.#cachedWorkspaceTreeAt = Date.now();
 			includeTree = this.#cachedWorkspaceTree;
@@ -11821,6 +11833,27 @@ export class AgentSession {
 	/** Skills loaded by SDK (always includes bundled GJC workflow defaults unless explicitly overridden by SDK callers) */
 	get skills(): readonly Skill[] {
 		return this.#skills;
+	}
+
+	/**
+	 * Install the skill set discovered at a newly rescoped cwd (`move_session`).
+	 * Project-scoped skills belong to the directory they were discovered in, so
+	 * they must not survive a move out of it.
+	 */
+	async replaceSkills(skills: Skill[]): Promise<void> {
+		this.#skills = skills;
+		await this.refreshBaseSystemPrompt();
+	}
+
+	/**
+	 * Retire the cached workspace tree after a rescope so the next turn re-scans
+	 * at the new cwd instead of re-presenting the abandoned launcher root.
+	 */
+	retireWorkspaceTreeForRescope(): void {
+		this.#initialWorkspaceTree = undefined;
+		this.#cachedWorkspaceTree = undefined;
+		this.#cachedWorkspaceTreeAt = 0;
+		this.#pendingWorkspaceTreeRescope = true;
 	}
 
 	/** Skill loading warnings captured by SDK */

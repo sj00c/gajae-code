@@ -7190,6 +7190,13 @@ export class SessionManager {
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
 	#cwdTransitionOwner: symbol | undefined;
 	#cwdGeneration = 0;
+	/** Number of tool executions currently holding a shared read lease on `cwd`. */
+	#cwdReaderCount = 0;
+	/** Resolved when the last outstanding read lease is released. */
+	#cwdReadersDrained: (() => void) | undefined;
+	#cwdReadersIdle: Promise<void> = Promise.resolve();
+	/** Set while a writer is queued or running so new readers do not starve it. */
+	#cwdWriterPending = 0;
 	/** Depth of the non-yielding same-session persistence fence (reentrancy counter). */
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
@@ -10512,14 +10519,56 @@ export class SessionManager {
 			() => promise,
 			() => promise,
 		);
-		await previous.catch(() => {});
+		// Announce the writer BEFORE awaiting the queue so readers arriving during
+		// the wait queue behind it rather than starving it indefinitely.
+		this.#cwdWriterPending += 1;
 		const token = Symbol("cwd-transition");
-		this.#cwdTransitionOwner = token;
 		try {
+			await previous.catch(() => {});
+			// A reader that entered before this writer was announced still holds the
+			// old cwd; the transition may not commit until every such lease is
+			// released, otherwise an in-flight tool resolves paths across the move.
+			while (this.#cwdReaderCount > 0) await this.#cwdReadersIdle;
+			this.#cwdTransitionOwner = token;
 			return await cwdTransitionAls.run(token, fn);
 		} finally {
 			if (this.#cwdTransitionOwner === token) this.#cwdTransitionOwner = undefined;
+			this.#cwdWriterPending -= 1;
 			resolve();
+		}
+	}
+
+	/**
+	 * Run `fn` under a shared read lease on `cwd`.
+	 *
+	 * Tools that resolve relative paths against the session cwd must hold this
+	 * lease across their WHOLE execution, not merely re-check a generation before
+	 * they start: the check-then-yield shape lets a move commit inside the tool's
+	 * first `await`, so a command admitted for root A would execute in root B.
+	 * Writers wait for outstanding leases to drain, so the cwd observed at lease
+	 * acquisition stays authoritative until the lease is released.
+	 */
+	async runWithCwdReadLease<T>(fn: () => Promise<T>): Promise<T> {
+		const owner = this.#cwdTransitionOwner;
+		// The writer's own async context already holds exclusive access; taking a
+		// read lease there would wait on itself.
+		if (owner !== undefined && cwdTransitionAls.getStore() === owner) return fn();
+		while (this.#cwdWriterPending > 0) await this.#cwdTransitionTail.catch(() => {});
+		if (this.#cwdReaderCount === 0) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			this.#cwdReadersIdle = promise;
+			this.#cwdReadersDrained = resolve;
+		}
+		this.#cwdReaderCount += 1;
+		try {
+			return await fn();
+		} finally {
+			this.#cwdReaderCount -= 1;
+			if (this.#cwdReaderCount === 0) {
+				const drained = this.#cwdReadersDrained;
+				this.#cwdReadersDrained = undefined;
+				drained?.();
+			}
 		}
 	}
 
@@ -10537,6 +10586,55 @@ export class SessionManager {
 	}
 	static async openNoFollowDirectory(dir: string): Promise<fs.promises.FileHandle> {
 		return fs.promises.open(dir, CWD_NOFOLLOW_OPEN_FLAGS);
+	}
+
+	/**
+	 * Owner of this process's cwd, or undefined when no session has claimed it.
+	 *
+	 * `process.chdir` and the caches keyed off it are process-global, so only one
+	 * session may drive them. Ownership is an explicit claim rather than an
+	 * inference from `process.cwd() === session.cwd`: two sessions launched at the
+	 * same root both satisfy that comparison, and letting either one act on it
+	 * lets a move in one session chdir the process under its sibling.
+	 */
+	static #processCwdOwner: WeakRef<SessionManager> | undefined;
+
+	/**
+	 * Claim process-cwd authority for `manager` when it is unowned or the prior
+	 * owner has been collected. Returns whether `manager` holds the claim.
+	 */
+	static claimProcessCwdOwnership(manager: SessionManager): boolean {
+		const current = SessionManager.#processCwdOwner?.deref();
+		if (current === manager) return true;
+		if (current !== undefined) return false;
+		SessionManager.#processCwdOwner = new WeakRef(manager);
+		return true;
+	}
+
+	static isProcessCwdOwner(manager: SessionManager): boolean {
+		return SessionManager.#processCwdOwner?.deref() === manager;
+	}
+
+	static releaseProcessCwdOwnership(manager: SessionManager): void {
+		if (SessionManager.#processCwdOwner?.deref() === manager) SessionManager.#processCwdOwner = undefined;
+	}
+
+	/**
+	 * Verify that `process.cwd()` is the directory pinned by `expectedIdentity`.
+	 *
+	 * `process.chdir` resolves a NAME, so a path replaced after the last
+	 * name-based comparison lands the process outside the validated directory —
+	 * the exact confinement `move_session` exists to enforce. Node exposes no
+	 * `fchdir`, so the handle cannot be the chdir authority directly; comparing
+	 * the resulting cwd's identity to the pinned handle closes the same gap.
+	 */
+	static async assertProcessCwdIdentity(expectedIdentity: { dev: bigint; ino: bigint }): Promise<void> {
+		const observed = await fs.promises.stat(process.cwd(), { bigint: true });
+		if (observed.dev !== expectedIdentity.dev || observed.ino !== expectedIdentity.ino) {
+			throw new Error(
+				`Refusing to rescope: process cwd ${process.cwd()} is not the validated target directory (identity changed).`,
+			);
+		}
 	}
 
 	/**
@@ -15326,6 +15424,7 @@ export class SessionManager {
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
 		await this.joinCwdTransition();
+		SessionManager.releaseProcessCwdOwnership(this);
 		// Drain any uncommitted prepared successors before releasing resources so
 		// dispose/shutdown retains exact cleanup authority (#3138).
 		try {
