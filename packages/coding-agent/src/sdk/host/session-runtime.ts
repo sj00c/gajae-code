@@ -2615,6 +2615,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}>;
 				disposeGate?: () => void;
 				lifecycleActive: boolean;
+				lifecycleEpoch: number;
 		  }
 		| undefined;
 	// Shared with the control surface's terminal abort: the correlated
@@ -2663,6 +2664,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		let transitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		if (type === "agent_start") {
+			current.lifecycleEpoch += 1;
 			// Mark lifecycle active even when the drain is empty: a monitor/cron
 			// run started by the session has no SDK pending entry but is still a
 			// real active run that later in-run promotions must attach to instead
@@ -2698,6 +2700,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					? [current.activeInvocation]
 					: [];
 		}
+		const eventLifecycleEpoch = current.lifecycleEpoch;
 		// Observe whether the lifecycle publication actually landed: a terminal
 		// abort awaits this result so its durable row only claims
 		// terminalPublished when the correlated agent_end event reached the
@@ -2741,6 +2744,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") return;
 		if (type === "agent_end") {
+			if (current.lifecycleEpoch !== eventLifecycleEpoch) {
+				// A successor agent_start won the lifecycle race while this event's
+				// durable transitions were awaiting persistence. Never clear or
+				// overwrite the successor's owner/batch.
+				const resolvers = terminalPublicationCapture.resolvers;
+				terminalPublicationCapture.resolvers = undefined;
+				for (const resolve of resolvers ?? []) resolve(observed);
+				return;
+			}
 			if (failedTransitions.length > 0) {
 				// Durable terminalization failed. Keep the recovery-owned batch and
 				// its deadline leases alive so the deadline manager can replay a real
@@ -3228,6 +3240,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			waitForGateResolutionQuiescence,
 			disposeGate,
 			lifecycleActive: false,
+			lifecycleEpoch: 0,
 		};
 		try {
 			await runtime.start();
@@ -3258,6 +3271,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					waitForGateResolutionQuiescence,
 					disposeGate,
 					lifecycleActive: false,
+					lifecycleEpoch: 0,
 				};
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}
