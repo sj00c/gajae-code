@@ -238,6 +238,46 @@ test("agent_end upgrades a durable deadline terminal when it races a successful 
 	expect(reloaded.lookup("prompt", { clientRef: "upgrade-race-ref" })).toMatchObject({ status: "terminal_ok" });
 });
 
+test("failed agent_end upgrade persistence retains the deadline record for retry", async () => {
+	let records: unknown[] = [];
+	let writes = 0;
+	const store = {
+		path: null,
+		load: async () => records,
+		transact: async (mutator: (current: never[]) => never[]) => {
+			writes += 1;
+			const candidate = mutator(records as never);
+			if (writes === 3) throw new Error("upgrade persist failed");
+			records = candidate;
+		},
+	} as never;
+	const reconciliation = createInvocationReconciliation({ store });
+	const correlation = { commandId: "upgrade-failure-command", turnId: "upgrade-failure-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "upgrade-failure-ref");
+	await reconciliation.finalizeOutcome("prompt", correlation, {
+		kind: "failed",
+		code: "prompt_deadline_exceeded",
+		message: "deadline",
+	});
+	await expect(reconciliation.noteTransition("prompt", correlation, { type: "agent_end" })).rejects.toThrow(
+		"upgrade persist failed",
+	);
+	expect(reconciliation.lookup("prompt", { clientRef: "upgrade-failure-ref" })).toMatchObject({
+		status: "failed",
+		error: { code: "prompt_deadline_exceeded" },
+	});
+	const stale = createInvocationReconciliation({ store });
+	await stale.hydrate();
+	expect(stale.lookup("prompt", { clientRef: "upgrade-failure-ref" })).toMatchObject({
+		status: "failed",
+		error: { code: "prompt_deadline_exceeded" },
+	});
+	await reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+	const reloaded = createInvocationReconciliation({ store });
+	await reloaded.hydrate();
+	expect(reloaded.lookup("prompt", { clientRef: "upgrade-failure-ref" })).toMatchObject({ status: "terminal_ok" });
+});
+
 test("a reason attached after a prompt settled is never replaced by a later failure", async () => {
 	const reconciliation = createInvocationReconciliation();
 	const correlation = { commandId: "late-reason-command", turnId: "late-reason-turn" };

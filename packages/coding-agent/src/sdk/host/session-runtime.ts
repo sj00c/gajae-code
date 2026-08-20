@@ -662,9 +662,12 @@ export function createInvocationReconciliation(
 					records.set(recordKey, upgraded);
 					try {
 						await persist();
-					} catch {
-						// The already durable terminal remains authoritative; the event
-						// was not swallowed and can be retried by the lifecycle caller.
+					} catch (error) {
+						// Restore the durable deadline record identity so the lifecycle
+						// caller retains ownership and retries instead of clearing the
+						// lease after a contradictory in-memory success.
+						if (records.get(recordKey) === upgraded) records.set(recordKey, current);
+						throw error;
 					}
 					return;
 				}
@@ -677,9 +680,9 @@ export function createInvocationReconciliation(
 					records.set(recordKey, upgraded);
 					try {
 						await persist();
-					} catch {
-						// Keep the existing durable terminal; the end event remains
-						// retryable and is never converted into a nonterminal record.
+					} catch (error) {
+						if (records.get(recordKey) === upgraded) records.set(recordKey, record);
+						throw error;
 					}
 					return;
 				}
