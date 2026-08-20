@@ -9858,7 +9858,10 @@ export class AgentSession {
 			this.#cachedWorkspaceTreeAt = Date.now();
 			this.#initialWorkspaceTree = undefined;
 			includeTree = this.#cachedWorkspaceTree;
-		} else if (this.#pendingWorkspaceTreeRescope || Date.now() - this.#cachedWorkspaceTreeAt >= VOLATILE_TREE_TTL_MS) {
+		} else if (
+			this.#pendingWorkspaceTreeRescope ||
+			Date.now() - this.#cachedWorkspaceTreeAt >= VOLATILE_TREE_TTL_MS
+		) {
 			// A rescope retires the cached tree regardless of TTL, and must re-scan
 			// rather than reuse the launch-root snapshot the service already holds.
 			const rescoped = this.#pendingWorkspaceTreeRescope;

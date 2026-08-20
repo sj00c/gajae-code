@@ -766,7 +766,9 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 				return original();
 			};
 			const moveTool = session.getToolByName("move_session")!;
-			await expect(moveTool.execute("move-rebind-fail", { path: "repo-b" })).rejects.toThrow(/python rebind exploded/);
+			await expect(moveTool.execute("move-rebind-fail", { path: "repo-b" })).rejects.toThrow(
+				/python rebind exploded/,
+			);
 			// No half-moved session: cwd, process cwd, and generation are unchanged.
 			expect(sessionManager.getCwd()).toBe(cwdA);
 			expect(sessionManager.getCwdGeneration()).toBe(0);

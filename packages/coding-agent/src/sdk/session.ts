@@ -2265,9 +2265,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											);
 											clearPluginRootsAndCaches(restoreRegistry ? [restoreRegistry] : undefined);
 											await rebindCwdCapturingAuthority(canonicalFrom).catch(restoreError => {
-												logger.warn("Failed to restore launch-root tool authority after a rejected rescope", {
-													error: safeErrorForLog(restoreError),
-												});
+												logger.warn(
+													"Failed to restore launch-root tool authority after a rejected rescope",
+													{
+														error: safeErrorForLog(restoreError),
+													},
+												);
 											});
 											throw rescopeFailure;
 										}
