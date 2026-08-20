@@ -8,6 +8,14 @@ import type { Api, Model, Provider } from "./types";
 const DEFAULT_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
 
+// A legacy row has no dynamic-ID marker, so concurrent cold-start resolutions
+// would otherwise all fetch before the first one can publish that marker.
+const legacyDynamicRefreshes = new Map<string, Promise<void>>();
+
+function legacyDynamicRefreshKey(providerId: Provider, cacheDbPath: string | undefined, provenance: string): string {
+	return `${cacheDbPath ?? "<default>"}\0${providerId}\0${provenance}`;
+}
+
 /**
  * Controls when dynamic endpoint models should be fetched.
  */
@@ -127,6 +135,43 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	options: ModelManagerOptions<TApi, TModelsDevPayload>,
 	strategy: ModelRefreshStrategy = "online-if-uncached",
 ): Promise<ModelResolutionResult<TApi>> {
+	const provenance = options.cacheDynamicModelProvenance;
+	const now = options.now ?? Date.now;
+	const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+	const legacyCache = readModelCache<TApi>(options.providerId, ttlMs, now, options.cacheDbPath);
+	if (
+		strategy === "offline" ||
+		typeof options.fetchDynamicModels !== "function" ||
+		provenance === undefined ||
+		legacyCache === null ||
+		legacyCache.dynamicModelIds !== undefined
+	) {
+		return resolveProviderModelsUncoalesced(options, strategy);
+	}
+
+	const refreshKey = legacyDynamicRefreshKey(options.providerId, options.cacheDbPath, provenance);
+	const inFlightRefresh = legacyDynamicRefreshes.get(refreshKey);
+	if (inFlightRefresh) {
+		await inFlightRefresh;
+		return resolveProviderModelsUncoalesced(options, strategy);
+	}
+
+	const refreshCompletion = Promise.withResolvers<void>();
+	legacyDynamicRefreshes.set(refreshKey, refreshCompletion.promise);
+	try {
+		return await resolveProviderModelsUncoalesced(options, strategy);
+	} finally {
+		if (legacyDynamicRefreshes.get(refreshKey) === refreshCompletion.promise) {
+			legacyDynamicRefreshes.delete(refreshKey);
+		}
+		refreshCompletion.resolve();
+	}
+}
+
+async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsDevPayload = unknown>(
+	options: ModelManagerOptions<TApi, TModelsDevPayload>,
+	strategy: ModelRefreshStrategy = "online-if-uncached",
+): Promise<ModelResolutionResult<TApi>> {
 	const now = options.now ?? Date.now;
 	const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
 	const dbPath = options.cacheDbPath;
@@ -141,12 +186,20 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		cache.dynamicModelProvenance !== undefined &&
 		cache.dynamicModelProvenance === options.cacheDynamicModelProvenance;
 	const cacheProvenanceMismatch = cache?.dynamicModelIds !== undefined && !cacheDynamicModelIdsCurrent;
+	// A provider that supplies cache provenance has opted into live-catalog
+	// authority. Rows written before that provider enabled discovery have no
+	// dynamic IDs, so they must be synchronized once rather than suppressing the
+	// first live fetch for their full TTL.
+	const cacheNeedsInitialDynamicRefresh =
+		hasDynamicFetcher && options.cacheDynamicModelProvenance !== undefined && cache?.dynamicModelIds === undefined;
 	const hasAuthoritativeCache =
 		!hasDynamicFetcher ||
-		((cache?.authoritative ?? false) && (cache?.dynamicModelIds === undefined || cacheDynamicModelIdsCurrent));
+		((cache?.authoritative ?? false) &&
+			!cacheNeedsInitialDynamicRefresh &&
+			(cache?.dynamicModelIds === undefined || cacheDynamicModelIdsCurrent));
 	const cacheAgeMs = cache ? now() - cache.updatedAt : Number.POSITIVE_INFINITY;
 	const shouldFetchFromNetwork =
-		cacheProvenanceMismatch && strategy !== "offline"
+		(cacheProvenanceMismatch || cacheNeedsInitialDynamicRefresh) && strategy !== "offline"
 			? true
 			: shouldFetchRemoteSources(strategy, cache?.fresh ?? false, hasAuthoritativeCache, cacheAgeMs);
 	const staticFingerprint = fingerprintStatic(staticModels);
@@ -245,6 +298,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 					false,
 					staticFingerprint,
 					dbPath,
+					options.cacheDynamicModelProvenance === undefined ? undefined : [],
+					options.cacheDynamicModelProvenance,
 				);
 			}
 		}

@@ -353,6 +353,57 @@ describe("GLM ZCode OAuth login provider", () => {
 		}
 	});
 
+	it("sanitizes and bounds names for unbundled catalog models", async () => {
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					data: [{ id: "glm-future", name: `\u001b]0;pwned\u0007GLM Future\n${"x".repeat(300)}` }],
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			)) as unknown as typeof fetch;
+		try {
+			const discovered = (await fetchDynamicModels())?.find(model => model.id === "glm-future");
+			expect(discovered?.name).toStartWith("GLM Future ");
+			expect(discovered?.name).toHaveLength(200);
+			expect(discovered?.name).toMatch(/^[^\x00-\x1f\x7f]*$/);
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it("uses the configured trusted GLM endpoint for discovery and requests", async () => {
+		await withEnv({ ZCODE_PLAN_ANTHROPIC_BASE_URL: "https://zai-gateway.example.test/anthropic/" }, async () => {
+			const requests: string[] = [];
+			const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+			const fetchDynamicModels = options.fetchDynamicModels;
+			if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+			const originalFetch = global.fetch;
+			global.fetch = (async (input: string | URL | Request) => {
+				requests.push(String(input));
+				return new Response(JSON.stringify({ data: [{ id: "glm-5.2" }] }), {
+					headers: { "Content-Type": "application/json" },
+				});
+			}) as typeof fetch;
+			try {
+				const models = await fetchDynamicModels();
+				expect(models?.[0]?.baseUrl).toBe("https://zai-gateway.example.test/anthropic");
+				expect(requests).toEqual(["https://zai-gateway.example.test/anthropic/v1/models"]);
+				const model = getBundledModel("glm-zcode", "glm-5.2") as Parameters<
+					typeof buildAnthropicClientOptions
+				>[0]["model"];
+				expect(buildAnthropicClientOptions({ model, apiKey: MINTED_KEY }).baseURL).toBe(
+					"https://zai-gateway.example.test/anthropic",
+				);
+			} finally {
+				global.fetch = originalFetch;
+			}
+		});
+	});
+
 	it("keeps static models when no GLM ZCode credential is configured", () => {
 		expect(glmZcodeModelManagerOptions().fetchDynamicModels).toBeUndefined();
 	});

@@ -81,6 +81,7 @@ import {
 	parseStreamingJson,
 } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
+import { GLM_ZCODE_ANTHROPIC_BASE_URL } from "../utils/oauth/glm-zcode";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
 import { getRetryAfterMsFromHeaders } from "../utils/retry-after";
@@ -1144,6 +1145,10 @@ type FoundryTlsOptions = {
 	key?: string;
 };
 
+export function resolveGlmZcodeAnthropicBaseUrl(): string {
+	return normalizeAnthropicBaseUrl($credentialEnv("ZCODE_PLAN_ANTHROPIC_BASE_URL")) ?? GLM_ZCODE_ANTHROPIC_BASE_URL;
+}
+
 function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: string): string | undefined {
 	if (model.provider === "github-copilot") {
 		return normalizeAnthropicBaseUrl(resolveGitHubCopilotBaseUrl(model.baseUrl, apiKey) ?? model.baseUrl);
@@ -1152,9 +1157,7 @@ function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: st
 	// calls api.z.ai directly (no zcode.z.ai gateway, no captcha). Pin the base so dynamic
 	// discovery / stale bundled catalogs / model cache can't redirect it elsewhere.
 	if (model.provider === "glm-zcode") {
-		return (
-			normalizeAnthropicBaseUrl($credentialEnv("ZCODE_PLAN_ANTHROPIC_BASE_URL")) ?? "https://api.z.ai/api/anthropic"
-		);
+		return resolveGlmZcodeAnthropicBaseUrl();
 	}
 	if (model.provider === "anthropic" && isFoundryEnabled()) {
 		const foundryBaseUrl = normalizeAnthropicBaseUrl($credentialEnv("FOUNDRY_BASE_URL"));

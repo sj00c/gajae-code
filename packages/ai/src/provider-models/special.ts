@@ -2,11 +2,10 @@ import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import { once, sanitizeText } from "@gajae-code/utils";
 
 import type { ModelManagerOptions } from "../model-manager";
-import { buildZCodeSourceHeaders } from "../providers/anthropic";
+import { buildZCodeSourceHeaders, resolveGlmZcodeAnthropicBaseUrl } from "../providers/anthropic";
 import { fetchOpenCodexModels, OPENCODEX_MODEL_CACHE_TTL_MS } from "../providers/openai-opencodex-responses";
 import { fetchCodexModels } from "../utils/discovery/codex";
 import { fetchOpenAICompatibleModels } from "../utils/discovery/openai-compatible";
-import { GLM_ZCODE_ANTHROPIC_BASE_URL } from "../utils/oauth/glm-zcode";
 import { createBundledReferenceMap } from "./bundled-references";
 export function openCodexModelManagerOptions(): ModelManagerOptions<"openai-responses"> {
 	return {
@@ -93,7 +92,7 @@ export function glmZcodeModelManagerOptions(
 	config: GlmZcodeModelManagerConfig = {},
 ): ModelManagerOptions<"anthropic-messages"> {
 	const apiKey = config.apiKey;
-	const baseUrl = GLM_ZCODE_ANTHROPIC_BASE_URL;
+	const baseUrl = resolveGlmZcodeAnthropicBaseUrl();
 	const providerRefs = createBundledReferenceMap<"anthropic-messages">("glm-zcode");
 	// Same-family GLM references: the thin `glm-zcode` slice bundles only the
 	// newest model, while the `zai` slice carries the rest of the GLM family
@@ -105,6 +104,7 @@ export function glmZcodeModelManagerOptions(
 
 	return {
 		providerId: "glm-zcode",
+		...(apiKey ? { cacheDynamicModelProvenance: `${Bun.hash(apiKey).toString(36)}\0${baseUrl}` } : undefined),
 		...(apiKey
 			? {
 					fetchDynamicModels: () =>
@@ -119,20 +119,22 @@ export function glmZcodeModelManagerOptions(
 								"anthropic-dangerous-direct-browser-access": "true",
 							},
 							mapModel: (entry, defaults) => {
-								const reference = resolveReference(defaults.id);
-								if (!reference) return defaults;
 								// The remote catalog is provider-controlled text that ends up
 								// rendered in the TUI model selector; strip ANSI/OSC and other
 								// control sequences at the discovery boundary.
 								const remoteName =
 									typeof entry.name === "string" && entry.name.length > 0
-										? sanitizeText(entry.name).replace(/\s+/g, " ").trim()
+										? sanitizeText(entry.name).replace(/\s+/g, " ").trim().slice(0, 200)
 										: "";
+								const reference = resolveReference(defaults.id);
+								if (!reference) {
+									return { ...defaults, name: remoteName || defaults.id };
+								}
 								return {
 									...reference,
 									id: defaults.id,
 									provider: "glm-zcode",
-									name: remoteName.length > 0 ? remoteName.slice(0, 200) : reference.name,
+									name: remoteName || reference.name,
 									baseUrl,
 									contextWindow:
 										defaults.contextWindow === UNK_CONTEXT_WINDOW
