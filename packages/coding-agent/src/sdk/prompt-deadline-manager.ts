@@ -224,6 +224,14 @@ export class PromptDeadlineManager {
 					this.#uncertaintyRecoveryPending.add(key);
 					return;
 				}
+				const current = this.#leases.get(key);
+				if (current !== lease || current.generation !== generation) {
+					// The timer map is keyed by correlation, so never clear or replace
+					// it after this failed attempt has become stale. The current owner
+					// already owns its own timer; reschedule only that live lease.
+					if (current) this.#schedule(key);
+					return;
+				}
 				this.#clearTimer(key);
 				const timer = setTimeout(
 					() => this.#recoverUncertainty(key, correlation, lease, generation),

@@ -285,9 +285,11 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.onAccepted(correlation);
 		await Bun.sleep(6_800);
 		await recoveryStarted.promise;
+		const finalizeBeforeReplacement = state.finalizeCalls;
 		await Bun.sleep(1_200);
 		expect(state.uncertainCalls).toBe(1);
 		expect(manager.has(correlation)).toBe(true);
+		expect(state.finalizeCalls).toBeGreaterThan(finalizeBeforeReplacement);
 		manager.clearAll();
 	}, 15_000);
 
@@ -309,10 +311,12 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		await Bun.sleep(6_800);
 		await recoveryStarted.promise;
 		manager.onProgress(correlation);
+		const finalizeBeforeRenewedLease = state.finalizeCalls;
 		recoveryRelease.resolve();
 		await Bun.sleep(1_200);
 		expect(state.uncertainCalls).toBe(1);
 		expect(manager.has(correlation)).toBe(true);
+		expect(state.finalizeCalls).toBeGreaterThan(finalizeBeforeRenewedLease);
 		manager.clearAll();
 	}, 15_000);
 
