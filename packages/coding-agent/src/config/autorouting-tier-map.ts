@@ -146,13 +146,27 @@ export const TIER_MAP_SKIP_LIST = {
 	},
 	"vercel-ai-gateway/google/gemini-3.7-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"zai/glm-5.3": { rationale: "post-rebase catalog addition from dev; not yet curated" },
-	"cursor/gemini-3.7-flash-high": { rationale: "post-rebase catalog addition from dev; not yet curated" },
-	"cursor/gemini-3.7-flash-low": { rationale: "post-rebase catalog addition from dev; not yet curated" },
-	"cursor/gemini-3.7-flash-medium": { rationale: "post-rebase catalog addition from dev; not yet curated" },
-	"google-antigravity/gemini-3.7-flash-high": { rationale: "post-rebase catalog addition from dev; not yet curated" },
-	"google-antigravity/gemini-3.7-flash-low": { rationale: "post-rebase catalog addition from dev; not yet curated" },
-	"google-antigravity/gemini-3.7-flash-medium": { rationale: "post-rebase catalog addition from dev; not yet curated" },
-	"google-antigravity/gemini-3.7-flash-tiered": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"cursor/gemini-3.7-flash-high": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cursor/gemini-3.7-flash-low": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"cursor/gemini-3.7-flash-medium": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"google-antigravity/gemini-3.7-flash-high": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"google-antigravity/gemini-3.7-flash-low": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"google-antigravity/gemini-3.7-flash-medium": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
+	"google-antigravity/gemini-3.7-flash-tiered": {
+		rationale: "post-rebase catalog addition from dev; not yet curated",
+	},
 	"google-gemini-cli/gemini-3.7-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"alibaba-token-plan/MiniMax-M2.5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"alibaba-token-plan/deepseek-v3.2": { rationale: "post-rebase catalog addition from dev; not yet curated" },

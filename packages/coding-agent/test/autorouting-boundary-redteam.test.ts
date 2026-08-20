@@ -1046,7 +1046,13 @@ describe("autorouting boundary red-team: routing evidence, retries, and residue"
 describe("autorouting boundary red-team: malformed evidence and hostile selectors", () => {
 	it("fails closed on control-only selectors and hostile local config values", async () => {
 		const hostile = ["../escape/model", "provider/\u0000\u0001", `provider/${"x".repeat(10_000)}`, "аlpha/model"];
-		const localIssues = hostile.flatMap(selector => validateAutoroutingLocal({ tiers: { fast: [selector] } }));
+		const perSelectorIssues = hostile.map(selector => validateAutoroutingLocal({ tiers: { fast: [selector] } }));
+		const localIssues = perSelectorIssues.flat();
+		// The selector grammar caps length at the routing-evidence bound, so the over-long
+		// entry is rejected here, before it can execute and fail finalization; the other
+		// hostile shapes stay grammar-valid and flow to the executor's sanitization paths.
+		const overLongIssues = perSelectorIssues[2];
+		const toleratedIssues = [0, 1, 3].flatMap(index => perSelectorIssues[index]);
 		let controlOnlyError = "";
 		try {
 			await runSubprocess({
@@ -1075,7 +1081,7 @@ describe("autorouting boundary red-team: malformed evidence and hostile selector
 			localIssueDetails: localIssues.map(issue => issue.detail),
 			controlOnlyError,
 		};
-		const pass = localIssues.length === 0 && controlOnlyError.length === 0;
+		const pass = overLongIssues.length > 0 && toleratedIssues.length === 0 && controlOnlyError.length === 0;
 		record(
 			"hostile-selector-sanitization",
 			"AC12",
@@ -1943,7 +1949,7 @@ describe("autorouting boundary red-team generation 3 delta re-attacks", () => {
 
 	it("shared bounded-skip projection matches routed preflight and manual fallback", async () => {
 		const catalog = [model("present", "model")];
-		const longMissing = (index: number) => `missing/${"x".repeat(300)}-${index}`;
+		const longMissing = (index: number) => `missing/${"x".repeat(200)}-${index}`;
 		const missingSelectors = Array.from({ length: 20 }, (_, index) => longMissing(index));
 		const discover = vi
 			.spyOn(discoveryModule, "discoverAgents")

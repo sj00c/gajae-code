@@ -6,7 +6,6 @@ import * as path from "node:path";
 import {
 	AUTOROUTING_SELECTOR_MAX_LENGTH,
 	AUTOROUTING_SELECTOR_PATTERN,
-	isValidAutoroutingSelector,
 	type AutoroutingProvenance,
 	type AutoroutingSetup,
 	autoroutingProviderOrderHint,
@@ -14,6 +13,7 @@ import {
 	buildAutoroutingEnabledPatch,
 	buildAutoroutingSettingsBatch,
 	evaluateAutoroutingProvenanceState,
+	isValidAutoroutingSelector,
 	validateAutoroutingEffective,
 	validateAutoroutingLocal,
 	validateAutoroutingProvenance,
