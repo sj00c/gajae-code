@@ -2745,6 +2745,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				waitForGateResolutionQuiescence: () => Promise<void>;
 				activeInvocation?: { kind: InvocationKind; correlation: InvocationCorrelation };
 				drainedInvocations?: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
+				attachedInvocations?: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 				openLifecycleBatches: Array<{
 					invocations: Array<{
 						kind: InvocationKind;
@@ -2792,11 +2793,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (!batch || batch.length === 0) {
 				current.activeInvocation = undefined;
 				current.drainedInvocations = undefined;
+				current.attachedInvocations = undefined;
 				activePromptOwnerHolder.connectionIds = undefined;
 				return;
 			}
 			current.activeInvocation = batch[0];
 			current.drainedInvocations = batch.map(({ kind, correlation }) => ({ kind, correlation }));
+			current.attachedInvocations = undefined;
 			const owners = new Set<string>();
 			for (const entry of batch) if (entry.connectionId !== undefined) owners.add(entry.connectionId);
 			activePromptOwnerHolder.connectionIds = owners;
@@ -2833,11 +2836,24 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// aborted-turn end that lands after a successor agent_start must
 			// terminalize the aborted invocation, never the successor.
 			const ended = current.openLifecycleBatches[0];
-			transitions = ended
+			const baseTransitions = ended
 				? ended.invocations.map(({ kind, correlation }) => ({ kind, correlation }))
 				: current.activeInvocation
 					? [current.activeInvocation]
 					: [];
+			const attached = current.attachedInvocations ?? [];
+			const seen = new Set(
+				baseTransitions.map(({ correlation }) => `${correlation.commandId}:${correlation.turnId}`),
+			);
+			transitions = [
+				...baseTransitions,
+				...attached.filter(({ correlation }) => {
+					const id = `${correlation.commandId}:${correlation.turnId}`;
+					if (seen.has(id)) return false;
+					seen.add(id);
+					return true;
+				}),
+			];
 		}
 		const eventLifecycleEpoch = current.lifecycleEpoch;
 		// Observe whether the lifecycle publication actually landed: a terminal
@@ -3116,12 +3132,21 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// actually consumed — so attach idempotently (#4668 review P1).
 					if (current.drainedInvocations === undefined)
 						current.drainedInvocations = current.activeInvocation ? [current.activeInvocation] : [];
+					if (current.attachedInvocations === undefined) current.attachedInvocations = [];
 					const alreadyAttached = current.drainedInvocations.some(
 						entry =>
 							entry.correlation.commandId === correlation.commandId &&
 							entry.correlation.turnId === correlation.turnId,
 					);
 					if (!alreadyAttached) current.drainedInvocations.push({ kind, correlation });
+					if (
+						!current.attachedInvocations.some(
+							entry =>
+								entry.correlation.commandId === correlation.commandId &&
+								entry.correlation.turnId === correlation.turnId,
+						)
+					)
+						current.attachedInvocations.push({ kind, correlation });
 					return;
 				}
 				// No in-flight run visible and this is an in-run consumption
