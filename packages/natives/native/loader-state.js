@@ -1,5 +1,5 @@
 import * as childProcess from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -51,16 +51,68 @@ function getNativesDir() {
 
 function addonBytesMatch(left, right) {
 	try {
-		const leftStat = fs.statSync(left);
-		const rightStat = fs.statSync(right);
-		return leftStat.size === rightStat.size && Buffer.compare(fs.readFileSync(left), fs.readFileSync(right)) === 0;
+		return safeFileSnapshot(left).hash === safeFileSnapshot(right).hash;
 	} catch {
 		return false;
 	}
 }
 
 function addonContentDigest(file) {
-	return createHash("sha256").update(fs.readFileSync(file)).digest("hex").slice(0, 24);
+	return safeFileSnapshot(file).hash.slice(0, 24);
+}
+
+function safeFileSnapshot(file) {
+	const stat = fs.lstatSync(file);
+	if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("native addon path is not a regular file");
+	const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+	const fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+	try {
+		const opened = fs.fstatSync(fd);
+		if (!opened.isFile()) throw new Error("native addon path is not a regular file");
+		const bytes = fs.readFileSync(fd);
+		return {
+			bytes,
+			hash: createHash("sha256").update(bytes).digest("hex"),
+			identity: `${opened.dev}:${opened.ino}:${opened.size}:${opened.mtimeMs}`,
+		};
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+function safeDirectoryPath(directory) {
+	const resolved = path.resolve(directory);
+	const parsed = path.parse(resolved);
+	let current = parsed.root;
+	for (const part of resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+		current = path.join(current, part);
+		try {
+			const stat = fs.lstatSync(current);
+			if (stat.isSymbolicLink() || (!stat.isDirectory() && current !== resolved)) return false;
+		} catch (error) {
+			if (error?.code === "ENOENT") return true;
+			return false;
+		}
+	}
+	try {
+		const stat = fs.lstatSync(resolved);
+		return stat.isDirectory() && !stat.isSymbolicLink();
+	} catch (error) {
+		return error?.code === "ENOENT";
+	}
+}
+
+function recordStagedSnapshot(ctx, candidate, snapshot) {
+	ctx.stagedCandidateSnapshots ??= new Map();
+	ctx.stagedCandidateSnapshots.set(candidate, snapshot);
+}
+
+function validateStagedCandidate(ctx, candidate) {
+	const expected = ctx.stagedCandidateSnapshots?.get(candidate);
+	if (!expected) return;
+	const current = safeFileSnapshot(candidate);
+	if (current.hash !== expected.hash || current.identity !== expected.identity)
+		throw new Error("staged addon changed before load");
 }
 
 // =========================================================================
@@ -478,19 +530,38 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 		ctx.candidates = ctx.candidates.filter(candidate => path.basename(candidate) !== filename);
 	};
 	const refreshAddon = (sourcePath, refreshPath) => {
-		if (fs.existsSync(refreshPath) && addonBytesMatch(refreshPath, sourcePath)) return refreshPath;
-		const temporaryPath = `${refreshPath}.tmp-${process.pid}`;
+		if (!safeDirectoryPath(path.dirname(refreshPath))) throw new Error("refresh directory is not a safe directory");
+		const source = safeFileSnapshot(sourcePath);
 		try {
-			fs.copyFileSync(sourcePath, temporaryPath);
+			const existing = safeFileSnapshot(refreshPath);
+			if (existing.hash === source.hash) return refreshPath;
+			throw new Error("refresh destination contains different bytes");
+		} catch (error) {
+			if (error?.code !== "ENOENT" && error?.message !== "ENOENT") throw error;
+		}
+		const temporaryPath = `${refreshPath}.tmp-${process.pid}-${randomUUID()}`;
+		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+		let fd;
+		try {
+			fd = fs.openSync(temporaryPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+			fs.writeFileSync(fd, source.bytes);
+			fs.fsyncSync(fd);
+			fs.closeSync(fd);
+			fd = undefined;
+			const staged = safeFileSnapshot(temporaryPath);
+			if (staged.hash !== source.hash) throw new Error("temporary addon bytes do not match the source");
 			try {
 				fs.renameSync(temporaryPath, refreshPath);
 			} catch {
-				if (!addonBytesMatch(refreshPath, sourcePath)) throw new Error("refresh destination is unavailable");
-				fs.rmSync(temporaryPath, { force: true });
+				const winner = safeFileSnapshot(refreshPath);
+				if (winner.hash !== source.hash) throw new Error("refresh destination is unavailable");
 			}
-			if (!addonBytesMatch(refreshPath, sourcePath)) throw new Error("restaged addon bytes do not match the current package artifact");
+			const final = safeFileSnapshot(refreshPath);
+			if (final.hash !== source.hash) throw new Error("restaged addon bytes do not match the current package artifact");
+			recordStagedSnapshot(ctx, refreshPath, final);
 			return refreshPath;
 		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
 			fs.rmSync(temporaryPath, { force: true });
 		}
 	};
@@ -690,7 +761,10 @@ export function loadNative(options = {}) {
 	const runtimeCandidates = embeddedIsAuthoritative ? prepended : prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
 	const loaded = loadFromCandidates({
 		candidates: runtimeCandidates,
-		requireCandidate: options.requireCandidate ?? (candidate => require_(candidate)),
+		requireCandidate: candidate => {
+			validateStagedCandidate(ctx, candidate);
+			return options.requireCandidate ? options.requireCandidate(candidate) : require_(candidate);
+		},
 		validateCandidate: options.validateCandidate ?? ((bindings, candidate) => validateLoadedBindings(ctx, bindings, candidate)),
 		describeCandidate: candidate => candidate,
 	});

@@ -42,14 +42,18 @@ async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 15_000
 
 type SessionListResponse = Record<string, unknown>;
 
-async function createSessionListBroker(
-	responder: (input: Record<string, unknown>) => SessionListResponse,
-): Promise<{ directory: string; agentDir: string; requests: Array<Record<string, unknown>> }> {
+async function createSessionListBroker(responder: (input: Record<string, unknown>) => SessionListResponse): Promise<{
+	directory: string;
+	agentDir: string;
+	requests: Array<Record<string, unknown>>;
+	connections: () => number;
+}> {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-session-list-"));
 	directories.push(directory);
 	const agentDir = path.join(directory, ".gjc", "agent");
 	const token = "acp-session-list-token";
 	const requests: Array<Record<string, unknown>> = [];
+	let connectionCount = 0;
 	let server!: TestServer;
 	server = Bun.serve({
 		hostname: "127.0.0.1",
@@ -61,6 +65,7 @@ async function createSessionListBroker(
 		},
 		websocket: {
 			open(socket) {
+				connectionCount += 1;
 				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
 			},
 			message(socket, raw) {
@@ -87,7 +92,7 @@ async function createSessionListBroker(
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
 	});
-	return { directory, agentDir, requests };
+	return { directory, agentDir, requests, connections: () => connectionCount };
 }
 
 test("ACP advertised skill commands require one complete canonical text block", () => {
@@ -106,6 +111,18 @@ test("ACP advertised skill commands require one complete canonical text block", 
 		name: "not-advertised",
 		args: "",
 	});
+});
+
+test("concurrent ACP broker requests share one canonical connection", async () => {
+	const fixture = await createSessionListBroker(() => ({ sessions: [] }));
+	const agent = new AcpAgent({ signal: new AbortController().signal } as unknown as AgentSideConnection, {
+		agentDir: fixture.agentDir,
+		expectedPackageGeneration: "test",
+	});
+	const [first, second] = await Promise.all([agent.listSessions({}), agent.listSessions({})]);
+	expect(first).toEqual({ sessions: [] });
+	expect(second).toEqual({ sessions: [] });
+	expect(fixture.connections()).toBe(1);
 });
 test("production ACP routes zero-session SDK globals through the broker adapter", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-production-"));

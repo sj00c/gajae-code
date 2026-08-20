@@ -20,6 +20,7 @@
  * build`) and on non-Windows so the regular path is unchanged.
  */
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -193,6 +194,47 @@ describe("windows native addon staging", () => {
 			),
 		).toBeNull();
 		expect(errors).toEqual(["staged addon context is incomplete"]);
+	});
+
+	it("rejects a symlinked content-addressed refresh entry", async () => {
+		if (process.platform === "win32") return;
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-symlink-"));
+		const nativeDir = path.join(root, "native");
+		const versionedDir = path.join(root, "versioned");
+		const filename = "pi_natives.win32-x64.node";
+		const sourcePath = path.join(nativeDir, filename);
+		const refreshPath = path.join(
+			versionedDir,
+			`.refresh-${createHash("sha256").update("new-addon").digest("hex").slice(0, 24)}-${filename}`,
+		);
+		await fs.mkdir(nativeDir, { recursive: true });
+		await fs.mkdir(versionedDir, { recursive: true });
+		await fs.writeFile(sourcePath, "new-addon");
+		await fs.writeFile(path.join(versionedDir, filename), "old-addon");
+		await fs.symlink(sourcePath, refreshPath);
+		try {
+			const errors: string[] = [];
+			expect(
+				maybeStageNodeModulesAddon(
+					{
+						isCompiledBinary: false,
+						platformTag: "win32-x64",
+						stageFromNodeModules: true,
+						versionedDir,
+						addonFilenames: [filename],
+						optionalPackageNativeDirs: [],
+						nativeDir,
+					},
+					errors,
+				),
+			).toBeNull();
+			expect(errors).toEqual([
+				expect.stringContaining("staged addon drift"),
+				expect.stringContaining("staged addon refresh"),
+			]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("removes drifted staged candidates before native loading", async () => {

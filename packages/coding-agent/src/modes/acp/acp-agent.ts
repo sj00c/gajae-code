@@ -1206,6 +1206,7 @@ export class AcpAgent implements Agent {
 	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
+	#brokerResolution: Promise<BrokerConnection> | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
 	readonly #promptWatchdogClock: PromptWatchdogClock;
@@ -2432,6 +2433,18 @@ export class AcpAgent implements Agent {
 	}
 
 	async #brokerConnection(): Promise<BrokerConnection> {
+		if (this.#brokerResolution) return this.#brokerResolution;
+		let resolution!: Promise<BrokerConnection>;
+		resolution = this.#resolveBrokerConnection();
+		this.#brokerResolution = resolution;
+		try {
+			return await resolution;
+		} finally {
+			if (this.#brokerResolution === resolution) this.#brokerResolution = undefined;
+		}
+	}
+
+	async #resolveBrokerConnection(): Promise<BrokerConnection> {
 		if (this.#broker) {
 			const current = resolveSdkPackageAuthority();
 			const existing = this.#broker;
@@ -2448,39 +2461,65 @@ export class AcpAgent implements Agent {
 					(pending.packageVersion === current.packageVersion &&
 						pending.installationIdentity === current.installationIdentity));
 			if (generationMatches) return pending;
+			const beforeClose = resolveSdkPackageAuthority({ force: true });
+			if (
+				this.#broker !== existing ||
+				(this.#expectedPackageGeneration === undefined &&
+					(beforeClose.generation !== current.generation ||
+						beforeClose.packageVersion !== current.packageVersion ||
+						beforeClose.installationIdentity !== current.installationIdentity))
+			)
+				throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed during connection replacement.");
 			this.#broker = undefined;
 			await pending.adapter.close().catch(() => undefined);
 			await pending.client.close().catch(() => undefined);
 		}
-		if (!this.#broker) {
-			let pending!: Promise<BrokerConnection>;
-			pending = (async () => {
-				const discovery = await ensureBroker({
-					agentDir: this.#agentDir,
-					...(this.#expectedPackageGeneration === undefined
-						? {}
-						: { expectedPackageGeneration: this.#expectedPackageGeneration }),
-				});
-				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
-				const adapter = new AcpSdkAdapter({ client });
-				adapter.onReconnectFailed(() => {
-					if (this.#broker === pending) this.#broker = undefined;
-					void adapter.close().catch(() => undefined);
-				});
-				await adapter.start();
-				return {
-					adapter,
-					client,
-					packageGeneration: discovery.packageGeneration,
-					packageVersion: discovery.packageVersion,
-					installationIdentity: discovery.installationIdentity,
-				};
-			})();
-			this.#broker = pending;
-		}
-		const pending = this.#broker;
+		const discovery = await ensureBroker({
+			agentDir: this.#agentDir,
+			...(this.#expectedPackageGeneration === undefined
+				? {}
+				: { expectedPackageGeneration: this.#expectedPackageGeneration }),
+		});
+		const authorityAfterEnsure = resolveSdkPackageAuthority({ force: true });
+		if (
+			this.#expectedPackageGeneration === undefined &&
+			(discovery.packageGeneration !== authorityAfterEnsure.generation ||
+				discovery.packageVersion !== authorityAfterEnsure.packageVersion ||
+				discovery.installationIdentity !== authorityAfterEnsure.installationIdentity)
+		)
+			throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed before connection publication.");
+		let pending!: Promise<BrokerConnection>;
+		pending = (async () => {
+			const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
+			const adapter = new AcpSdkAdapter({ client });
+			adapter.onReconnectFailed(() => {
+				if (this.#broker === pending) this.#broker = undefined;
+				void adapter.close().catch(() => undefined);
+			});
+			await adapter.start();
+			return {
+				adapter,
+				client,
+				packageGeneration: discovery.packageGeneration,
+				packageVersion: discovery.packageVersion,
+				installationIdentity: discovery.installationIdentity,
+			};
+		})();
 		try {
-			return await pending;
+			const connection = await pending;
+			const authorityBeforePublish = resolveSdkPackageAuthority({ force: true });
+			if (
+				this.#expectedPackageGeneration === undefined &&
+				(connection.packageGeneration !== authorityBeforePublish.generation ||
+					connection.packageVersion !== authorityBeforePublish.packageVersion ||
+					connection.installationIdentity !== authorityBeforePublish.installationIdentity)
+			) {
+				await connection.adapter.close().catch(() => undefined);
+				await connection.client.close().catch(() => undefined);
+				throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed before connection publication.");
+			}
+			this.#broker = pending;
+			return connection;
 		} catch (error) {
 			if (this.#broker === pending) this.#broker = undefined;
 			throw error;

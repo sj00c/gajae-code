@@ -1442,7 +1442,12 @@ impl Process {
 	pub fn signal_root(&self, signal: i32) -> bool {
 		#[cfg(target_os = "macos")]
 		{
-			self.inner.kill(signal)
+			// macOS exposes no atomic signal-if-start-time-matches primitive. The
+			// identity recheck in `DarwinProcess::kill` cannot close the PID-reuse
+			// window between the check and `kill(2)`, so broker retirement must fail
+			// closed rather than claim that this path is incarnation-safe.
+			let _ = (self, signal);
+			false
 		}
 		#[cfg(not(target_os = "macos"))]
 		{
@@ -2055,9 +2060,8 @@ mod tests {
 		);
 	}
 
-	/// Darwin's stable process reference must deliver the fallback signal
-	/// through its start-time identity check rather than requiring callers to
-	/// use raw kill.
+	/// Darwin's stable process reference must refuse the fallback signal because
+	/// macOS has no atomic identity-bound signal primitive.
 	#[cfg(target_os = "macos")]
 	#[test]
 	fn signal_root_terminates_the_pinned_child() {
@@ -2069,7 +2073,9 @@ mod tests {
 			.expect("spawn sleep");
 		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
 		let process = Process::from_pid(pid).expect("child process reference");
-		assert!(process.signal_root(TERM_SIGNAL));
-		assert!(!child.wait().expect("wait child").success());
+		assert!(!process.signal_root(TERM_SIGNAL));
+		assert!(child.try_wait().expect("poll child").is_none());
+		child.kill().expect("cleanup child");
+		let _ = child.wait();
 	}
 }

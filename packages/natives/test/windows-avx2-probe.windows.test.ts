@@ -62,5 +62,6 @@ describe("windows AVX2 probe live execution (#4652)", () => {
 			// makes PowerShell unavailable or unresponsive.
 			expect(elapsedMs).toBeLessThan(WINDOWS_AVX2_PROBE_BUDGET_MS);
 		},
+		15_000,
 	);
 });
