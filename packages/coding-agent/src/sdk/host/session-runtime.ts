@@ -475,6 +475,13 @@ export function createInvocationReconciliation(
 			: undefined;
 	let persistenceChain: Promise<void> = Promise.resolve();
 	let mutationRevision = 0;
+	const pendingFinalizations = new Map<
+		string,
+		{
+			finalizedRecord: InvocationRecord;
+			completion: PromiseWithResolvers<void>;
+		}
+	>();
 	const persist = async (): Promise<void> => {
 		const run = async (): Promise<void> => {
 			// Construct the candidate only when this serialized write starts. A
@@ -631,8 +638,22 @@ export function createInvocationReconciliation(
 		},
 		async noteTransition(kind, correlation, frame) {
 			if (!correlation) return;
-			const record = records.get(key(kind, correlation));
+			const recordKey = key(kind, correlation);
+			let record = records.get(recordKey);
 			if (!record) return;
+			const pending = pendingFinalizations.get(recordKey);
+			if (pending?.finalizedRecord === record) {
+				try {
+					await pending.completion.promise;
+				} catch {
+					// The deadline write failed; continue against the restored record
+					// so a real lifecycle event is never swallowed.
+				}
+				const current = records.get(recordKey);
+				if (frame.type === "agent_end" && current === pending.finalizedRecord) return;
+				record = current;
+				if (!record) return;
+			}
 			if (record.terminalAt !== undefined) {
 				// Same late agent_failed enrichment as the kind-aware bus reconciler: a
 				// failure reason may arrive on a different delivery path than the one that
@@ -647,11 +668,11 @@ export function createInvocationReconciliation(
 						error: formatPromptFailureForLocalLog(frame.error),
 					});
 					next.error = sanitizePromptFailure(frame.error);
-					records.set(key(kind, correlation), next);
+					records.set(recordKey, next);
 					try {
 						await persist();
 					} catch (error) {
-						if (records.get(key(kind, correlation)) === next) records.set(key(kind, correlation), record);
+						if (records.get(recordKey) === next) records.set(recordKey, record);
 						throw error;
 					}
 				}
@@ -674,11 +695,11 @@ export function createInvocationReconciliation(
 				next.status = next.error === undefined ? "terminal_ok" : "failed";
 				next.terminalAt = Date.now();
 			}
-			records.set(key(kind, correlation), next);
+			records.set(recordKey, next);
 			try {
 				await persist();
 			} catch (error) {
-				if (records.get(key(kind, correlation)) === next) records.set(key(kind, correlation), record);
+				if (records.get(recordKey) === next) records.set(recordKey, record);
 				throw error;
 			}
 		},
@@ -723,7 +744,8 @@ export function createInvocationReconciliation(
 			return outcome;
 		},
 		async finalizeOutcome(kind, correlation, outcome, isCurrent) {
-			const record = records.get(key(kind, correlation));
+			const recordKey = key(kind, correlation);
+			const record = records.get(recordKey);
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return;
 			const finalOutcome = (outcome ??
 				(record as unknown as { pendingOutcome?: { kind: string; code: string; message: string } })
@@ -738,21 +760,27 @@ export function createInvocationReconciliation(
 			}
 			(finalizedRecord as unknown as Record<string, unknown>).pendingOutcome = undefined;
 			if (isCurrent !== undefined && !isCurrent()) return;
-			records.set(key(kind, correlation), finalizedRecord);
+			const completion = Promise.withResolvers<void>();
+			const pending = { finalizedRecord, completion };
+			pendingFinalizations.set(recordKey, pending);
+			records.set(recordKey, finalizedRecord);
 			try {
 				await persist();
-			} catch (error) {
-				const current = records.get(key(kind, correlation));
-				if (current === finalizedRecord) records.set(key(kind, correlation), previousRecord);
-				throw error;
-			}
-			if (isCurrent !== undefined && !isCurrent()) {
-				const current = records.get(key(kind, correlation));
-				if (current === finalizedRecord) {
-					records.set(key(kind, correlation), previousRecord);
-					await persist();
+				if (isCurrent !== undefined && !isCurrent()) {
+					const current = records.get(recordKey);
+					if (current === finalizedRecord) {
+						records.set(recordKey, previousRecord);
+						await persist();
+					}
 				}
-				return;
+			} catch (error) {
+				const current = records.get(recordKey);
+				if (current === finalizedRecord) records.set(recordKey, previousRecord);
+				completion.reject(error);
+				throw error;
+			} finally {
+				if (pendingFinalizations.get(recordKey) === pending) pendingFinalizations.delete(recordKey);
+				completion.resolve();
 			}
 		},
 	};

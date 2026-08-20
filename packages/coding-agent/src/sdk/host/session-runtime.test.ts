@@ -169,6 +169,52 @@ test("durable reload keeps agent_end terminal across a paused successor transiti
 	});
 });
 
+test("agent_end is not swallowed when deadline persistence fails", async () => {
+	let records: unknown[] = [];
+	let pauseNext = false;
+	let failNext = false;
+	const persistStarted = Promise.withResolvers<void>();
+	const releasePersist = Promise.withResolvers<void>();
+	const store = {
+		path: null,
+		load: async () => records,
+		transact: async (mutator: (current: never[]) => never[]) => {
+			const candidate = mutator(records as never);
+			if (pauseNext) {
+				pauseNext = false;
+				persistStarted.resolve();
+				await releasePersist.promise;
+			}
+			if (failNext) {
+				failNext = false;
+				throw new Error("held store failed");
+			}
+			records = candidate;
+		},
+	} as never;
+	const reconciliation = createInvocationReconciliation({ store });
+	const correlation = { commandId: "finalize-race-command", turnId: "finalize-race-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "finalize-race-ref");
+	pauseNext = true;
+	failNext = true;
+	const deadline = reconciliation.finalizeOutcome("prompt", correlation, {
+		kind: "failed",
+		code: "prompt_deadline_exceeded",
+		message: "deadline",
+	});
+	await persistStarted.promise;
+	const terminal = reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+	releasePersist.resolve();
+	await expect(deadline).rejects.toThrow("held store failed");
+	await terminal;
+	const reloaded = createInvocationReconciliation({ store });
+	await reloaded.hydrate();
+	expect(reloaded.lookup("prompt", { clientRef: "finalize-race-ref" })).toMatchObject({
+		status: "terminal_ok",
+		terminalAt: expect.any(Number),
+	});
+});
+
 test("a reason attached after a prompt settled is never replaced by a later failure", async () => {
 	const reconciliation = createInvocationReconciliation();
 	const correlation = { commandId: "late-reason-command", turnId: "late-reason-turn" };
