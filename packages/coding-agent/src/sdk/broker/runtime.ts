@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import internalSourceMarker from "./internal-source-marker-2178.txt" with { type: "file" };
 
@@ -121,21 +120,11 @@ function regularFilesUnder(directory: string): string[] {
 	return [...new Set(files)].sort((left, right) => left.localeCompare(right));
 }
 
-function stagedNativeFiles(packageVersion: string): string[] {
-	if (process.platform !== "win32") return [];
-	const xdgDataHome = process.env.XDG_DATA_HOME;
-	const baseDirectory =
-		xdgDataHome && fs.existsSync(path.join(xdgDataHome, "gjc"))
-			? path.join(xdgDataHome, "gjc", "natives")
-			: path.join(os.homedir(), ".gjc", "natives");
-	const directory = path.join(baseDirectory, packageVersion);
-	return fs.existsSync(directory) ? regularFilesUnder(directory) : [];
-}
-
 /**
  * Include local workspace runtime inputs resolved by source Bun launches. External npm bytes are
  * package-manager inputs represented by the root lockfile; mutable application and native bytes
- * remain inside this content-bound trust boundary.
+ * remain inside this content-bound trust boundary. The user cache is a derived loader artifact,
+ * never generation authority: loader-state validates it against the current package bytes.
  */
 function workspaceDependencyFiles(packageDirectory: string): string[] {
 	const workspaceRoot = path.dirname(packageDirectory);
@@ -275,7 +264,6 @@ function sourceDescriptor(
 		path.join(canonicalPackageDirectory, "package.json"),
 		...regularFilesUnder(canonicalSourceDirectory),
 		...workspaceDependencyFiles(canonicalPackageDirectory),
-		...stagedNativeFiles(packageVersion),
 		config,
 	];
 	const lockfile = path.resolve(canonicalPackageDirectory, "../../bun.lock");
