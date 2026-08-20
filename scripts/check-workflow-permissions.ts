@@ -21,7 +21,8 @@ export interface WorkflowInput {
 }
 
 export const JOB_WRITE_ALLOWLIST: readonly { workflow: string; job: string; scope: string }[] = [
-	{ workflow: ".github/workflows/ci.yml", job: "publish", scope: "contents" },
+	// GitHub Release finalization writes the release; it holds no OIDC token.
+	{ workflow: ".github/workflows/ci.yml", job: "release_finalize", scope: "contents" },
 	// npm trusted publishing (OIDC) needs a GitHub identity token to mint a
 	// short-lived registry credential. It grants nothing in this repository, and
 	// it is what removes the long-lived NPM_TOKEN from the release path.
@@ -43,7 +44,7 @@ const EXPECTED_WORKFLOW_DEFAULT = "an explicit least-privilege permissions block
 const EXPECTED_SCOPE_VALUE = '"read", "write", or "none"';
 const EXPECTED_NON_WRITE_SCOPE = '"read" or "none"';
 const EXPECTED_PERMISSION_VALUE = '"read-all" or a permissions mapping';
-const JOB_WRITE_ALLOWLIST_NOTE = 'only job "publish" in .github/workflows/ci.yml may hold contents: write or id-token: write';
+const JOB_WRITE_ALLOWLIST_NOTE = 'only jobs "release_finalize" (contents: write) and "publish" (id-token: write) in .github/workflows/ci.yml may hold write scopes';
 
 type RecordValue = Record<string, unknown>;
 

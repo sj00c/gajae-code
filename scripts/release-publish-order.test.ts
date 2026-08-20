@@ -465,6 +465,7 @@ describe("native release binary coverage", () => {
 		const binaries = workflowJob(workflow, "binaries");
 		const prepare = workflowJob(workflow, "release_prepare");
 		const publish = workflowJob(workflow, "publish");
+		const finalize = workflowJob(workflow, "release_finalize");
 
 		for (const job of [native, binaries]) {
 			expect(job).toContain("startsWith(github.ref, 'refs/tags/v')");
@@ -480,21 +481,21 @@ describe("native release binary coverage", () => {
 		expect(binaries).toContain("needs: [native, release_metadata]");
 		expect(prepare).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
 		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
+		expect(finalize).toContain("needs: [publish, release_metadata]");
 
 		expect(prepare).toContain("--prepare-evidence --evidence-dir");
 		expect(prepare).toContain("Persist pre-publication package evidence");
-		expect(publish).toContain("--publish-from-evidence");
-		expect(publish).toContain("gajae-production-release");
-		expect(publish).toContain("gajae-nightly-release");
 		expect(publish).toContain("id-token: write");
+		expect(publish).toContain("Publish sealed tarballs to npm");
+		expect(finalize).toContain("--finalize-evidence");
 
-		expect(publish).toContain("softprops/action-gh-release");
-		expect(publish).toContain("draft: false");
-		expect(publish).toContain("release-binaries/gjc-*");
-		expect(publish).toContain("gajae-release-packages-v1.json");
-		expect(publish).toContain("gajae-release-channel-v1.json");
-		expect(publish).toContain("fail_on_unmatched_files: true");
-		expect(publish).toContain("Verify immutable GitHub Release");
+		expect(finalize).toContain("softprops/action-gh-release");
+		expect(finalize).toContain("draft: false");
+		expect(finalize).toContain("release-binaries/gjc-*");
+		expect(finalize).toContain("gajae-release-packages-v1.json");
+		expect(finalize).toContain("gajae-release-channel-v1.json");
+		expect(finalize).toContain("fail_on_unmatched_files: true");
+		expect(finalize).toContain("Verify immutable GitHub Release");
 
 		// The paranoid multi-job evidence/verify chain is gone.
 		for (const removed of [

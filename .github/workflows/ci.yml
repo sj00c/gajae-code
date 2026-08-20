@@ -635,41 +635,35 @@ jobs:
            run: echo "Stable release approved for ${{ github.ref }} via the npm-release environment gate"
 
    publish:
-      # Minimal credential boundary: the only job holding contents: write and
-      # the OIDC identity token. All untrusted work (dependency installs,
-      # native builds, GitHub API reads, notes derivation) happened in
-      # release_prepare; this job consumes integrity-checked artifacts and
-      # performs only the irreversible steps. It deliberately runs NO
-      # repository-controlled installation, dependency cache, or package
-      # lifecycle scripts. The publish script and its
-      # release-evidence helper import only node/bun builtins, so a bare
-      # checkout of the tagged (trusted, main-ancestry-gated) revision
-      # suffices.
+      # Fixed publisher boundary: the ONLY job holding the OIDC identity
+      # token, and it holds nothing else — no contents scope, no checkout, no
+      # bun, no repository code. A malicious tagged revision cannot influence
+      # what executes here: the steps are pinned actions plus this workflow
+      # shell, and the payload is the sha512-sealed tarball set produced by
+      # release_prepare. Publication itself is `npm publish` from the exact,
+      # integrity-verified npm CLI against the sealed bytes only; the sealed
+      # sha512 is re-verified at this boundary before every publish, registry
+      # state is reconciled by integrity, and the per-package receipt feeds
+      # the finalize job's evidence.
       #
       # The OIDC subject stays ref-scoped (repo:...:ref:refs/tags/v*) — the
       # identity the npm trusted-publisher registrations and the shipped
       # v0.14.1 exchange already prove. Owner-controlled release
       # prerequisites that cannot be set from this repository (documented
       # blocker, verified absent at review time): a ruleset protecting
-      # `main`, and a tag ruleset for `refs/tags/v*` restricting creation to
-      #      maintainers. Do NOT scope this job to a GitHub environment
-      #      without first re-registering every published package's trusted
-      #      publisher for the environment-scoped OIDC subject.
+      # `main`, a tag ruleset for `refs/tags/v*` restricting creation to
+      # maintainers, and the npm-release environment on release_approval
+      # with required non-self reviewers and no admin bypass.
       if: ${{ needs.release_prepare.result == 'success' && (needs.release_metadata.outputs.channel == 'nightly' || needs.release_approval.result == 'success') }}
       needs: [release_prepare, release_approval, release_metadata]
       timeout-minutes: 45
       runs-on: ubuntu-22.04
       permissions:
-         contents: write
          # npm trusted publishing (OIDC): npm >= 11.5.1 exchanges this job's
          # GitHub OIDC token for a short-lived registry credential, so no
          # long-lived NPM_TOKEN is involved and nothing expires under us.
          id-token: write
       steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-           with:
-              # The publish boundary never persists the workflow token.
-              persist-credentials: false
          - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
               # Exact patch pin: this job holds the OIDC identity token, so the
@@ -693,6 +687,105 @@ jobs:
               echo "$NPM_TARBALL_SHA512  $tmp/npm-${NPM_PIN_VERSION}.tgz" | sha512sum --check --strict -
               npm install -g "$tmp/npm-${NPM_PIN_VERSION}.tgz"
               test "$(npm --version)" = "$NPM_PIN_VERSION"
+         - name: Download pre-publication package evidence
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: release-evidence-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-evidence
+         - name: Publish sealed tarballs to npm
+           env:
+              RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}
+              RELEASE_VERSION: ${{ needs.release_metadata.outputs.version }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              evidence_dir="$RUNNER_TEMP/release-evidence"
+              expected="$evidence_dir/gajae-release-packages-expected-v1.json"
+              registry="https://registry.npmjs.org/"
+              case "$RELEASE_CHANNEL" in
+                 stable) npm_tag=latest ;;
+                 nightly) npm_tag=nightly ;;
+                 *) echo "Unknown release channel $RELEASE_CHANNEL" >&2; exit 1 ;;
+              esac
+              records="$RUNNER_TEMP/receipt-records.json"
+              echo '[]' > "$records"
+              count="$(jq '.packages | length' "$expected")"
+              for index in $(seq 0 $((count - 1))); do
+                 record="$(jq -c ".packages[$index]" "$expected")"
+                 name="$(jq -r '.name' <<<"$record")"
+                 version="$(jq -r '.version' <<<"$record")"
+                 sha="$(jq -r '.tarball_sha512' <<<"$record")"
+                 expected_sri="$(jq -r '.expected_sri' <<<"$record")"
+                 tarball="$evidence_dir/tarballs/$sha.tgz"
+                 # Re-verify the sealed bytes at the credential boundary.
+                 echo "$sha  $tarball" | sha512sum --check --strict -
+                 published=false
+                 observed="$(npm view "${name}@${version}" dist.integrity --registry="$registry" 2>/dev/null || true)"
+                 if [ "$observed" = "$expected_sri" ]; then
+                    echo "Skipping $name@$version (registry already carries the sealed bytes)"
+                 else
+                    if ! output="$(npm publish "$tarball" --access public --registry="$registry" --tag="$npm_tag" 2>&1)"; then
+                       raced="$(npm view "${name}@${version}" dist.integrity --registry="$registry" 2>/dev/null || true)"
+                       if [ "$raced" != "$expected_sri" ]; then
+                          echo "npm publish failed for $name@$version: $output" >&2
+                          exit 1
+                       fi
+                       echo "Skipping $name@$version (concurrent exact publication)"
+                    else
+                       published=true
+                       echo "Published $name@$version"
+                    fi
+                    # npm is read-after-write eventually consistent: re-observe
+                    # with bounded backoff until the sealed integrity is visible.
+                    attempt=0
+                    while :; do
+                       attempt=$((attempt + 1))
+                       observed="$(npm view "${name}@${version}" dist.integrity --registry="$registry" 2>/dev/null || true)"
+                       [ "$observed" = "$expected_sri" ] && break
+                       if [ "$attempt" -ge 12 ]; then
+                          echo "$name@$version did not become visible with the sealed integrity" >&2
+                          exit 1
+                       fi
+                       sleep 5
+                    done
+                 fi
+                 tagged="$(npm view "${name}@${npm_tag}" version --registry="$registry" 2>/dev/null || true)"
+                 if [ "$tagged" != "$version" ]; then
+                    echo "npm tag $npm_tag for $name resolves $tagged, expected $version" >&2
+                    exit 1
+                 fi
+                 jq --arg name "$name" --arg version "$version" --arg sha "$sha" --arg sri "$observed" --argjson published "$published" \
+                    '. += [{name:$name, version:$version, tarball_sha512:$sha, registry_integrity:$sri, published:$published}]' \
+                    "$records" > "$records.tmp"
+                 mv "$records.tmp" "$records"
+              done
+              jq -n --arg version "$RELEASE_VERSION" --arg channel "$RELEASE_CHANNEL" --slurpfile packages "$records" \
+                 '{schema_version: 1, release_version: $version, release_channel: $channel, packages: $packages[0]}' \
+                 > "$evidence_dir/gajae-release-oidc-publish-receipt-v1.json"
+         - name: Persist OIDC publish receipt
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: release-publish-receipt-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-evidence/gajae-release-oidc-publish-receipt-v1.json
+              if-no-files-found: error
+              retention-days: 30
+              overwrite: true
+
+   release_finalize:
+      # Repository-write boundary WITHOUT the OIDC token: assembles the final
+      # release evidence from the fixed publisher's receipt, creates the
+      # GitHub Release, and verifies it. Repository code may execute here
+      # because no npm credential capability exists in this job.
+      if: ${{ needs.publish.result == 'success' }}
+      needs: [publish, release_metadata]
+      timeout-minutes: 45
+      runs-on: ubuntu-22.04
+      permissions:
+         contents: write
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+           with:
+              persist-credentials: false
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3.14"
@@ -700,6 +793,11 @@ jobs:
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               name: release-evidence-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-evidence
+         - name: Download OIDC publish receipt
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: release-publish-receipt-${{ needs.release_metadata.outputs.version }}
               path: ${{ runner.temp }}/release-evidence
          - name: Download validated release notes
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
@@ -712,24 +810,14 @@ jobs:
               set -euo pipefail
               cd "$RUNNER_TEMP/release-notes"
               sha256sum --check --strict release-notes.sha256
-         - name: Publish packages to npm
+         - name: Assemble final release evidence
            env:
               RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}
            shell: bash
            run: |
               set -euo pipefail
-              evidence_dir="$RUNNER_TEMP/release-evidence"
-              if [ "$RELEASE_CHANNEL" = nightly ]; then
-                 serialization_key=gajae-nightly-release
-              else
-                 serialization_key=gajae-production-release
-              fi
-              # Deliberately no registry credential in scope: any stale one
-              # would take precedence over OIDC and fail closed with a registry
-              # 404 that reads like a missing package.
-              bun scripts/ci-release-publish.ts --publish-from-evidence \
-                 --evidence-dir "$evidence_dir" \
-                 --release-serialization-key "$serialization_key" \
+              bun scripts/ci-release-publish.ts --finalize-evidence \
+                 --evidence-dir "$RUNNER_TEMP/release-evidence" \
                  --release-channel "$RELEASE_CHANNEL"
          - name: Download release binaries
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4

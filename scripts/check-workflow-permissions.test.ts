@@ -43,7 +43,7 @@ describe("workflow permission policy", () => {
 		]);
 	});
 
-	test("ci.yml has an exact read-scoped workflow default and one write job", async () => {
+	test("ci.yml has an exact read-scoped workflow default and two write jobs", async () => {
 		const workflows = await readWorkflowDocuments();
 		const ci = workflows.find(workflow => workflow.file === CI_WORKFLOW);
 		expect(ci).toBeDefined();
@@ -51,14 +51,16 @@ describe("workflow permission policy", () => {
 
 		expect(REQUIRED_READ_DEFAULT).toContain(CI_WORKFLOW);
 		expect(document.permissions).toEqual({ contents: "read" });
-		// publish is the only job allowed to escalate: contents for the GitHub
-		// Release, and id-token for npm trusted publishing (OIDC), which is what
-		// keeps a long-lived registry credential out of the release path.
+		// Exactly two jobs may escalate, with disjoint capabilities:
+		// release_finalize holds contents for the GitHub Release (no OIDC), and
+		// publish holds id-token for npm trusted publishing (no repository
+		// scope) — which keeps a long-lived registry credential out of the
+		// release path.
 		expect(JOB_WRITE_ALLOWLIST).toEqual([
-			{ workflow: CI_WORKFLOW, job: "publish", scope: "contents" },
+			{ workflow: CI_WORKFLOW, job: "release_finalize", scope: "contents" },
 			{ workflow: CI_WORKFLOW, job: "publish", scope: "id-token" },
 		]);
-		expect(jobWriteScopes(document)).toEqual(["publish.contents", "publish.id-token"]);
+		expect(jobWriteScopes(document)).toEqual(["release_finalize.contents", "publish.id-token"]);
 	});
 
 	test("dev-ci.yml has an exact read-scoped workflow default and no write job scope", async () => {
@@ -120,7 +122,7 @@ describe("workflow permission policy", () => {
 		expect(violation.message).toContain(CI_WORKFLOW);
 		expect(violation.message).toContain("check");
 		expect(violation.message).toContain("jobs.check.permissions.contents");
-		expect(violation.message).toContain('only job "publish"');
+		expect(violation.message).toContain('only jobs "release_finalize"');
 	});
 
 	test("detects a ci.yml check job write-all mutation", async () => {

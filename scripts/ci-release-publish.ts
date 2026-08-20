@@ -126,6 +126,7 @@ export type ReleasePublishCli =
 	| { mode: "check-types" }
 	| { mode: "dry-run" }
 	| { mode: "prepare-evidence"; evidenceDir: string; releaseChannel: ReleaseChannel }
+	| { mode: "finalize-evidence"; evidenceDir: string; releaseChannel: ReleaseChannel }
 	| { mode: "publish-from-evidence"; evidenceDir: string; releaseSerializationKey: string; releaseChannel: ReleaseChannel };
 
 function extractReleaseChannel(argv: readonly string[]): { releaseChannel: ReleaseChannel; remaining: string[] } {
@@ -180,8 +181,12 @@ export function parseReleasePublishCli(argv: readonly string[]): ReleasePublishC
 			const { releaseChannel, remaining } = extractReleaseChannel(argumentsForMode);
 			return { mode: "publish-from-evidence", ...parsePublishEvidenceOptions(remaining), releaseChannel };
 		}
+		case "--finalize-evidence": {
+			const { releaseChannel, remaining } = extractReleaseChannel(argumentsForMode);
+			return { mode: "finalize-evidence", evidenceDir: parseEvidenceDirectory(mode, remaining), releaseChannel };
+		}
 		default:
-			throw new Error("Use exactly one mode: --evidence-self-test, --check-types, --dry-run, --prepare-evidence --evidence-dir <directory> [--release-channel stable|nightly], or --publish-from-evidence --evidence-dir <directory> --release-serialization-key <shared-cross-version-key> [--release-channel stable|nightly]");
+			throw new Error("Use exactly one mode: --evidence-self-test, --check-types, --dry-run, --prepare-evidence --evidence-dir <directory> [--release-channel stable|nightly], --finalize-evidence --evidence-dir <directory> [--release-channel stable|nightly], or --publish-from-evidence --evidence-dir <directory> --release-serialization-key <shared-cross-version-key> [--release-channel stable|nightly]");
 	}
 }
 const nativePlatformPackages: readonly PublishPackage[] = [
@@ -598,6 +603,15 @@ async function prepareExpectedEvidence(evidenceDirectory: string, releaseChannel
 	});
 	const expectedPath = path.join(evidenceDirectory, EXPECTED_EVIDENCE_FILE);
 	const digest = await writeImmutableEvidence(expectedPath, expected);
+	// The fixed publish boundary no longer runs this script, so the
+	// pre-publication protected-tag snapshot must be captured here, in the
+	// credential-free preparation job, for the finalize step's channel
+	// evidence.
+	const protectedBefore = await observeRegistryTagSnapshot(expected.packages, NPM_RELEASE_TAG);
+	await writeImmutableBytes(
+		path.join(evidenceDirectory, CHANNEL_BEFORE_EVIDENCE_FILE),
+		canonicalJsonBytes({ schema_version: 1, snapshot: protectedBefore }),
+	);
 	console.log(JSON.stringify({
 		ok: true,
 		phase: "expected-evidence",
@@ -611,6 +625,10 @@ async function prepareExpectedEvidence(evidenceDirectory: string, releaseChannel
 function isMissingRegistryPackage(output: string): boolean {
 	return /\bE404\b|404 Not Found|is not in this registry/iu.test(output);
 }
+export const CHANNEL_BEFORE_EVIDENCE_FILE = "gajae-release-channel-before-v1.json";
+/** Written by the fixed (no-repo-code) OIDC publish boundary; finalize requires it. */
+export const PUBLISH_RECEIPT_FILE = "gajae-release-oidc-publish-receipt-v1.json";
+
 export interface RegistryTagSnapshotRecord {
 	name: string;
 	version: string | null;
@@ -1154,6 +1172,74 @@ async function publishFromExpectedEvidence(evidenceDirectory: string, releaseSer
 	}));
 }
 
+/**
+ * Finalize a release published by the fixed OIDC boundary: requires the
+ * boundary's publish receipt, re-observes the registry, and writes the final
+ * and channel evidence. Runs in the contents:write-only finalize job — never
+ * in the id-token boundary.
+ */
+async function finalizeReleaseEvidence(evidenceDirectory: string, releaseChannel: ReleaseChannel): Promise<void> {
+	const expectedPath = path.join(evidenceDirectory, EXPECTED_EVIDENCE_FILE);
+	const expectedAsset = await readExpectedEvidenceFile(expectedPath);
+	assertReleaseVersionForChannel(expectedAsset.value.release_version, releaseChannel);
+
+	// The fixed publish boundary must have recorded every expected package.
+	const receiptPath = path.join(evidenceDirectory, PUBLISH_RECEIPT_FILE);
+	if (!(await Bun.file(receiptPath).exists())) {
+		throw new Error(`Missing OIDC publish receipt ${PUBLISH_RECEIPT_FILE}; the fixed publish boundary did not complete`);
+	}
+	const receipt = JSON.parse(await Bun.file(receiptPath).text()) as {
+		schema_version?: number;
+		release_version?: string;
+		packages?: { name: string; version: string; tarball_sha512: string }[];
+	};
+	if (receipt.schema_version !== 1 || receipt.release_version !== expectedAsset.value.release_version || !Array.isArray(receipt.packages)) {
+		throw new Error("OIDC publish receipt does not match the expected release identity");
+	}
+	const receiptByName = new Map(receipt.packages.map(record => [record.name, record]));
+	for (const record of expectedAsset.value.packages) {
+		const seen = receiptByName.get(record.name);
+		if (seen === undefined || seen.version !== record.version || seen.tarball_sha512 !== record.tarball_sha512) {
+			throw new Error(`OIDC publish receipt is missing or mismatches ${record.name}@${record.version}`);
+		}
+	}
+
+	const policy = releasePolicy(releaseChannel);
+	const observations = await reobserveExpectedEvidencePackages(expectedAsset.value.packages, async (record) => {
+		const tarballPath = path.join(evidenceDirectory, "tarballs", `${record.tarball_sha512}.tgz`);
+		return observeRegistryPackage(record, await readRetainedTarball(record, tarballPath), policy);
+	}, releaseChannel);
+	const beforePath = path.join(evidenceDirectory, CHANNEL_BEFORE_EVIDENCE_FILE);
+	const beforeAsset = JSON.parse(await Bun.file(beforePath).text()) as { schema_version?: number; snapshot?: RegistryTagSnapshotRecord[] };
+	if (beforeAsset.schema_version !== 1 || !Array.isArray(beforeAsset.snapshot)) {
+		throw new Error(`Missing or malformed pre-publication tag snapshot ${CHANNEL_BEFORE_EVIDENCE_FILE}`);
+	}
+	const protectedAfter = await observeRegistryTagSnapshot(expectedAsset.value.packages, NPM_RELEASE_TAG);
+	const channelEvidence = createReleaseChannelEvidence({
+		sourceCommit: expectedAsset.value.source_commit,
+		releaseVersion: expectedAsset.value.release_version,
+		releaseChannel,
+		before: beforeAsset.snapshot,
+		after: protectedAfter,
+	});
+	const final = createFinalEvidence(expectedAsset.value, expectedAsset.sha256, observations);
+	const finalPath = path.join(evidenceDirectory, FINAL_EVIDENCE_FILE);
+	const finalDigest = await writeImmutableEvidence(finalPath, final);
+	const channelEvidencePath = path.join(evidenceDirectory, RELEASE_CHANNEL_EVIDENCE_FILE);
+	const channelEvidenceDigest = await writeImmutableBytes(channelEvidencePath, canonicalJsonBytes(channelEvidence));
+	console.log(JSON.stringify({
+		ok: true,
+		phase: "final-evidence",
+		expected_evidence: expectedPath,
+		expected_evidence_sha256: expectedAsset.sha256,
+		final_evidence: finalPath,
+		final_evidence_sha256: finalDigest,
+		verified_packages: final.packages.length,
+		channel_evidence: channelEvidencePath,
+		channel_evidence_sha256: channelEvidenceDigest,
+	}));
+}
+
 async function dryRun(): Promise<void> {
 	isDryRun = true;
 	try {
@@ -1189,11 +1275,15 @@ async function main(): Promise<void> {
 	}
 	if (command.mode === "prepare-evidence") {
 		// Declaration checks (`bun x tsc`) resolve and execute packages, so they
-		// belong in the credential-free preparation job. The publish job runs
-		// with contents: write + id-token: write and no dependency install, so
-		// dependency resolution must never re-enter that boundary.
+		// belong in the credential-free preparation job. The OIDC publish
+		// boundary executes no repository code at all, so dependency resolution
+		// must never re-enter it.
 		await checkTypeDeclarations();
 		await prepareExpectedEvidence(command.evidenceDir, command.releaseChannel);
+		return;
+	}
+	if (command.mode === "finalize-evidence") {
+		await finalizeReleaseEvidence(command.evidenceDir, command.releaseChannel);
 		return;
 	}
 	await publishFromExpectedEvidence(command.evidenceDir, command.releaseSerializationKey, command.releaseChannel);

@@ -42,7 +42,7 @@ export interface ReleaseRunJobObservation {
 	name: string;
 }
 
-export const STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME = "publish";
+export const STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME = "release_finalize";
 
 export type StableReleaseFinalizationReceipt =
 	| { outcome: "missing" }
