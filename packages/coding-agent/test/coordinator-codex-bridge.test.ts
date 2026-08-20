@@ -598,7 +598,10 @@ describe("Coordinator Codex resume bridge", () => {
 			server.callTool("gjc_coordinator_list_questions", { session_id: "session-1" }),
 		).resolves.toMatchObject({
 			ok: false,
-			reason: "resource_gone",
+			error: {
+				code: "resource_gone",
+				message: "Coordinator resource is no longer available.",
+			},
 		});
 		expect((await fs.readdir(path.join(root, ".gjc", "coordinator-state", "v1"))).length).toBeGreaterThan(0);
 	});

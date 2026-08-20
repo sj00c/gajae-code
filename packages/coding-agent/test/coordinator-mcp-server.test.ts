@@ -600,7 +600,7 @@ async function patchTurnDelivery(
 describe("Coordinator MCP canonical SDK controls", () => {
 	it("fails closed instead of reusing a sequence after a malformed journal line", async () => {
 		const root = await tempRoot();
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		const journal = path.join(namespace, "events", "event-journal.jsonl");
 		await fs.mkdir(path.dirname(journal), { recursive: true });
 		await fs.writeFile(
@@ -623,7 +623,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 
 	it("serializes event sequence allocation across coordinator processes", async () => {
 		const root = await tempRoot();
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		const marker = path.join(root, "start");
 		const modulePath = path.resolve(import.meta.dir, "../src/coordinator-mcp/server.ts");
 		const script = (writer: string) => `
@@ -3278,7 +3278,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				allow_mutation: true,
 				codex_host_session_id: "corrupt-codex-host",
 			}),
-		).resolves.toMatchObject({ ok: false, error: { code: "unavailable", message: "state_corrupt" } });
+		).resolves.toMatchObject({
+			ok: false,
+			error: { code: "unavailable", message: "Coordinator service is unavailable." },
+		});
 		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
 			"codex_handoff_explicit_source_missing",
 		);
@@ -3877,7 +3880,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			idempotency_key: "report-webhook-1",
 			allow_mutation: true,
 		});
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await awaitEventWebhookDeliveriesForTest(namespace);
 		const events = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0 });
 		const journalRows = events.events as Array<Record<string, unknown>>;
@@ -3917,7 +3920,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			idempotency_key: "report-webhook-restart-1",
 			allow_mutation: true,
 		});
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await awaitEventWebhookDeliveriesForTest(namespace);
 		const journalRows = (await firstServer.callTool("gjc_coordinator_watch_events", { after_seq: 0 }))
 			.events as Array<Record<string, unknown>>;
@@ -3969,7 +3972,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			idempotency_key: "report-no-webhook-1",
 			allow_mutation: true,
 		});
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await awaitEventWebhookDeliveriesForTest(namespace);
 		expect(posts).toEqual([]);
 		await expect(fs.readdir(path.join(namespace, "webhook-outbox"))).rejects.toMatchObject({
@@ -3996,7 +3999,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		await registerSdkSession(server, root);
 		const events = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0 });
 		expect((events.events as unknown[]).length).toBeGreaterThan(0);
-		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const namespace = coordinatorNamespace(root);
 		await awaitEventWebhookDeliveriesForTest(namespace);
 		expect(posts).toEqual([]);
 		const diagnostic = await fs.readFile(path.join(namespace, "event-webhook-errors.log"), "utf8");
@@ -4113,12 +4116,17 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 	it("does not repeat broker close after post-close verification becomes uncertain", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
-		let listCalls = 0;
+		let failNextPostCloseList = false;
 		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
 			globalResult: operation => {
-				if (operation !== "session.list") return undefined;
-				listCalls += 1;
-				if (listCalls === 2) return { ok: true, result: { sessions: "malformed" } };
+				if (operation === "session.close") {
+					failNextPostCloseList = true;
+					return undefined;
+				}
+				if (operation === "session.list" && failNextPostCloseList) {
+					failNextPostCloseList = false;
+					return { ok: true, result: { sessions: "malformed" } };
+				}
 				return undefined;
 			},
 		});
@@ -4128,15 +4136,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			allow_mutation: true,
 		});
 		expect(started).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
-		const sessionFile = path.join(
-			root,
-			".gjc",
-			"coordinator-state",
-			"local",
-			"repo",
-			"sessions",
-			"created-session-1.json",
-		);
+		const sessionFile = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
 		const sessionRecord = JSON.parse(await fs.readFile(sessionFile, "utf8"));
 		await Bun.write(sessionFile, JSON.stringify({ ...sessionRecord, ephemeral: true }));
 
@@ -4145,11 +4145,13 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			allow_mutation: true,
 		});
 		expect(first).toMatchObject({ ok: false, reason: "close_failed" });
+		expect(await Bun.file(sessionFile).exists()).toBe(true);
 		const second = await server.callTool("gjc_coordinator_stop_session", {
 			session_id: "created-session-1",
 			allow_mutation: true,
 		});
 		expect(second).toMatchObject({ ok: true, closed: true });
+		expect(await Bun.file(sessionFile).exists()).toBe(false);
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
 
@@ -5288,6 +5290,14 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		});
 		runtimeTurnId = String((sent.result as Record<string, unknown>).turn_id);
 		await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const queued = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "queued legacy follow-up",
+			queue: true,
+			idempotency_key: "legacy-q12-follow-up",
+			allow_mutation: true,
+		});
+		expect(queued).toMatchObject({ ok: true, queued: true });
 		await patchSessionState(server, root, "visible-session", {
 			state: "needs_user_input",
 			ready_for_input: false,
@@ -5306,12 +5316,18 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 			questions: [expect.objectContaining({ question_id: "legacy-q12", status: "pending" })],
 		});
 		const imported = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
-			canonical: { queue: { active_turn_id: string | null }; turns: Record<string, { status: string }> };
+			canonical: {
+				queue: { active_turn_id: string | null; ordered_turn_ids: string[] };
+				turns: Record<string, { status: string }>;
+			};
 		};
 		const sentTurnId = sent.turn_id;
 		expect(typeof sentTurnId).toBe("string");
 		if (typeof sentTurnId !== "string") throw new Error("missing_legacy_turn_id");
 		expect(imported.canonical.queue.active_turn_id).toBe(sentTurnId);
+		const queuedTurnId = String(queued.turn_id);
+		expect(imported.canonical.queue.ordered_turn_ids).toEqual([queuedTurnId]);
+		expect(imported.canonical.turns[queuedTurnId]).toMatchObject({ status: "queued" });
 		expect(imported.canonical.turns[sentTurnId]).toMatchObject({
 			status: "waiting_for_answer",
 			question_ids: ["legacy-q12"],

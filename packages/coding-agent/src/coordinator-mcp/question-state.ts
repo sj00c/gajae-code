@@ -2,12 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withFileLock } from "../config/file-lock";
-import {
-	appendCoordinatorFile,
-	ensureCoordinatorDirectory,
-	syncCoordinatorDirectory,
-	writeCoordinatorAtomic,
-} from "./durability";
+import { ensureCoordinatorDirectory, syncCoordinatorDirectory, writeCoordinatorAtomic } from "./durability";
 import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec";
 
 export type CoordinatorSessionState =
@@ -2061,8 +2056,11 @@ export async function enumeratePublicDeliveries(
 	for (const sessionId of boundedSessions) {
 		lastVisitedSession = sessionId;
 		if (options.signal?.aborted) throw options.signal.reason ?? new Error("aborted");
-		if (cursorSession && sessionId < cursorSession) continue;
-		const afterOrderKey = sessionId === cursorSession ? cursorOrderKey : undefined;
+		// A round-robin cursor selects the next session to visit; it is not a
+		// delivery order key. Applying it as a lexical delivery filter starves
+		// sessions whose IDs sort before the cursor (including UUID/numeric IDs).
+		if (!roundRobin && cursorSession && sessionId < cursorSession) continue;
+		const afterOrderKey = !roundRobin && sessionId === cursorSession ? cursorOrderKey : undefined;
 		let batch: PublicDeliveryClaimV1[] = [];
 		const remaining = boundedLimit - claims.length;
 		if (remaining <= 0) break;
@@ -2078,9 +2076,9 @@ export async function enumeratePublicDeliveries(
 		for (const claim of batch) claims.push({ ...claim, session_id: sessionId });
 		if (claims.length >= boundedLimit) break;
 	}
-	const filtered = claims
-		.filter(claim => deliveryOrderKey(claim.session_id, claim.event) > cursor)
-		.slice(0, boundedLimit);
+	const filtered = (
+		roundRobin ? claims : claims.filter(claim => deliveryOrderKey(claim.session_id, claim.event) > cursor)
+	).slice(0, boundedLimit);
 	const last = filtered.at(-1);
 	return {
 		claims: filtered,
@@ -2251,7 +2249,7 @@ export async function removeSessionTransaction(
 				if (Object.values(transaction.outbox).some(event => event.public_delivery.state !== "acknowledged"))
 					return false;
 				await fs.rm(file, { force: true });
-				await fsyncDirectory(path.dirname(file));
+				await syncCoordinatorDirectory(path.dirname(file));
 				delete registry.roster?.[sessionId];
 				delete registry.retained_sessions?.[sessionId];
 				return true;

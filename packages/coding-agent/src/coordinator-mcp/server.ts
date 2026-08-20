@@ -56,7 +56,6 @@ import {
 } from "./codex-wake-publisher";
 import {
 	appendCoordinatorFile,
-	CoordinatorPublicationUncertainError,
 	ensureCoordinatorDirectory,
 	syncCoordinatorDirectory,
 	writeCoordinatorAtomic,
@@ -1054,6 +1053,7 @@ const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	broker_unavailable: "SDK broker is unavailable.",
 	broker_bootstrap_failed: "SDK broker bootstrap failed.",
 	broker_cleanup_unverified: "SDK broker cleanup could not be verified.",
+	broker_compensation_unobserved: "SDK broker session cleanup could not be verified.",
 	broker_discovery_unsupported: "SDK broker discovery state is unsupported.",
 	broker_discovery_access_denied: "SDK broker discovery cannot be accessed.",
 	broker_discovery_unavailable: "SDK broker discovery is unavailable.",
@@ -1675,6 +1675,10 @@ async function writeJournalJsonAtomic(file: string, value: unknown): Promise<voi
 }
 
 function parseJournalLines(raw: string): { events: CoordinatorEvent[]; offsets: number[]; tornTail: boolean } {
+	// A journal without a trailing newline is an interrupted append. Never
+	// silently truncate it: callers must fail closed rather than risk reusing a
+	// sequence or treating a partial record as durable history.
+	if (raw.length > 0 && !raw.endsWith("\n")) throw new Error("state_corrupt");
 	const events: CoordinatorEvent[] = [];
 	const offsets: number[] = [];
 	let offset = 0;
@@ -1695,10 +1699,9 @@ function parseJournalLines(raw: string): { events: CoordinatorEvent[]; offsets: 
 			throw new Error("event_journal_corrupt");
 		}
 		const event = asRecord(value);
+		if (event?.schema_version !== 1 || typeof event.seq !== "number" || !Number.isSafeInteger(event.seq))
+			throw new Error("state_corrupt");
 		if (
-			event?.schema_version !== 1 ||
-			typeof event.seq !== "number" ||
-			!Number.isSafeInteger(event.seq) ||
 			event.seq <= previousSeq ||
 			typeof event.id !== "string" ||
 			event.id.length === 0 ||
@@ -1916,6 +1919,7 @@ const codexWakePublishTails = new Map<string, Promise<void>>();
 const eventWebhookConfigs = new Map<string, EventWebhookConfig | null>();
 const eventWebhookDeliveries = new Map<string, WebhookDelivery>();
 const eventWebhookTails = new Map<string, Promise<void>>();
+const eventWebhookStartupTails = new Map<string, Promise<void>>();
 const EVENT_WEBHOOK_ERROR_CAP = 240;
 
 async function appendEventWebhookDiagnostic(namespaceDir: string, eventId: string, error: unknown): Promise<void> {
@@ -1950,9 +1954,14 @@ function enqueueEventWebhook(namespaceDir: string, event: CoordinatorEvent): voi
 	});
 }
 
-/** Test-only helper that waits for queued event webhook deliveries in a namespace. */
-export async function awaitEventWebhookDeliveriesForTest(namespaceDir: string): Promise<void> {
+async function awaitEventWebhookDeliveries(namespaceDir: string): Promise<void> {
 	await Promise.all([...eventWebhookTails.entries()].filter(([key]) => key === namespaceDir).map(([, tail]) => tail));
+}
+
+/** Test-only helper that waits for startup replay and queued deliveries in a namespace. */
+export async function awaitEventWebhookDeliveriesForTest(namespaceDir: string): Promise<void> {
+	await eventWebhookStartupTails.get(namespaceDir);
+	await awaitEventWebhookDeliveries(namespaceDir);
 }
 
 const CODEX_WAKE_ERROR_CAP = 240;
@@ -2348,29 +2357,26 @@ async function appendCoordinatorEvent(
 			options.signal ? { signal: options.signal } : undefined,
 		);
 		if (!event) throw new Error("event_journal_corrupt");
-		const codexWake = await maybeRecordCodexWake(namespaceDir, event).catch(async error => {
-			await appendCodexWakeDiagnostic(namespaceDir, event!, error);
-			return null;
-		});
+		const persistedEvent = event as CoordinatorEvent;
 		let codexWake: { handoff: CodexHandoffRegistrationV1; event: CodexWakeEventV1 | null } | null;
 		try {
-			codexWake = await maybeRecordCodexWake(namespaceDir, event);
+			codexWake = await maybeRecordCodexWake(namespaceDir, persistedEvent);
 		} catch (error) {
 			try {
-				await appendCodexWakeDiagnostic(namespaceDir, event, error);
+				await appendCodexWakeDiagnostic(namespaceDir, persistedEvent, error);
 			} catch (diagnosticError) {
 				// The canonical event is already durable. Preserve that committed
 				// result even when the optional diagnostic cannot be persisted.
 				logger.warn("Coordinator Codex wake diagnostic persistence failed", {
-					eventId: event.id,
+					eventId: persistedEvent.id,
 					error: String(diagnosticError),
 				});
 			}
 			codexWake = null;
 		}
 		if (codexWake) enqueueCodexWakePublish(namespaceDir, codexWake.handoff);
-		if (eventWebhookConfigs.has(namespaceDir)) enqueueEventWebhook(namespaceDir, event!);
-		return event!;
+		if (eventWebhookConfigs.has(namespaceDir)) enqueueEventWebhook(namespaceDir, persistedEvent);
+		return persistedEvent;
 	} finally {
 		release();
 		if (eventAppendQueues.get(namespaceDir) === queued) eventAppendQueues.delete(namespaceDir);
@@ -2383,7 +2389,6 @@ export async function appendCoordinatorEventForTest(
 ): Promise<CoordinatorEvent> {
 	return appendCoordinatorEvent(namespaceDir, input);
 }
-
 
 function boundedEventLimit(value: unknown): number {
 	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
@@ -3168,7 +3173,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		// surfaces the same error as a failing check.
 		eventWebhookConfig = null;
 		const reason = error instanceof Error ? error.message : "coordinator_event_webhook_invalid";
-		void (async () => {
+		const diagnostic = (async () => {
 			try {
 				await fs.mkdir(namespaceDir, { recursive: true });
 				await fs.appendFile(
@@ -3180,6 +3185,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				// Diagnostics are best-effort; delivery stays disabled either way.
 			}
 		})();
+		eventWebhookTails.set(namespaceDir, diagnostic);
 	}
 	eventWebhookConfigs.set(namespaceDir, eventWebhookConfig);
 	eventWebhookDeliveries.set(namespaceDir, services.eventWebhookDelivery ?? createDefaultEventWebhookDelivery());
@@ -3187,12 +3193,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (eventWebhookConfig === null) return;
 		try {
 			for (const event of (await readJournalSnapshot(namespaceDir)).events) enqueueEventWebhook(namespaceDir, event);
-			await awaitEventWebhookDeliveriesForTest(namespaceDir);
+			await awaitEventWebhookDeliveries(namespaceDir);
 		} catch (error) {
 			await appendEventWebhookDiagnostic(namespaceDir, "startup-replay", error);
 		}
 	})();
-	void startupEventWebhookReplay;
+	eventWebhookStartupTails.set(namespaceDir, startupEventWebhookReplay);
+	void startupEventWebhookReplay.finally(() => {
+		if (eventWebhookStartupTails.get(namespaceDir) === startupEventWebhookReplay)
+			eventWebhookStartupTails.delete(namespaceDir);
+	});
 	const startupCodexWakeReplay = (async () => {
 		try {
 			for (const handoff of await listCodexHandoffs(namespaceDir)) {
@@ -3465,6 +3475,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				typeof turn.turn_id !== "string" ||
 				!TURN_ID_PATTERN.test(turn.turn_id) ||
 				(!ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus) &&
+					turn.status !== "queued" &&
 					!TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus)) ||
 				!asRecord(turn.prompt) ||
 				!asRecord(turn.delivery) ||
@@ -3594,6 +3605,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			queue: {
 				ordered_turn_ids: Object.values(importedTurns)
 					.filter(turn => turn.status === "queued")
+					.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.turn_id.localeCompare(b.turn_id))
 					.map(turn => turn.turn_id),
 				active_turn_id: activeTurn?.turn_id ?? null,
 				selected_promotion: null,
@@ -5025,7 +5037,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return await operation();
 		} catch (error) {
 			const sessionId = remoteSession.value;
-			if (!sessionId) throw error;
+			if (!sessionId)
+				throw new SdkClientError(
+					UNOBSERVED_COMPENSATION_CODE,
+					"Coordinator creation outcome could not be identified for cleanup.",
+					{ primary: error },
+				);
 			try {
 				strictBrokerSessionClose(
 					await brokerSession(cwd, "session.close", { sessionId }, `${sessionId}:compensate-create`),
@@ -5335,6 +5352,25 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	): Promise<{ ok: boolean; reason?: string; closed: boolean; active_turn_id?: string; detail?: string }> {
 		const id = safeExternalId("session", rawId);
 		return await withSessionTransition(id, async () => {
+			// A successful broker close is durable before projection cleanup. Resume that
+			// manifest first, even while the session projection remains readable, so a
+			// verification-uncertain retry never reaches broker close again.
+			await ensureQuestionStateReady();
+			const pendingDeletion = await withNamespaceRegistry(
+				questionPaths,
+				async registry =>
+					Object.values(registry.deletions)
+						.filter(
+							entry =>
+								entry.session_id === id &&
+								(entry.phase === "broker_closed" || entry.phase === "cleanup_pending"),
+						)
+						.sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0] ?? null,
+			);
+			if (pendingDeletion) {
+				const complete = await completeDeletionCleanup(pendingDeletion, opts.reason, opts.force === true);
+				return complete ? { ok: true, closed: true } : { ok: false, reason: "delivery_pending", closed: false };
+			}
 			const session = asRecord(await readJsonFile(sessionFile(id)));
 			if (!session) {
 				await ensureQuestionStateReady();
@@ -5365,24 +5401,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return { ok: false, reason: "unknown_session", closed: false };
 			}
 
-			await ensureQuestionStateReady();
-			// A broker close may precede durable cleanup progress. Resume the admitted
-			// deletion directly from its registry manifest rather than closing again.
-			const pendingDeletion = await withNamespaceRegistry(
-				questionPaths,
-				async registry =>
-					Object.values(registry.deletions)
-						.filter(
-							entry =>
-								entry.session_id === id &&
-								(entry.phase === "broker_closed" || entry.phase === "cleanup_pending"),
-						)
-						.sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0] ?? null,
-			);
-			if (pendingDeletion) {
-				const complete = await completeDeletionCleanup(pendingDeletion, opts.reason, opts.force === true);
-				return complete ? { ok: true, closed: true } : { ok: false, reason: "delivery_pending", closed: false };
-			}
 			await ensureQuestionTransaction(id);
 			// Rebuild legacy projections before reaper eligibility checks. A crash after
 			// canonical terminal commit must not leave a stale active-turn file blocking reap.
@@ -7935,73 +7953,99 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					...(preparesExistingThread ? { prepare_existing_thread: true } : {}),
 					allow_mutation: true,
 				};
+				const lifecycleTarget = coordinatorLifecycleTarget(config.sessionCommand, cwd);
+				const remoteSession = { value: null as string | null };
 				return await withToolIdempotency(
 					name,
 					idempotencyKey,
 					canonicalArgs,
-					async () => {
-						const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
-						if (creation.request.phase === "completed" && creation.request.safe_response)
-							return creation.request.safe_response;
-						let created: Record<string, unknown>;
-						let session: Record<string, unknown>;
-						let sessionId: string;
-						if (creation.request.canonical_create_intent) {
-							session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
-							sessionId = creation.request.canonical_create_intent.session.session_id;
-							created = { session_id: sessionId };
-						} else {
-							const remote = await prepareCreationBrokerCall(creation);
-							creationRemoteStarted = true;
-							created = brokerResult(
-								await brokerSession(
-									cwd,
-									"session.create",
-									{
+					async () =>
+						await withRemoteSessionCompensation(cwd, remoteSession, async () => {
+							const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
+							if (creation.request.phase === "completed" && creation.request.safe_response)
+								return creation.request.safe_response;
+							let created: Record<string, unknown>;
+							let session: Record<string, unknown>;
+							let sessionId: string;
+							if (creation.request.canonical_create_intent) {
+								session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
+								sessionId = creation.request.canonical_create_intent.session.session_id;
+								created = { session_id: sessionId };
+							} else {
+								const remote = await prepareCreationBrokerCall(creation);
+								creationRemoteStarted = true;
+								created = brokerResult(
+									await brokerSession(
 										cwd,
-										target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
-										...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
-										...(preparesExistingThread ? { readiness: "deferred" } : {}),
-										// Thread the coordinator state dir so the broker-spawned runtime
-										// writes terminal state to the coordinator-shared file (#2549).
-										coordinatorStateDir: namespaceDir,
-										coordinatorSidecarSigningKey:
-											sidecarSigningKeys.get(remote.candidate.key_id) ??
-											(() => {
-												throw new Error("sidecar_signing_key_unavailable");
-											})(),
-										coordinatorSidecarKeyId: remote.candidate.key_id,
-									},
-									remote.request.remote_create_key,
-								),
-							);
-							/**
-							 * Preparation is only real when the broker proves it. A create that
-							 * silently published readiness would leave a live session whose root
-							 * is already claimed, so the session is closed rather than reported
-							 * as prepared.
-							 */
-							if (preparesExistingThread && created.readiness !== "prepared") {
-								const unpreparedId = optionalString(created.sessionId ?? created.session_id);
-								let compensated = true;
-								if (unpreparedId) {
-									compensated = await brokerSession(
-										cwd,
-										"session.close",
-										{ sessionId: unpreparedId },
-										`${idempotencyKey}:unprepared-close`,
-									).then(
-										() => true,
-										() => false,
-									);
+										"session.create",
+										{
+											cwd,
+											target: lifecycleTarget,
+											...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+											...(preparesExistingThread ? { readiness: "deferred" } : {}),
+											// Thread the coordinator state dir so the broker-spawned runtime
+											// writes terminal state to the coordinator-shared file (#2549).
+											coordinatorStateDir: namespaceDir,
+											coordinatorSidecarSigningKey:
+												sidecarSigningKeys.get(remote.candidate.key_id) ??
+												(() => {
+													throw new Error("sidecar_signing_key_unavailable");
+												})(),
+											coordinatorSidecarKeyId: remote.candidate.key_id,
+										},
+										remote.request.remote_create_key,
+									),
+								);
+								remoteSession.value = optionalString(created.sessionId ?? created.session_id);
+								/**
+								 * Preparation is only real when the broker proves it. A create that
+								 * silently published readiness would leave a live session whose root
+								 * is already claimed, so the session is closed rather than reported
+								 * as prepared.
+								 */
+								if (preparesExistingThread && created.readiness !== "prepared") {
+									const unpreparedId = optionalString(created.sessionId ?? created.session_id);
+									let compensated = true;
+									if (unpreparedId) {
+										compensated = await Promise.resolve(
+											strictBrokerSessionClose(
+												await brokerSession(
+													cwd,
+													"session.close",
+													{ sessionId: unpreparedId },
+													`${idempotencyKey}:unprepared-close`,
+												),
+												unpreparedId,
+											),
+										).then(
+											() => true,
+											() => false,
+										);
+									}
+									if (!unpreparedId)
+										throw new SdkClientError(
+											UNOBSERVED_COMPENSATION_CODE,
+											"SDK broker created a session but returned no usable session identity; the outcome is unobserved.",
+											{ creation_response: created },
+										);
+									sessionId = safeExternalId("session", unpreparedId);
+									const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
+									const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
+									session = normalizeSession({
+										session_id: sessionId,
+										cwd: sessionCwd,
+										...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+										broker_workspace: binding.workspace,
+										endpoint_generation: binding.endpointGeneration,
+										endpoint_incarnation: binding.endpointIncarnation,
+									});
 								}
-								if (!unpreparedId)
-									throw new SdkClientError(
-										UNOBSERVED_COMPENSATION_CODE,
-										"SDK broker created a session but returned no usable session identity; the outcome is unobserved.",
-										{ creation_response: created },
-									);
-								sessionId = safeExternalId("session", unpreparedId);
+								const reconciled = await reconcileCreationBrokerCall(
+									creation.keyDigest,
+									remote.candidate,
+									created,
+								);
+								sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
 								const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
 								const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
 								session = normalizeSession({
@@ -8011,63 +8055,87 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									broker_workspace: binding.workspace,
 									endpoint_generation: binding.endpointGeneration,
 									endpoint_incarnation: binding.endpointIncarnation,
+									sidecar_verifier: reconciled.sidecar_verifier,
 								});
 							}
-							const reconciled = await reconcileCreationBrokerCall(
-								creation.keyDigest,
-								remote.candidate,
-								created,
-							);
-							sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
-							const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
-							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
-							session = normalizeSession({
-								session_id: sessionId,
-								cwd: sessionCwd,
-								...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
-								broker_workspace: binding.workspace,
-								endpoint_generation: binding.endpointGeneration,
-								endpoint_incarnation: binding.endpointIncarnation,
-								sidecar_verifier: reconciled.sidecar_verifier,
-							});
-						}
-						const intent: CanonicalCreateIntentV1 = {
-							kind: "start",
-							session: canonicalCreationSnapshot(session),
-							remote_create_key: creation.request.remote_create_key,
-							initial_state: prompt ? "running" : preparesExistingThread ? "prepared" : "ready_for_input",
-							initial_prompt: prompt
-								? { text: prompt, caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex") }
-								: null,
-							initial_events: [
-								{
+							const intent: CanonicalCreateIntentV1 = {
+								kind: "start",
+								session: canonicalCreationSnapshot(session),
+								remote_create_key: creation.request.remote_create_key,
+								initial_state: prompt ? "running" : preparesExistingThread ? "prepared" : "ready_for_input",
+								initial_prompt: prompt
+									? {
+											text: prompt,
+											caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
+										}
+									: null,
+								initial_events: [
+									{
+										kind: "session.started",
+										entity: "session",
+										entity_id: sessionId,
+										created_at: new Date().toISOString(),
+									},
+								],
+							};
+							await bindCreationRequest(questionPaths, creation.keyDigest, intent);
+							await commitCreationWal(questionPaths, creation.keyDigest, intent);
+							await writeJsonFile(sessionFile(sessionId), session);
+							const lifecycle = publicLifecycleReceipt(created, sessionId);
+							if (prompt) {
+								const promptKey = await claimCanonicalPrompt(sessionId, prompt, "turn.prompt", idempotencyKey);
+								const acknowledgement = await dispatchOrRecoverPrompt(
+									session,
+									sessionId,
+									"turn.prompt",
+									prompt,
+									idempotencyKey,
+									promptKey,
+								);
+								const turn = await recordAcceptedPrompt(
+									sessionId,
+									prompt,
+									"turn.prompt",
+									null,
+									acknowledgement,
+									promptKey,
+								);
+								await appendCoordinatorEvent(namespaceDir, {
 									kind: "session.started",
-									entity: "session",
-									entity_id: sessionId,
-									created_at: new Date().toISOString(),
-								},
-							],
-						};
-						await bindCreationRequest(questionPaths, creation.keyDigest, intent);
-						await commitCreationWal(questionPaths, creation.keyDigest, intent);
-						await writeJsonFile(sessionFile(sessionId), session);
-						const lifecycle = publicLifecycleReceipt(created, sessionId);
-						if (prompt) {
-							const promptKey = await claimCanonicalPrompt(sessionId, prompt, "turn.prompt", idempotencyKey);
-							const acknowledgement = await dispatchOrRecoverPrompt(
-								session,
-								sessionId,
-								"turn.prompt",
-								prompt,
-								idempotencyKey,
-								promptKey,
-							);
-							const turn = await recordAcceptedPrompt(
+									sessionId,
+									summary: preparesExistingThread
+										? `Session ${sessionId} prepared through SDK lifecycle control`
+										: `Session ${sessionId} started through SDK lifecycle control`,
+									payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
+								});
+								const response = {
+									ok: true,
+									session: publicCoordinatorSession(session),
+									lifecycle,
+									turn_id: turn.turn_id,
+									active_turn_id: TERMINAL_TURN_STATUSES.has(turn.status) ? null : turn.turn_id,
+									status: turn.status,
+									queued: turn.delivery.queued,
+									delivered: turn.delivery.delivered,
+									operation: "turn.prompt",
+									turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+									result: publicSdkAcknowledgement(acknowledgement),
+									session_state: publicCoordinatorSessionState(
+										await readSessionState(namespaceDir, sessionId),
+									),
+								};
+								await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
+								await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
+								return response;
+							}
+							const sessionState = await writeSessionState(
+								namespaceDir,
 								sessionId,
 								preparesExistingThread ? "prepared" : "ready_for_input",
 								{ live: null, reason: null },
 							);
 							await appendCoordinatorEvent(namespaceDir, {
+								stableId: deterministicOutboxId(sessionId, 1, "session.started", "session", sessionId),
 								kind: "session.started",
 								sessionId,
 								summary: preparesExistingThread
@@ -8080,36 +8148,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								session: publicCoordinatorSession(session),
 								session_state: publicCoordinatorSessionState(sessionState),
 								lifecycle,
-								turn_id: turn.turn_id,
-								active_turn_id: TERMINAL_TURN_STATUSES.has(turn.status) ? null : turn.turn_id,
-								status: turn.status,
-								queued: turn.delivery.queued,
-								delivered: turn.delivery.delivered,
-								operation: "turn.prompt",
-								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
-								result: publicSdkAcknowledgement(acknowledgement),
-								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
 							};
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
 							return response;
-						}
-						const sessionState = await writeSessionState(
-							namespaceDir,
-							sessionId,
-							preparesExistingThread ? "prepared" : "ready_for_input",
-							{ live: null, reason: null },
-						);
-						await appendCoordinatorEvent(namespaceDir, {
-							stableId: deterministicOutboxId(sessionId, 1, "session.started", "session", sessionId),
-							kind: "session.started",
-							sessionId,
-							summary: preparesExistingThread
-								? `Session ${sessionId} prepared through SDK lifecycle control`
-								: `Session ${sessionId} started through SDK lifecycle control`,
-							payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
-						});
-					},
+						}),
 					true,
 					response =>
 						isUnobservedCompensation(response) || creationRemoteStarted || isRouterRequestAmbiguous(response),

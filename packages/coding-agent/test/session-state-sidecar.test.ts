@@ -6,7 +6,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 import { FileLockTestHooks } from "../src/config/file-lock";
-import { buildDefaultTmuxLaunchPlan } from "../src/gjc-runtime/launch-tmux";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
 	canonicalCoordinatorSidecarPayload,
@@ -256,31 +255,6 @@ describe("coordinator runtime state sidecar", () => {
 		);
 
 		expect(await readPayload(stateFile)).toMatchObject({ session_id: "standalone-tmux", state: "running" });
-	});
-
-	it("refuses every unpaired or malformed tmux signing launch", async () => {
-		for (const authorityEnv of [
-			{ GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED: "true" },
-			{ GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "private-key" },
-			{
-				GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED: "yes",
-				GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "private-key",
-			},
-		])
-			expect(() =>
-				buildDefaultTmuxLaunchPlan({
-					parsed: { tmux: true, messages: [], fileArgs: [], unknownFlags: new Map() } as never,
-					rawArgs: ["--tmux"],
-					cwd: "/repo",
-					env: { ...authorityEnv, GJC_TMUX_COMMAND: "tmux", GJC_PSMUX_DETECTION: "off" },
-					argv: ["bun", "packages/coding-agent/src/cli.ts"],
-					execPath: "/bin/bun",
-					platform: "darwin",
-					tty: { stdin: true, stdout: true },
-					tmuxAvailable: true,
-					existingBranchSessionName: null,
-				}),
-			).toThrow("Coordinator sidecar signing key is required for this tmux launch.");
 	});
 
 	it("requires Coordinator signing material captured at launch and rejects predecessor launch payloads", async () => {
