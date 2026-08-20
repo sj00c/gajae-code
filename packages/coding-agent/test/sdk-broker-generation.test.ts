@@ -2,9 +2,10 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { Broker } from "../src/sdk/broker/broker";
 import { brokerProcessIncarnation, readBrokerDiscovery, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { brokerOwnerForTest, ensureBroker } from "../src/sdk/broker/ensure";
+import { brokerOwnerForTest, ensureBroker, signalExactBrokerForTest } from "../src/sdk/broker/ensure";
 import { resolveSdkInternalSpawnCommandForTest, resolveSdkPackageGeneration } from "../src/sdk/broker/runtime";
 
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-generation-"));
@@ -151,6 +152,23 @@ describe("sdk broker package generation", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	}, 15_000);
+
+	it("uses the incarnation-bound native signal for Darwin unknown-operation fallback", () => {
+		const originalPlatform = process.platform;
+		const processRef = {
+			incarnation: "darwin:1700000000:123456",
+			signalRoot: vi.fn(() => true),
+		};
+		const fromPid = vi.spyOn(nativeProcessBindings().Process, "fromPid").mockReturnValue(processRef as never);
+		Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
+		try {
+			expect(signalExactBrokerForTest(4_242, processRef.incarnation)).toBe(true);
+			expect(processRef.signalRoot).toHaveBeenCalledWith(os.constants.signals.SIGTERM);
+		} finally {
+			Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			fromPid.mockRestore();
+		}
+	});
 
 	it("serializes concurrent stale-broker retirements into one replacement", async () => {
 		const dir = await temp();

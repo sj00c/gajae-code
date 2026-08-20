@@ -105,8 +105,22 @@ export interface LoaderContext {
 	addonFilenames?: string[];
 	versionedDir?: string;
 	candidates?: string[];
+	stageFromNodeModules?: boolean;
+	nativeDir?: string;
+	optionalPackageNativeDirs?: string[];
 	selectedVariant?: "modern" | "baseline" | null;
 }
+
+export interface NodeModulesStageContext {
+	stageFromNodeModules: boolean;
+	versionedDir: string;
+	addonFilenames: string[];
+	optionalPackageNativeDirs: string[];
+	nativeDir: string;
+	candidates?: string[];
+}
+
+export function maybeStageNodeModulesAddon(ctx: NodeModulesStageContext, errors: string[]): string | null;
 
 export function embeddedAddonIsAuthoritative(
 	ctx: LoaderContext,
@@ -116,9 +130,9 @@ export function embeddedAddonIsAuthoritative(
 export interface LoadNativeOptions {
 	context?: LoaderContext;
 	extractEmbeddedAddons?: (ctx: LoaderContext) => string[];
-	stageNodeModulesAddon?: () => string | null;
+	stageNodeModulesAddon?: (ctx: LoaderContext, errors: string[]) => string | null;
 	requireCandidate?: (candidate: string) => Record<string, unknown>;
-	validateCandidate?: (bindings: Record<string, unknown>) => void;
+	validateCandidate?: (bindings: Record<string, unknown>, candidate: string) => void;
 }
 
 export function loadNative(options?: LoadNativeOptions): Record<string, unknown>;

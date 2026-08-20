@@ -311,7 +311,6 @@ function signalExactBroker(pid: number, incarnation: string): boolean {
 		if (!processRef || processRef.incarnation !== incarnation) return false;
 		const signal = os.constants.signals.SIGTERM;
 		if (signal === undefined) return false;
-		if (process.platform === "darwin") return false;
 		return processRef.signalRoot(signal);
 	} catch {
 		return false;
@@ -612,6 +611,10 @@ export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBroker
 /** Test hook: returns a stop handle for the detached broker this process spawned. */
 export function brokerOwnerForTest(agentDir: string): BrokerOwner | undefined {
 	return owners.get(agentDir);
+}
+/** Test hook: exercise the identity-fenced stale-broker signal fallback. */
+export function signalExactBrokerForTest(pid: number, incarnation: string): boolean {
+	return signalExactBroker(pid, incarnation);
 }
 /** Test hook: drives the detached-broker reap on a controllable child surface. */
 export function reapSpawnedBrokerForTest(child: ChildProcess, timing: ReapTiming = DEFAULT_REAP_TIMING): Promise<void> {

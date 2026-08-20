@@ -22,6 +22,7 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { NodeModulesStageContext } from "../native/loader-state.js";
 import {
 	getAddonFilenames,
 	loadNative,
@@ -155,7 +156,10 @@ describe("windows native addon staging", () => {
 				},
 				errors,
 			);
-			expect(staged).toBeNull();
+			expect(staged).toBeString();
+			expect(staged).not.toBe(path.join(versionedDir, filename));
+			expect(staged).not.toContain(nativeDir);
+			expect(await fs.readFile(staged as string, "utf8")).toBe("new-addon");
 			expect(errors).toEqual([expect.stringContaining("staged addon drift")]);
 			await fs.rm(path.join(nativeDir, filename));
 			const orphanErrors: string[] = [];
@@ -189,34 +193,49 @@ describe("windows native addon staging", () => {
 		await fs.writeFile(sourcePath, "new-addon");
 		await fs.writeFile(stagedPath, "old-addon");
 		try {
-			const attempted: string[] = [];
-			const errors: string[] = [];
-			const bindings = loadNative({
-				context: {
-					isCompiledBinary: false,
-					stageFromNodeModules: true,
-					platformTag: "win32-x64",
-					packageVersion: "test",
-					selectedVariant: "baseline",
-					versionedDir,
-					nativeDir,
-					optionalPackageNativeDirs: [],
-					addonFilenames: [filename],
-					candidates: [stagedPath, sourcePath],
-				},
-				extractEmbeddedAddons: () => [],
-				stageNodeModulesAddon: (ctx, stageErrors) => maybeStageNodeModulesAddon(ctx, stageErrors),
-				requireCandidate: candidate => {
-					attempted.push(candidate);
-					if (candidate !== sourcePath) throw new Error("staged candidate should have been rejected");
-					return { selected: candidate };
-				},
-				validateCandidate: () => undefined,
-			});
+			const loadSelected = () => {
+				const attempted: string[] = [];
+				const bindings = loadNative({
+					context: {
+						isCompiledBinary: false,
+						stageFromNodeModules: true,
+						platformTag: "win32-x64",
+						packageVersion: "test",
+						selectedVariant: "baseline",
+						versionedDir,
+						nativeDir,
+						optionalPackageNativeDirs: [],
+						addonFilenames: [filename],
+						candidates: [stagedPath, sourcePath],
+					},
+					extractEmbeddedAddons: () => [],
+					stageNodeModulesAddon: (ctx, stageErrors) =>
+						maybeStageNodeModulesAddon(ctx as NodeModulesStageContext, stageErrors),
+					requireCandidate: candidate => {
+						attempted.push(candidate);
+						if (candidate === stagedPath || candidate === sourcePath) {
+							throw new Error("stale node_modules candidate should not be loaded");
+						}
+						return { selected: candidate };
+					},
+					validateCandidate: () => undefined,
+				});
+				return { bindings, attempted };
+			};
 
-			expect(bindings).toEqual({ selected: sourcePath });
-			expect(attempted).toEqual([sourcePath]);
-			expect(errors).toEqual([]);
+			const first = loadSelected();
+			expect(first.attempted).toHaveLength(1);
+			expect(first.attempted[0]).not.toBe(sourcePath);
+			expect(first.attempted[0]).not.toBe(stagedPath);
+			expect(first.attempted[0]).not.toContain(nativeDir);
+			expect(await fs.readFile(first.attempted[0], "utf8")).toBe("new-addon");
+
+			await fs.writeFile(sourcePath, "newer-addon");
+			const second = loadSelected();
+			expect(second.attempted).toHaveLength(1);
+			expect(second.attempted[0]).not.toBe(first.attempted[0]);
+			expect(second.attempted[0]).not.toBe(sourcePath);
+			expect(await fs.readFile(second.attempted[0], "utf8")).toBe("newer-addon");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

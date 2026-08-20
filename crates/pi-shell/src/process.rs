@@ -1428,8 +1428,10 @@ impl Process {
 	/// Send `signal` only to this pinned root process.
 	///
 	/// Linux delivers through the owned pidfd and Windows through the owned
-	/// process handle, so PID reuse cannot redirect the signal. Darwin has no
-	/// equivalent stable kernel authority and deliberately fails closed.
+	/// process handle. Darwin has no pidfd, so its platform implementation
+	/// re-reads the kernel start-time identity immediately before the syscall
+	/// and refuses when the published incarnation is no longer present; callers
+	/// never fall back to a raw PID signal.
 	#[cfg_attr(
 		target_os = "macos",
 		allow(
@@ -1440,8 +1442,7 @@ impl Process {
 	pub fn signal_root(&self, signal: i32) -> bool {
 		#[cfg(target_os = "macos")]
 		{
-			let _ = signal;
-			false
+			self.inner.kill(signal)
 		}
 		#[cfg(not(target_os = "macos"))]
 		{

@@ -458,9 +458,9 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 	if (!ctx.stageFromNodeModules) return null;
 
 	let stagedPath = null;
-	const rejectStagedCandidate = targetPath => {
+	const rejectCandidates = candidates => {
 		if (!Array.isArray(ctx.candidates)) return;
-		ctx.candidates = ctx.candidates.filter(candidate => candidate !== targetPath);
+		ctx.candidates = ctx.candidates.filter(candidate => !candidates.includes(candidate));
 	};
 	const sourceDirs = [...ctx.optionalPackageNativeDirs, ctx.nativeDir];
 	for (const filename of ctx.addonFilenames) {
@@ -470,12 +470,24 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 		if (fs.existsSync(targetPath)) {
 			if (!sourcePath) {
 				errors.push(`staged addon orphan (${filename}): no current package artifact exists`);
-				rejectStagedCandidate(targetPath);
+				rejectCandidates([targetPath]);
 				continue;
 			}
 			if (sourcePath && !addonBytesMatch(targetPath, sourcePath)) {
 				errors.push(`staged addon drift (${filename}): cached bytes differ from the current package artifact`);
-				rejectStagedCandidate(targetPath);
+				rejectCandidates([targetPath, sourcePath]);
+				try {
+					const refreshDir = fs.mkdtempSync(path.join(ctx.versionedDir, `.refresh-${process.pid}-`));
+					const refreshPath = path.join(refreshDir, filename);
+					fs.copyFileSync(sourcePath, refreshPath);
+					if (!addonBytesMatch(refreshPath, sourcePath)) {
+						throw new Error("restaged addon bytes do not match the current package artifact");
+					}
+					stagedPath = stagedPath || refreshPath;
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					errors.push(`staged addon refresh (${filename}): ${message}`);
+				}
 				continue;
 			}
 			stagedPath = stagedPath || targetPath;
