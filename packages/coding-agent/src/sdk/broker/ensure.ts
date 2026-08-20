@@ -2,10 +2,12 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import path from "node:path";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { SdkClient } from "../client/client";
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
-import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
+import { resolveSdkInternalSpawnCommand, resolveSdkPackageGeneration, type SdkInternalSpawnCommand } from "./runtime";
 import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
 export interface EnsureBrokerSettings {
 	agentDir: string;
@@ -20,7 +22,7 @@ export interface EnsureBrokerSettings {
 	 * Generation of the package this process would spawn (see runtime.ts). A live
 	 * broker publishing a different generation predates the current install — it
 	 * loaded its code before the package was replaced — and is retired before a
-	 * fresh broker is spawned. Omitted: any live broker is reused unchanged.
+	 * fresh broker is spawned. Omitted: ensureBroker resolves the current generation.
 	 */
 	expectedPackageGeneration?: string;
 }
@@ -124,6 +126,7 @@ type EnsureOutcome =
 	| { kind: "local-started-fixture"; discovery: BrokerDiscovery; owner: BrokerOwner; child: ChildProcess };
 interface EnsureInFlight {
 	initiator: EnsureInitiator;
+	expectedPackageGeneration: string;
 	promise: Promise<EnsureOutcome>;
 	discovery: Promise<BrokerDiscovery>;
 }
@@ -300,15 +303,33 @@ function createFixtureLease(owner: BrokerOwner, child: ChildProcess): ExactFixtu
  */
 const STALE_BROKER_SHUTDOWN_TIMEOUT_MS = 2_000;
 
+/** Sends SIGTERM only through an OS process reference bound to the published incarnation. */
+function signalExactBroker(pid: number, incarnation: string): boolean {
+	try {
+		const processRef = nativeProcessBindings().Process.fromPid(pid);
+		if (!processRef || processRef.incarnation !== incarnation) return false;
+		const signal = os.constants.signals.SIGTERM;
+		if (signal === undefined) return false;
+		if (process.platform === "darwin") {
+			const current = nativeProcessBindings().Process.fromPid(pid);
+			if (!current || current.incarnation !== incarnation) return false;
+			process.kill(pid, "SIGTERM");
+			return true;
+		}
+		return processRef.signalRoot(signal);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Stop a live broker whose published generation differs from the package this
  * process would spawn. The authenticated `broker.shutdown` op is tried first;
  * brokers that predate the op (or fail transport) take an identity-fenced
- * SIGTERM instead. Best-effort: on any failure the caller falls back to reusing
- * whatever discovery still advertises, which is exactly the pre-recycle
- * behavior, so availability never regresses.
+ * SIGTERM instead. Retirement is best-effort, but a mismatched discovery that
+ * remains published is never returned to a lifecycle caller.
  */
-async function retireStaleBroker(agentDir: string, stale: BrokerDiscovery, heartbeatTtlMs?: number): Promise<void> {
+async function retireStaleBroker(agentDir: string, stale: BrokerDiscovery, heartbeatTtlMs?: number): Promise<boolean> {
 	try {
 		const client = await SdkClient.connect(stale.url, stale.token, {
 			timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
@@ -322,20 +343,44 @@ async function retireStaleBroker(agentDir: string, stale: BrokerDiscovery, heart
 	} catch {
 		// RPC unreachable or unknown_operation (broker predates the shutdown op):
 		// signal the published identity only when the pid still proves it.
-		if (brokerProcessIncarnation(stale.pid) === stale.incarnation) {
-			try {
-				process.kill(stale.pid, "SIGTERM");
-			} catch {
-				// raced the broker's own exit
-			}
-		}
+		signalExactBroker(stale.pid, stale.incarnation);
 	}
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
 	while (Date.now() < deadline) {
 		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-		if (!current || current.pid !== stale.pid || current.incarnation !== stale.incarnation) return;
+		if (!current || current.pid !== stale.pid || current.incarnation !== stale.incarnation) return true;
 		await sleep(50);
 	}
+	return false;
+}
+
+function matchesExpectedPackageGeneration(
+	discovery: BrokerDiscovery,
+	expectedPackageGeneration: string | undefined,
+): boolean {
+	return expectedPackageGeneration === undefined || discovery.packageGeneration === expectedPackageGeneration;
+}
+
+function staleBrokerRetirementUnverified(
+	expectedPackageGeneration: string,
+	actualPackageGeneration: string | undefined,
+): Error {
+	return new Error(
+		`SDK broker package generation ${actualPackageGeneration ?? "unknown"} does not match expected generation ${expectedPackageGeneration}, and stale broker retirement was not verified.`,
+	);
+}
+
+async function retireAndReadReplacement(
+	settings: EnsureBrokerSettings,
+	stale: BrokerDiscovery,
+): Promise<BrokerDiscovery | undefined> {
+	const expectedPackageGeneration = settings.expectedPackageGeneration;
+	if (expectedPackageGeneration === undefined) return stale;
+	await retireStaleBroker(settings.agentDir, stale, settings.heartbeatTtlMs);
+	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+	if (!replacement) return undefined;
+	if (matchesExpectedPackageGeneration(replacement, expectedPackageGeneration)) return replacement;
+	throw staleBrokerRetirementUnverified(expectedPackageGeneration, replacement.packageGeneration);
 }
 
 async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: EnsureInitiator): Promise<EnsureOutcome> {
@@ -345,23 +390,34 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	if (priorOwner) {
 		// A retained cleanup failure fences every discovery record. Only a ready
 		// record bound to this exact child incarnation may be reused.
-		if (priorOwner.canReuse(existing)) return { kind: "prior-local-owner", discovery: existing!, owner: priorOwner };
+		if (
+			priorOwner.canReuse(existing) &&
+			existing !== null &&
+			matchesExpectedPackageGeneration(existing, settings.expectedPackageGeneration)
+		)
+			return { kind: "prior-local-owner", discovery: existing, owner: priorOwner };
 		await priorOwner.stop();
 		const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-		if (discoveredAfterCleanup) return { kind: "external-discovery", discovery: discoveredAfterCleanup };
+		if (discoveredAfterCleanup) {
+			if (matchesExpectedPackageGeneration(discoveredAfterCleanup, settings.expectedPackageGeneration))
+				return { kind: "external-discovery", discovery: discoveredAfterCleanup };
+			const replacement = await retireAndReadReplacement(settings, discoveredAfterCleanup);
+			if (replacement) return { kind: "external-discovery", discovery: replacement };
+		}
 	} else if (existing) {
 		const stale =
 			settings.expectedPackageGeneration !== undefined &&
 			existing.packageGeneration !== settings.expectedPackageGeneration;
 		if (!stale) return { kind: "external-discovery", discovery: existing };
-		await retireStaleBroker(settings.agentDir, existing, settings.heartbeatTtlMs);
-		// Reuse whatever now owns discovery: a concurrent ensurer's fresh broker,
-		// or the stale one itself when retirement did not complete.
-		const afterRetire = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-		if (afterRetire) return { kind: "external-discovery", discovery: afterRetire };
+		const replacement = await retireAndReadReplacement(settings, existing);
+		if (replacement) return { kind: "external-discovery", discovery: replacement };
 	}
 
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
+	if (settings.expectedPackageGeneration !== undefined && command.generation !== settings.expectedPackageGeneration)
+		throw new Error(
+			`SDK broker package generation changed during startup: expected ${settings.expectedPackageGeneration}, resolved ${command.generation}.`,
+		);
 	const spawnLog = await openBrokerSpawnLog(settings.agentDir);
 	// A stale marker must never be misattributed to this spawn; clear it first.
 	await clearBrokerStartupFailureMarker(settings.agentDir);
@@ -388,6 +444,13 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			try {
 				const discovered = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 				if (discovered) {
+					if (!matchesExpectedPackageGeneration(discovered, settings.expectedPackageGeneration)) {
+						await owner.stop();
+						throw staleBrokerRetirementUnverified(
+							settings.expectedPackageGeneration!,
+							discovered.packageGeneration,
+						);
+					}
 					if (owner.markReady(discovered)) {
 						return initiator === "fixture-lease"
 							? { kind: "local-started-fixture", discovery: discovered, owner, child }
@@ -412,6 +475,11 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				for (let retry = 0; retry < 20; retry++) {
 					const winner = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 					if (winner) {
+						if (!matchesExpectedPackageGeneration(winner, settings.expectedPackageGeneration))
+							throw staleBrokerRetirementUnverified(
+								settings.expectedPackageGeneration!,
+								winner.packageGeneration,
+							);
 						await owner.stop();
 						return { kind: "external-discovery", discovery: winner };
 					}
@@ -461,7 +529,7 @@ function startEnsure(settings: EnsureBrokerSettings, initiator: EnsureInitiator)
 	const promise = ensureBrokerOnce(settings, initiator);
 	const discovery = promise.then(outcome => outcome.discovery);
 	void discovery.catch(() => {});
-	const entry = { initiator, promise, discovery };
+	const entry = { initiator, expectedPackageGeneration: settings.expectedPackageGeneration!, promise, discovery };
 	ensureInFlight.set(settings.agentDir, entry);
 	const clear = (): void => {
 		if (ensureInFlight.get(settings.agentDir) === entry) ensureInFlight.delete(settings.agentDir);
@@ -470,16 +538,27 @@ function startEnsure(settings: EnsureBrokerSettings, initiator: EnsureInitiator)
 	return entry;
 }
 
+function normalizeEnsureSettings(settings: EnsureBrokerSettings): EnsureBrokerSettings {
+	if (settings.expectedPackageGeneration !== undefined) return settings;
+	return { ...settings, expectedPackageGeneration: resolveSdkPackageGeneration() };
+}
+
 /** Starts the detached broker entrypoint when discovery has no live owner. */
 export function ensureBroker(settings: EnsureBrokerSettings): Promise<BrokerDiscovery> {
-	const inFlight = ensureInFlight.get(settings.agentDir) ?? startEnsure(settings, "discovery");
-	return inFlight.discovery;
+	const normalized = normalizeEnsureSettings(settings);
+	const inFlight = ensureInFlight.get(normalized.agentDir) ?? startEnsure(normalized, "discovery");
+	if (inFlight.expectedPackageGeneration === normalized.expectedPackageGeneration) return inFlight.discovery;
+	return inFlight.discovery.then(discovery => {
+		if (matchesExpectedPackageGeneration(discovery, normalized.expectedPackageGeneration)) return discovery;
+		throw staleBrokerRetirementUnverified(normalized.expectedPackageGeneration!, discovery.packageGeneration);
+	});
 }
 
 /** Starts one fresh fixture broker and returns its sole exact-child close lease. */
 export function startFixtureBrokerWithLeaseForTest(settings: EnsureBrokerSettings): Promise<StartedFixtureBroker> {
-	if (ensureInFlight.has(settings.agentDir)) return Promise.reject(fixtureLeaseUnavailable());
-	const inFlight = startEnsure(settings, "fixture-lease");
+	const normalized = normalizeEnsureSettings(settings);
+	if (ensureInFlight.has(normalized.agentDir)) return Promise.reject(fixtureLeaseUnavailable());
+	const inFlight = startEnsure(normalized, "fixture-lease");
 	return inFlight.promise.then(outcome => {
 		if (outcome.kind !== "local-started-fixture") throw fixtureLeaseUnavailable();
 		return { discovery: outcome.discovery, lease: createFixtureLease(outcome.owner, outcome.child) };

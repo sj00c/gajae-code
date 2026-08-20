@@ -1,11 +1,11 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { brokerOwnerForTest, ensureBroker } from "../src/sdk/broker/ensure";
-import { resolveSdkPackageGeneration } from "../src/sdk/broker/runtime";
+import { resolveSdkInternalSpawnCommandForTest, resolveSdkPackageGeneration } from "../src/sdk/broker/runtime";
 
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-generation-"));
 
@@ -24,6 +24,30 @@ describe("sdk broker package generation", () => {
 		expect(resolveSdkPackageGeneration()).toBe(first);
 	});
 
+	it("binds compiled generation to content, not only size and mtime", async () => {
+		const dir = await temp();
+		const executable = path.join(dir, "gjc-copy");
+		try {
+			await fs.copyFile(process.execPath, executable);
+			const markerName = "internal-source-marker-2178-abcd.txt";
+			const evidence = {
+				execPath: executable,
+				markerPath: `/$bunfs/root/${markerName}`,
+				embeddedFiles: [{ name: markerName }],
+			} as const;
+			const before = resolveSdkInternalSpawnCommandForTest("broker-internal", evidence);
+			const stat = await fs.stat(executable);
+			const bytes = await fs.readFile(executable);
+			bytes[0] ^= 0xff;
+			await fs.writeFile(executable, bytes);
+			await fs.utimes(executable, stat.atime, stat.mtime);
+			const after = resolveSdkInternalSpawnCommandForTest("broker-internal", evidence);
+			expect(after.generation).not.toBe(before.generation);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("reuses a live broker whose generation matches the caller's expectation", async () => {
 		const dir = await temp();
 		const broker = new Broker({ agentDir: dir, packageGeneration: "current-gen" });
@@ -37,9 +61,9 @@ describe("sdk broker package generation", () => {
 		}
 	}, 15_000);
 
-	it("reuses a live broker of any generation when no expectation is given", async () => {
+	it("uses the current package generation by default", async () => {
 		const dir = await temp();
-		const broker = new Broker({ agentDir: dir, packageGeneration: "arbitrary-gen" });
+		const broker = new Broker({ agentDir: dir, packageGeneration: resolveSdkPackageGeneration() });
 		try {
 			const published = await broker.start();
 			const discovery = await ensureBroker({ agentDir: dir });
@@ -69,6 +93,22 @@ describe("sdk broker package generation", () => {
 			await cleanup(dir, stale);
 		}
 	}, 30_000);
+
+	it("does not reuse a stale broker when retirement cannot be proven", async () => {
+		const dir = await temp();
+		const stale = new Broker({ agentDir: dir, packageGeneration: "stale-gen" });
+		const stop = vi.spyOn(stale, "stop").mockResolvedValue(undefined);
+		try {
+			await stale.start();
+			const expected = resolveSdkPackageGeneration();
+			await expect(ensureBroker({ agentDir: dir, expectedPackageGeneration: expected })).rejects.toThrow(
+				"stale broker retirement was not verified",
+			);
+		} finally {
+			stop.mockRestore();
+			await cleanup(dir, stale);
+		}
+	}, 15_000);
 
 	it("serializes concurrent stale-broker retirements into one replacement", async () => {
 		const dir = await temp();

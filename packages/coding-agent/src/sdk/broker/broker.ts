@@ -36,6 +36,7 @@ import {
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
+import { resolveSdkPackageGeneration } from "./runtime";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
 import { BrokerTransport } from "./transport";
 
@@ -799,7 +800,7 @@ export class Broker {
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			agentDir: settings.agentDir,
-			packageGeneration: settings.packageGeneration ?? "unknown",
+			packageGeneration: settings.packageGeneration ?? resolveSdkPackageGeneration(),
 			port: settings.port ?? 0,
 			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
 			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),

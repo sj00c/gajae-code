@@ -96,24 +96,34 @@ function expectedPackageIdentity(packageDirectory: string): string {
 	}
 }
 
-/**
- * Digest of the exact on-disk package a descriptor would spawn. File mtimes cover
- * same-version replacement (binary rebuild, in-place reinstall); the manifest
- * version covers package managers that preserve tarball mtimes. In-memory code
- * vintage is deliberately not an input: a process that outlived an upgrade must
- * still compute the SAME value a freshly spawned broker publishes, or every
- * ensure would retire a current broker.
- */
+/** Returns every regular source input below a trusted runtime directory in stable order. */
+function regularFilesUnder(directory: string): string[] {
+	const files: string[] = [];
+	const visit = (current: string): void => {
+		for (const entry of fs
+			.readdirSync(current, { withFileTypes: true })
+			.sort((left, right) => left.name.localeCompare(right.name))) {
+			const candidate = path.join(current, entry.name);
+			if (entry.isDirectory()) visit(candidate);
+			else if (entry.isFile()) files.push(candidate);
+		}
+	};
+	visit(directory);
+	return files;
+}
+
+/** Digest the actual bytes of the trusted launch inputs, not only filesystem metadata. */
 function sdkPackageGeneration(kind: SdkInternalSpawnCommand["kind"], version: string, files: string[]): string {
 	const hash = createHash("sha256");
 	hash.update(kind);
 	hash.update("\0");
 	hash.update(version);
 	for (const file of files) {
-		const stat = fs.statSync(file, { bigint: true });
 		hash.update("\0");
 		hash.update(file);
-		hash.update(`:${stat.size}:${stat.mtimeNs}`);
+		const contents = fs.readFileSync(file);
+		hash.update(`:${contents.byteLength}:`);
+		hash.update(contents);
 	}
 	return hash.digest("hex");
 }
@@ -156,7 +166,11 @@ function sourceDescriptor(
 		args: ["--no-env-file", `--config=${config}`, cli, "sdk", action],
 		env: internalEnvironment(options.environment ?? process.env, true),
 		cwd: canonicalBrokerDirectory,
-		generation: sdkPackageGeneration("bun-source", packageVersion, [cli, config]),
+		generation: sdkPackageGeneration("bun-source", packageVersion, [
+			path.join(canonicalPackageDirectory, "package.json"),
+			...regularFilesUnder(canonicalSourceDirectory),
+			config,
+		]),
 	};
 }
 
@@ -192,8 +206,11 @@ export function resolveSdkInternalSpawnCommand(action: SdkInternalAction): SdkIn
 }
 
 /** Resolve the generation the production descriptor would publish, without spawning. */
+let cachedSdkPackageGeneration: string | undefined;
 export function resolveSdkPackageGeneration(): string {
-	return resolveSdkInternalSpawnCommand("broker-internal").generation;
+	if (cachedSdkPackageGeneration === undefined)
+		cachedSdkPackageGeneration = resolveSdkInternalSpawnCommand("broker-internal").generation;
+	return cachedSdkPackageGeneration;
 }
 
 /** Test hook: injects runtime evidence without weakening the production marker authority. */

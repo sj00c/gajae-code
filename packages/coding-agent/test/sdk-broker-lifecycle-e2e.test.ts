@@ -4799,7 +4799,6 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 	try {
 		const acp = new AcpAgent({ signal: new AbortController().signal } as never, {
 			agentDir: agentDirs[0],
-			expectedPackageGeneration: "test",
 		});
 		expect(await acp.listSessions({})).toEqual({ sessions: [] });
 		expect(await readSdkBrokerDiscovery(agentDirs[0])).not.toBeNull();
