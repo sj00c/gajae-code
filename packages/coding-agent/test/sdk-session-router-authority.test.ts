@@ -1921,8 +1921,13 @@ describe("SessionRouter dispatch authority", () => {
 		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
 		const body = JSON.stringify({ sessionId, url: "ws://publishwin.test", token: "v1", pid: 42 });
 		await Bun.write(endpointFile, body);
-		let indexedMtimeMs = fs.statSync(endpointFile).mtimeMs;
+		const originalStat = fs.statSync(endpointFile);
+		// The indexed mtime is fixed for the whole test: the replacement must be
+		// indistinguishable from the original on every field except the inode.
+		const indexedMtimeMs = Math.floor(originalStat.mtimeMs);
+		await fsPromises.utimes(endpointFile, new Date(indexedMtimeMs), new Date(indexedMtimeMs));
 		let replaceInHook = false;
+		let replacedIno: number | bigint = originalStat.ino;
 		const index = {
 			open: async () => {},
 			refresh: async () => {},
@@ -1970,7 +1975,12 @@ describe("SessionRouter dispatch authority", () => {
 					const staging = `${endpointFile}.pubwin.tmp`;
 					await Bun.write(staging, body);
 					await fsPromises.rename(staging, endpointFile);
-					indexedMtimeMs = fs.statSync(endpointFile).mtimeMs;
+					// PRESERVE the indexed mtime across the rename (#4730 review): if the
+					// replacement carried a new mtime, #readProvenEndpoint would reject on
+					// the mtime fence before reaching the inode comparison, and this pin
+					// would pass for a reason adjacent to the one it names.
+					await fsPromises.utimes(endpointFile, new Date(indexedMtimeMs), new Date(indexedMtimeMs));
+					replacedIno = fs.statSync(endpointFile).ino;
 				},
 				setInterval: (() => 0) as unknown as typeof setInterval,
 				clearInterval: (() => {}) as unknown as typeof clearInterval,
@@ -1984,6 +1994,9 @@ describe("SessionRouter dispatch authority", () => {
 
 			replaceInHook = true;
 			await router.start();
+			// The inode is what changed; mtime is preserved, so only identity rejects.
+			expect(Math.floor(fs.statSync(endpointFile).mtimeMs)).toBe(indexedMtimeMs);
+			expect(replacedIno).not.toBe(originalStat.ino);
 			// The replacement is refused at the commit point, so nothing is published.
 			expect(router.attachment(sessionId) ?? undefined).toBeUndefined();
 		} finally {
