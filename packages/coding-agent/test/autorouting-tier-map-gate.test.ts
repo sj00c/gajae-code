@@ -45,4 +45,43 @@ describe("autorouting tier-map CI gate", () => {
 		expect(result.unlabeledKeys).toEqual([]);
 		expect(result.skippedKeys).toEqual(["qianfan/deepseek-v3.2"]);
 	});
+
+	it("rejects a skip entry with an empty rationale", () => {
+		const catalog = {
+			qianfan: { "deepseek-v3.2": { provider: "qianfan", id: "deepseek-v3.2", reasoning: false, input: ["text"] } },
+		};
+		const result = checkAutoroutingTierMap(catalog, {}, { "qianfan/deepseek-v3.2": { rationale: "   " } });
+		expect(result.ok).toBe(false);
+		expect(result.report.invalidSkipKeys).toEqual(["qianfan/deepseek-v3.2"]);
+	});
+
+	it("rejects a skip entry whose key violates the selector grammar", () => {
+		const catalog = {
+			qianfan: { "deepseek-v3.2": { provider: "qianfan", id: "deepseek-v3.2", reasoning: false, input: ["text"] } },
+		};
+		const result = checkAutoroutingTierMap(catalog, {}, { "qianfan/glob*": { rationale: "rationale" } });
+		expect(result.ok).toBe(false);
+		expect(result.report.invalidSkipKeys).toEqual(["qianfan/glob*"]);
+	});
+
+	it("rejects a skip entry whose key no longer exists in the catalog", () => {
+		const catalog = {
+			qianfan: { "deepseek-v3.2": { provider: "qianfan", id: "deepseek-v3.2", reasoning: false, input: ["text"] } },
+		};
+		const result = checkAutoroutingTierMap(catalog, {}, { "qianfan/removed-key": { rationale: "rationale" } });
+		expect(result.ok).toBe(false);
+		expect(result.report.staleSkipKeys).toEqual(["qianfan/removed-key"]);
+	});
+
+	it("rejects a key that is both labeled and skipped", () => {
+		const catalog = {
+			qianfan: { "deepseek-v3.2": { provider: "qianfan", id: "deepseek-v3.2", reasoning: false, input: ["text"] } },
+		};
+		const result = checkAutoroutingTierMap(
+			catalog,
+			{ "qianfan/deepseek-v3.2": [{ tier: "fast", rank: 1 }] },
+			{ "qianfan/deepseek-v3.2": { rationale: "rationale" } },
+		);
+		expect(result.ok).toBe(false);
+	});
 });

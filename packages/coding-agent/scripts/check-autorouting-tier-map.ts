@@ -31,6 +31,8 @@ export type AutoroutingTierMapGateReport = {
 	unlabeledKeys: string[];
 	invalidLabelKeys: string[];
 	outOfScopeLabelKeys: string[];
+	invalidSkipKeys: string[];
+	staleSkipKeys: string[];
 	baselineSkipCount: number;
 };
 
@@ -82,6 +84,15 @@ export function getAutoroutingTierMapGateReport(
 	const unlabeledKeys = [...catalogKeys].filter(key => !Object.hasOwn(labels, key) && !Object.hasOwn(skips, key));
 	const inScopeKeys = [...catalogKeys];
 	const inScopeSkipped = skippedKeys.filter(key => catalogKeys.has(key));
+	const invalidSkipKeys = skippedKeys.filter(key => {
+		const entry = (skips as Record<string, { rationale?: unknown }>)[key];
+		const rationale = entry?.rationale;
+		return typeof rationale !== "string" || rationale.trim().length === 0 || !isValidAutoroutingSelector(key);
+	});
+	const staleSkipKeys = skippedKeys.filter(key => !catalogKeys.has(key) && !invalidSkipKeys.includes(key));
+	// A key that is both labeled and skipped would let a curated tier assignment hide
+	// behind a skip rationale; fold it into the invalid set.
+	staleSkipKeys.push(...skippedKeys.filter(key => Object.hasOwn(labels, key) && !staleSkipKeys.includes(key)));
 	return {
 		inScopeKeys,
 		labeledKeys,
@@ -89,6 +100,8 @@ export function getAutoroutingTierMapGateReport(
 		unlabeledKeys: unlabeledKeys.sort((left, right) => left.localeCompare(right)),
 		invalidLabelKeys,
 		outOfScopeLabelKeys,
+		invalidSkipKeys,
+		staleSkipKeys,
 		baselineSkipCount: inScopeSkipped.filter(
 			key => (skips as Record<string, { baseline?: true }>)[key]?.baseline === true,
 		).length,
@@ -117,7 +130,9 @@ export function checkAutoroutingTierMap(
 	const ok =
 		report.unlabeledKeys.length === 0 &&
 		report.invalidLabelKeys.length === 0 &&
-		report.outOfScopeLabelKeys.length === 0;
+		report.outOfScopeLabelKeys.length === 0 &&
+		report.invalidSkipKeys.length === 0 &&
+		report.staleSkipKeys.length === 0;
 	return { ok, report };
 }
 
@@ -138,13 +153,19 @@ export const runTierMapGate = runAutoroutingTierMapGate;
 
 function printFailure(report: AutoroutingTierMapGateReport): void {
 	const failures = [
-		...new Set([...report.unlabeledKeys, ...report.invalidLabelKeys, ...report.outOfScopeLabelKeys]),
+		...new Set([
+			...report.unlabeledKeys,
+			...report.invalidLabelKeys,
+			...report.outOfScopeLabelKeys,
+			...report.invalidSkipKeys,
+			...report.staleSkipKeys,
+		]),
 	].sort((a, b) => a.localeCompare(b));
 	console.error("Autorouting tier-map gate failed.");
 	console.error("Offending provider/model-id keys:");
 	for (const key of failures) console.error(`- ${key}`);
 	console.error(
-		"Add each new key to CURATED_TIER_LABELS with reviewed tier/rank data, or add it to TIER_MAP_SKIP_LIST with a non-empty rationale.",
+		"Add each new key to CURATED_TIER_LABELS with reviewed tier/rank data, or add it to TIER_MAP_SKIP_LIST with a non-empty rationale; remove skip entries whose key left the catalog or the selector grammar.",
 	);
 }
 
