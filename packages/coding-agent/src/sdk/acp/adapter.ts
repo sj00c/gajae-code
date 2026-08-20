@@ -222,6 +222,11 @@ export class AcpSdkAdapter {
 	}
 
 	async attachmentReady(attachment: SessionAttachment): Promise<void> {
+		// Guard BEFORE the branch (#4730 review): the same-object path below never
+		// reaches acceptAttachment, so guarding only inside that one arm let a
+		// current attachment without the maintenance capability activate providers
+		// and acquire leases it can never renew.
+		assertMaintenanceCapability(attachment);
 		if (this.#attachment !== attachment) this.acceptAttachment(attachment);
 		else {
 			this.#abortActiveReverseRequests();

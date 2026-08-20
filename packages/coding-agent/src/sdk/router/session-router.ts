@@ -386,6 +386,8 @@ export class SessionRouter {
 	 * preserves size, mtime and body cannot keep a superseded endpoint authorized.
 	 */
 	readonly #endpointInodes = new Map<string, bigint>();
+	/** Inode proven inside the last successful #readEndpoint authority read, keyed by endpoint path. */
+	readonly #provenEndpointInodes = new Map<string, bigint>();
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
@@ -1021,7 +1023,15 @@ export class SessionRouter {
 		const endpoint = await readSdkSessionEndpoint(repo, indexed.sessionId, scope);
 		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
 		const endpointStat = await fs.stat(endpoint.path).catch(() => undefined);
-		if (!endpointStat || endpointStat.mtimeMs !== indexed.endpointMtimeMs) return null;
+		const endpointIno = await fs
+			.stat(endpoint.path, { bigint: true })
+			.then(value => value.ino)
+			.catch(() => undefined);
+		if (!endpointStat || endpointIno === undefined || endpointStat.mtimeMs !== indexed.endpointMtimeMs) return null;
+		// Identity is proven INSIDE this authority read (#4730 review): sampling it
+		// afterwards would let an identical rename between the read and the sample
+		// install the replacement's inode as the trusted baseline.
+		const provenIno = endpointIno;
 		let raw: Record<string, unknown>;
 		try {
 			const parsed = JSON.parse(await Bun.file(endpoint.path).text());
@@ -1038,13 +1048,27 @@ export class SessionRouter {
 			raw.token !== endpoint.token
 		)
 			return null;
+		// Fail CLOSED on stat error and on any identity change across the body read.
 		const endpointStatAfterRead = await fs.stat(endpoint.path).catch(() => undefined);
-		if (!endpointStatAfterRead || endpointStatAfterRead.mtimeMs !== indexed.endpointMtimeMs) return null;
+		const inoAfterRead = await fs
+			.stat(endpoint.path, { bigint: true })
+			.then(value => value.ino)
+			.catch(() => undefined);
+		if (
+			!endpointStatAfterRead ||
+			inoAfterRead === undefined ||
+			endpointStatAfterRead.mtimeMs !== indexed.endpointMtimeMs ||
+			inoAfterRead !== provenIno
+		)
+			return null;
 		await this.#index.refresh();
 		const listing = this.#index.listSessions();
 		if (listing.warnings.length > 0) return null;
 		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
 		if (!current || !sameIndexedAuthority(indexed, current)) return null;
+		// Record the proven identity for this exact path so callers that publish an
+		// attachment bind to what authority validated, never to a later re-stat.
+		this.#provenEndpointInodes.set(endpoint.path, provenIno);
 		return endpoint;
 	}
 
@@ -1109,17 +1133,17 @@ export class SessionRouter {
 		if (!this.#running(runEpoch)) return false;
 		if (indexed.endpointMtimeMs === undefined) return false;
 		const endpoint = resolvedEndpoint ?? (await this.#readEndpoint(indexed));
-		// Capture the endpoint inode HERE, adjacent to the authority proof above,
-		// not at registration (#4730 review). Capturing it later would let a
-		// rename-replace landing in that window be recorded as the trusted identity,
-		// which is exactly the replacement this identity exists to detect.
-		const provenIno =
-			endpoint === null
-				? undefined
-				: await fs
-						.stat(endpoint.path, { bigint: true })
-						.then(value => value.ino)
-						.catch(() => undefined);
+		// The identity proven INSIDE the authority read above; never re-stat here,
+		// because a rename in this window would be captured as trusted (#4730
+		// review). A pre-resolved endpoint (adoption/lifecycle handoff) carries no
+		// such proof, so it samples once here -- that path never had an authority
+		// read of its own to bind to.
+		let provenIno = endpoint === null ? undefined : this.#provenEndpointInodes.get(endpoint.path);
+		if (endpoint !== null && provenIno === undefined)
+			provenIno = await fs
+				.stat(endpoint.path, { bigint: true })
+				.then(value => value.ino)
+				.catch(() => undefined);
 		const retirementAfterValidation = this.#retirements.get(indexed.sessionId);
 		if (retirementAfterValidation) await retirementAfterValidation;
 		if ((this.#retirementVersions.get(indexed.sessionId) ?? 0) !== retirementVersion)
@@ -1325,10 +1349,20 @@ export class SessionRouter {
 				if (attached) this.#endpointInodes.delete(attached.id);
 			},
 		};
+		// Re-check at publication (#4730 review): the endpoint must STILL be the
+		// file authority validated. Fail closed on stat error or any identity
+		// change instead of publishing an attachment bound to a successor.
+		if (provenIno === undefined) return false;
+		const publishIno = await fs
+			.stat(endpoint.path, { bigint: true })
+			.then(value => value.ino)
+			.catch(() => undefined);
+		if (publishIno === undefined || publishIno !== provenIno) {
+			attached.dispose();
+			return false;
+		}
 		this.#sessions.set(indexed.sessionId, attached);
-		// The identity proven alongside the endpoint authority read above; a later
-		// re-stat here could observe a replacement and trust it.
-		if (provenIno !== undefined) this.#endpointInodes.set(attached.id, provenIno);
+		this.#endpointInodes.set(attached.id, provenIno);
 		if (deferPublication)
 			this.#adopted.set(indexed.sessionId, {
 				generation: indexed.endpointGeneration,

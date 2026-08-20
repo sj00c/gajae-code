@@ -187,7 +187,22 @@ test("a capability-less attachment is rejected on the handoff paths too (#4730 r
 			send: async () => {},
 		};
 		expect(() => adapter.acceptAttachment(legacy)).toThrow(/sendMaintenance/);
-		await expect(adapter.attachmentReady(legacy)).rejects.toThrow(/sendMaintenance/);
+		// The different-object path is guarded above. The SAME-object path must be
+		// guarded too, and asserting it needs an adapter whose CURRENT attachment
+		// is the capability-less one -- otherwise attachmentReady re-enters the
+		// different-object branch and just re-tests the first guard (#4730 review).
+		const sameObject = new AcpSdkAdapter({
+			router: harness.router as never,
+			attachment: legacy,
+			sessionId: legacy.sessionId,
+		});
+		const registeredBefore = harness.requests.filter(frame => frame.type === "register_provider").length;
+		await expect(sameObject.attachmentReady(legacy)).rejects.toThrow(/sendMaintenance/);
+		// Rejected before provider registration: no lease may exist for an
+		// attachment that cannot renew one.
+		expect(harness.requests.filter(frame => frame.type === "register_provider").length).toBe(registeredBefore);
+		expect(sameObject.leaseIds.size).toBe(0);
+		await sameObject.close();
 		// The supported attachment keeps renewing; the refusal did not wedge it.
 		await waitFor(() => harness.maintenance.length >= 1, "heartbeat still renewing after refusal");
 	} finally {
