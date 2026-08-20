@@ -9,6 +9,7 @@ import {
 	brokerOwnerForTest,
 	canRetireStaleBrokerForTest,
 	ensureBroker,
+	matchesExpectedBrokerAuthorityForTest,
 	signalExactBrokerForTest,
 } from "../src/sdk/broker/ensure";
 import {
@@ -49,6 +50,50 @@ describe("sdk broker package generation", () => {
 		const first = resolveSdkPackageGeneration();
 		expect(first).toMatch(/^[0-9a-f]{64}$/);
 		expect(resolveSdkPackageGeneration()).toBe(first);
+	});
+
+	it("rejects same-generation startup winners with mismatched authority", () => {
+		const authority = resolveSdkPackageAuthority();
+		const discovery = {
+			version: 1,
+			protocolVersion: 3,
+			packageGeneration: authority.generation,
+			packageVersion: authority.packageVersion,
+			installationIdentity: authority.installationIdentity,
+			ownerId: "startup-race-winner",
+			pid: process.pid,
+			incarnation: brokerProcessIncarnation(process.pid)!,
+			host: "127.0.0.1",
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "startup-race-token",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		} as const;
+		expect(
+			matchesExpectedBrokerAuthorityForTest(
+				{ ...discovery, packageVersion: "0.0.1" },
+				authority.generation,
+				authority.packageVersion,
+				authority.installationIdentity,
+			),
+		).toBe(false);
+		expect(
+			matchesExpectedBrokerAuthorityForTest(
+				{ ...discovery, installationIdentity: `${authority.installationIdentity}-foreign` },
+				authority.generation,
+				authority.packageVersion,
+				authority.installationIdentity,
+			),
+		).toBe(false);
+		expect(
+			matchesExpectedBrokerAuthorityForTest(
+				discovery,
+				authority.generation,
+				authority.packageVersion,
+				authority.installationIdentity,
+			),
+		).toBe(true);
 	});
 
 	it("binds compiled generation to content, not only size and mtime", async () => {

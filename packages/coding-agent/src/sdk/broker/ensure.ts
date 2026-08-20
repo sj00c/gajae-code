@@ -617,7 +617,14 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			try {
 				const discovered = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 				if (discovered) {
-					if (!matchesExpectedPackageGeneration(discovered, settings.expectedPackageGeneration)) {
+					if (
+						!matchesExpectedPackageGeneration(
+							discovered,
+							settings.expectedPackageGeneration,
+							settings.expectedPackageVersion,
+							settings.expectedInstallationIdentity,
+						)
+					) {
 						await owner.stop();
 						throw staleBrokerRetirementUnverified(
 							settings.expectedPackageGeneration!,
@@ -648,7 +655,14 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				for (let retry = 0; retry < 20; retry++) {
 					const winner = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 					if (winner) {
-						if (!matchesExpectedPackageGeneration(winner, settings.expectedPackageGeneration))
+						if (
+							!matchesExpectedPackageGeneration(
+								winner,
+								settings.expectedPackageGeneration,
+								settings.expectedPackageVersion,
+								settings.expectedInstallationIdentity,
+							)
+						)
 							throw staleBrokerRetirementUnverified(
 								settings.expectedPackageGeneration!,
 								winner.packageGeneration,
@@ -817,6 +831,20 @@ export function signalExactBrokerForTest(pid: number, incarnation: string): bool
 /** Test hook: validates ordered same-install retirement authority. */
 export function canRetireStaleBrokerForTest(stale: BrokerDiscovery, authority: SdkPackageAuthority): boolean {
 	return canRetireStaleBroker(stale, authority);
+}
+/** Test hook: validates the full authority tuple used for spawned discoveries and race winners. */
+export function matchesExpectedBrokerAuthorityForTest(
+	discovery: BrokerDiscovery,
+	expectedPackageGeneration: string,
+	expectedPackageVersion: string,
+	expectedInstallationIdentity: string,
+): boolean {
+	return matchesExpectedPackageGeneration(
+		discovery,
+		expectedPackageGeneration,
+		expectedPackageVersion,
+		expectedInstallationIdentity,
+	);
 }
 /** Test hook: drives the detached-broker reap on a controllable child surface. */
 export function reapSpawnedBrokerForTest(child: ChildProcess, timing: ReapTiming = DEFAULT_REAP_TIMING): Promise<void> {
