@@ -2032,9 +2032,13 @@ export class Agent {
 			} as AgentMessage;
 
 			this.#state.error = err?.message || String(err);
-			if (!abortController.signal.aborted) {
-				this.#emit({ type: "agent_failed", error: err, scope: handle.scope });
-			}
+			this.#emit({
+				type: "agent_failed",
+				error: abortController.signal.aborted
+					? Object.assign(new Error("Request was aborted"), { code: "aborted" })
+					: err,
+				scope: handle.scope,
+			});
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {
 				stopReason: abortController.signal.aborted ? "cancelled" : "error",
 				messages: [errorMsg],

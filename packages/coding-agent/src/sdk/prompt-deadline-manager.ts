@@ -82,6 +82,10 @@ export class PromptDeadlineManager {
 			this.#schedule(key);
 			return;
 		}
+		// Fence lifecycle adoption before replaying a real terminal transition.
+		// A successor agent_start must not drain this correlation while its
+		// durable upgrade is still pending or being retried.
+		this.#expiring.add(key);
 		if (this.#pendingTerminalTransitions.has(key)) {
 			try {
 				await this.#reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
@@ -93,9 +97,6 @@ export class PromptDeadlineManager {
 			}
 			return;
 		}
-		// Fence ownership synchronously before the first await. A late agent_start
-		// must not drain this correlation while durable expiry is in flight.
-		this.#expiring.add(key);
 		let lookup: { status: string };
 		try {
 			lookup = this.#reconciliation.lookup("prompt", correlation) as { status: string };

@@ -349,6 +349,7 @@ import type { WorkspaceTreeRuntime } from "../runtime/workspace-tree-service";
 import { MCPManager } from "../runtime-mcp/manager";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
+import { sanitizePromptFailure } from "../sdk/prompt-failure";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
 import {
@@ -7182,7 +7183,7 @@ export class AgentSession {
 				await this.#extensionRunner.emit(
 					{
 						type: "agent_failed",
-						error: event.error,
+						error: sanitizePromptFailure(event.error),
 					},
 					undefined,
 					deliveryScope,
