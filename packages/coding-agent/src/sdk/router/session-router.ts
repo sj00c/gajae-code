@@ -800,9 +800,12 @@ export class SessionRouter {
 		// stat and the listSessions()/request() below, which would let a forced
 		// request go out through a no-longer-authoritative attachment (#4730
 		// review). Forced passes therefore take the locked authority read.
+		// `refresh()` is the locked read; `open()` is deliberately NOT re-run per
+		// forced pass -- re-entering it disturbs the shared open-group state that
+		// live attachments and replay cursors depend on, which broke socket-loss
+		// resume.
 		let changed: boolean;
 		if (force) {
-			await this.#index.open();
 			await this.#index.refresh();
 			changed = true;
 		} else changed = await this.#index.refreshIfChanged();
