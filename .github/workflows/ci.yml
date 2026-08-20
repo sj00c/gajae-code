@@ -709,10 +709,19 @@ jobs:
               esac
               records="$RUNNER_TEMP/receipt-records.json"
               echo '[]' > "$records"
-              count="$(jq '.packages | length' "$expected")"
-              for index in $(seq 0 $((count - 1))); do
-                 record="$(jq -c ".packages[$index]" "$expected")"
-                 name="$(jq -r '.name' <<<"$record")"
+              order_file="$evidence_dir/gajae-release-publish-order-v1.json"
+              # The sealed plan publishes dependencies before dependents; it
+              # must cover exactly the expected package set.
+              if [ "$(jq -r '.order[]' "$order_file" | sort)" != "$(jq -r '.packages[].name' "$expected" | sort)" ]; then
+                 echo "Publish order file does not cover exactly the expected package set" >&2
+                 exit 1
+              fi
+              for name in $(jq -r '.order[]' "$order_file"); do
+                 record="$(jq -c --arg name "$name" '.packages[] | select(.name == $name)' "$expected")"
+                 if [ -z "$record" ]; then
+                    echo "Publish order references unknown package $name" >&2
+                    exit 1
+                 fi
                  version="$(jq -r '.version' <<<"$record")"
                  sha="$(jq -r '.tarball_sha512' <<<"$record")"
                  expected_sri="$(jq -r '.expected_sri' <<<"$record")"

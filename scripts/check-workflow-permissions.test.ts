@@ -60,7 +60,7 @@ describe("workflow permission policy", () => {
 			{ workflow: CI_WORKFLOW, job: "release_finalize", scope: "contents" },
 			{ workflow: CI_WORKFLOW, job: "publish", scope: "id-token" },
 		]);
-		expect(jobWriteScopes(document)).toEqual(["release_finalize.contents", "publish.id-token"]);
+		expect(jobWriteScopes(document)).toEqual(["publish.id-token", "release_finalize.contents"]);
 	});
 
 	test("dev-ci.yml has an exact read-scoped workflow default and no write job scope", async () => {

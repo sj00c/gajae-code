@@ -196,6 +196,24 @@ describe("unscoped gajae-code package publication", () => {
 		}
 	});
 
+	test("seals the dependency-ordered plan into evidence and the fixed publish boundary consumes it", async () => {
+		// The OIDC publish job must publish in planExpectedEvidencePublication
+		// order, not evidence-array (name-sorted) order. The order is computed in
+		// the credential-free prepare job and sealed as an artifact.
+		const script = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
+		expect(script).toContain('PUBLISH_ORDER_FILE = "gajae-release-publish-order-v1.json"');
+		expect(script).toContain("planExpectedEvidencePublication(expected.packages)");
+
+		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
+		const publish = workflowJob(workflow, "publish");
+		expect(publish).toContain("gajae-release-publish-order-v1.json");
+		expect(publish).toContain("for name in $(jq -r '.order[]'");
+		// No direct evidence-array iteration may remain in the boundary.
+		expect(publish).not.toContain(".packages[$index]");
+		// The boundary rejects a plan that does not cover exactly the expected set.
+		expect(publish).toContain("does not cover exactly the expected package set");
+	});
+
 	test("rejects duplicate, missing, and extra evidence records before publication", async () => {
 		const records = canonicalEvidenceRecords();
 		const published: string[] = [];

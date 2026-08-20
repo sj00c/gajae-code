@@ -612,6 +612,13 @@ async function prepareExpectedEvidence(evidenceDirectory: string, releaseChannel
 		path.join(evidenceDirectory, CHANNEL_BEFORE_EVIDENCE_FILE),
 		canonicalJsonBytes({ schema_version: 1, snapshot: protectedBefore }),
 	);
+	// The fixed publish boundary iterates the sealed plan, so dependency order
+	// (e.g. @gajae-code/ai before @gajae-code/agent-core) must be computed here.
+	const publicationOrder = planExpectedEvidencePublication(expected.packages).map(record => record.name);
+	await writeImmutableBytes(
+		path.join(evidenceDirectory, PUBLISH_ORDER_FILE),
+		canonicalJsonBytes({ schema_version: 1, order: publicationOrder }),
+	);
 	console.log(JSON.stringify({
 		ok: true,
 		phase: "expected-evidence",
@@ -626,6 +633,8 @@ function isMissingRegistryPackage(output: string): boolean {
 	return /\bE404\b|404 Not Found|is not in this registry/iu.test(output);
 }
 export const CHANNEL_BEFORE_EVIDENCE_FILE = "gajae-release-channel-before-v1.json";
+/** Dependency-ordered publication plan sealed by release_prepare; the fixed boundary publishes in exactly this order. */
+export const PUBLISH_ORDER_FILE = "gajae-release-publish-order-v1.json";
 /** Written by the fixed (no-repo-code) OIDC publish boundary; finalize requires it. */
 export const PUBLISH_RECEIPT_FILE = "gajae-release-oidc-publish-receipt-v1.json";
 
