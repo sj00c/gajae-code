@@ -12,6 +12,7 @@ import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ACP_PROMPT_INFERENCE_TIMEOUT_MS } from "../src/sdk/prompt-watchdog";
+import { TEST_BROKER_PACKAGE_AUTHORITY } from "./helpers/sdk-broker-fixture";
 
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
@@ -281,6 +282,8 @@ async function createFixture(
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
+		packageVersion: TEST_BROKER_PACKAGE_AUTHORITY.packageVersion,
+		installationIdentity: TEST_BROKER_PACKAGE_AUTHORITY.installationIdentity,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",

@@ -40,6 +40,7 @@ export type SdkInternalSpawnCommand =
 	  };
 
 type EmbeddedFile = Blob | { name: string };
+const commandAuthorityPaths = new WeakMap<object, string[]>();
 
 /** Test-only injectable inputs for hostile evidence and platform grammar coverage. */
 export interface SdkInternalRuntimeDescriptorTestOptions {
@@ -108,12 +109,13 @@ function expectedPackageIdentity(packageDirectory: string): string {
 }
 
 /** Returns every regular source input below a trusted runtime directory in stable order. */
-function regularFilesUnder(directory: string): string[] {
+function regularFilesUnder(directory: string, excludedNames: ReadonlySet<string> = new Set()): string[] {
 	const files: string[] = [];
 	const visit = (current: string): void => {
 		for (const entry of fs
 			.readdirSync(current, { withFileTypes: true })
 			.sort((left, right) => left.name.localeCompare(right.name))) {
+			if (excludedNames.has(entry.name)) continue;
 			const candidate = path.join(current, entry.name);
 			if (entry.isDirectory()) visit(candidate);
 			else if (entry.isFile() || entry.isSymbolicLink()) {
@@ -132,10 +134,9 @@ function regularFilesUnder(directory: string): string[] {
 }
 
 /**
- * Include local workspace runtime inputs resolved by source Bun launches. External npm bytes are
- * package-manager inputs represented by the root lockfile; mutable application and native bytes
- * remain inside this content-bound trust boundary. The user cache is a derived loader artifact,
- * never generation authority: loader-state validates it against the current package bytes.
+ * Include local workspace runtime inputs resolved by source Bun launches. The user cache is a
+ * derived loader artifact, never generation authority: loader-state validates it against the
+ * current package bytes.
  */
 function workspaceDependencyFiles(packageDirectory: string): string[] {
 	const workspaceRoot = path.dirname(packageDirectory);
@@ -220,6 +221,85 @@ function workspaceDependencyFiles(packageDirectory: string): string[] {
 		const candidate = resolveWorkspaceDirectory(name);
 		if (candidate && fs.existsSync(candidate)) visit(candidate);
 	}
+	return files;
+}
+
+function trustedRuntimeRoot(packageDirectory: string): string {
+	let current = fs.realpathSync(packageDirectory);
+	for (let depth = 0; depth < 8; depth++) {
+		const manifestPath = path.join(current, "package.json");
+		const lockfilePath = path.join(current, "bun.lock");
+		if (fs.existsSync(lockfilePath)) return current;
+		try {
+			const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { name?: unknown };
+			if (manifest.name === "gajae-code") return current;
+		} catch {}
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	throw new Error("SDK internal launch refused: runtime dependency root is not lockfile-verifiable.");
+}
+
+/** Hash every resolved runtime package, not just mutable local workspace packages. */
+function resolvedRuntimeDependencyFiles(packageDirectory: string): string[] {
+	const trustedRoot = trustedRuntimeRoot(packageDirectory);
+	const files: string[] = [];
+	const visited = new Set<string>();
+	const resolvePackage = (fromDirectory: string, name: string): string | undefined => {
+		let current = fromDirectory;
+		while (true) {
+			const candidate = path.join(current, "node_modules", name);
+			if (fs.existsSync(candidate)) return fs.realpathSync(candidate);
+			const parent = path.dirname(current);
+			if (parent === current) return undefined;
+			current = parent;
+		}
+	};
+	const visit = (directory: string, optional: boolean): void => {
+		let canonical: string;
+		try {
+			canonical = fs.realpathSync(directory);
+		} catch {
+			if (optional) return;
+			throw new Error("SDK internal launch refused: required runtime dependency is unresolved.");
+		}
+		if (!containedPath(trustedRoot, canonical))
+			throw new Error("SDK internal launch refused: runtime dependency escapes its trusted root.");
+		if (visited.has(canonical)) return;
+		visited.add(canonical);
+		const manifestPath = path.join(canonical, "package.json");
+		let manifest: {
+			dependencies?: Record<string, unknown>;
+			optionalDependencies?: Record<string, unknown>;
+			peerDependencies?: Record<string, unknown>;
+		};
+		try {
+			manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as typeof manifest;
+		} catch {
+			if (optional) return;
+			throw new Error("SDK internal launch refused: runtime dependency metadata is unreadable.");
+		}
+		files.push(...regularFilesUnder(canonical, new Set(["node_modules"])));
+		const optionalNames = new Set([
+			...Object.keys(manifest.optionalDependencies ?? {}),
+			...Object.keys(manifest.peerDependencies ?? {}),
+		]);
+		const names = new Set([
+			...Object.keys(manifest.dependencies ?? {}),
+			...Object.keys(manifest.optionalDependencies ?? {}),
+			...Object.keys(manifest.peerDependencies ?? {}),
+		]);
+		for (const name of names) {
+			const resolved = resolvePackage(canonical, name);
+			if (!resolved) {
+				if (optionalNames.has(name)) continue;
+				throw new Error(`SDK internal launch refused: required runtime dependency is unresolved (${name}).`);
+			}
+			visit(resolved, optionalNames.has(name));
+		}
+	};
+	visit(packageDirectory, false);
 	return files;
 }
 
@@ -315,11 +395,13 @@ function sourceDescriptor(
 		path.join(canonicalPackageDirectory, "package.json"),
 		...regularFilesUnder(canonicalSourceDirectory),
 		...workspaceDependencyFiles(canonicalPackageDirectory),
+		...resolvedRuntimeDependencyFiles(canonicalPackageDirectory),
 		config,
+		runtime,
 	];
 	const lockfile = trustedProjectLockfile(canonicalPackageDirectory);
 	if (lockfile) generationFiles.push(lockfile);
-	return {
+	const command: SdkInternalSpawnCommand = {
 		kind: "bun-source",
 		file: runtime,
 		args: ["--no-env-file", `--config=${config}`, cli, "sdk", action],
@@ -329,6 +411,14 @@ function sourceDescriptor(
 		packageVersion,
 		installationIdentity: canonicalPackageDirectory,
 	};
+	commandAuthorityPaths.set(command, [
+		canonicalPackageDirectory,
+		canonicalSourceDirectory,
+		canonicalBrokerDirectory,
+		runtime,
+		...generationFiles,
+	]);
+	return command;
 }
 
 function resolveSdkInternalSpawnCommandWithEvidence(
@@ -346,7 +436,7 @@ function resolveSdkInternalSpawnCommandWithEvidence(
 	if (embeddedFiles.length === 0 && isSourceMarker) return sourceDescriptor(action, options, markerPath);
 	if (exactCompiledArtifact && compiledMarkerPath) {
 		const executable = regularReadablePath(path.resolve(options.execPath ?? process.execPath), "compiled executable");
-		return {
+		const command: SdkInternalSpawnCommand = {
 			kind: "compiled",
 			file: executable,
 			args: ["sdk", action],
@@ -355,28 +445,90 @@ function resolveSdkInternalSpawnCommandWithEvidence(
 			packageVersion: packageJson.version,
 			installationIdentity: executable,
 		};
+		commandAuthorityPaths.set(command, [executable]);
+		return command;
 	}
 	throw new Error("SDK internal launch refused: compiled-runtime marker evidence is inconsistent.");
 }
 
 /** Resolve the production descriptor from the statically imported marker and current Bun runtime evidence. */
 export function resolveSdkInternalSpawnCommand(action: SdkInternalAction): SdkInternalSpawnCommand {
-	return resolveSdkInternalSpawnCommandWithEvidence(action, {});
+	if (authorityCache && !authorityCache.invalidated) {
+		const cached = internalCommandCache.get(action);
+		if (cached)
+			return {
+				...cached,
+				env: internalEnvironment(process.env, cached.kind === "bun-source"),
+			};
+		const broker = internalCommandCache.get("broker-internal");
+		if (broker) {
+			const command: SdkInternalSpawnCommand = {
+				...broker,
+				args: [...broker.args.slice(0, -1), action],
+				env: internalEnvironment(process.env, broker.kind === "bun-source"),
+			};
+			const paths = commandAuthorityPaths.get(broker);
+			if (paths) commandAuthorityPaths.set(command, paths);
+			internalCommandCache.set(action, command);
+			return command;
+		}
+	}
+	const command = resolveSdkInternalSpawnCommandWithEvidence(action, {});
+	internalCommandCache.set(action, command);
+	return command;
 }
 
 /** Resolve the current generation the production descriptor would publish, without spawning. */
-export function resolveSdkPackageGeneration(): string {
-	return resolveSdkInternalSpawnCommand("broker-internal").generation;
+type AuthorityCache = {
+	authority: SdkPackageAuthority;
+	invalidated: boolean;
+};
+
+let authorityCache: AuthorityCache | undefined;
+const authorityWatchers = new Map<string, fs.FSWatcher>();
+const internalCommandCache = new Map<SdkInternalAction, SdkInternalSpawnCommand>();
+
+function watchAuthorityPaths(paths: string[]): void {
+	for (const input of paths) {
+		const directory = path.dirname(input);
+		if (authorityWatchers.has(directory)) continue;
+		try {
+			const watcher = fs.watch(directory, () => {
+				if (authorityCache) authorityCache.invalidated = true;
+			});
+			watcher.on("error", () => {
+				if (authorityCache) authorityCache.invalidated = true;
+			});
+			watcher.unref();
+			authorityWatchers.set(directory, watcher);
+		} catch {
+			if (authorityCache) authorityCache.invalidated = true;
+		}
+	}
 }
 
 /** Resolve the ordered, installation-bound authority used before broker retirement. */
-export function resolveSdkPackageAuthority(): SdkPackageAuthority {
+export function resolveSdkPackageAuthority(options: { force?: boolean } = {}): SdkPackageAuthority {
+	if (!options.force && authorityCache && !authorityCache.invalidated) return authorityCache.authority;
+	if (options.force) {
+		authorityCache = undefined;
+		internalCommandCache.clear();
+	}
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
-	return {
+	const authority = {
 		generation: command.generation,
 		packageVersion: command.packageVersion ?? packageJson.version,
 		installationIdentity: command.installationIdentity ?? command.file,
 	};
+	const paths = commandAuthorityPaths.get(command) ?? [command.file];
+	authorityCache = { authority, invalidated: false };
+	internalCommandCache.set("broker-internal", command);
+	watchAuthorityPaths(paths);
+	return authority;
+}
+
+export function resolveSdkPackageGeneration(): string {
+	return resolveSdkPackageAuthority().generation;
 }
 
 /** Test hook: injects runtime evidence without weakening the production marker authority. */

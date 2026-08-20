@@ -4,6 +4,7 @@ import type { AgentSideConnection, SessionNotification } from "@agentclientproto
 import { AcpAgent, transcriptReplayContent } from "@gajae-code/coding-agent/modes/acp/acp-agent";
 import { TempDir } from "@gajae-code/utils";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { TEST_BROKER_PACKAGE_AUTHORITY } from "../helpers/sdk-broker-fixture";
 import {
 	type ExactSessionAuthorityFixture,
 	registerExactSessionAuthority,
@@ -239,6 +240,8 @@ describe("ACP transcript replay degradation", () => {
 			version: 1,
 			protocolVersion: 3,
 			packageGeneration: "test",
+			packageVersion: TEST_BROKER_PACKAGE_AUTHORITY.packageVersion,
+			installationIdentity: TEST_BROKER_PACKAGE_AUTHORITY.installationIdentity,
 			ownerId: "test-owner",
 			pid: process.pid,
 			host: "127.0.0.1",

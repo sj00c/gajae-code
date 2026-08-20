@@ -23,7 +23,7 @@ import {
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
 import { ensureBroker } from "../broker/ensure";
-import { resolveSdkPackageGeneration } from "../broker/runtime";
+
 import { SessionIndex } from "../broker/session-index";
 import {
 	collectAuthenticatedProfileProviders,
@@ -3002,10 +3002,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRegistered) return;
 			try {
-				await ensureBroker({
-					agentDir: options.agentDir,
-					expectedPackageGeneration: resolveSdkPackageGeneration(),
-				});
+				await ensureBroker({ agentDir: options.agentDir });
 				const index = await new SessionIndex(options.agentDir).open();
 				const locator = { repo: path.resolve(ctx.cwd), stateRoot };
 				await runtime.registerWithBroker({

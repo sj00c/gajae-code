@@ -949,7 +949,9 @@ export default class Sdk extends Command {
 			agentDir,
 			// Published in broker discovery so ensurers can retire a broker that
 			// predates the current package install instead of reusing stale code.
-			packageGeneration: resolveSdkPackageGeneration(),
+			packageGeneration: process.env.GJC_SDK_PACKAGE_GENERATION ?? resolveSdkPackageGeneration(),
+			packageVersion: process.env.GJC_SDK_PACKAGE_VERSION,
+			installationIdentity: process.env.GJC_SDK_INSTALLATION_IDENTITY,
 			resolveDirectoryMigration: async cwd => {
 				const policy = (await Settings.loadForScope({ cwd, agentDir })).get("session.directoryMigration");
 				return policy === "disabled" ? "disabled" : "copy-retain";

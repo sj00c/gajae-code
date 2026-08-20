@@ -10,6 +10,7 @@ import { SdkClientError } from "../src/sdk/client";
 import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
 import type { SessionAttachment } from "../src/sdk/router";
 import { SESSION_ABORT_TIMEOUT_MS, SESSION_REQUEST_TIMEOUT_MS } from "../src/sdk/session-reconnect";
+import { TEST_BROKER_PACKAGE_AUTHORITY } from "./helpers/sdk-broker-fixture";
 
 class FakeSdkClient {
 	connectionId = "acp-connection";
@@ -675,6 +676,8 @@ test("the production ACP MCP launch path preserves broker admission timeout fail
 			version: 1,
 			protocolVersion: 3,
 			packageGeneration: "test",
+			packageVersion: TEST_BROKER_PACKAGE_AUTHORITY.packageVersion,
+			installationIdentity: TEST_BROKER_PACKAGE_AUTHORITY.installationIdentity,
 			ownerId: "acp-admission-timeout-owner",
 			pid: process.pid,
 			host: "127.0.0.1",

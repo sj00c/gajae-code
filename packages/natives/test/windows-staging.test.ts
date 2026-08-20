@@ -22,7 +22,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { NodeModulesStageContext } from "../native/loader-state.js";
 import {
 	getAddonFilenames,
 	loadNative,
@@ -148,6 +147,8 @@ describe("windows native addon staging", () => {
 			const errors: string[] = [];
 			const staged = maybeStageNodeModulesAddon(
 				{
+					isCompiledBinary: false,
+					platformTag: "win32-x64",
 					stageFromNodeModules: true,
 					versionedDir,
 					addonFilenames: [filename],
@@ -166,6 +167,8 @@ describe("windows native addon staging", () => {
 			expect(
 				maybeStageNodeModulesAddon(
 					{
+						isCompiledBinary: false,
+						platformTag: "win32-x64",
 						stageFromNodeModules: true,
 						versionedDir,
 						addonFilenames: [filename],
@@ -209,8 +212,7 @@ describe("windows native addon staging", () => {
 						candidates: [stagedPath, sourcePath],
 					},
 					extractEmbeddedAddons: () => [],
-					stageNodeModulesAddon: (ctx, stageErrors) =>
-						maybeStageNodeModulesAddon(ctx as NodeModulesStageContext, stageErrors),
+					stageNodeModulesAddon: (ctx, stageErrors) => maybeStageNodeModulesAddon(ctx, stageErrors),
 					requireCandidate: candidate => {
 						attempted.push(candidate);
 						if (candidate === stagedPath || candidate === sourcePath) {

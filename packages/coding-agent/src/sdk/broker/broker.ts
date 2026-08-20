@@ -802,12 +802,17 @@ export class Broker {
 	#resolveCompletion!: () => void;
 	#rejectCompletion!: (error: unknown) => void;
 	constructor(settings: BrokerSettings) {
-		const authority = resolveSdkPackageAuthority();
+		const authority =
+			settings.packageGeneration === undefined ||
+			settings.packageVersion === undefined ||
+			settings.installationIdentity === undefined
+				? resolveSdkPackageAuthority()
+				: undefined;
 		this.settings = {
 			agentDir: settings.agentDir,
-			packageGeneration: settings.packageGeneration ?? authority.generation,
-			packageVersion: settings.packageVersion ?? authority.packageVersion,
-			installationIdentity: settings.installationIdentity ?? authority.installationIdentity,
+			packageGeneration: settings.packageGeneration ?? authority!.generation,
+			packageVersion: settings.packageVersion ?? authority!.packageVersion,
+			installationIdentity: settings.installationIdentity ?? authority!.installationIdentity,
 			port: settings.port ?? 0,
 			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
 			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),

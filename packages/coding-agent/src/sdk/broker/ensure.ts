@@ -136,6 +136,8 @@ type EnsureOutcome =
 interface EnsureInFlight {
 	initiator: EnsureInitiator;
 	expectedPackageGeneration: string;
+	expectedPackageVersion: string;
+	expectedInstallationIdentity: string;
 	promise: Promise<EnsureOutcome>;
 	discovery: Promise<BrokerDiscovery>;
 }
@@ -383,6 +385,29 @@ function sameBrokerIdentity(left: BrokerDiscovery, right: BrokerDiscovery): bool
 	);
 }
 
+function hasCompletePackageAuthority(discovery: BrokerDiscovery): boolean {
+	return typeof discovery.packageVersion === "string" && typeof discovery.installationIdentity === "string";
+}
+
+function isAuthorizedBrokerEndpoint(discovery: BrokerDiscovery): boolean {
+	try {
+		const endpoint = new URL(discovery.url);
+		return (
+			endpoint.protocol === "ws:" &&
+			endpoint.hostname === "127.0.0.1" &&
+			endpoint.hostname === discovery.host &&
+			endpoint.port === String(discovery.port) &&
+			endpoint.username === "" &&
+			endpoint.password === "" &&
+			endpoint.pathname === "/" &&
+			endpoint.search === "" &&
+			endpoint.hash === ""
+		);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Stop a live broker whose published generation differs from the package this
  * process would spawn. The authenticated `broker.shutdown` op is tried first;
@@ -396,10 +421,15 @@ async function retireStaleBroker(
 	expectedPackageGeneration: string,
 	heartbeatTtlMs?: number,
 ): Promise<boolean> {
-	const preflightAuthority = resolveSdkPackageAuthority();
+	const preflightAuthority = resolveSdkPackageAuthority({ force: true });
 	if (preflightAuthority.generation !== expectedPackageGeneration) return false;
-	if (!canRetireStaleBroker(stale, preflightAuthority)) return false;
+	const legacy = !hasCompletePackageAuthority(stale);
+	if (!legacy && !canRetireStaleBroker(stale, preflightAuthority)) return false;
+	const currentBeforeConnect = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
+	if (!currentBeforeConnect || !sameBrokerIdentity(currentBeforeConnect, stale)) return false;
+	if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
 	try {
+		if (legacy) throw new Error("legacy broker discovery requires signal fallback");
 		const client = await SdkClient.connect(stale.url, stale.token, {
 			timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
 			reconnectAttempts: 0,
@@ -413,12 +443,13 @@ async function retireStaleBroker(
 		// RPC unreachable or unknown_operation (broker predates the shutdown op):
 		// Re-read both installation authority and the publication identity immediately
 		// before signaling. A replacement or package mutation must never be targeted.
-		const currentAuthority = resolveSdkPackageAuthority();
+		const currentAuthority = resolveSdkPackageAuthority({ force: true });
 		if (currentAuthority.generation !== expectedPackageGeneration) return false;
-		if (!canRetireStaleBroker(stale, currentAuthority)) return false;
+		if (!legacy && !canRetireStaleBroker(stale, currentAuthority)) return false;
 		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 		if (!current) return true;
 		if (!sameBrokerIdentity(current, stale)) return true;
+		if (!isAuthorizedBrokerEndpoint(current)) return false;
 		if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
 	}
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
@@ -433,8 +464,17 @@ async function retireStaleBroker(
 function matchesExpectedPackageGeneration(
 	discovery: BrokerDiscovery,
 	expectedPackageGeneration: string | undefined,
+	expectedPackageVersion?: string,
+	expectedInstallationIdentity?: string,
 ): boolean {
-	return expectedPackageGeneration === undefined || discovery.packageGeneration === expectedPackageGeneration;
+	return (
+		expectedPackageGeneration === undefined ||
+		(isAuthorizedBrokerEndpoint(discovery) &&
+			discovery.packageGeneration === expectedPackageGeneration &&
+			(expectedPackageVersion === undefined || discovery.packageVersion === expectedPackageVersion) &&
+			(expectedInstallationIdentity === undefined ||
+				discovery.installationIdentity === expectedInstallationIdentity))
+	);
 }
 
 function staleBrokerRetirementUnverified(
@@ -452,7 +492,7 @@ async function retireAndReadReplacement(
 ): Promise<BrokerDiscovery | undefined> {
 	const expectedPackageGeneration = settings.expectedPackageGeneration;
 	if (expectedPackageGeneration === undefined) return stale;
-	const authority = resolveSdkPackageAuthority();
+	const authority = resolveSdkPackageAuthority({ force: true });
 	if (authority.generation !== expectedPackageGeneration)
 		throw new Error(
 			`SDK broker package generation changed before retirement: expected ${expectedPackageGeneration}, resolved ${authority.generation}.`,
@@ -463,8 +503,12 @@ async function retireAndReadReplacement(
 			settings.expectedInstallationIdentity !== authority.installationIdentity)
 	)
 		throw new Error("SDK broker package installation identity changed before retirement.");
-	if (!canRetireStaleBroker(stale, authority))
+	if (hasCompletePackageAuthority(stale)) {
+		if (!canRetireStaleBroker(stale, authority))
+			throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
+	} else if (stale.packageGeneration === expectedPackageGeneration) {
 		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
+	}
 	const retired = await retireStaleBroker(
 		settings.agentDir,
 		stale,
@@ -474,12 +518,18 @@ async function retireAndReadReplacement(
 	if (!retired) throw staleBrokerRetirementUnverified(expectedPackageGeneration, stale.packageGeneration);
 	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 	if (!replacement) return undefined;
-	const currentPackageGeneration = resolveSdkPackageAuthority().generation;
+	const currentPackageGeneration = resolveSdkPackageAuthority({ force: true }).generation;
 	if (currentPackageGeneration !== expectedPackageGeneration)
 		throw new Error(
 			`SDK broker package generation changed during retirement: expected ${expectedPackageGeneration}, resolved ${currentPackageGeneration}.`,
 		);
-	if (replacement.packageGeneration === currentPackageGeneration) return replacement;
+	const currentAuthorityAfterRetirement = resolveSdkPackageAuthority({ force: true });
+	if (
+		replacement.packageGeneration === currentPackageGeneration &&
+		replacement.packageVersion === currentAuthorityAfterRetirement.packageVersion &&
+		replacement.installationIdentity === currentAuthorityAfterRetirement.installationIdentity
+	)
+		return replacement;
 	throw staleBrokerRetirementUnverified(currentPackageGeneration, replacement.packageGeneration);
 }
 
@@ -493,21 +543,37 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		if (
 			priorOwner.canReuse(existing) &&
 			existing !== null &&
-			matchesExpectedPackageGeneration(existing, settings.expectedPackageGeneration)
+			matchesExpectedPackageGeneration(
+				existing,
+				settings.expectedPackageGeneration,
+				settings.expectedPackageVersion,
+				settings.expectedInstallationIdentity,
+			)
 		)
 			return { kind: "prior-local-owner", discovery: existing, owner: priorOwner };
 		await priorOwner.stop();
 		const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 		if (discoveredAfterCleanup) {
-			if (matchesExpectedPackageGeneration(discoveredAfterCleanup, settings.expectedPackageGeneration))
+			if (
+				matchesExpectedPackageGeneration(
+					discoveredAfterCleanup,
+					settings.expectedPackageGeneration,
+					settings.expectedPackageVersion,
+					settings.expectedInstallationIdentity,
+				)
+			)
 				return { kind: "external-discovery", discovery: discoveredAfterCleanup };
 			const replacement = await retireAndReadReplacement(settings, discoveredAfterCleanup);
 			if (replacement) return { kind: "external-discovery", discovery: replacement };
 		}
 	} else if (existing) {
-		const stale =
-			settings.expectedPackageGeneration !== undefined &&
-			existing.packageGeneration !== settings.expectedPackageGeneration;
+		const accepted = matchesExpectedPackageGeneration(
+			existing,
+			settings.expectedPackageGeneration,
+			settings.expectedPackageVersion,
+			settings.expectedInstallationIdentity,
+		);
+		const stale = settings.expectedPackageGeneration !== undefined && !accepted;
 		if (!stale) return { kind: "external-discovery", discovery: existing };
 		const replacement = await retireAndReadReplacement(settings, existing);
 		if (replacement) return { kind: "external-discovery", discovery: replacement };
@@ -522,10 +588,14 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	// A stale marker must never be misattributed to this spawn; clear it first.
 	await clearBrokerStartupFailureMarker(settings.agentDir);
 	try {
+		const environment = brokerSpawnEnvironment(command, settings.env);
+		environment.GJC_SDK_PACKAGE_GENERATION = command.generation;
+		if (command.packageVersion) environment.GJC_SDK_PACKAGE_VERSION = command.packageVersion;
+		if (command.installationIdentity) environment.GJC_SDK_INSTALLATION_IDENTITY = command.installationIdentity;
 		const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
 			detached: true,
 			stdio: ["ignore", "ignore", spawnLog ? spawnLog.handle.fd : "ignore"],
-			env: brokerSpawnEnvironment(command, settings.env),
+			env: environment,
 			...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 		});
 		// The child holds its own duplicate of the descriptor; this one is done.
@@ -629,7 +699,14 @@ function startEnsure(settings: EnsureBrokerSettings, initiator: EnsureInitiator)
 	const promise = ensureBrokerOnce(settings, initiator);
 	const discovery = promise.then(outcome => outcome.discovery);
 	void discovery.catch(() => {});
-	const entry = { initiator, expectedPackageGeneration: settings.expectedPackageGeneration!, promise, discovery };
+	const entry = {
+		initiator,
+		expectedPackageGeneration: settings.expectedPackageGeneration!,
+		expectedPackageVersion: settings.expectedPackageVersion!,
+		expectedInstallationIdentity: settings.expectedInstallationIdentity!,
+		promise,
+		discovery,
+	};
 	ensureInFlight.set(settings.agentDir, entry);
 	const clear = (): void => {
 		if (ensureInFlight.get(settings.agentDir) === entry) ensureInFlight.delete(settings.agentDir);
@@ -652,9 +729,22 @@ function normalizeEnsureSettings(settings: EnsureBrokerSettings): EnsureBrokerSe
 export function ensureBroker(settings: EnsureBrokerSettings): Promise<BrokerDiscovery> {
 	const normalized = normalizeEnsureSettings(settings);
 	const inFlight = ensureInFlight.get(normalized.agentDir) ?? startEnsure(normalized, "discovery");
-	if (inFlight.expectedPackageGeneration === normalized.expectedPackageGeneration) return inFlight.discovery;
+	if (
+		inFlight.expectedPackageGeneration === normalized.expectedPackageGeneration &&
+		inFlight.expectedPackageVersion === normalized.expectedPackageVersion &&
+		inFlight.expectedInstallationIdentity === normalized.expectedInstallationIdentity
+	)
+		return inFlight.discovery;
 	return inFlight.discovery.then(discovery => {
-		if (matchesExpectedPackageGeneration(discovery, normalized.expectedPackageGeneration)) return discovery;
+		if (
+			matchesExpectedPackageGeneration(
+				discovery,
+				normalized.expectedPackageGeneration,
+				normalized.expectedPackageVersion,
+				normalized.expectedInstallationIdentity,
+			)
+		)
+			return discovery;
 		throw staleBrokerRetirementUnverified(normalized.expectedPackageGeneration!, discovery.packageGeneration);
 	});
 }

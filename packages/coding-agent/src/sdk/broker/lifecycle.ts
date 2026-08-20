@@ -3691,6 +3691,9 @@ async function executeLifecycleResponse(
 					stdio: "ignore",
 					env: {
 						...("kind" in cmd ? cmd.env : process.env),
+						GJC_SDK_PACKAGE_GENERATION: cmd.generation,
+						...(cmd.packageVersion ? { GJC_SDK_PACKAGE_VERSION: cmd.packageVersion } : {}),
+						...(cmd.installationIdentity ? { GJC_SDK_INSTALLATION_IDENTITY: cmd.installationIdentity } : {}),
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 						GJC_SESSION_ID: launch.id,

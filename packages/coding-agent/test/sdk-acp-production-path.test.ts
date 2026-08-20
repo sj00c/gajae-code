@@ -5,6 +5,7 @@ import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { resolveSdkPackageAuthority } from "../src/sdk/broker/runtime";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 
 type TestServer = {
@@ -15,6 +16,7 @@ type TestServer = {
 
 const directories: string[] = [];
 const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
+const packageAuthority = resolveSdkPackageAuthority();
 
 afterEach(async () => {
 	for (const server of servers.splice(0)) server.stop(true);
@@ -74,6 +76,8 @@ async function createSessionListBroker(
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
+		packageVersion: packageAuthority.packageVersion,
+		installationIdentity: packageAuthority.installationIdentity,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",
@@ -134,6 +138,8 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
+		packageVersion: packageAuthority.packageVersion,
+		installationIdentity: packageAuthority.installationIdentity,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",
@@ -651,6 +657,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
+		packageVersion: packageAuthority.packageVersion,
+		installationIdentity: packageAuthority.installationIdentity,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",

@@ -463,9 +463,26 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 	if (!ctx.stageFromNodeModules) return null;
 
 	let stagedPath = null;
-	const rejectCandidates = candidates => {
+	const rejectFilename = filename => {
 		if (!Array.isArray(ctx.candidates)) return;
-		ctx.candidates = ctx.candidates.filter(candidate => !candidates.includes(candidate));
+		ctx.candidates = ctx.candidates.filter(candidate => path.basename(candidate) !== filename);
+	};
+	const refreshAddon = (sourcePath, refreshPath) => {
+		if (fs.existsSync(refreshPath) && addonBytesMatch(refreshPath, sourcePath)) return refreshPath;
+		const temporaryPath = `${refreshPath}.tmp-${process.pid}`;
+		try {
+			fs.copyFileSync(sourcePath, temporaryPath);
+			try {
+				fs.renameSync(temporaryPath, refreshPath);
+			} catch {
+				if (!addonBytesMatch(refreshPath, sourcePath)) throw new Error("refresh destination is unavailable");
+				fs.rmSync(temporaryPath, { force: true });
+			}
+			if (!addonBytesMatch(refreshPath, sourcePath)) throw new Error("restaged addon bytes do not match the current package artifact");
+			return refreshPath;
+		} finally {
+			fs.rmSync(temporaryPath, { force: true });
+		}
 	};
 	const sourceDirs = [...ctx.optionalPackageNativeDirs, ctx.nativeDir];
 	for (const filename of ctx.addonFilenames) {
@@ -475,22 +492,23 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 		if (fs.existsSync(targetPath)) {
 			if (!sourcePath) {
 				errors.push(`staged addon orphan (${filename}): no current package artifact exists`);
-				rejectCandidates([targetPath]);
+				rejectFilename(filename);
 				continue;
 			}
 			if (sourcePath && !addonBytesMatch(targetPath, sourcePath)) {
 				errors.push(`staged addon drift (${filename}): cached bytes differ from the current package artifact`);
-				rejectCandidates([targetPath, sourcePath]);
+				rejectFilename(filename);
 				try {
 					const refreshPath = path.join(ctx.versionedDir, `.refresh-${addonContentDigest(sourcePath)}-${filename}`);
-					if (!fs.existsSync(refreshPath)) fs.copyFileSync(sourcePath, refreshPath);
-					if (!addonBytesMatch(refreshPath, sourcePath)) {
-						throw new Error("restaged addon bytes do not match the current package artifact");
-					}
-					stagedPath = stagedPath || refreshPath;
+					const refreshed = refreshAddon(sourcePath, refreshPath);
+					ctx.candidates = [refreshed, ...(ctx.candidates ?? [])].filter(
+						(candidate, index, all) => all.indexOf(candidate) === index,
+					);
+					stagedPath = stagedPath || refreshed;
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					errors.push(`staged addon refresh (${filename}): ${message}`);
+					rejectFilename(filename);
 				}
 				continue;
 			}

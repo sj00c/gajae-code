@@ -111,16 +111,7 @@ export interface LoaderContext {
 	selectedVariant?: "modern" | "baseline" | null;
 }
 
-export interface NodeModulesStageContext {
-	stageFromNodeModules: boolean;
-	versionedDir: string;
-	addonFilenames: string[];
-	optionalPackageNativeDirs: string[];
-	nativeDir: string;
-	candidates?: string[];
-}
-
-export function maybeStageNodeModulesAddon(ctx: NodeModulesStageContext, errors: string[]): string | null;
+export function maybeStageNodeModulesAddon(ctx: LoaderContext, errors: string[]): string | null;
 
 export function embeddedAddonIsAuthoritative(
 	ctx: LoaderContext,

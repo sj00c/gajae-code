@@ -4,6 +4,7 @@ import type { AgentSideConnection, PromptRequest, SessionNotification } from "@a
 import { logger, TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { TEST_BROKER_PACKAGE_AUTHORITY } from "../helpers/sdk-broker-fixture";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -269,6 +270,8 @@ export function createFixture(
 			version: 1,
 			protocolVersion: 3,
 			packageGeneration: "test",
+			packageVersion: TEST_BROKER_PACKAGE_AUTHORITY.packageVersion,
+			installationIdentity: TEST_BROKER_PACKAGE_AUTHORITY.installationIdentity,
 			ownerId: "test-owner",
 			pid: process.pid,
 			host: "127.0.0.1",

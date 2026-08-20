@@ -20,6 +20,7 @@ import type {
 	SlashCommandRuntime,
 	TuiSlashCommandRuntime,
 } from "../src/slash-commands/types";
+import { TEST_BROKER_PACKAGE_AUTHORITY } from "./helpers/sdk-broker-fixture";
 
 /**
  * Writes the SDK session endpoint file and the session-index registration event
@@ -196,6 +197,8 @@ async function createAcpPromptFixture(): Promise<AcpPromptFixture> {
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
+		packageVersion: TEST_BROKER_PACKAGE_AUTHORITY.packageVersion,
+		installationIdentity: TEST_BROKER_PACKAGE_AUTHORITY.installationIdentity,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",

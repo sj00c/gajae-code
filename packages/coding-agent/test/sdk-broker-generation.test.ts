@@ -16,6 +16,7 @@ import {
 	resolveSdkPackageAuthority,
 	resolveSdkPackageGeneration,
 } from "../src/sdk/broker/runtime";
+import { SdkClient } from "../src/sdk/client/client";
 
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-generation-"));
 
@@ -278,6 +279,37 @@ describe("sdk broker package generation", () => {
 			expect(signalRoot).not.toHaveBeenCalled();
 		} finally {
 			fromPid.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not connect with a token to an unvalidated stale endpoint", async () => {
+		const dir = await temp();
+		const authority = resolveSdkPackageAuthority();
+		const incarnation = brokerProcessIncarnation(process.pid);
+		const connect = vi.spyOn(SdkClient, "connect");
+		try {
+			expect(incarnation).toBeString();
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "legacy-endpoint-generation",
+				packageVersion: olderPackageVersion(authority.packageVersion),
+				installationIdentity: authority.installationIdentity,
+				ownerId: "unvalidated-endpoint",
+				pid: process.pid,
+				incarnation: incarnation!,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://localhost:1/unvalidated",
+				token: "must-not-be-sent",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			await expect(ensureBroker({ agentDir: dir })).rejects.toThrow("stale broker retirement was not verified");
+			expect(connect).not.toHaveBeenCalled();
+		} finally {
+			connect.mockRestore();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
