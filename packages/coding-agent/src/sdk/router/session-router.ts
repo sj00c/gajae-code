@@ -380,6 +380,12 @@ export class SessionRouter {
 		{ generation: number; frames: Array<{ seq: number; frame: Record<string, unknown> }> }
 	>();
 	readonly #reviving = new Set<string>();
+	/**
+	 * Endpoint-file inode captured when each attachment was published (#4730
+	 * review). Maintenance renewal compares against this so a rename-replace that
+	 * preserves size, mtime and body cannot keep a superseded endpoint authorized.
+	 */
+	readonly #endpointInodes = new Map<string, bigint>();
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
@@ -946,8 +952,20 @@ export class SessionRouter {
 		const indexed = attached.indexed;
 		if (!isSessionAuthorityEligible(indexed)) return false;
 		if (indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return false;
+		// mtime alone is not a replacement-safe identity (#4730 review): a rewrite or
+		// rename-replace inside one filesystem tick can preserve it. The inode the
+		// attachment was PUBLISHED against is therefore the identity, and the
+		// generation is compared so a re-registration reusing the same url/token/pid
+		// cannot keep the old attachment authorized.
+		const publishedIno = this.#endpointInodes.get(attached.id);
+		if (publishedIno === undefined) return false;
 		const statBefore = await fs.stat(attached.endpoint.path).catch(() => undefined);
-		if (!statBefore || statBefore.mtimeMs !== indexed.endpointMtimeMs) return false;
+		const inoBefore = await fs
+			.stat(attached.endpoint.path, { bigint: true })
+			.then(value => value.ino)
+			.catch(() => undefined);
+		if (!statBefore || inoBefore === undefined || inoBefore !== publishedIno) return false;
+		if (statBefore.mtimeMs !== indexed.endpointMtimeMs) return false;
 		let raw: Record<string, unknown>;
 		try {
 			const parsed = JSON.parse(await Bun.file(attached.endpoint.path).text());
@@ -964,8 +982,21 @@ export class SessionRouter {
 			raw.token !== attached.endpoint.token
 		)
 			return false;
+		// The endpoint record itself carries no generation, so generation identity
+		// comes from the indexed row this attachment was published against.
+		if (indexed.endpointGeneration !== attached.generation) return false;
+		if (raw.endpointGeneration !== undefined && raw.endpointGeneration !== attached.generation) return false;
 		const statAfter = await fs.stat(attached.endpoint.path).catch(() => undefined);
-		return statAfter !== undefined && statAfter.mtimeMs === indexed.endpointMtimeMs;
+		const inoAfter = await fs
+			.stat(attached.endpoint.path, { bigint: true })
+			.then(value => value.ino)
+			.catch(() => undefined);
+		return (
+			statAfter !== undefined &&
+			inoAfter !== undefined &&
+			statAfter.mtimeMs === indexed.endpointMtimeMs &&
+			inoAfter === publishedIno
+		);
 	}
 
 	async #readEndpoint(indexed: IndexedSession): Promise<SdkSessionEndpoint | null> {
@@ -1280,6 +1311,13 @@ export class SessionRouter {
 			},
 		};
 		this.#sessions.set(indexed.sessionId, attached);
+		this.#endpointInodes.set(
+			attached.id,
+			await fs
+				.stat(endpoint.path, { bigint: true })
+				.then(value => value.ino)
+				.catch(() => 0n),
+		);
 		if (deferPublication)
 			this.#adopted.set(indexed.sessionId, {
 				generation: indexed.endpointGeneration,
@@ -1537,6 +1575,7 @@ export class SessionRouter {
 		if (this.#sessions.get(attached.sessionId) !== attached) return;
 		this.#retirementVersions.set(attached.sessionId, (this.#retirementVersions.get(attached.sessionId) ?? 0) + 1);
 		this.#sessions.delete(attached.sessionId);
+		this.#endpointInodes.delete(attached.id);
 		attached.dispose();
 		const gate = Promise.withResolvers<void>();
 		this.#retirements.set(attached.sessionId, gate.promise);

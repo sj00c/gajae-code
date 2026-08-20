@@ -1906,6 +1906,90 @@ describe("SessionRouter dispatch authority", () => {
 			await router.stop();
 		}
 	});
+	test("sendMaintenance fails closed when the endpoint file is replaced under it (#4730 review)", async () => {
+		// A replacement that preserves sessionId/pid/url/token and even mtime must
+		// not keep the old attachment authorized: mtime is not a replacement-safe
+		// identity. The inode is, so a rename-replace under the heartbeat has to
+		// fail closed rather than renew a lease against a superseded endpoint.
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4730-hbrepl-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const sessionId = "hb-replaced";
+		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+		const body = JSON.stringify({ sessionId, url: "ws://hbrepl.test", token: "v1", pid: 42 });
+		await Bun.write(endpointFile, body);
+		let indexedMtimeMs = fs.statSync(endpointFile).mtimeMs;
+		const sent: Record<string, unknown>[] = [];
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			refreshIfChanged: async () => true,
+			get indexSeq() {
+				return 1;
+			},
+			listSessions: () => ({
+				indexSeq: 1,
+				sessions: [
+					{
+						sessionId,
+						locator: { repo, stateRoot },
+						endpointGeneration: 1,
+						pid: 42,
+						endpointMtimeMs: indexedMtimeMs,
+						live: true,
+						indexSeq: 1,
+						ambiguous: false,
+						terminal: false,
+					},
+				],
+				warnings: [],
+			}),
+		} as unknown as SessionIndex;
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => ({
+					onFrame: () => () => {},
+					request: async () => ({ events: [] }),
+					close: async () => {},
+					send: (frame: Record<string, unknown>) => {
+						sent.push(frame);
+					},
+				}),
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+		try {
+			await router.start();
+			const attachment = router.attachment(sessionId);
+			expect(attachment?.isCurrent()).toBe(true);
+			// Control: renewal works against the original record.
+			await attachment!.sendMaintenance?.("lease-ok");
+			expect(sent).toHaveLength(1);
+
+			// Rename-replace the endpoint with identical bytes, then declare the
+			// replacement's own mtime as the indexed authority so the mtime fence
+			// passes and ONLY the inode can distinguish the new file. That is the
+			// case a same-tick rename-over produces on a coarse filesystem.
+			const staging = `${endpointFile}.repl.tmp`;
+			await Bun.write(staging, body);
+			await fsPromises.rename(staging, endpointFile);
+			indexedMtimeMs = fs.statSync(endpointFile).mtimeMs;
+
+			await expect(attachment!.sendMaintenance?.("lease-after-replace")).rejects.toThrow(
+				/endpoint authority changed/i,
+			);
+			// No heartbeat frame was emitted for the superseded endpoint.
+			expect(sent).toHaveLength(1);
+		} finally {
+			await router.stop();
+		}
+	});
 	test("idle sweep retires an attachment whose row goes dead or stale (#4689 review)", async () => {
 		// The sweep exists so time-driven transitions are still detected once the
 		// 2s tick stopped projecting. Proving the body ran is not enough: the row
