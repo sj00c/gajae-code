@@ -1974,12 +1974,19 @@ describe("SessionRouter dispatch authority", () => {
 
 			// Rename-replace the endpoint with identical bytes, then declare the
 			// replacement's own mtime as the indexed authority so the mtime fence
-			// passes and ONLY the inode can distinguish the new file. That is the
+			// PASSES and ONLY the inode can distinguish the new file. That is the
 			// case a same-tick rename-over produces on a coarse filesystem.
+			const originalIno = fs.statSync(endpointFile).ino;
 			const staging = `${endpointFile}.repl.tmp`;
 			await Bun.write(staging, body);
 			await fsPromises.rename(staging, endpointFile);
 			indexedMtimeMs = fs.statSync(endpointFile).mtimeMs;
+			// Assert the collision the test depends on: the mtime fence cannot
+			// reject this replacement, and the inode is the only difference. Without
+			// this the test could pass through the mtime fence and prove nothing.
+			const replaced = fs.statSync(endpointFile);
+			expect(replaced.mtimeMs).toBe(indexedMtimeMs);
+			expect(replaced.ino).not.toBe(originalIno);
 
 			await expect(attachment!.sendMaintenance?.("lease-after-replace")).rejects.toThrow(
 				/endpoint authority changed/i,

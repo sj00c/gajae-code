@@ -1308,6 +1308,10 @@ export class SessionRouter {
 						new SessionRouterError("pre_send", "SDK session publication was detached before completion."),
 					);
 				barrier.held = undefined;
+				// Every teardown path (retirement, replacement, stop, failed
+				// publication) routes through dispose(), so the published-inode entry
+				// is dropped here rather than at one call site (#4730 review).
+				if (attached) this.#endpointInodes.delete(attached.id);
 			},
 		};
 		this.#sessions.set(indexed.sessionId, attached);
@@ -1575,7 +1579,6 @@ export class SessionRouter {
 		if (this.#sessions.get(attached.sessionId) !== attached) return;
 		this.#retirementVersions.set(attached.sessionId, (this.#retirementVersions.get(attached.sessionId) ?? 0) + 1);
 		this.#sessions.delete(attached.sessionId);
-		this.#endpointInodes.delete(attached.id);
 		attached.dispose();
 		const gate = Promise.withResolvers<void>();
 		this.#retirements.set(attached.sessionId, gate.promise);

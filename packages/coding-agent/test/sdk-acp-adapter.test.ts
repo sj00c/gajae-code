@@ -132,6 +132,39 @@ const waitFor = async (predicate: () => boolean, label: string): Promise<void> =
 	throw new Error(`Timed out waiting for ${label}`);
 };
 
+test("an attachment without sendMaintenance is rejected at setup, leaving no lease (#4730 review)", async () => {
+	// A custom attachment that predates the maintenance capability must fail with
+	// an explicit migration error at setup, not silently stop renewing leases
+	// later when the heartbeat fires.
+	const harness = createRouterHarness();
+	const legacy: SessionAttachment = {
+		sessionId: harness.attachment.sessionId,
+		connectionId: "router-connection-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async frame => {
+			harness.sent.push(frame);
+		},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: legacy,
+		sessionId: legacy.sessionId,
+		providers: [{ capability: "ui", definitions: [] }],
+		heartbeatMs: 5,
+	});
+	await expect(adapter.start()).rejects.toThrow(/sendMaintenance/);
+	try {
+		// No heartbeat may be emitted for an attachment that cannot renew.
+		const before = harness.maintenance.length;
+		await Bun.sleep(40);
+		expect(harness.maintenance.length).toBe(before);
+		expect(harness.maintenance).toHaveLength(0);
+	} finally {
+		await adapter.close();
+	}
+});
+
 test("ACP lease heartbeats take the maintenance route, never the reconciling send path (#4689)", async () => {
 	// The 5s lease heartbeat was one of the two timers that forced a locked
 	// authority reconcile per attached session. A regression back to send() (or
