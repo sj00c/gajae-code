@@ -3685,15 +3685,23 @@ async function executeLifecycleResponse(
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
+				const commandEnvironment =
+					"kind" in cmd
+						? {
+								...cmd.env,
+								GJC_SDK_PACKAGE_GENERATION: cmd.generation,
+								...(cmd.packageVersion ? { GJC_SDK_PACKAGE_VERSION: cmd.packageVersion } : {}),
+								...(cmd.installationIdentity
+									? { GJC_SDK_INSTALLATION_IDENTITY: cmd.installationIdentity }
+									: {}),
+							}
+						: process.env;
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
 					stdio: "ignore",
 					env: {
-						...("kind" in cmd ? cmd.env : process.env),
-						GJC_SDK_PACKAGE_GENERATION: cmd.generation,
-						...(cmd.packageVersion ? { GJC_SDK_PACKAGE_VERSION: cmd.packageVersion } : {}),
-						...(cmd.installationIdentity ? { GJC_SDK_INSTALLATION_IDENTITY: cmd.installationIdentity } : {}),
+						...commandEnvironment,
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 						GJC_SESSION_ID: launch.id,
