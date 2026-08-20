@@ -155,6 +155,54 @@ describe("online-if-uncached model refresh", () => {
 		expect(discoveryCalls).toBe(1);
 	});
 
+	test("coalesces concurrent refreshes when the cache is missing", async () => {
+		const providerId = "cache-concurrent-missing-dynamic-catalog";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		const fetchStarted = Promise.withResolvers<void>();
+		const releaseFetch = Promise.withResolvers<void>();
+		let discoveryCalls = 0;
+		const options = {
+			providerId,
+			staticModels,
+			cacheDbPath,
+			cacheDynamicModelProvenance: provenance,
+			now: () => now,
+			fetchDynamicModels: async () => {
+				discoveryCalls += 1;
+				fetchStarted.resolve();
+				await releaseFetch.promise;
+				return [model(providerId, "dynamic")];
+			},
+		};
+
+		const first = resolveProviderModels<Api>(options, "online-if-uncached");
+		await fetchStarted.promise;
+		const second = resolveProviderModels<Api>(options, "online-if-uncached");
+		expect(discoveryCalls).toBe(1);
+
+		releaseFetch.resolve();
+		const [firstResult, secondResult] = await Promise.all([first, second]);
+		expect(firstResult.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
+		expect(secondResult.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
+	});
+
+	test("sanitizes poisoned cached display names", async () => {
+		const providerId = "cache-poisoned-display-name";
+		const now = 1_700_000_000_000;
+		const poisoned = { ...model(providerId, "cached-id"), name: `\u001b]0;pwned\u0007Cached\n${"x".repeat(300)}` };
+		writeModelCache(providerId, now, [poisoned], true, "empty", cacheDbPath);
+
+		const result = await resolveProviderModels<Api>(
+			{ providerId, staticModels: [], cacheDbPath, now: () => now },
+			"offline",
+		);
+
+		expect(result.models[0]?.name).toBe("Cached x".padEnd(200, "x"));
+		expect(result.models[0]?.name).toMatch(/^[^\x00-\x1f\x7f]*$/);
+	});
+
 	test("retains authoritative dynamic IDs separately from merged static models", async () => {
 		const providerId = "cache-authoritative-ids";
 		const staticModels = [model(providerId, "static")];

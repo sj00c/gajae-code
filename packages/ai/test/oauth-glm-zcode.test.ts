@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import { getBundledModel } from "../src/models";
@@ -10,6 +11,7 @@ import {
 	buildAnthropicClientOptions,
 	buildAnthropicHeaders,
 	buildZCodeSourceHeaders,
+	resolveGlmZcodeAnthropicBaseUrl,
 } from "../src/providers/anthropic";
 import { isOAuthToken } from "../src/utils/anthropic-auth";
 import { getOAuthProviders, refreshOAuthToken } from "../src/utils/oauth";
@@ -402,6 +404,51 @@ describe("GLM ZCode OAuth login provider", () => {
 				global.fetch = originalFetch;
 			}
 		});
+	});
+
+	it("falls back from hostile GLM endpoint values", async () => {
+		for (const value of [
+			"http://evil.example.test/anthropic",
+			"javascript:alert(1)",
+			"https://user:password@evil.example.test/anthropic",
+			"https://evil.example.test/anthropic?token=secret",
+			"https://evil.example.test/anthropic#fragment",
+			"https://evil.example.test/a\nX: y",
+		] as const) {
+			await withEnv({ ZCODE_PLAN_ANTHROPIC_BASE_URL: value }, async () => {
+				expect(resolveGlmZcodeAnthropicBaseUrl()).toBe(GLM_ZCODE_ANTHROPIC_BASE_URL);
+			});
+		}
+	});
+
+	it("bounds hostile unbundled IDs and metadata", async () => {
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					data: [
+						{
+							id: "glm-\u001b[31mfuture",
+							name: "\u0000\u007f",
+							context_length: 1e308,
+							max_tokens: 1e308,
+						},
+					],
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			)) as unknown as typeof fetch;
+		try {
+			const discovered = (await fetchDynamicModels())?.[0];
+			expect(discovered?.name).toBe("glm-future");
+			expect(discovered?.name).not.toMatch(/[\x00-\x1f\x7f]/);
+			expect(discovered?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
+			expect(discovered?.maxTokens).toBe(UNK_MAX_TOKENS);
+		} finally {
+			global.fetch = originalFetch;
+		}
 	});
 
 	it("keeps static models when no GLM ZCode credential is configured", () => {

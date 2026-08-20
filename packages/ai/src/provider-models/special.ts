@@ -126,9 +126,10 @@ export function glmZcodeModelManagerOptions(
 									typeof entry.name === "string" && entry.name.length > 0
 										? sanitizeText(entry.name).replace(/\s+/g, " ").trim().slice(0, 200)
 										: "";
+								const safeIdName = sanitizeText(defaults.id).replace(/\s+/g, " ").trim().slice(0, 200);
 								const reference = resolveReference(defaults.id);
 								if (!reference) {
-									return { ...defaults, name: remoteName || defaults.id };
+									return { ...defaults, name: remoteName || safeIdName || "Unnamed model" };
 								}
 								return {
 									...reference,

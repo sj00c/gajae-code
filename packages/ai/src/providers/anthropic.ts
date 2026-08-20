@@ -1146,7 +1146,26 @@ type FoundryTlsOptions = {
 };
 
 export function resolveGlmZcodeAnthropicBaseUrl(): string {
-	return normalizeAnthropicBaseUrl($credentialEnv("ZCODE_PLAN_ANTHROPIC_BASE_URL")) ?? GLM_ZCODE_ANTHROPIC_BASE_URL;
+	const configured = $credentialEnv("ZCODE_PLAN_ANTHROPIC_BASE_URL")?.trim();
+	if (!configured || /[\u0000-\u001f\u007f-\u009f]/u.test(configured)) {
+		return GLM_ZCODE_ANTHROPIC_BASE_URL;
+	}
+	try {
+		const parsed = new URL(configured);
+		if (
+			parsed.protocol !== "https:" ||
+			parsed.hostname.length === 0 ||
+			parsed.username.length > 0 ||
+			parsed.password.length > 0 ||
+			parsed.search.length > 0 ||
+			parsed.hash.length > 0
+		) {
+			return GLM_ZCODE_ANTHROPIC_BASE_URL;
+		}
+		return normalizeAnthropicBaseUrl(parsed.toString()) ?? GLM_ZCODE_ANTHROPIC_BASE_URL;
+	} catch {
+		return GLM_ZCODE_ANTHROPIC_BASE_URL;
+	}
 }
 
 function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: string): string | undefined {

@@ -314,16 +314,17 @@ function extractModelEntriesFromNode(node: unknown): ParsedOpenAICompatibleModel
 }
 
 /**
- * First finite positive number among candidates, else the fallback.
+ * First positive safe integer among candidates, else the fallback.
  *
- * Rejects non-numbers, non-finite values (JSON `1e400` parses to
- * `Infinity`), zero, and negatives so a malformed catalog field can never
- * poison compaction thresholds or output budgets with `Infinity`.
+ * Rejects non-numbers, non-finite values (JSON `1e400` parses to `Infinity`),
+ * fractions, values outside the safe integer range, zero, and negatives so a
+ * malformed catalog field can never poison compaction thresholds or output
+ * budgets.
  */
 function firstPositiveModelNumber(fallback: number, ...candidates: readonly unknown[]): number {
 	for (const candidate of candidates) {
 		const value = toNumber(candidate);
-		if (value !== undefined && value > 0 && Number.isFinite(value)) {
+		if (value !== undefined && Number.isSafeInteger(value) && value > 0) {
 			return value;
 		}
 	}
