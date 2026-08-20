@@ -4,7 +4,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	AUTOROUTING_SELECTOR_MAX_LENGTH,
 	AUTOROUTING_SELECTOR_PATTERN,
+	isValidAutoroutingSelector,
 	type AutoroutingProvenance,
 	type AutoroutingSetup,
 	autoroutingProviderOrderHint,
@@ -154,6 +156,13 @@ describe("autorouting typed settings contract", () => {
 		expect(validateSettingPatch({ "task.autorouting.tiers": { fast: ["bare-model"] } })).toEqual([
 			expect.objectContaining({ path: "task.autorouting.tiers.fast.0" }),
 		]);
+	});
+	it("rejects selectors longer than the routing-evidence bound before execution", () => {
+		const longId = "m".repeat(AUTOROUTING_SELECTOR_MAX_LENGTH);
+		expect(isValidAutoroutingSelector(`provider/${longId}`)).toBe(false);
+		expect(isValidAutoroutingSelector(`provider/${"m".repeat(200)}`)).toBe(true);
+		// The tiers validator must refuse the same over-long selector at config time.
+		expect(validateAutoroutingLocal({ tiers: { fast: [`provider/${longId}`] } })).not.toEqual([]);
 	});
 
 	it("emits closed nested JSON schemas for setup and provenance", async () => {

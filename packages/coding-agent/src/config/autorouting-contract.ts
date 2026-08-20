@@ -46,6 +46,9 @@ export type AutoroutingProvenance = {
 	tiersFingerprint: string;
 };
 
+/** Hard upper bound shared with the routing-evidence invariant in task/types.ts. */
+export const AUTOROUTING_SELECTOR_MAX_LENGTH = 256;
+
 /** The exact selector grammar published by the generated config schema. */
 export const AUTOROUTING_SELECTOR_PATTERN = "^[^/\\s*?\\[]+\\/[^\\s*?\\[]+(?::(?:minimal|low|medium|high|xhigh))?$";
 
@@ -108,6 +111,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 export function isValidAutoroutingSelector(value: unknown): value is string {
 	if (typeof value !== "string" || value.length === 0 || value.trim() !== value) return false;
+	if (value.length > AUTOROUTING_SELECTOR_MAX_LENGTH) return false;
 	if (/[*?[]/.test(value)) return false;
 	if (!new RegExp(AUTOROUTING_SELECTOR_PATTERN).test(value)) return false;
 	const separator = value.indexOf("/");
