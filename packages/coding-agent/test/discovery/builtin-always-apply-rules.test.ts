@@ -40,6 +40,10 @@ async function loadNativeRules(ctx: LoadContext): Promise<Rule[]> {
 	return result.items;
 }
 
+function nativeContext(): LoadContext {
+	return { cwd: project, home, userAgentDir: path.join(home, ".gjc", "agent"), repoRoot: project };
+}
+
 /** Mirror createAgentSession bucketing for non-TTSR rules. */
 function bucketRules(rules: Rule[]): { rulebookRules: Rule[]; alwaysApplyRules: Rule[] } {
 	const rulebookRules: Rule[] = [];
@@ -84,7 +88,7 @@ MAGICPROBE7F3A is the passphrase.
 `,
 	);
 
-	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
+	const rules = await loadNativeRules(nativeContext());
 	const probe = rules.find(r => r.name === "probe");
 
 	expect(probe).toBeDefined();
@@ -105,7 +109,7 @@ USERMAGIC9K2 is the user passphrase.
 `,
 	);
 
-	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
+	const rules = await loadNativeRules(nativeContext());
 	const probe = rules.find(r => r.name === "user-probe");
 
 	expect(probe).toBeDefined();
@@ -125,7 +129,7 @@ Other rule body.
 `,
 	);
 
-	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
+	const rules = await loadNativeRules(nativeContext());
 	const sticky = rules.find(r => r.name === "RULES");
 	const other = rules.find(r => r.name === "other");
 
@@ -154,7 +158,7 @@ On-demand body stays out of always-apply injection.
 `,
 	);
 
-	const discovered = await loadNativeRules({ cwd: project, home, repoRoot: project });
+	const discovered = await loadNativeRules(nativeContext());
 	const { rulebookRules, alwaysApplyRules } = bucketRules(discovered);
 
 	expect(alwaysApplyRules.map(r => r.name)).toContain("probe");
@@ -200,7 +204,7 @@ Optional body.
 `,
 	);
 
-	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
+	const rules = await loadNativeRules(nativeContext());
 	const optional = rules.find(r => r.name === "optional");
 	const { rulebookRules, alwaysApplyRules } = bucketRules(rules);
 

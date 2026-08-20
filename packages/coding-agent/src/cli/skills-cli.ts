@@ -72,6 +72,7 @@ export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 		const settings = await Settings.loadForScope({ cwd: process.cwd() });
 		const result = await discoverRuntimeSkills({
 			cwd: process.cwd(),
+			agentDir: settings.getAgentDir(),
 			source,
 			policy: {
 				...settings.getGroup("skills"),

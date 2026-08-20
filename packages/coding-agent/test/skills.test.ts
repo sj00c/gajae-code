@@ -11,6 +11,7 @@ import {
 	parseSkillInvocations,
 	type Skill,
 } from "@gajae-code/coding-agent/extensibility/skills";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 
 const fixturesDir = path.resolve(import.meta.dirname, "fixtures/skills");
 const collisionFixturesDir = path.resolve(import.meta.dirname, "fixtures/skills-collision");
@@ -402,6 +403,10 @@ description: Skill loaded from a tilde-expanded custom directory.
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-zero-config-skills-"));
 			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-zero-config-home-"));
 			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
+			// The user skill scope is the agent directory (the trusted-home
+			// snapshot ignores the os.homedir mock), so isolate exactly that.
+			const originalAgentDir = getAgentDir();
+			setAgentDir(path.join(tempHome, ".gjc", "agent"));
 			try {
 				for (const [root, name] of [
 					[path.join(tempDir, ".gjc", "skills", "project-skill"), "project-skill"],
@@ -422,6 +427,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 				const { skills } = await loadSkills({ cwd: tempDir });
 				expect(skills.map(skill => skill.name).sort()).toEqual(["project-skill", "user-skill"]);
 			} finally {
+				setAgentDir(originalAgentDir);
 				homedirSpy.mockRestore();
 				await fs.rm(tempDir, { recursive: true, force: true });
 				await fs.rm(tempHome, { recursive: true, force: true });
@@ -432,6 +438,8 @@ description: Skill loaded from a tilde-expanded custom directory.
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-precedence-skills-"));
 			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-precedence-home-"));
 			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
+			const originalAgentDir = getAgentDir();
+			setAgentDir(path.join(tempHome, ".gjc", "agent"));
 			try {
 				// Mark the repo root so the ancestor walk covers the nested package.
 				await fs.mkdir(path.join(tempDir, ".git"));
@@ -470,6 +478,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 					path.join(tempHome, ".gjc", "agent", "skills", "shared"),
 				);
 			} finally {
+				setAgentDir(originalAgentDir);
 				homedirSpy.mockRestore();
 				await fs.rm(tempDir, { recursive: true, force: true });
 				await fs.rm(tempHome, { recursive: true, force: true });
@@ -510,6 +519,8 @@ description: Skill loaded from a tilde-expanded custom directory.
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-trust-skills-"));
 			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-trust-home-"));
 			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
+			const originalAgentDir = getAgentDir();
+			setAgentDir(path.join(tempHome, ".gjc", "agent"));
 			try {
 				const write = async (root: string, name: string) => {
 					await fs.mkdir(root, { recursive: true });
@@ -533,6 +544,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 				const masterOff = await loadSkills({ cwd: tempDir, enabled: false });
 				expect(masterOff.skills).toHaveLength(0);
 			} finally {
+				setAgentDir(originalAgentDir);
 				homedirSpy.mockRestore();
 				await fs.rm(tempDir, { recursive: true, force: true });
 				await fs.rm(tempHome, { recursive: true, force: true });

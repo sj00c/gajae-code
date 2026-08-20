@@ -142,8 +142,9 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	const userTrusted = resolveSkillScopeTrust(options, "user");
 
 	// Skill scope trust decides which canonical locations are loaded: project
-	// scope covers `.gjc/skills` (walk-up), user scope covers `~/.gjc/agent/skills`
-	// and the legacy user roots. Claude/Codex convention skills are import
+	// scope covers `.gjc/skills` (walk-up), user scope covers the agent
+	// directory's `skills` root (`gjc config dir`) and the legacy home-relative
+	// user roots. Claude/Codex convention skills are import
 	// sources into `.gjc`, never loaded directly.
 	function isSourceEnabled(source: SourceMeta): boolean {
 		const { provider, level } = source;

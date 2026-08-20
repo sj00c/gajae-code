@@ -47,6 +47,7 @@ describe("skill-management", () => {
 				const records = await listNativeSkillsForManagement({
 					cwd,
 					home,
+					agentDir: path.join(home, ".gjc", "agent"),
 					policy: { ignoredSkills: ["ignored-*"], disabledExtensions: ["skill:disabled-helper"] },
 				});
 				const byName = new Map(records.map(record => [record.name, record]));
@@ -90,6 +91,7 @@ describe("skill-management", () => {
 				const records = await listNativeSkillsForManagement({
 					cwd,
 					home,
+					agentDir: path.join(home, ".gjc", "agent"),
 					policy: { trustProjectSkills: false },
 				});
 				expect(records.map(record => record.name)).toEqual(["user-helper"]);
@@ -127,6 +129,7 @@ describe("skill-management", () => {
 					cwd,
 					home,
 					scope: "user",
+					agentDir: path.join(home, ".gjc", "agent"),
 					name: "my-skill",
 					content: validContent,
 				});

@@ -111,6 +111,31 @@ export function getUserPath(ctx: LoadContext, source: SourceId, subpath: string)
 }
 
 /**
+ * Deterministic user-scope skill scan directories, highest precedence first.
+ *
+ * The canonical root is the agent directory (`getAgentDir()`, moved by
+ * `--agent-dir` / `GJC_CODING_AGENT_DIR` / `setAgentDir()`) — the target of
+ * every user-scope skill writer (`gjc migrate`, `gjc skill`). An agent-directory
+ * profile is a *separate* user scope, the same contract as MCP user config
+ * (#4768): its legacy home-relative roots are not scanned, so a profile cannot
+ * pick up the default profile's skills (and vice versa). In the default
+ * profile the agent directory is `<home>/<configDir>/agent` and the configured
+ * legacy roots below it are still honored, exactly as before.
+ */
+export function getUserSkillScanDirs(home: string, userAgentDir: string): string[] {
+	if (path.resolve(userAgentDir) !== path.resolve(path.join(home, SOURCE_PATHS.native.userAgent))) {
+		return [path.join(userAgentDir, "skills")];
+	}
+	return [
+		...new Set([
+			path.join(home, SOURCE_PATHS.native.userAgent, "skills"),
+			path.join(home, SOURCE_PATHS.native.userBase, "skills"),
+			path.join(home, ".gjc", "skills"),
+		]),
+	];
+}
+
+/**
  * Get project-level path for a source (cwd only).
  */
 export function getProjectPath(ctx: LoadContext, source: SourceId, subpath: string): string | null {
