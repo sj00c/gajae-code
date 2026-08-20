@@ -255,13 +255,26 @@ async function candidateNumbers(repo: string, sha: string): Promise<number[]> {
 	return JSON.parse(raw) as number[];
 }
 
+/** Picks the earliest MERGED pull request by merge timestamp, not creation time. */
+export function earliestMergedPullRequest(pullRequests: readonly { number: number; mergedAt: string }[]): number | undefined {
+	let earliest: { number: number; mergedAt: string } | undefined;
+	for (const pr of pullRequests) {
+		if (earliest === undefined || pr.mergedAt < earliest.mergedAt || (pr.mergedAt === earliest.mergedAt && pr.number < earliest.number)) {
+			earliest = pr;
+		}
+	}
+	return earliest?.number;
+}
+
 async function firstMergedPullRequest(repo: string, author: string): Promise<number | undefined> {
+	// The search API cannot sort by merge time, so fetch a bounded created-asc
+	// window and select the minimum merge timestamp.
 	const raw = await gh([
 		"search", "prs", "--repo", repo, "--author", author, "--merged",
-		"--sort", "created", "--order", "asc", "--limit", "1", "--json", "number",
+		"--sort", "created", "--order", "asc", "--limit", "50", "--json", "number,mergedAt",
 	]);
 	if (raw.trim() === "") return undefined;
-	return (JSON.parse(raw) as { number: number }[])[0]?.number;
+	return earliestMergedPullRequest(JSON.parse(raw) as { number: number; mergedAt: string }[]);
 }
 
 /**

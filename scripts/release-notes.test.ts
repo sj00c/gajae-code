@@ -5,6 +5,7 @@ import {
 	SHIPPED_COVERAGE_THRESHOLD,
 	attributeCommit,
 	buildReleaseNotes,
+	earliestMergedPullRequest,
 	isExplicitEmptyGhResult,
 	normalizeSubject,
 	parseReleaseNotesCli,
@@ -284,5 +285,24 @@ describe("fail-closed gh result classification", () => {
 		// A bare/unknown failure must never be mistaken for an explicit empty.
 		expect(isExplicitEmptyGhResult(1, "")).toBe(false);
 		expect(isExplicitEmptyGhResult(128, "fatal: something else")).toBe(false);
+	});
+});
+
+describe("first merged pull request selection", () => {
+	test("selects by merge time, not creation time", () => {
+		// #10 was created first but merged last; #12 was created later but merged first.
+		expect(earliestMergedPullRequest([
+			{ number: 10, mergedAt: "2026-02-01T00:00:00Z" },
+			{ number: 12, mergedAt: "2026-01-15T00:00:00Z" },
+			{ number: 11, mergedAt: "2026-01-20T00:00:00Z" },
+		])).toBe(12);
+		expect(earliestMergedPullRequest([])).toBeUndefined();
+	});
+
+	test("breaks merge-time ties by the lower pull request number", () => {
+		expect(earliestMergedPullRequest([
+			{ number: 9, mergedAt: "2026-01-15T00:00:00Z" },
+			{ number: 7, mergedAt: "2026-01-15T00:00:00Z" },
+		])).toBe(7);
 	});
 });
