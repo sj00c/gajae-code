@@ -270,7 +270,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			return [
 				toSessionNotification(sessionId, {
 					sessionUpdate: "session_info_update",
-					_meta: { gjcPhase: "error", gjcRunning: false, gjcAgentFailed: true },
+					_meta: { gjcPhase: "error", running: true, gjcRunning: true, gjcAgentFailed: true },
 				}),
 			];
 		case "auto_compaction_start":

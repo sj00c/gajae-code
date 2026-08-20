@@ -21,6 +21,9 @@ interface FakeReconciliation {
 	uncertainCalls: number;
 	noteTransitionFrames: string[];
 	finalizeCodes: string[];
+	uncertainFailures: number;
+	uncertainStarted?: () => void;
+	uncertainRelease?: Promise<void>;
 
 	/** When set, a failing finalize still leaves the durable record terminal (lost race). */
 	terminalOnFailure?: boolean;
@@ -31,7 +34,7 @@ function fakeReconciliation(): {
 		lookup: () => { status: string };
 		claimPendingOutcome: () => Promise<void>;
 		noteTransition: (_kind: string, _correlation: unknown, frame?: { type?: string }) => Promise<void>;
-		markUncertain: () => Promise<void>;
+		markUncertain: (_kind: string, _correlation: unknown, isCurrent?: () => boolean) => Promise<void>;
 		finalizeOutcome: (
 			_kind: string,
 			_correlation: unknown,
@@ -50,6 +53,7 @@ function fakeReconciliation(): {
 		uncertainCalls: 0,
 		noteTransitionFrames: [],
 		finalizeCodes: [],
+		uncertainFailures: 0,
 	};
 	return {
 		state,
@@ -61,8 +65,12 @@ function fakeReconciliation(): {
 				if (state.noteTransitionCalls <= state.noteTransitionFailures) throw new Error("terminal replay failed");
 				state.status = "terminal_ok";
 			},
-			markUncertain: async () => {
+			markUncertain: async (_kind: string, _correlation: unknown, isCurrent?: () => boolean) => {
 				state.uncertainCalls += 1;
+				state.uncertainStarted?.();
+				if (state.uncertainRelease) await state.uncertainRelease;
+				if (state.uncertainCalls <= state.uncertainFailures) throw new Error("uncertainty persistence failed");
+				if (isCurrent !== undefined && !isCurrent()) return;
 				state.status = "uncertain";
 			},
 			claimPendingOutcome: async () => {
@@ -213,6 +221,48 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		expect(state.uncertainCalls).toBe(1);
 		expect(state.status).toBe("uncertain");
 		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
+	}, 15_000);
+
+	test("retries uncertainty persistence after the first recovery write fails", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		state.finalizeFailures = Number.MAX_SAFE_INTEGER;
+		state.uncertainFailures = 1;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-uncertain-retry", turnId: "turn-uncertain-retry" };
+		manager.onAccepted(correlation);
+		await Bun.sleep(6_800);
+		await Bun.sleep(1_200);
+		expect(state.uncertainCalls).toBe(2);
+		expect(state.status).toBe("uncertain");
+		expect(manager.has(correlation)).toBe(false);
+	}, 15_000);
+
+	test("stale uncertainty completion cannot clear a replacement lease", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		state.finalizeFailures = Number.MAX_SAFE_INTEGER;
+		const recoveryStarted = Promise.withResolvers<void>();
+		const recoveryRelease = Promise.withResolvers<void>();
+		state.uncertainStarted = () => recoveryStarted.resolve();
+		state.uncertainRelease = recoveryRelease.promise;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-reaccept", turnId: "turn-reaccept" };
+		manager.onAccepted(correlation);
+		await Bun.sleep(6_800);
+		await recoveryStarted.promise;
+		manager.clear(correlation);
+		manager.onAccepted(correlation);
+		recoveryRelease.resolve();
+		await Bun.sleep(30);
+		expect(manager.has(correlation)).toBe(true);
 		manager.clearAll();
 	}, 15_000);
 

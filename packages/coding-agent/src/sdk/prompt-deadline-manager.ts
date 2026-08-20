@@ -9,7 +9,9 @@ import {
 } from "./prompt-deadline-lease";
 
 const MAX_EXPIRY_RETRIES = 5;
+const MAX_UNCERTAINTY_RETRIES = 3;
 const EXPIRY_RETRY_DELAY_MS = 1_000;
+const UNCERTAINTY_RETRY_DELAY_MS = 1_000;
 
 type DeadlineReconciliation = InvocationReconciliation | KindAwareReconciliation;
 
@@ -30,6 +32,7 @@ export class PromptDeadlineManager {
 	readonly #timers = new Map<string, ReturnType<typeof setTimeout>>();
 	readonly #reconciliation: DeadlineReconciliation;
 	readonly #expiryRetries = new Map<string, number>();
+	readonly #uncertaintyRetries = new Map<string, number>();
 	readonly #expiring = new Set<string>();
 	readonly #pendingTerminalTransitions = new Set<string>();
 	readonly #getLeaseMs: () => number;
@@ -177,23 +180,37 @@ export class PromptDeadlineManager {
 		this.#expiryRetries.set(key, attempts);
 		this.#clearTimer(key);
 		if (attempts > MAX_EXPIRY_RETRIES) {
-			const correlation = this.#correlations.get(key);
-			const lease = this.#leases.get(key);
-			const generation = lease?.generation;
-			if (correlation && typeof this.#reconciliation.markUncertain === "function") {
-				void this.#reconciliation
-					.markUncertain("prompt", correlation, () => {
-						const current = this.#leases.get(key);
-						return current === lease && current?.generation === generation;
-					})
-					.then(() => this.clear(correlation))
-					.catch(() => undefined);
-			}
+			this.#recoverUncertainty(key);
 			return;
 		}
 		const timer = setTimeout(() => void this.#onDeadline(key), EXPIRY_RETRY_DELAY_MS);
 		(timer as unknown as { unref?: () => void }).unref?.();
 		this.#timers.set(key, timer);
+	}
+
+	#recoverUncertainty(key: string): void {
+		const correlation = this.#correlations.get(key);
+		const lease = this.#leases.get(key);
+		const generation = lease?.generation;
+		if (!correlation || !lease || typeof this.#reconciliation.markUncertain !== "function") return;
+		const attempts = (this.#uncertaintyRetries.get(key) ?? 0) + 1;
+		this.#uncertaintyRetries.set(key, attempts);
+		void this.#reconciliation
+			.markUncertain("prompt", correlation, () => {
+				const current = this.#leases.get(key);
+				return current === lease && current.generation === generation;
+			})
+			.then(() => {
+				const current = this.#leases.get(key);
+				if (current === lease && current.generation === generation) this.clear(correlation);
+			})
+			.catch(() => {
+				if (attempts >= MAX_UNCERTAINTY_RETRIES) return;
+				this.#clearTimer(key);
+				const timer = setTimeout(() => this.#recoverUncertainty(key), UNCERTAINTY_RETRY_DELAY_MS);
+				(timer as unknown as { unref?: () => void }).unref?.();
+				this.#timers.set(key, timer);
+			});
 	}
 
 	onAccepted(correlation: InvocationCorrelation): void {
@@ -237,6 +254,7 @@ export class PromptDeadlineManager {
 		this.#leases.delete(key);
 		this.#correlations.delete(key);
 		this.#expiryRetries.delete(key);
+		this.#uncertaintyRetries.delete(key);
 		this.#expiring.delete(key);
 		this.#pendingTerminalTransitions.delete(key);
 	}
@@ -246,6 +264,7 @@ export class PromptDeadlineManager {
 		this.#leases.clear();
 		this.#correlations.clear();
 		this.#expiryRetries.clear();
+		this.#uncertaintyRetries.clear();
 		this.#expiring.clear();
 		this.#pendingTerminalTransitions.clear();
 	}

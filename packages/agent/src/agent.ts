@@ -54,6 +54,19 @@ import type {
 } from "./types";
 import { setAgentTerminalOwnerContext } from "./types";
 
+const SAFE_FAILURE_CODE = /^[A-Za-z0-9._-]{1,64}$/;
+
+function sanitizeAgentFailure(error: unknown): { code: string; message: string } {
+	let code = "agent_failed";
+	try {
+		const candidate = error as { code?: unknown } | undefined;
+		if (typeof candidate?.code === "string" && SAFE_FAILURE_CODE.test(candidate.code)) code = candidate.code;
+	} catch {
+		// Untrusted provider errors may expose throwing accessors.
+	}
+	return { code, message: "Agent run failed." };
+}
+
 function assertUserImagePlaceholdersHavePayload(messages: readonly AgentMessage[]): void {
 	for (const message of messages) {
 		if (!("role" in message) || message.role !== "user") continue;
@@ -2034,9 +2047,11 @@ export class Agent {
 			this.#state.error = err?.message || String(err);
 			this.#emit({
 				type: "agent_failed",
-				error: abortController.signal.aborted
-					? Object.assign(new Error("Request was aborted"), { code: "aborted" })
-					: err,
+				error: sanitizeAgentFailure(
+					abortController.signal.aborted
+						? Object.assign(new Error("Request was aborted"), { code: "aborted" })
+						: err,
+				),
 				scope: handle.scope,
 			});
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {

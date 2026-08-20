@@ -6,6 +6,24 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { createAssistantMessage } from "./helpers";
 
 describe("Agent", () => {
+	it("sanitizes provider details before publishing agent_failed", async () => {
+		const secret = "provider-token=super-secret request-body-password=hunter2";
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error(secret), { code: "provider_down", request: { secret } });
+			},
+		});
+		const failures: Array<{ code?: string; message?: string }> = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_failed") failures.push(event.error as { code?: string; message?: string });
+		});
+		await agent.prompt("trigger failure", { fallbackManaged: true });
+		expect(failures).toHaveLength(1);
+		expect(failures[0]).toEqual({ code: "provider_down", message: "Agent run failed." });
+		expect(JSON.stringify(failures[0])).not.toContain("super-secret");
+		expect(JSON.stringify(failures[0])).not.toContain("hunter2");
+	});
+
 	it("preserves first-event timeout options and runtime mutations", () => {
 		const absent = new Agent();
 		expect(absent.streamFirstEventTimeoutMs).toBeUndefined();
