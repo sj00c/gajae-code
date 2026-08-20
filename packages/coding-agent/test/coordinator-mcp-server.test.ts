@@ -6467,7 +6467,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		expect(await fs.readFile(legacyFile)).toEqual(legacyBefore);
 	});
 
-	it("recovers a missing newest stable-id sidecar without duplicating the journal event", async () => {
+	it("recovers a missing historical stable-id sidecar without duplicating the journal event", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
@@ -6481,6 +6481,13 @@ describe("Coordinator MCP deep-audit regressions", () => {
 			sessionId: "visible-session",
 			summary: "durable before sidecar",
 		});
+		for (let index = 0; index < 600; index++)
+			await appendCoordinatorEventForTest(namespace, {
+				stableId: `later-journal-event-${index.toString().padStart(3, "0")}`,
+				kind: "turn.completed",
+				sessionId: "visible-session",
+				summary: "x".repeat(512),
+			});
 		await fs.rm(path.join(events, "event-index", `${createHash("sha256").update(stableId).digest("hex")}.json`), {
 			force: true,
 		});

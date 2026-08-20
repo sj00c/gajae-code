@@ -3530,6 +3530,9 @@ describe("tmux owner isolation launch gate", () => {
 				env: {
 					GJC_COORDINATOR_SESSION_ID: sessionId,
 					GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,
+					[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+					[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: "managed-private-pkcs8-der-base64",
+					[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: "a".repeat(64),
 				},
 				argv: ["bun", "cli.ts"],
 				execPath: "/bin/bun",
@@ -3553,6 +3556,7 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).toContain(`GJC_TMUX_OWNER_GENERATION='${generation.generation}'`);
 			expect(innerCommand).toContain(`GJC_TMUX_OWNER_STATE_DIR='${root}'`);
 			expect(innerCommand).toContain("GJC_TMUX_OWNER_SERVER_KEY='tmux'");
+			expect(innerCommand).not.toContain("managed-private-pkcs8-der-base64");
 			expect(innerCommand).toStartWith("exec env GJC_TMUX_LAUNCHED=1");
 			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_RUN_ID='[0-9a-f-]{36}'/i);
 			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);

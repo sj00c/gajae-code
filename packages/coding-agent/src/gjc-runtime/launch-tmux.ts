@@ -1099,7 +1099,6 @@ function trustedReplacementAuthority(
 
 function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
 	if (plan.ownerGeneration) return;
-	const env = context.env ?? process.env;
 	const sessionId = plan.sessionId ?? plan.sessionName;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
 	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
@@ -1121,7 +1120,8 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 			extraEnv: {
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: plan.sessionStateFile ?? "",
-				...coordinatorSidecarSigningEnv(env),
+				// The tmux server inherits the bootstrap secret as child environment;
+				// never serialize it into the command argument passed to tmux.
 				[GJC_TMUX_ACTIVE_SESSION_ENV]: plan.sessionName,
 				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,

@@ -422,8 +422,15 @@ export async function listCodexHandoffs(namespaceDir: string): Promise<CodexHand
 		} catch {
 			throw new Error("state_corrupt");
 		}
-		const handoff = await readCodexHandoff(namespaceDir, workUnit);
-		if (handoff) handoffs.push(handoff);
+		try {
+			const handoff = await readCodexHandoff(namespaceDir, workUnit);
+			if (handoff) handoffs.push(handoff);
+		} catch (error) {
+			// A legacy token-backed handoff cannot be authenticated until it is
+			// explicitly re-registered. Do not let it block valid handoffs.
+			if (error instanceof Error && error.message === "codex_token_file_reregistration_required") continue;
+			throw error;
+		}
 	}
 	return handoffs.sort((left, right) => left.work_unit.localeCompare(right.work_unit));
 }

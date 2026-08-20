@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	ackCodexWakeEvent,
 	bindDelegateCodexHandoff,
+	listCodexHandoffs,
 	listCodexWakeEvents,
 	readCodexHandoff,
 	recordCodexWakeEvent,
@@ -132,6 +133,31 @@ describe("Codex handoff durable state", () => {
 			}),
 		).rejects.toThrow("token_material_not_allowed");
 	});
+	it("lists valid handoffs when a legacy token registration requires migration", async () => {
+		const root = await tempRoot();
+		const tokenRoot = await tempRoot();
+		const tokenFile = path.join(tokenRoot, "token.txt");
+		await fs.writeFile(tokenFile, "token", { mode: 0o600 });
+		await registerCodexHandoff(root, {
+			work_unit: "valid-session",
+			thread_id: "valid-thread",
+			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+		});
+		const legacy = await registerCodexHandoff(root, {
+			work_unit: "legacy-session",
+			thread_id: "legacy-thread",
+			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+			token_file: tokenFile,
+			token_root: tokenRoot,
+		});
+		const { token_file_identity: _identity, ...legacyWithoutIdentity } = legacy;
+		await fs.writeFile(
+			path.join(root, "codex-handoffs", "legacy-session.json"),
+			JSON.stringify(legacyWithoutIdentity),
+		);
+		expect(await listCodexHandoffs(root)).toMatchObject([{ work_unit: "valid-session" }]);
+	});
+
 	it("creates exactly one wake across concurrent Bun processes", async () => {
 		const root = await tempRoot();
 		const marker = path.join(root, "start");

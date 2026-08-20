@@ -455,9 +455,39 @@ async function readTransactionJson<T>(file: string): Promise<T | null> {
 		throw new Error("state_corrupt");
 	}
 }
+function migrateLegacyTransactionV1(transaction: CoordinatorSessionTransactionV1): void {
+	const record = transaction as unknown as Record<string, unknown>;
+	if (record.schema_version !== 1 || !record.canonical || !record.outbox || !record.requests) return;
+	if (!Object.hasOwn(record, "creation_intent_digest")) {
+		record.creation_intent_digest = digest(
+			canonicalJson({
+				kind: "legacy-v1",
+				namespace_id: record.namespace_id,
+				session_id: record.session_id,
+				canonical: record.canonical,
+			}),
+		);
+	}
+	const canonical = record.canonical as Record<string, unknown>;
+	const session = canonical.session as Record<string, unknown> | undefined;
+	const broker = session?.broker as Record<string, unknown> | undefined;
+	if (broker && (!broker.sidecar_verifier || typeof broker.sidecar_verifier !== "object")) {
+		// Pre-signing WALs have no runtime private key to recover. Assign an
+		// unowned verifier so their historical state remains readable while all
+		// future sidecar updates fail closed until the runtime is re-established.
+		const keyId = digest(`legacy-sidecar-verifier\0${record.namespace_id}\0${record.session_id}`);
+		broker.sidecar_verifier = {
+			key_id: keyId,
+			public_key: Buffer.from(keyId, "hex").toString("base64"),
+		};
+	}
+	normalizeOutbox(transaction);
+}
+
 function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespaceId: string, sessionId: string): void {
 	const isRecord = (value: unknown): value is Record<string, unknown> =>
 		typeof value === "object" && value !== null && !Array.isArray(value);
+	migrateLegacyTransactionV1(transaction);
 	const isTime = (value: unknown) => typeof value === "string" && Number.isFinite(Date.parse(value));
 	const safeId = (value: unknown) => typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(value);
 	const turnStatuses = new Set([

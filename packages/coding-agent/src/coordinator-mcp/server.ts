@@ -123,6 +123,7 @@ import {
 	listCanonicalActiveSessions,
 	type NamespaceDeletionEntryV1,
 	type OperationRequestV1,
+	type PublicDeliveryClaimV1,
 	type RuntimeProvenanceTokenV1,
 	readDeliveryDiscoveryCursor,
 	readSchedulerRoster,
@@ -1759,50 +1760,17 @@ async function migrateLegacyJournalIndexLocked(
 	} satisfies EventJournalIndexMigration);
 }
 
-async function readJournalStableIdFromTail(
+async function readJournalStableId(
 	namespaceDir: string,
 	eventId: string,
 ): Promise<{ event: CoordinatorEvent; offset: number } | null> {
-	const file = eventJournalFile(namespaceDir);
-	let handle: fs.FileHandle;
-	try {
-		handle = await fs.open(file, "r");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw error;
-	}
-	try {
-		const stat = await handle.stat();
-		const start = Math.max(0, stat.size - 256 * 1024);
-		const buffer = Buffer.alloc(stat.size - start);
-		const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-		const bytes = buffer.subarray(0, bytesRead);
-		let offset = start;
-		let text: string;
-		if (start > 0) {
-			const firstNewline = bytes.indexOf(0x0a);
-			if (firstNewline < 0) return null;
-			offset += firstNewline + 1;
-			text = bytes.subarray(firstNewline + 1).toString("utf8");
-		} else text = bytes.toString("utf8");
-		for (const line of text.split("\n")) {
-			const lineBytes = Buffer.byteLength(line) + 1;
-			if (!line.trim()) {
-				offset += lineBytes;
-				continue;
-			}
-			try {
-				const value = asRecord(JSON.parse(line));
-				if (value?.id === eventId) return { event: value as unknown as CoordinatorEvent, offset };
-			} catch {
-				// A torn tail is repaired by the normal journal snapshot path.
-			}
-			offset += lineBytes;
-		}
-		return null;
-	} finally {
-		await handle.close();
-	}
+	// A missing sidecar can follow a crash after journal fsync. Search the full,
+	// validated journal so a later burst cannot make the stable row invisible.
+	const snapshot = await readJournalSnapshotLocked(namespaceDir);
+	const index = snapshot.events.findIndex(event => event.id === eventId);
+	if (index < 0) return null;
+	const offset = snapshot.offsets[index];
+	return typeof offset === "number" ? { event: snapshot.events[index]!, offset } : null;
 }
 
 async function readJournalSnapshotLocked(namespaceDir: string, repairTail = true): Promise<EventJournalSnapshot> {
@@ -2244,13 +2212,10 @@ async function appendCoordinatorEvent(
 	options: { signal?: AbortSignal } = {},
 ): Promise<CoordinatorEvent> {
 	const previous = eventAppendQueues.get(namespaceDir) ?? Promise.resolve();
-	let release!: () => void;
-	const current = new Promise<void>(resolve => {
-		release = resolve;
-	});
+	const current = Promise.withResolvers<void>();
 	const queued = previous.then(
-		() => current,
-		() => current,
+		() => current.promise,
+		() => current.promise,
 	);
 	eventAppendQueues.set(namespaceDir, queued);
 	await previous.catch(() => undefined);
@@ -2293,7 +2258,7 @@ async function appendCoordinatorEvent(
 						}
 					}
 					// The legacy map is consulted only during its one-time migration. Once
-					// retired, recover only the bounded journal tail left by a write crash.
+					// retired, a missing sidecar is recovered from the complete journal.
 					const migration = asRecord(await readJsonFile(eventJournalIndexMigrationFile(namespaceDir)));
 					if (migration?.schema_version !== 1) {
 						await readJournalSnapshotLocked(namespaceDir);
@@ -2310,7 +2275,7 @@ async function appendCoordinatorEvent(
 							}
 						}
 					}
-					const recovered = await readJournalStableIdFromTail(namespaceDir, input.stableId);
+					const recovered = await readJournalStableId(namespaceDir, input.stableId);
 					if (recovered) {
 						await writeJournalJsonAtomic(eventStableIndexFile(namespaceDir, input.stableId), {
 							seq: recovered.event.seq,
@@ -2378,7 +2343,7 @@ async function appendCoordinatorEvent(
 		if (eventWebhookConfigs.has(namespaceDir)) enqueueEventWebhook(namespaceDir, persistedEvent);
 		return persistedEvent;
 	} finally {
-		release();
+		current.resolve();
 		if (eventAppendQueues.get(namespaceDir) === queued) eventAppendQueues.delete(namespaceDir);
 	}
 }
@@ -5259,7 +5224,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 	async function drainSessionRetainedDeliveries(sessionId: string): Promise<boolean> {
 		for (;;) {
-			let claims: Awaited<ReturnType<typeof claimPublicDelivery>>;
+			let claims: PublicDeliveryClaimV1[];
 			try {
 				claims = await claimPublicDelivery(questionPaths, sessionId, { limit: 128 });
 			} catch (error) {
@@ -6055,20 +6020,23 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return acknowledgement;
 	}
 
-	/** Commits terminal fencing, question revocation, report, and promotion together before legacy projection. */
-	async function commitTerminalTransition(
-		turn: TurnRecord,
-		input: {
-			desiredState: CoordinatorSessionStateValue;
-			reason: PublicReason | null;
-			report?: CanonicalReportSnapshotV1;
-			promoteQueuedTurn?: boolean;
-		},
-	): Promise<{
+	type TerminalTransitionInput = {
+		desiredState: CoordinatorSessionStateValue;
+		reason: PublicReason | null;
+		report?: CanonicalReportSnapshotV1;
+		promoteQueuedTurn?: boolean;
+	};
+	type TerminalTransitionResult = {
 		promotedTurnId: string | null;
 		desiredState: CoordinatorSessionStateValue;
 		transitioned: boolean;
-	}> {
+	};
+
+	/** Commits terminal fencing, question revocation, report, and promotion together before legacy projection. */
+	async function commitTerminalTransition(
+		turn: TurnRecord,
+		input: TerminalTransitionInput,
+	): Promise<TerminalTransitionResult> {
 		await ensureQuestionTransaction(turn.session_id);
 		return await withAdmittedSessionTransaction(questionPaths, turn.session_id, async transaction => {
 			const existing = transaction.canonical.turns[turn.turn_id];
@@ -6400,11 +6368,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 	async function projectTerminalTransition(
 		turn: TurnRecord,
-		input: Parameters<typeof commitTerminalTransition>[1] & {
+		input: TerminalTransitionInput & {
 			live?: boolean | null;
 			signal?: AbortSignal;
 		},
-	): Promise<Awaited<ReturnType<typeof commitTerminalTransition>>> {
+	): Promise<TerminalTransitionResult> {
 		const result = await commitTerminalTransition(turn, input);
 		if (input.report) await services.afterCanonicalReportCommit?.(turn.session_id);
 		await repairCanonicalProjections(turn.session_id, { signal: input.signal });
@@ -9426,11 +9394,9 @@ export async function pumpCoordinatorMcpStream(
 	};
 
 	const drainInFlightAndWrites = async (): Promise<void> => {
-		let timer: NodeJS.Timeout | undefined;
-		const timeout = new Promise<"timed_out">(resolve => {
-			timer = setTimeout(() => resolve("timed_out"), drainTimeoutMs);
-			(timer as { unref?: () => void }).unref?.();
-		});
+		const timeout = Promise.withResolvers<"timed_out">();
+		const timer = setTimeout(() => timeout.resolve("timed_out"), drainTimeoutMs);
+		(timer as { unref?: () => void }).unref?.();
 		const drain = async (): Promise<"drained"> => {
 			while (true) {
 				if (inFlight.size > 0) await Promise.allSettled([...inFlight]);
@@ -9440,14 +9406,14 @@ export async function pumpCoordinatorMcpStream(
 			}
 		};
 		try {
-			if ((await Promise.race([drain(), timeout])) === "timed_out") {
+			if ((await Promise.race([drain(), timeout.promise])) === "timed_out") {
 				writerState = "closed";
 				draining = true;
 				dataQueue.length = 0;
 				detachInput();
 			}
 		} finally {
-			if (timer) clearTimeout(timer);
+			clearTimeout(timer);
 		}
 	};
 

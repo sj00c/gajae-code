@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -101,7 +102,7 @@ function journalRow(overrides: Record<string, unknown> = {}): { id: string; sess
 }
 
 function outboxPath(namespaceDir: string, eventId: string): string {
-	return path.join(namespaceDir, "webhook-outbox", `${eventId}.json`);
+	return path.join(namespaceDir, "webhook-outbox", `${createHash("sha256").update(eventId).digest("hex")}.json`);
 }
 
 describe("parseEventWebhookConfig", () => {
@@ -210,6 +211,20 @@ describe("deliverEventWebhook", () => {
 		// Second call with the same row is a dedupe: no further POST.
 		await deliverEventWebhook(namespaceDir, minimalConfig(), event, () => JSON.stringify(event), delivery);
 		expect(attempts).toHaveLength(1);
+	});
+
+	it("uses a bounded filename for legal long stable IDs", async () => {
+		const namespaceDir = await tempRoot();
+		const sessionId = `s${"x".repeat(127)}`;
+		const event = journalRow({
+			id: `txn:${sessionId}:1:session.registered:session:${sessionId}`,
+			session_id: sessionId,
+		});
+		const { delivery, attempts } = recordingDelivery([{ ok: true }]);
+		await deliverEventWebhook(namespaceDir, minimalConfig(), event, () => JSON.stringify(event), delivery);
+		expect(attempts).toHaveLength(1);
+		const names = await fs.readdir(path.join(namespaceDir, "webhook-outbox"));
+		expect(names).toEqual([`${createHash("sha256").update(event.id).digest("hex")}.json`]);
 	});
 
 	it("retries with exponential backoff and keeps the same id on redelivery", async () => {
