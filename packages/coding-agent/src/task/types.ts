@@ -2,6 +2,7 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai/core";
 import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../config/autorouting-contract";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
 import type { SpawnRoiReconciliation } from "./roi-reconciliation";
@@ -512,19 +513,23 @@ const AUTOROUTING_ATTEMPT_CODES = new Set<AutoroutingAttemptCode>([
 ]);
 
 function validBoundedSelector(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0 && value.length <= 256;
+	return typeof value === "string" && value.length > 0 && value.length <= AUTOROUTING_SELECTOR_MAX_LENGTH;
 }
 
 export function assertRoutingEvidenceInvariant(evidence: TaskRoutingEvidence): void {
 	const terminalWithoutModel = evidence.terminal !== undefined || evidence.notExecuted === true;
-	if (!terminalWithoutModel && (!evidence.effectiveModel || evidence.effectiveModel.length > 256))
+	if (
+		!terminalWithoutModel &&
+		(!evidence.effectiveModel || evidence.effectiveModel.length > AUTOROUTING_SELECTOR_MAX_LENGTH)
+	)
 		throw new Error("Invalid effective routing model.");
 	if (evidence.authResolvedModel && evidence.authResolvedModel === evidence.effectiveModel)
 		throw new Error("authResolvedModel must differ from effectiveModel when present.");
 	if (evidence.authResolvedModel !== undefined && !validBoundedSelector(evidence.authResolvedModel))
 		throw new Error("Invalid auth-resolved routing model.");
 
-	if (evidence.requestedSelector.length > 256) throw new Error("Invalid requested routing selector.");
+	if (evidence.requestedSelector.length > AUTOROUTING_SELECTOR_MAX_LENGTH)
+		throw new Error("Invalid requested routing selector.");
 	if (evidence.skips && evidence.skips.length > 16) throw new Error("Too many autorouting skips.");
 	if (evidence.attempts && evidence.attempts.length > 6) throw new Error("Too many autorouting attempts.");
 	if (

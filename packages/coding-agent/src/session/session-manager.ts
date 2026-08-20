@@ -19217,11 +19217,12 @@ export class SessionManager {
 		await this.flush();
 		await this.#closePersistWriter();
 		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
-		// Lifecycle invariant: a staged session must carry exactly one attempt root through
-		// commit. An adopted staging manager whose attempt id differs from the staged
-		// publication means a second root was adopted over the first, orphaning it from cleanup.
-		const adoptedAttemptId = this.#adoptedArtifactManager?.getAttemptId();
-		if (adoptedAttemptId !== undefined && adoptedAttemptId !== staged.attemptId)
+		// Lifecycle invariant: while a staged publication is uncommitted, the session must
+		// carry exactly the attempt-rooted staging manager it opened with. openStaged,
+		// stagedNestedManaged, and openStagedSession all pre-adopt an attempt-rooted
+		// manager, so an adopted manager that is absent or foreign means a second root
+		// replaced the first — orphaning the original from commit/discard cleanup.
+		if (this.#adoptedArtifactManager?.getAttemptId() !== staged.attemptId)
 			throw new Error("Staged session artifact root does not match the staged attempt.");
 		const parentArtifacts =
 			this.#stagedArtifactParent ??
@@ -19389,10 +19390,9 @@ export class SessionManager {
 		// staging or artifacts would strand that transcript with dangling references.
 		if (staged.preservedUnproven) return;
 		const cleanupErrors: Error[] = [];
-		// Same single-root invariant as commitStaged: fail closed when a second staging
-		// root was adopted over the publication's own attempt root.
-		const discardAdoptedAttemptId = this.#adoptedArtifactManager?.getAttemptId();
-		if (discardAdoptedAttemptId !== undefined && discardAdoptedAttemptId !== staged.attemptId) {
+		// Same strict single-root invariant as commitStaged: an absent or foreign adopted
+		// manager means the publication's own attempt root was replaced or released.
+		if (this.#adoptedArtifactManager?.getAttemptId() !== staged.attemptId) {
 			cleanupErrors.push(new Error("Staged session artifact root does not match the staged attempt."));
 		}
 		const captureCleanupError = (error: unknown): void => {

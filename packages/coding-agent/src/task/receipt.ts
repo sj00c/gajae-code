@@ -1,3 +1,4 @@
+import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../config/autorouting-contract";
 import {
 	assertRoutingEvidenceInvariant,
 	hasCompleteUsageCostBreakdown,
@@ -251,11 +252,13 @@ function validatedRoutingEvidence(value: TaskRoutingEvidence | undefined): TaskR
 	try {
 		const bounded: TaskRoutingEvidence = {
 			...value,
-			requestedSelector: value.requestedSelector.slice(0, 256),
-			skips: value.skips?.slice(0, 16).map(skip => ({ ...skip, selector: skip.selector.slice(0, 256) })),
+			requestedSelector: value.requestedSelector.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH),
+			skips: value.skips
+				?.slice(0, 16)
+				.map(skip => ({ ...skip, selector: skip.selector.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH) })),
 			attempts: value.attempts
 				?.slice(0, 6)
-				.map(attempt => ({ ...attempt, selector: attempt.selector.slice(0, 256) })),
+				.map(attempt => ({ ...attempt, selector: attempt.selector.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH) })),
 		};
 		assertRoutingEvidenceInvariant(bounded);
 		return bounded;

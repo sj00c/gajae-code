@@ -91,8 +91,9 @@ export function getAutoroutingTierMapGateReport(
 	});
 	const staleSkipKeys = skippedKeys.filter(key => !catalogKeys.has(key) && !invalidSkipKeys.includes(key));
 	// A key that is both labeled and skipped would let a curated tier assignment hide
-	// behind a skip rationale; fold it into the invalid set.
-	staleSkipKeys.push(...skippedKeys.filter(key => Object.hasOwn(labels, key) && !staleSkipKeys.includes(key)));
+	// behind a skip rationale; it is an invalid skip, not a stale one.
+	const bothLabeledAndSkipped = skippedKeys.filter(key => Object.hasOwn(labels, key));
+	invalidSkipKeys.push(...bothLabeledAndSkipped.filter(key => !invalidSkipKeys.includes(key)));
 	return {
 		inScopeKeys,
 		labeledKeys,

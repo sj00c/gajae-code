@@ -32,6 +32,7 @@ import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-
 import * as canonicalSdk from "@gajae-code/coding-agent/sdk";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
+import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../config/autorouting-contract";
 import { ModelRegistry } from "../config/model-registry";
 import { formatModelString, resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
@@ -2665,7 +2666,7 @@ export function boundedSelector(value: string): string {
 	const bounded = value
 		.normalize("NFKC")
 		.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
-		.slice(0, 256);
+		.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH);
 	return bounded || "<omitted-selector>";
 }
 
