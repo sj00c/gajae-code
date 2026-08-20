@@ -199,10 +199,19 @@ type AttachedSession = {
 	readonly notificationSubscription: NotificationSubscription;
 	notificationCancelled: boolean;
 	readonly notificationCursor: { generation: number; seq: number };
+	readonly cursor: { seq: number };
+	published: boolean;
 	frameTail: Promise<void>;
 	disposed: boolean;
+	barrierFailed: boolean;
+	replaying: boolean;
+	held: Array<{ seq: number; frame: Record<string, unknown> }> | undefined;
 	dispose: () => void;
 };
+const DELIVERY_ATTEMPT_LIMIT = 3;
+const REPLAY_BARRIER_LIMIT = 1024;
+const REPLAY_RETRY_ATTEMPTS = 3;
+const REPLAY_RETRY_BACKOFF_MS = 100;
 
 const ATTACH_CONNECT_TIMEOUT_MS = 10_000;
 /**
@@ -233,6 +242,24 @@ function readEndpointMtime(value: unknown): number | undefined {
 
 function readSequence(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : undefined;
+}
+function readReplayGap(
+	value: unknown,
+):
+	| Readonly<{ kind: "generation_reset"; toGeneration: number }>
+	| Readonly<{ kind: "sequence_gap"; fromSeq: number; toSeq: number }>
+	| undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const gap = value as Record<string, unknown>;
+	if (gap.kind === "generation_reset") {
+		const toGeneration = readGeneration(gap.toGeneration);
+		return toGeneration === undefined ? undefined : { kind: "generation_reset", toGeneration };
+	}
+	if (gap.kind !== "sequence_gap") return undefined;
+	const fromSeq = readSequence(gap.fromSeq);
+	const toSeq = readSequence(gap.toSeq);
+	if (fromSeq === undefined || toSeq === undefined || toSeq < fromSeq) return undefined;
+	return { kind: "sequence_gap", fromSeq, toSeq };
 }
 
 function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame | undefined {
@@ -297,6 +324,12 @@ export class SessionRouter {
 	readonly #index: SessionIndex;
 	readonly #sessions = new Map<string, AttachedSession>();
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
+	readonly #undelivered = new Map<string, { generation: number; seq: number; attempts: number }>();
+	readonly #recoveredFrames = new Map<
+		string,
+		{ generation: number; frames: Array<{ seq: number; frame: Record<string, unknown> }> }
+	>();
+	readonly #resumeCursor = new Map<string, { generation: number; seq: number }>();
 	#stopTimer: (() => void) | undefined;
 	#scanTail: Promise<void> = Promise.resolve();
 	#ready = false;
@@ -493,18 +526,34 @@ export class SessionRouter {
 			throw new SessionRouterError("pre_send", "SDK session endpoint changed before command dispatch.");
 		if (expectedAttachment !== undefined && attached.capability !== expectedAttachment)
 			throw new SessionRouterError("pre_send", "SDK session attachment changed before command dispatch.");
+		if (attached.barrierFailed) {
+			await this.#scanSerialized();
+			const rebuilt = this.#sessions.get(sessionId);
+			if (!rebuilt || rebuilt.disposed)
+				throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not attached.");
+		}
+		const live = this.#sessions.get(sessionId);
+		if (!live || live.disposed)
+			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not attached.");
+		if (!callerPinnedCurrent) {
+			const proved = await this.#proveAttachedEndpoint(live);
+			if (!proved) {
+				await this.#retire(live, "replaced_same_generation");
+				throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
+			}
+		}
 		// A caller that sized its own budget keeps it; everything else gets the
 		// long-lived session budget instead of the transport's one-shot default,
 		// which a cold host's first credential-collecting query outruns (#4258).
-		const response = await attached.client.request(this.#prepareFrame(attached, frame), {
+		const response = await live.client.request(this.#prepareFrame(live, frame), {
 			...options,
 			timeoutMs: options?.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
 		});
 		if (
-			this.#sessions.get(sessionId) !== attached ||
-			attached.disposed ||
-			(expectedGeneration !== undefined && attached.generation !== expectedGeneration) ||
-			(expectedAttachment !== undefined && attached.capability !== expectedAttachment)
+			this.#sessions.get(sessionId) !== live ||
+			live.disposed ||
+			(expectedGeneration !== undefined && live.generation !== expectedGeneration) ||
+			(expectedAttachment !== undefined && live.capability !== expectedAttachment)
 		)
 			throw new SessionRouterError("ambiguous", "SDK session attachment changed while awaiting command response.");
 		return response;
@@ -513,7 +562,8 @@ export class SessionRouter {
 	/** Resolves the provider-neutral binding authority for an attached session. */
 	async bindingAuthority(sessionId: string): Promise<{ sessionId: string; endpointGeneration: number } | undefined> {
 		const attached = this.#sessions.get(sessionId);
-		if (!attached || attached.disposed) return undefined;
+		if (!attached || attached.disposed || attached.barrierFailed) return undefined;
+		if (!(await this.#proveAttachedEndpoint(attached))) return undefined;
 		return { sessionId, endpointGeneration: attached.generation };
 	}
 
@@ -675,6 +725,7 @@ export class SessionRouter {
 			if (
 				existing &&
 				!existing.disposed &&
+				!existing.barrierFailed &&
 				existing.generation === session.endpointGeneration &&
 				existing.pid === session.pid &&
 				existing.endpointMtimeMs === session.endpointMtimeMs
@@ -689,7 +740,11 @@ export class SessionRouter {
 				await this.#retire(existing, "removed");
 				continue;
 			}
-			if (existing && !existing.disposed) await this.#retire(existing, "replaced");
+			if (existing && !existing.disposed)
+				await this.#retire(
+					existing,
+					existing.generation === session.endpointGeneration ? "replaced_same_generation" : "replaced",
+				);
 			if (session.endpointMtimeMs === undefined || session.pid === undefined) continue;
 			const endpoint = await this.#readEndpoint(session);
 			if (!this.#running(runEpoch) || !endpoint) continue;
@@ -711,7 +766,7 @@ export class SessionRouter {
 			}
 		}
 		for (const [sessionId, attached] of [...this.#sessions]) {
-			if (liveIds.has(sessionId) || attached.disposed || attached.source === "adopted") continue;
+			if (liveIds.has(sessionId) || attached.disposed) continue;
 			await this.#retire(attached, "removed");
 		}
 		if (!this.#running(runEpoch)) return;
@@ -762,7 +817,12 @@ export class SessionRouter {
 				if (attached && !attached.disposed) await this.#retire(attached);
 			},
 		});
-		const notificationCursor = { generation: input.generation, seq: 0 };
+		const undelivered = this.#undelivered.get(input.sessionId);
+		const saved = this.#resumeCursor.get(input.sessionId);
+		let resumeSeq = 0;
+		if (undelivered?.generation === input.generation) resumeSeq = Math.max(resumeSeq, undelivered.seq - 1);
+		if (saved?.generation === input.generation) resumeSeq = Math.max(resumeSeq, saved.seq);
+		const notificationCursor = { generation: input.generation, seq: resumeSeq };
 		const notificationSubscription: NotificationSubscription = Object.freeze({
 			sessionId: input.sessionId,
 			subscriptionId: `notification:${input.sessionId}:${crypto.randomUUID()}`,
@@ -794,7 +854,17 @@ export class SessionRouter {
 		});
 		const disposeFrames = client.onFrame(frame => {
 			const current = attached;
-			if (!current || current.disposed) return;
+			if (!current || current.disposed || current.barrierFailed) return;
+			if (current.replaying) {
+				const seq = readSequence(frame.seq) ?? 0;
+				current.held ??= [];
+				if (current.held.length >= REPLAY_BARRIER_LIMIT) {
+					this.#failBarrier(current, `hold buffer overflowed at ${REPLAY_BARRIER_LIMIT} frames`);
+					return;
+				}
+				current.held.push({ seq, frame });
+				return;
+			}
 			current.frameTail = current.frameTail.catch(() => undefined).then(() => this.#deliverFrame(current, frame));
 			void current.frameTail;
 		});
@@ -846,8 +916,13 @@ export class SessionRouter {
 			notificationSubscription,
 			notificationCancelled: false,
 			notificationCursor,
+			cursor: { seq: resumeSeq },
+			published: false,
 			frameTail: Promise.resolve(),
 			disposed: false,
+			barrierFailed: false,
+			replaying: false,
+			held: undefined,
 			dispose: () => {
 				if (!attached || attached.disposed) return;
 				attached.disposed = true;
@@ -885,6 +960,7 @@ export class SessionRouter {
 			void Promise.resolve(this.#deps.onSessionRemoved?.(capability, "removed")).catch(() => undefined);
 			throw error;
 		}
+		attached.published = true;
 		// Initial event_replay is serialized on the attachment's own frame tail so
 		// live frames land behind it. Publication does not await that tail: start()
 		// still joins it for bootstrap callers, while periodic scan/request stay
@@ -895,30 +971,100 @@ export class SessionRouter {
 	}
 
 	async #replayAttached(attached: AttachedSession): Promise<void> {
-		if (attached.disposed || this.#sessions.get(attached.sessionId) !== attached) return;
-		let replay: Record<string, unknown>;
+		if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached) return;
+		attached.replaying = true;
+		attached.held ??= [];
+		const held = attached.held;
+		const sinceSeq = attached.cursor.seq;
 		try {
-			replay = await attached.client.request({
-				type: "event_replay",
-				sinceGeneration: attached.generation,
-				sinceSeq: attached.notificationCursor.seq,
-			});
-		} catch (error) {
-			logger.warn(
-				`SDK session ${attached.sessionId} event replay failed; live delivery continues (${String(error)}).`,
+			let replay: Record<string, unknown> | undefined;
+			for (let attempt = 0; ; attempt++) {
+				try {
+					replay = await attached.client.request({
+						type: "event_replay",
+						sinceGeneration: attached.generation,
+						sinceSeq,
+					});
+					break;
+				} catch (error) {
+					if (attempt >= REPLAY_RETRY_ATTEMPTS) {
+						this.#failBarrier(attached, "replay went unanswered");
+						return;
+					}
+					logger.warn(`SDK session ${attached.sessionId} event replay failed; retrying (${String(error)}).`);
+					await Bun.sleep(REPLAY_RETRY_BACKOFF_MS * 2 ** attempt);
+					if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached)
+						return;
+				}
+			}
+			if (!replay) return;
+			if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached) return;
+			if (!(await this.#deliverRecoveredFrames(attached))) return;
+			const heldReplay = held.find(entry => entry.frame.type === "event_replay_result");
+			const rawEvents = Array.isArray(replay.events)
+				? replay.events
+				: Array.isArray(heldReplay?.frame.events)
+					? heldReplay.frame.events
+					: [];
+			const events = rawEvents.filter(
+				(event): event is Record<string, unknown> => !!event && typeof event === "object" && !Array.isArray(event),
 			);
-			return;
-		}
-		if (attached.disposed || this.#sessions.get(attached.sessionId) !== attached) return;
-		const events = Array.isArray(replay.events)
-			? replay.events.filter(
-					(event): event is Record<string, unknown> =>
-						!!event && typeof event === "object" && !Array.isArray(event),
-				)
-			: [];
-		for (const event of events) {
-			if (attached.disposed || this.#sessions.get(attached.sessionId) !== attached) return;
-			await this.#deliverFrame(attached, event);
+			const gapValue = replay.gap ?? heldReplay?.frame.gap;
+			if (gapValue !== undefined) {
+				const gap = readReplayGap(gapValue);
+				if (!gap) {
+					this.#failBarrier(attached, "replay reported a gap it did not state");
+					return;
+				}
+				if (gap.kind === "generation_reset") {
+					this.#failBarrier(attached, `replay reported a generation reset to ${gap.toGeneration}`);
+					return;
+				}
+				if (gap.fromSeq !== sinceSeq + 1) {
+					this.#failBarrier(
+						attached,
+						`replay conceded sequences ${gap.fromSeq}-${gap.toSeq} for a request that resumed from seq ${sinceSeq}`,
+					);
+					return;
+				}
+				const retained = events
+					.map(event => readSequence(event.seq))
+					.find(seq => seq !== undefined && seq <= gap.toSeq);
+				if (retained !== undefined) {
+					this.#failBarrier(
+						attached,
+						`replay conceded sequences ${gap.fromSeq}-${gap.toSeq} while returning seq ${retained}`,
+					);
+					return;
+				}
+				const recovered = held
+					.filter(entry => entry.seq <= gap.toSeq && entry.frame.type !== "event_replay_result")
+					.sort((left, right) => left.seq - right.seq);
+				const carried = held.filter(entry => entry.seq > gap.toSeq);
+				held.splice(0, held.length, ...carried);
+				const recoveredNote =
+					recovered.length > 0 ? `, ${recovered.length} of them recovered from live delivery` : "";
+				logger.warn(
+					`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
+				);
+				for (const entry of recovered) this.#rememberRecoveredFrame(attached, entry.seq, entry.frame);
+				if (!(await this.#deliverRecoveredFrames(attached))) return;
+				if (gap.toSeq > attached.cursor.seq) attached.cursor.seq = gap.toSeq;
+			}
+			for (const event of events) {
+				if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached)
+					return;
+				await this.#deliverFrame(attached, event);
+			}
+			for (const entry of [...held]) {
+				if (attached.disposed || attached.barrierFailed) return;
+				if (entry.frame.type === "event_replay_result") continue;
+				await this.#deliverFrame(attached, entry.frame);
+			}
+			held.splice(0, held.length);
+		} finally {
+			attached.replaying = false;
+			if (attached.held === held) attached.held = undefined;
 		}
 	}
 
@@ -956,30 +1102,126 @@ export class SessionRouter {
 	}
 
 	async #deliverFrame(attached: AttachedSession, frame: Record<string, unknown>): Promise<void> {
-		if (attached.disposed || this.#sessions.get(attached.sessionId) !== attached) return;
+		if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached) return;
+		if (!attached.published) return;
 		const correlated = this.#correlateFrame(frame);
 		if (!correlated) return;
 		if (correlated.sessionId !== undefined && correlated.sessionId !== attached.sessionId) return;
 		if (correlated.generation !== undefined && correlated.generation !== attached.generation) return;
-		const seq = correlated.seq;
+		const seq = correlated.seq ?? readSequence(frame.seq);
 		if (seq !== undefined) {
-			if (correlated.generation === undefined) return;
-			if (seq <= attached.notificationCursor.seq && correlated.generation === attached.notificationCursor.generation)
+			if (correlated.generation === undefined && readGeneration(frame.generation) === undefined) return;
+			if (
+				seq <= attached.cursor.seq &&
+				(correlated.generation === undefined || correlated.generation === attached.generation)
+			)
 				return;
 		}
+		const ownsSequence =
+			seq !== undefined &&
+			(correlated.generation === attached.generation || correlated.generation === undefined) &&
+			(correlated.sessionId === undefined || correlated.sessionId === attached.sessionId);
 		const publicationId =
-			seq !== undefined && correlated.generation === attached.generation
-				? `${attached.sessionId}:${attached.generation}:${seq}`
-				: undefined;
+			seq !== undefined && ownsSequence ? `${attached.sessionId}:${attached.generation}:${seq}` : undefined;
 		const delivered = publicationId === undefined ? correlated : { ...correlated, publicationId };
 		this.#dispatchNotificationFrame(attached, delivered);
-		await Promise.resolve()
-			.then(() => this.#deps.onFrame?.(attached.capability, delivered))
-			.catch(error =>
-				logger.warn(`SDK provider frame hook failed: ${error instanceof Error ? error.message : String(error)}`),
+		try {
+			await this.#deps.onFrame?.(attached.capability, delivered);
+		} catch (error) {
+			if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached) return;
+			if (seq === undefined || !ownsSequence) throw error;
+			this.#failDelivery(attached, seq, error, frame);
+			return;
+		}
+		if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached) return;
+		if (seq !== undefined && ownsSequence) {
+			this.#undelivered.delete(attached.sessionId);
+			this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
+			if (seq > attached.cursor.seq) attached.cursor.seq = seq;
+		}
+	}
+
+	#failBarrier(attached: AttachedSession, reason: string): void {
+		if (attached.disposed || attached.barrierFailed) return;
+		attached.barrierFailed = true;
+		attached.held = undefined;
+		logger.warn(
+			`chat daemon replay barrier failed (${reason}); rebuilding session ${attached.sessionId} at generation ${attached.generation} from seq ${attached.cursor.seq}.`,
+		);
+	}
+
+	#failDelivery(attached: AttachedSession, seq: number, error: unknown, frame: Record<string, unknown>): void {
+		const previous = this.#undelivered.get(attached.sessionId);
+		const attempts = previous?.generation === attached.generation && previous.seq === seq ? previous.attempts + 1 : 1;
+		const reason = error instanceof Error ? error.message : String(error);
+		if (attempts >= DELIVERY_ATTEMPT_LIMIT) {
+			this.#undelivered.delete(attached.sessionId);
+			this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
+			attached.cursor.seq = seq;
+			logger.warn(
+				`chat daemon conceded seq ${seq} of session ${attached.sessionId} at generation ${attached.generation} after ${attempts} refused publications (${reason}); delivery resumes above it.`,
 			);
-		if (seq !== undefined && !attached.disposed)
-			attached.notificationCursor.seq = Math.max(attached.notificationCursor.seq, seq);
+			return;
+		}
+		this.#undelivered.set(attached.sessionId, { generation: attached.generation, seq, attempts });
+		this.#rememberRecoveredFrame(attached, seq, frame);
+		this.#failBarrier(attached, `publication failed at seq ${seq} (${reason})`);
+	}
+
+	#rememberRecoveredFrame(attached: AttachedSession, seq: number, frame: Record<string, unknown>): void {
+		let pending = this.#recoveredFrames.get(attached.sessionId);
+		if (!pending || pending.generation !== attached.generation) {
+			pending = { generation: attached.generation, frames: [] };
+			this.#recoveredFrames.set(attached.sessionId, pending);
+		}
+		const existing = pending.frames.find(item => item.seq === seq);
+		if (existing) existing.frame = frame;
+		else {
+			pending.frames.push({ seq, frame });
+			pending.frames.sort((left, right) => left.seq - right.seq);
+		}
+	}
+
+	#removeRecoveredFrame(sessionId: string, generation: number, seq: number): void {
+		const pending = this.#recoveredFrames.get(sessionId);
+		if (!pending || pending.generation !== generation) return;
+		pending.frames = pending.frames.filter(item => item.seq !== seq);
+		if (pending.frames.length === 0) this.#recoveredFrames.delete(sessionId);
+	}
+
+	async #deliverRecoveredFrames(attached: AttachedSession): Promise<boolean> {
+		const pending = this.#recoveredFrames.get(attached.sessionId);
+		if (!pending || pending.generation !== attached.generation) return true;
+		for (const item of [...pending.frames]) {
+			if (item.seq <= attached.cursor.seq) {
+				this.#removeRecoveredFrame(attached.sessionId, attached.generation, item.seq);
+				continue;
+			}
+			await this.#deliverFrame(attached, item.frame);
+			if (attached.barrierFailed || attached.disposed) return false;
+		}
+		return true;
+	}
+
+	async #proveAttachedEndpoint(attached: AttachedSession): Promise<boolean> {
+		if (attached.source === "adopted") {
+			const indexed = await this.#indexedLiveSession(attached.sessionId);
+			if (!indexed) return false;
+			return (
+				indexed.endpointGeneration === attached.generation &&
+				indexed.pid === attached.pid &&
+				indexed.endpointMtimeMs === attached.endpointMtimeMs
+			);
+		}
+		const indexed = await this.#indexedLiveSession(attached.sessionId);
+		if (!indexed) return false;
+		const endpoint = await this.#readEndpoint(indexed);
+		return (
+			!!endpoint &&
+			endpoint.url === attached.endpoint.url &&
+			endpoint.token === attached.endpoint.token &&
+			endpoint.pid === attached.pid
+		);
 	}
 
 	#recordNotificationReceipt(
@@ -1055,6 +1297,10 @@ export class SessionRouter {
 		attached: AttachedSession,
 		reason: "removed" | "replaced" | "replaced_same_generation" = "removed",
 	): Promise<void> {
+		this.#resumeCursor.set(attached.sessionId, {
+			generation: attached.generation,
+			seq: attached.cursor.seq,
+		});
 		if (this.#sessions.get(attached.sessionId) === attached) this.#sessions.delete(attached.sessionId);
 		if (attached.disposed) return;
 		attached.dispose();

@@ -9,7 +9,7 @@ For a beginner-friendly application development guide (recipes, customization, a
 
 The SDK exposes a generic action/reply protocol without requiring integrations to scrape the terminal. SDK core owns all managed attachment discovery and credential-bearing clients through `SessionRouter`; Telegram, Discord, Slack, ACP, MCP, and CLI adapters receive only capability-scoped operations and never endpoint credentials.
 
-> Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
+> Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` as a direct-attachment router: credentials and opaque capabilities stay in Router, with replay-cursor and publication-concession guarantees retained. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
 ## External attachment policy
 

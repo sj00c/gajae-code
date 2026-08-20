@@ -19,7 +19,7 @@ and
 `6e147d58~1:packages/coding-agent/src/modes/shared/agent-wire/session-registry.ts:1-53`.
 `SDK equivalent` means a current operation or documented SDK protocol covers the
 control/query intent, not that its transport or event semantics are identical.
-`transport-gap — retired` means the direct `gjc sdk serve` relay and standalone transport clients were removed when `SessionRouter` became the sole external attachment authority.
+`transport-gap — retired` means the direct `gjc sdk serve` relay and standalone transport clients were removed when `SessionRouter` became the sole external attachment path (direct-attachment stub under issue #4530, with replay-cursor and publication-concession guarantees retained).
 `phase-2-gap` means no equivalent has been implemented by this audit.
 
 Operation names and their stated roles are from

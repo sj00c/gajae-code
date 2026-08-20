@@ -27,10 +27,10 @@ Gajae-Code packages the runtime as a reusable component:
   a production agent loop (tools, retries, compaction, session files, model
   fallback chains) in one call.
 - **A managed machine interface is available.** Top-level sessions host an internal
-  loopback endpoint, while SDK-core `SessionRouter` retains its discovery record,
-  credentials, replay cursor, and exact attachment authority. Applications use
-  Coordinator MCP, the SDK session CLI, or a configured managed adapter rather
-  than opening that endpoint directly.
+  loopback endpoint, while SDK-core `SessionRouter` retains discovery records and
+  credentials, issues opaque attachments, and delivers a replay cursor with
+  publication concession. Applications use Coordinator MCP, the SDK session CLI,
+  or a configured managed adapter rather than opening that endpoint directly.
 - **Many subscribers, one session.** In-process subscribers and configured managed
   adapters can observe the same session without sharing endpoint credentials.
 - **Not just for coding.** Tools, skills, rules, and the system prompt are all

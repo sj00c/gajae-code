@@ -317,7 +317,7 @@ Artifact paths are canonicalized, symlink escapes are rejected, and output is by
 
 ## Managed SDK attachment integration
 
-Bots must attach through a managed SDK-core adapter backed by `SessionRouter`. Do not read `.gjc/state/sdk` endpoint records, retain URL/token credentials, or open raw per-session WebSockets. `SessionRouter` owns endpoint resolution, credentials, replay, reconnect, rotation, and exact opaque attachment authority; provider code owns only transport and presentation state.
+Bots must attach through a managed SDK-core adapter backed by `SessionRouter`. Do not read `.gjc/state/sdk` endpoint records, retain URL/token credentials, or open raw per-session WebSockets. `SessionRouter` owns endpoint resolution, credentials, replay cursor, reconnect, rotation, publication concession, and opaque attachment capabilities; it does not expose broker-index fencing to providers. Provider code owns only transport and presentation state.
 
 Use the Telegram, Discord, or Slack managed adapter for a single live session. Use Coordinator MCP for multi-session orchestration, artifacts, status, and durable workflow-gate operations. Lifecycle mutations always enter `SessionLifecycleService` and the Broker ledger with a stable idempotency identity.
 The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions; the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
