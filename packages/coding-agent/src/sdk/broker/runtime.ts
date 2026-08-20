@@ -114,32 +114,74 @@ function regularFilesUnder(directory: string): string[] {
 
 /** Include source trees for local workspace dependencies resolved by source Bun launches. */
 function workspaceDependencyFiles(packageDirectory: string): string[] {
-	let manifest: {
+	const workspaceRoot = path.dirname(packageDirectory);
+	const files: string[] = [];
+	const visited = new Set<string>();
+	const workspaceDirectories = new Map<string, string>();
+	for (const entry of fs.readdirSync(workspaceRoot, { withFileTypes: true })) {
+		if (!entry.isDirectory()) continue;
+		const directory = path.join(workspaceRoot, entry.name);
+		try {
+			const manifest = JSON.parse(fs.readFileSync(path.join(directory, "package.json"), "utf8")) as {
+				name?: unknown;
+			};
+			if (typeof manifest.name === "string") workspaceDirectories.set(manifest.name, directory);
+		} catch {
+			// Non-package workspace directories are irrelevant to the runtime closure.
+		}
+	}
+	const resolveWorkspaceDirectory = (name: string): string | undefined => {
+		const suffix = name.slice("@gajae-code/".length);
+		const candidate = path.resolve(workspaceRoot, suffix);
+		if (!containedPath(workspaceRoot, candidate))
+			throw new Error("SDK internal launch refused: workspace dependency escapes its trusted root.");
+		return fs.existsSync(candidate) ? candidate : workspaceDirectories.get(name);
+	};
+	const visit = (dependencyDirectory: string): void => {
+		const canonicalDirectory = fs.realpathSync(dependencyDirectory);
+		if (!containedPath(workspaceRoot, canonicalDirectory) || visited.has(canonicalDirectory)) return;
+		visited.add(canonicalDirectory);
+		const manifestPath = path.join(canonicalDirectory, "package.json");
+		let manifest: {
+			dependencies?: Record<string, unknown>;
+			devDependencies?: Record<string, unknown>;
+			optionalDependencies?: Record<string, unknown>;
+		};
+		try {
+			manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as typeof manifest;
+		} catch {
+			throw new Error("SDK internal launch refused: workspace dependency metadata is unreadable.");
+		}
+		files.push(manifestPath);
+		const sourceDirectory = path.join(canonicalDirectory, "src");
+		const nativeDirectory = path.join(canonicalDirectory, "native");
+		if (fs.existsSync(sourceDirectory)) files.push(...regularFilesUnder(sourceDirectory));
+		if (fs.existsSync(nativeDirectory)) files.push(...regularFilesUnder(nativeDirectory));
+		const names = new Set([
+			...Object.keys(manifest.dependencies ?? {}),
+			...Object.keys(manifest.devDependencies ?? {}),
+			...Object.keys(manifest.optionalDependencies ?? {}),
+		]);
+		for (const name of names) {
+			if (!name.startsWith("@gajae-code/")) continue;
+			const candidate = resolveWorkspaceDirectory(name);
+			if (candidate && fs.existsSync(candidate)) visit(candidate);
+		}
+	};
+	const rootManifest = JSON.parse(fs.readFileSync(path.join(packageDirectory, "package.json"), "utf8")) as {
 		dependencies?: Record<string, unknown>;
 		devDependencies?: Record<string, unknown>;
 		optionalDependencies?: Record<string, unknown>;
 	};
-	try {
-		manifest = JSON.parse(fs.readFileSync(path.join(packageDirectory, "package.json"), "utf8")) as typeof manifest;
-	} catch {
-		return [];
-	}
-	const workspaceRoot = path.dirname(packageDirectory);
-	const names = new Set([
-		...Object.keys(manifest.dependencies ?? {}),
-		...Object.keys(manifest.devDependencies ?? {}),
-		...Object.keys(manifest.optionalDependencies ?? {}),
+	const rootNames = new Set([
+		...Object.keys(rootManifest.dependencies ?? {}),
+		...Object.keys(rootManifest.devDependencies ?? {}),
+		...Object.keys(rootManifest.optionalDependencies ?? {}),
 	]);
-	const files: string[] = [];
-	for (const name of names) {
+	for (const name of rootNames) {
 		if (!name.startsWith("@gajae-code/")) continue;
-		const dependencyDirectory = path.join(workspaceRoot, name.slice("@gajae-code/".length));
-		const sourceDirectory = path.join(dependencyDirectory, "src");
-		const nativeDirectory = path.join(dependencyDirectory, "native");
-		if (!fs.existsSync(dependencyDirectory)) continue;
-		files.push(path.join(dependencyDirectory, "package.json"));
-		if (fs.existsSync(sourceDirectory)) files.push(...regularFilesUnder(sourceDirectory));
-		if (fs.existsSync(nativeDirectory)) files.push(...regularFilesUnder(nativeDirectory));
+		const candidate = resolveWorkspaceDirectory(name);
+		if (candidate && fs.existsSync(candidate)) visit(candidate);
 	}
 	return files;
 }
