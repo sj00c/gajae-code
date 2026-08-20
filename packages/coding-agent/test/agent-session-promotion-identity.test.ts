@@ -162,22 +162,24 @@ describe("queued promotion run identity (#4668)", () => {
 			tool,
 		);
 		const promotions: boolean[] = [];
+		const dispatchDispositions: boolean[] = [];
 		const promptDone = session.prompt("first task");
 		while (!session.isStreaming) await Bun.sleep(5);
 		// A PLAIN prompt: no deliverAs, no queuedAtDispatch snapshot — the exact
 		// SDK dispatch-race shape.
 		await session.sendUserMessage("raced prompt", {
+			onDispatchDisposition: promotion => dispatchDispositions.push(promotion.startsOwnRun),
 			onQueuedPromoted: promotion => promotions.push(promotion.startsOwnRun),
 		});
 		// The divert disposition must already be reported: the submission has
 		// resolved, so a synchronous settlement reading the disposition now must
 		// see in-run consumption, not an unknown (own-run) outcome.
-		expect(promotions[0]).toBe(false);
+		expect(dispatchDispositions[0]).toBe(false);
 		gate.resolve();
 		await promptDone;
 		await session.waitForIdle();
-		// Every disposition reported for this submission stays in-run.
-		expect(promotions.length).toBeGreaterThan(0);
+		// The public promotion callback fires once at actual consumption and stays in-run.
+		expect(promotions.length).toBe(1);
 		expect(promotions.every(startsOwnRun => startsOwnRun === false)).toBe(true);
 	});
 

@@ -1199,6 +1199,7 @@ export interface ExtensionAPI {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
+			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			/** Internal SDK correlation owner for an exact queued follow-up. */
 			sdkRunToken?: string;

@@ -11577,6 +11577,8 @@ export class AgentSession {
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
 			onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void;
+			/** Internal dispatch disposition used before actual queue consumption. */
+			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			sdkRunToken?: string;
 		},
@@ -11746,9 +11748,9 @@ export class AgentSession {
 				// submission promise resolves NOW, before any consumption or promotion
 				// hook fires; without a synchronous disposition the SDK settlement
 				// would terminalize the accepted request as an own-run completion
-				// before it is consumed. Report the actual in-run disposition so the
+				// before it is consumed. Report the internal in-run disposition so the
 				// runtime attaches the correlation to the in-flight run instead.
-				options?.onQueuedPromoted?.({ startsOwnRun: false });
+				options?.onDispatchDisposition?.({ startsOwnRun: false });
 				options?.onPreflightAccepted?.();
 				return;
 			}

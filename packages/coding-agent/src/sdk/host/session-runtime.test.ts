@@ -98,6 +98,7 @@ test("preserves an agent failure code in host prompt reconciliation", async () =
 		type: "agent_failed",
 		error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
 	});
+	await reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
 	expect(reconciliation.lookup("prompt", { clientRef: "failed-ref" })).toMatchObject({
 		status: "failed",
 		error: { code: "provider_unavailable", message: "Prompt submission failed." },
@@ -112,6 +113,7 @@ test("a late agent failure never overwrites the reason an already terminal recor
 		type: "agent_failed",
 		error: Object.assign(new Error("stream interrupted"), { code: "upstream_stream_interrupted" }),
 	});
+	await reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
 	const claimed = reconciliation.lookup("prompt", { clientRef: "first-reason-ref" });
 	expect(claimed).toMatchObject({
 		status: "failed",
@@ -2493,15 +2495,17 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("terminalize-prompt", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					throw Object.assign(
-						new Error("upstream request failed: stream interrupted before terminal response event"),
-						{ code: "upstream_stream_interrupted" },
-					);
+					await new Promise<void>(() => {});
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
 			expect(accepted.ok).toBe(true);
 			const { commandId, turnId } = accepted.result ?? {};
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("stream interrupted"), { code: "upstream_stream_interrupted" }),
+			});
+			await harness.emit("agent_end");
 			// Provider text is redacted on the wire by contract (sanitizePromptFailure);
 			// the failure reason survives as the safe-token code.
 			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
@@ -2516,20 +2520,21 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
-	test("an aborted prompt reports a terminal failed status instead of hanging", async () => {
+	test("a canceled prompt reports a terminal failed status instead of hanging", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-abort-"));
 		try {
-			const inflight = Promise.withResolvers<void>();
 			const harness = await invocationHarness("terminalize-abort", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await inflight.promise;
+					await new Promise<void>(() => {});
 				},
-				abort: () => inflight.reject(Object.assign(new Error("turn aborted"), { code: "aborted" })),
+				abort: () => {},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
 			const { commandId, turnId } = accepted.result ?? {};
-			expect(await harness.control("turn.abort", {})).toMatchObject({ ok: true });
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", { error: Object.assign(new Error("turn aborted"), { code: "aborted" }) });
+			await harness.emit("agent_end");
 			expect(await settledStatus(harness, "turn.prompt_status", { commandId, turnId })).toMatchObject({
 				status: "failed",
 				error: { code: "aborted" },
@@ -2637,12 +2642,17 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("terminalize-skill", cwd, {
 				invokeSkill: async (_name, _args, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					throw Object.assign(new Error("skill provider stream interrupted"), { code: "upstream_error" });
+					await new Promise<void>(() => {});
 				},
 			});
 			const accepted = await harness.control("skill.invoke", { name: "ralplan" });
 			expect(accepted.ok).toBe(true);
 			const { commandId, turnId } = accepted.result ?? {};
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("skill provider stream interrupted"), { code: "upstream_error" }),
+			});
+			await harness.emit("agent_end");
 			expect(await settledStatus(harness, "skill.invoke_status", { commandId, turnId })).toMatchObject({
 				status: "failed",
 				error: { code: "upstream_error" },
@@ -3275,24 +3285,14 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
-	test("agent_failed is a terminal lifecycle boundary that preserves the failure cause", async () => {
-		// Exact-head review (#4668 P1): the agent_failed listener discarded the
-		// failure event and only cleared leases, leaving lifecycleActive, the
-		// tracked invocation batch, and owner connection IDs live. A failed run
-		// without a subsequent agent_end must still terminalize with its real
-		// reason and full terminal teardown.
+	test("agent_failed is diagnostic until agent_end terminalizes the run", async () => {
+		// Exact-head review (#4668 P1): agent_failed is an additive diagnostic;
+		// ownership, lifecycle state, and the deadline remain until agent_end.
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-agent-failed-"));
 		try {
-			let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
 			const harness = await invocationHarness("agent-failed", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
-						promoted = (
-							options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined
-						)?.onQueuedPromoted;
-						return;
-					}
 					// The failing turn accepts and then never makes progress on its own.
 					await new Promise<void>(() => {});
 				},
@@ -3304,20 +3304,11 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
 			});
 			const idsFailing = { commandId: failing.result?.commandId, turnId: failing.result?.turnId };
+			expect((await harness.query("turn.prompt_status", idsFailing)).result?.status).toBe("in_flight");
+			await harness.emit("agent_end");
 			expect(await settledStatus(harness, "turn.prompt_status", idsFailing)).toMatchObject({
 				status: "failed",
 				error: { code: "provider_unavailable" },
-			});
-			// Teardown proof: with lifecycleActive cleared, an in-run consumption
-			// reported after the failure has no live run to attach to and takes the
-			// bounded no-active-run terminal path instead of joining a zombie run.
-			const followUp = await harness.control("turn.follow_up", { text: "late" });
-			expect(followUp.ok).toBe(true);
-			promoted?.({ startsOwnRun: false });
-			const idsFollowUp = { commandId: followUp.result?.commandId, turnId: followUp.result?.turnId };
-			expect(await settledStatus(harness, "turn.prompt_status", idsFollowUp)).toMatchObject({
-				status: "failed",
-				error: { code: "busy" },
 			});
 			await harness.stop();
 		} finally {

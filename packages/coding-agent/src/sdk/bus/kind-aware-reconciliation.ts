@@ -345,6 +345,12 @@ export function createKindAwareReconciliation(
 				if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
 				return { value: undefined, changed: true };
 			}
+			if (frame.type === "agent_failed") {
+				// agent_failed is additive diagnostics; agent_end remains the sole
+				// terminal lifecycle boundary for the correlated invocation.
+				record.error ??= sanitizePromptFailure(frame.error);
+				return { value: undefined, changed: true };
+			}
 			const pendingOutcome = record.pendingOutcome;
 			record.terminalAt = now();
 			if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
@@ -359,12 +365,8 @@ export function createKindAwareReconciliation(
 				}
 				record.receiptState = record.pendingReceiptState ?? "missing";
 				record.pendingReceiptState = undefined;
-			} else if (frame.type === "agent_failed") {
-				record.status = "failed";
-				record.error = sanitizePromptFailure(frame.error);
-				record.receiptState = frame.content?.text?.trim() ? "present" : "missing";
 			} else {
-				record.status = "terminal_ok";
+				record.status = record.error === undefined ? "terminal_ok" : "failed";
 				record.receiptState = frame.content?.text?.trim() ? "present" : "missing";
 			}
 			cleanupRecords(candidate);

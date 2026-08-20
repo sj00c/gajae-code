@@ -413,6 +413,7 @@ export type InvocationKind = "prompt" | "skill" | "steer";
 type InvocationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed" | "uncertain";
 interface InvocationRecord extends InvocationCorrelation {
 	kind: InvocationKind;
+	revision: number;
 	clientRef?: string;
 	status: InvocationStatus;
 	acceptedAt: number;
@@ -473,6 +474,8 @@ export function createInvocationReconciliation(
 			? path.join(options.stateRoot, ".sdk-reconciliation", `${options.sessionId}.json`)
 			: undefined;
 	let persistenceChain: Promise<void> = Promise.resolve();
+	let mutationRevision = 0;
+	const revisionOf = (record: InvocationRecord): number => record.revision ?? 0;
 	const persist = async (snapshot: readonly InvocationRecord[] = [...records.values()]): Promise<void> => {
 		if (store) {
 			await store.transact(() => [...snapshot]);
@@ -528,7 +531,13 @@ export function createInvocationReconciliation(
 				if (candidate.kind !== "prompt" && candidate.kind !== "skill") continue;
 				if (!candidate.commandId || !candidate.turnId || typeof candidate.acceptedAt !== "number") continue;
 				const kind = candidate.kind as InvocationKind;
-				const record: InvocationRecord = { ...candidate, kind } as InvocationRecord;
+				const persistedRevision = (candidate as SdkOnlyInvocationRecord & { revision?: unknown }).revision;
+				const record: InvocationRecord = {
+					...candidate,
+					kind,
+					revision: typeof persistedRevision === "number" ? persistedRevision : ++mutationRevision,
+				} as InvocationRecord;
+				mutationRevision = Math.max(mutationRevision, record.revision);
 				// Never re-hydrate a failure reason that could contain provider secrets
 				// into a fresh process (origin/dev sanitization preserved).
 				if (record.status === "failed") record.error = sanitizePromptFailure(record.error);
@@ -567,6 +576,8 @@ export function createInvocationReconciliation(
 					record.error = { code: "process_restart", message: "Reconciliation incomplete after process restart." };
 				}
 				if (record.status === "failed") record.error = sanitizePromptFailure(record.error);
+				record.revision = typeof record.revision === "number" ? record.revision : ++mutationRevision;
+				mutationRevision = Math.max(mutationRevision, record.revision);
 				records.set(key(record.kind, record), { ...record });
 			}
 		}
@@ -605,6 +616,7 @@ export function createInvocationReconciliation(
 			records.set(key(kind, correlation), {
 				...correlation,
 				kind,
+				revision: ++mutationRevision,
 				...(clientRef === undefined ? {} : { clientRef }),
 				status: "accepted",
 				acceptedAt: Date.now(),
@@ -623,34 +635,42 @@ export function createInvocationReconciliation(
 				// claimed the terminal. Enrich the settled record instead of dropping it;
 				// never resurrect (status/terminalAt untouched), and first reason wins.
 				if (frame.type === "agent_failed" && record.error === undefined) {
+					const next = { ...record, revision: ++mutationRevision };
 					logger.error("SDK invocation failed (late)", {
 						kind,
 						commandId: correlation.commandId,
 						turnId: correlation.turnId,
 						error: formatPromptFailureForLocalLog(frame.error),
 					});
-					record.error = sanitizePromptFailure(frame.error);
-					await persist();
+					next.error = sanitizePromptFailure(frame.error);
+					await persist([...records.values()].map(candidate => (candidate === record ? next : candidate)));
+					const current = records.get(key(kind, correlation));
+					if (current === record || (current !== undefined && revisionOf(current) < next.revision))
+						records.set(key(kind, correlation), next);
 				}
 				return;
 			}
+			const next = { ...record, revision: ++mutationRevision };
 			if (frame.type === "agent_start") {
-				record.status = "in_flight";
-				record.startedAt = Date.now();
+				next.status = "in_flight";
+				next.startedAt = Date.now();
+			} else if (frame.type === "agent_failed") {
+				// Failure is diagnostic only; agent_end remains the terminal boundary.
+				logger.error("SDK invocation failed", {
+					kind,
+					commandId: correlation.commandId,
+					turnId: correlation.turnId,
+					error: formatPromptFailureForLocalLog(frame.error),
+				});
+				next.error ??= sanitizePromptFailure(frame.error);
 			} else {
-				record.status = frame.type === "agent_failed" ? "failed" : "terminal_ok";
-				record.terminalAt = Date.now();
-				if (frame.type === "agent_failed") {
-					logger.error("SDK invocation failed", {
-						kind,
-						commandId: correlation.commandId,
-						turnId: correlation.turnId,
-						error: formatPromptFailureForLocalLog(frame.error),
-					});
-					record.error = sanitizePromptFailure(frame.error);
-				}
+				next.status = next.error === undefined ? "terminal_ok" : "failed";
+				next.terminalAt = Date.now();
 			}
-			await persist();
+			await persist([...records.values()].map(candidate => (candidate === record ? next : candidate)));
+			const current = records.get(key(kind, correlation));
+			if (current === record || (current !== undefined && revisionOf(current) < next.revision))
+				records.set(key(kind, correlation), next);
 		},
 		lookup(kind, selector) {
 			const record = find(kind, selector);
@@ -681,8 +701,12 @@ export function createInvocationReconciliation(
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return outcome;
 			const pending = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
 			if (pending !== undefined) return pending;
-			(record as unknown as Record<string, unknown>).pendingOutcome = outcome;
-			await persist();
+			const next = { ...record, revision: ++mutationRevision } as InvocationRecord & { pendingOutcome?: unknown };
+			next.pendingOutcome = outcome;
+			await persist([...records.values()].map(candidate => (candidate === record ? next : candidate)));
+			const current = records.get(key(kind, correlation));
+			if (current === record || (current !== undefined && revisionOf(current) < next.revision))
+				records.set(key(kind, correlation), next);
 			return outcome;
 		},
 		async finalizeOutcome(kind, correlation, outcome, isCurrent) {
@@ -692,7 +716,8 @@ export function createInvocationReconciliation(
 				(record as unknown as { pendingOutcome?: { kind: string; code: string; message: string } })
 					.pendingOutcome) as { kind: string; code: string; message: string } | undefined;
 			const previousRecord = { ...record };
-			const finalizedRecord: InvocationRecord = { ...record, terminalAt: Date.now() };
+			const baseRevision = revisionOf(record);
+			const finalizedRecord: InvocationRecord = { ...record, revision: ++mutationRevision, terminalAt: Date.now() };
 			if (finalOutcome?.kind === "failed") {
 				finalizedRecord.status = "failed";
 				finalizedRecord.error = { code: finalOutcome.code, message: finalOutcome.message };
@@ -705,14 +730,20 @@ export function createInvocationReconciliation(
 			try {
 				await persist(snapshot);
 			} catch (error) {
-				if (records.get(key(kind, correlation)) === record) records.set(key(kind, correlation), previousRecord);
+				const current = records.get(key(kind, correlation));
+				if (current === record || (current !== undefined && revisionOf(current) <= baseRevision))
+					records.set(key(kind, correlation), previousRecord);
 				throw error;
 			}
 			if (isCurrent !== undefined && !isCurrent()) {
-				if (records.get(key(kind, correlation)) === record) await persist([...records.values()]);
+				const current = records.get(key(kind, correlation));
+				if (current === record || (current !== undefined && revisionOf(current) <= baseRevision))
+					await persist([...records.values()]);
 				return;
 			}
-			if (records.get(key(kind, correlation)) === record) records.set(key(kind, correlation), finalizedRecord);
+			const current = records.get(key(kind, correlation));
+			if (current === record || (current !== undefined && revisionOf(current) < finalizedRecord.revision))
+				records.set(key(kind, correlation), finalizedRecord);
 		},
 	};
 }
@@ -1345,6 +1376,8 @@ function createControlSurface(
 		run: (options: {
 			onPreflightAccepted: () => void;
 			onPreflightAcceptCommit: () => Promise<void>;
+			/** Internal disposition before a queued submission is actually consumed. */
+			onDispatchDisposition: (promotion: { startsOwnRun: boolean }) => void;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
 			onQueuedPromoted: (promotion?: { startsOwnRun?: boolean }) => void;
 			queuedAtDispatch: boolean;
@@ -1419,6 +1452,9 @@ function createControlSurface(
 				run({
 					onPreflightAccepted: () => void accept().catch(() => undefined),
 					onPreflightAcceptCommit: accept,
+					onDispatchDisposition: promotion => {
+						promotionStartsOwnRun = promotion.startsOwnRun;
+					},
 					// A queued submission (busy-accepted steering, or a follow-up) that
 					// is later PROMOTED to its own run needs its pending ownership entry
 					// created at promotion so the submitting connection can
@@ -2725,9 +2761,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		try {
 			for (const invocation of transitions) {
 				try {
-					// agent_failed is a terminal lifecycle boundary (#4668 review P1):
-					// thread the observed failure cause into the transition so
-					// reconciliation keeps the real reason instead of a bare failure.
+					// agent_failed is additive diagnostic state; agent_end remains the
+					// lifecycle boundary that terminalizes ownership and deadlines.
 					const frame =
 						type === "agent_failed"
 							? {
@@ -2737,7 +2772,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								}
 							: { type };
 					await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, frame as never);
-					if ((type as string) === "agent_end" || (type as string) === "agent_failed") {
+					if ((type as string) === "agent_end") {
 						if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
 					}
 				} catch {
