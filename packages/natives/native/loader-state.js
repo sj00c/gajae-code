@@ -458,6 +458,10 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 	if (!ctx.stageFromNodeModules) return null;
 
 	let stagedPath = null;
+	const rejectStagedCandidate = targetPath => {
+		if (!Array.isArray(ctx.candidates)) return;
+		ctx.candidates = ctx.candidates.filter(candidate => candidate !== targetPath);
+	};
 	const sourceDirs = [...ctx.optionalPackageNativeDirs, ctx.nativeDir];
 	for (const filename of ctx.addonFilenames) {
 		const targetPath = path.join(ctx.versionedDir, filename);
@@ -466,10 +470,12 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 		if (fs.existsSync(targetPath)) {
 			if (!sourcePath) {
 				errors.push(`staged addon orphan (${filename}): no current package artifact exists`);
+				rejectStagedCandidate(targetPath);
 				continue;
 			}
 			if (sourcePath && !addonBytesMatch(targetPath, sourcePath)) {
 				errors.push(`staged addon drift (${filename}): cached bytes differ from the current package artifact`);
+				rejectStagedCandidate(targetPath);
 				continue;
 			}
 			stagedPath = stagedPath || targetPath;

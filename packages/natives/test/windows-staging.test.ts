@@ -24,6 +24,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	getAddonFilenames,
+	loadNative,
 	maybeStageNodeModulesAddon,
 	resolveLoaderCandidates,
 	shouldStageNodeModulesAddon,
@@ -171,6 +172,51 @@ describe("windows native addon staging", () => {
 				),
 			).toBeNull();
 			expect(orphanErrors).toEqual([expect.stringContaining("staged addon orphan")]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("removes drifted staged candidates before native loading", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-load-"));
+		const nativeDir = path.join(root, "native");
+		const versionedDir = path.join(root, "versioned");
+		const filename = "pi_natives.win32-x64.node";
+		const stagedPath = path.join(versionedDir, filename);
+		const sourcePath = path.join(nativeDir, filename);
+		await fs.mkdir(nativeDir, { recursive: true });
+		await fs.mkdir(versionedDir, { recursive: true });
+		await fs.writeFile(sourcePath, "new-addon");
+		await fs.writeFile(stagedPath, "old-addon");
+		try {
+			const attempted: string[] = [];
+			const errors: string[] = [];
+			const bindings = loadNative({
+				context: {
+					isCompiledBinary: false,
+					stageFromNodeModules: true,
+					platformTag: "win32-x64",
+					packageVersion: "test",
+					selectedVariant: "baseline",
+					versionedDir,
+					nativeDir,
+					optionalPackageNativeDirs: [],
+					addonFilenames: [filename],
+					candidates: [stagedPath, sourcePath],
+				},
+				extractEmbeddedAddons: () => [],
+				stageNodeModulesAddon: (ctx, stageErrors) => maybeStageNodeModulesAddon(ctx, stageErrors),
+				requireCandidate: candidate => {
+					attempted.push(candidate);
+					if (candidate !== sourcePath) throw new Error("staged candidate should have been rejected");
+					return { selected: candidate };
+				},
+				validateCandidate: () => undefined,
+			});
+
+			expect(bindings).toEqual({ selected: sourcePath });
+			expect(attempted).toEqual([sourcePath]);
+			expect(errors).toEqual([]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
