@@ -112,6 +112,27 @@ function regularFilesUnder(directory: string): string[] {
 	return files;
 }
 
+/** Include source trees for local workspace dependencies resolved by source Bun launches. */
+function workspaceDependencyFiles(packageDirectory: string): string[] {
+	let manifest: { dependencies?: Record<string, unknown>; devDependencies?: Record<string, unknown> };
+	try {
+		manifest = JSON.parse(fs.readFileSync(path.join(packageDirectory, "package.json"), "utf8")) as typeof manifest;
+	} catch {
+		return [];
+	}
+	const workspaceRoot = path.dirname(packageDirectory);
+	const names = new Set([...Object.keys(manifest.dependencies ?? {}), ...Object.keys(manifest.devDependencies ?? {})]);
+	const files: string[] = [];
+	for (const name of names) {
+		if (!name.startsWith("@gajae-code/")) continue;
+		const dependencyDirectory = path.join(workspaceRoot, name.slice("@gajae-code/".length));
+		const sourceDirectory = path.join(dependencyDirectory, "src");
+		if (!fs.existsSync(sourceDirectory)) continue;
+		files.push(path.join(dependencyDirectory, "package.json"), ...regularFilesUnder(sourceDirectory));
+	}
+	return files;
+}
+
 /** Digest the actual bytes of the trusted launch inputs, not only filesystem metadata. */
 function sdkPackageGeneration(kind: SdkInternalSpawnCommand["kind"], version: string, files: string[]): string {
 	const hash = createHash("sha256");
@@ -160,17 +181,21 @@ function sourceDescriptor(
 		!containedPath(canonicalBrokerDirectory, marker)
 	)
 		throw new Error("SDK internal launch refused: product runtime assets escape their trusted directories.");
+	const generationFiles = [
+		path.join(canonicalPackageDirectory, "package.json"),
+		...regularFilesUnder(canonicalSourceDirectory),
+		...workspaceDependencyFiles(canonicalPackageDirectory),
+		config,
+	];
+	const lockfile = path.resolve(canonicalPackageDirectory, "../../bun.lock");
+	if (fs.existsSync(lockfile)) generationFiles.push(lockfile);
 	return {
 		kind: "bun-source",
 		file: runtime,
 		args: ["--no-env-file", `--config=${config}`, cli, "sdk", action],
 		env: internalEnvironment(options.environment ?? process.env, true),
 		cwd: canonicalBrokerDirectory,
-		generation: sdkPackageGeneration("bun-source", packageVersion, [
-			path.join(canonicalPackageDirectory, "package.json"),
-			...regularFilesUnder(canonicalSourceDirectory),
-			config,
-		]),
+		generation: sdkPackageGeneration("bun-source", packageVersion, generationFiles),
 	};
 }
 
@@ -205,12 +230,9 @@ export function resolveSdkInternalSpawnCommand(action: SdkInternalAction): SdkIn
 	return resolveSdkInternalSpawnCommandWithEvidence(action, {});
 }
 
-/** Resolve the generation the production descriptor would publish, without spawning. */
-let cachedSdkPackageGeneration: string | undefined;
+/** Resolve the current generation the production descriptor would publish, without spawning. */
 export function resolveSdkPackageGeneration(): string {
-	if (cachedSdkPackageGeneration === undefined)
-		cachedSdkPackageGeneration = resolveSdkInternalSpawnCommand("broker-internal").generation;
-	return cachedSdkPackageGeneration;
+	return resolveSdkInternalSpawnCommand("broker-internal").generation;
 }
 
 /** Test hook: injects runtime evidence without weakening the production marker authority. */

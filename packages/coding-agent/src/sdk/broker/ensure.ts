@@ -306,16 +306,12 @@ const STALE_BROKER_SHUTDOWN_TIMEOUT_MS = 2_000;
 /** Sends SIGTERM only through an OS process reference bound to the published incarnation. */
 function signalExactBroker(pid: number, incarnation: string): boolean {
 	try {
+		if (pid === process.pid) return false;
 		const processRef = nativeProcessBindings().Process.fromPid(pid);
 		if (!processRef || processRef.incarnation !== incarnation) return false;
 		const signal = os.constants.signals.SIGTERM;
 		if (signal === undefined) return false;
-		if (process.platform === "darwin") {
-			const current = nativeProcessBindings().Process.fromPid(pid);
-			if (!current || current.incarnation !== incarnation) return false;
-			process.kill(pid, "SIGTERM");
-			return true;
-		}
+		if (process.platform === "darwin") return false;
 		return processRef.signalRoot(signal);
 	} catch {
 		return false;
@@ -377,10 +373,15 @@ async function retireAndReadReplacement(
 	const expectedPackageGeneration = settings.expectedPackageGeneration;
 	if (expectedPackageGeneration === undefined) return stale;
 	await retireStaleBroker(settings.agentDir, stale, settings.heartbeatTtlMs);
+	const currentPackageGeneration = resolveSdkPackageGeneration();
+	if (currentPackageGeneration !== expectedPackageGeneration)
+		throw new Error(
+			`SDK broker package generation changed during retirement: expected ${expectedPackageGeneration}, resolved ${currentPackageGeneration}.`,
+		);
 	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 	if (!replacement) return undefined;
-	if (matchesExpectedPackageGeneration(replacement, expectedPackageGeneration)) return replacement;
-	throw staleBrokerRetirementUnverified(expectedPackageGeneration, replacement.packageGeneration);
+	if (replacement.packageGeneration === currentPackageGeneration) return replacement;
+	throw staleBrokerRetirementUnverified(currentPackageGeneration, replacement.packageGeneration);
 }
 
 async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: EnsureInitiator): Promise<EnsureOutcome> {
