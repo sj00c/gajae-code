@@ -82,6 +82,7 @@ import {
 import {
 	resolveUltragoalValidationApplicability,
 	type UltragoalValidationApplicability,
+	type UltragoalValidationLane,
 } from "./ultragoal-validation-policy";
 import { resolveWorkflowSetting } from "./workflow-settings";
 
@@ -2768,8 +2769,7 @@ async function validateCompletionQualityGate(
 	}
 	const applicability = resolveUltragoalValidationApplicability({
 		changeSet: options.changeSet,
-		totalGoals: options.plan?.goals.length,
-		completedGoals: options.plan?.goals.filter(goal => goal.status === "complete").length,
+		requiredGoals: options.plan?.goals.filter(goal => goal.status !== "superseded").length,
 		hasOpenReviewBlockers: options.plan?.goals.some(goal => goal.status === "review_blocked") ?? false,
 		latestCohortSourceHash: options.ledger ? latestJoinedCohortSourceHash(options.ledger)?.sourceHash : undefined,
 		currentSourceHash: gateCohortSourceHash ?? undefined,
@@ -2784,11 +2784,18 @@ async function validateCompletionQualityGate(
 	const architectReview = qualityGateObject(gate.architectReview);
 	const executorQa = qualityGateObject(gate.executorQa);
 	const iteration = qualityGateObject(gate.iteration);
-	if (!architectReview || !executorQa || !iteration) {
+	// #4560: when the runtime-verified selection omits the architect lane, the
+	// boundary must not still demand architect evidence \u2014 otherwise the advertised
+	// omission is unusable and the caller has to run or fabricate the lane anyway.
+	// QA and iteration evidence stay mandatory in every case.
+	const architectRequired = !lowRiskReduced || applicability.lanes.architect.applicable;
+	if ((architectRequired && !architectReview) || !executorQa || !iteration) {
 		found.add(
 			"qualityGate",
 			"missing_required_sections",
-			"qualityGate requires architectReview, executorQa, and iteration objects",
+			architectRequired
+				? "qualityGate requires architectReview, executorQa, and iteration objects"
+				: "qualityGate requires executorQa and iteration objects",
 		);
 		found.throwIfAny();
 		return;
@@ -2830,31 +2837,33 @@ async function validateCompletionQualityGate(
 			);
 		}
 	}
-	if (
-		architectReview.architectureStatus !== CLEAN_ARCHITECT_STATUS ||
-		architectReview.productStatus !== CLEAN_ARCHITECT_STATUS ||
-		architectReview.codeStatus !== CLEAN_ARCHITECT_STATUS ||
-		architectReview.recommendation !== APPROVE_RECOMMENDATION
-	) {
-		found.add(
-			"architectReview",
-			"architect_not_clear",
-			"checkpoint --status complete requires architect review approval: architectReview architecture/product/code must be CLEAR and recommendation must be APPROVE",
+	if (architectReview) {
+		if (
+			architectReview.architectureStatus !== CLEAN_ARCHITECT_STATUS ||
+			architectReview.productStatus !== CLEAN_ARCHITECT_STATUS ||
+			architectReview.codeStatus !== CLEAN_ARCHITECT_STATUS ||
+			architectReview.recommendation !== APPROVE_RECOMMENDATION
+		) {
+			found.add(
+				"architectReview",
+				"architect_not_clear",
+				"checkpoint --status complete requires architect review approval: architectReview architecture/product/code must be CLEAR and recommendation must be APPROVE",
+			);
+		}
+		if (!nonEmptyStringArray(architectReview.commands)) {
+			found.add(
+				"architectReview.commands",
+				"missing_command_array",
+				"qualityGate architectReview.commands must be a non-empty string array",
+			);
+		}
+		found.check("architectReview.evidence", "missing_evidence", () =>
+			requireNonEmptyString(architectReview.evidence, "architectReview.evidence"),
+		);
+		found.check("architectReview.blockers", "non_empty_blockers", () =>
+			requireEmptyBlockers(architectReview.blockers, "architectReview.blockers"),
 		);
 	}
-	if (!nonEmptyStringArray(architectReview.commands)) {
-		found.add(
-			"architectReview.commands",
-			"missing_command_array",
-			"qualityGate architectReview.commands must be a non-empty string array",
-		);
-	}
-	found.check("architectReview.evidence", "missing_evidence", () =>
-		requireNonEmptyString(architectReview.evidence, "architectReview.evidence"),
-	);
-	found.check("architectReview.blockers", "non_empty_blockers", () =>
-		requireEmptyBlockers(architectReview.blockers, "architectReview.blockers"),
-	);
 	if (
 		executorQa.status !== PASSED_STATUS ||
 		executorQa.e2eStatus !== PASSED_STATUS ||
@@ -4874,6 +4883,7 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		"  record-critic-gate-override",
 		"  quality-gate init",
 		"  quality-gate source-hash",
+		"  quality-gate lane-selection",
 		"  quality-gate validate",
 
 		"",
@@ -5280,6 +5290,42 @@ async function dispatchUltragoalCommand(
 						? { status: 0, stdout: `${JSON.stringify(payload, null, 2)}\n` }
 						: { status: 0, stdout: `${sourceHash}\n` };
 				}
+				if (subcommand === "lane-selection") {
+					// #4560: expose the authoritative computed selection so a caller can
+					// declare `validationLaneSelection` without running or fabricating the
+					// very lanes the selection may omit.
+					const sessionId = currentUltragoalSessionId(cwd);
+					const changeSet = await computeCheckpointChangeSet(cwd);
+					const plan = await readUltragoalPlan(cwd, sessionId).catch(() => null);
+					const ledger = await readUltragoalLedger(cwd, sessionId).catch(() => null);
+					const authoritativeSourceHash = computeUltragoalReviewSourceHash(changeSet);
+					const applicability = resolveUltragoalValidationApplicability({
+						changeSet,
+						requiredGoals: plan?.goals.filter(goal => goal.status !== "superseded").length,
+						hasOpenReviewBlockers: plan?.goals.some(goal => goal.status === "review_blocked") ?? false,
+						latestCohortSourceHash: ledger ? latestJoinedCohortSourceHash(ledger)?.sourceHash : undefined,
+						currentSourceHash: authoritativeSourceHash ?? undefined,
+						authoritativeSourceHash,
+					});
+					const omittedLanes = (Object.keys(applicability.lanes) as UltragoalValidationLane[])
+						.filter(lane => !applicability.lanes[lane].applicable)
+						.sort();
+					const payload = {
+						validationLaneSelection: {
+							riskClass: applicability.riskClass,
+							reasons: applicability.selection,
+							omittedLanes,
+						},
+						basisUnchanged: applicability.basisUnchanged,
+						sourceHash: authoritativeSourceHash,
+					};
+					return json
+						? { status: 0, stdout: `${JSON.stringify(payload, null, 2)}\n` }
+						: {
+								status: 0,
+								stdout: `riskClass=${applicability.riskClass} omittedLanes=${omittedLanes.join(",") || "(none)"}\n`,
+							};
+				}
 				if (subcommand === "init") {
 					const out = flagValue(args, "--out");
 					if (!out?.trim()) {
@@ -5303,7 +5349,7 @@ async function dispatchUltragoalCommand(
 				if (subcommand !== "validate") {
 					return {
 						status: 1,
-						stderr: `Unknown gjc ultragoal quality-gate subcommand: ${subcommand ?? "(missing)"}; supported: init, source-hash, validate\n`,
+						stderr: `Unknown gjc ultragoal quality-gate subcommand: ${subcommand ?? "(missing)"}; supported: init, source-hash, lane-selection, validate\n`,
 					};
 				}
 				const qualityGateJson = flagValue(args, "--quality-gate-json");

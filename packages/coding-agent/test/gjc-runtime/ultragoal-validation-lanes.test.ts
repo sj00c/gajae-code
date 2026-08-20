@@ -111,13 +111,18 @@ function lane(sourceHash: string, status = "passed"): Record<string, unknown> {
 describe("ultragoal validation lane selection gate (#4560)", () => {
 	let root: string;
 	let cleanup: string[] = [];
+	let priorSessionId: string | undefined;
 
 	beforeEach(() => {
 		cleanup = [];
+		priorSessionId = process.env.GJC_SESSION_ID;
 	});
 
 	afterEach(async () => {
 		for (const dir of cleanup) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+		// Restore the ambient session id so shard order never becomes load-bearing.
+		if (priorSessionId === undefined) delete process.env.GJC_SESSION_ID;
+		else process.env.GJC_SESSION_ID = priorSessionId;
 	});
 
 	async function seedPlan(goalCount: number, files: Record<string, string>): Promise<void> {

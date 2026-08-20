@@ -12067,6 +12067,9 @@ export class AgentSession {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+		// #4560: clear before the read so a failed refresh can never leave a
+		// previous run's workflow owner in place for the recovery projector.
+		this.#lastCompactionActiveSkills = [];
 		try {
 			const state = await readVisibleSkillActiveState(this.sessionManager.getCwd(), this.sessionId, {
 				bypassCache: true,

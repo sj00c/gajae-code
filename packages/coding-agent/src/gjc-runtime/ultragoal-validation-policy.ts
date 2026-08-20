@@ -27,9 +27,13 @@ export type UltragoalValidationLane = "cleaner" | "architect" | "qa" | "terminal
 export interface UltragoalValidationApplicabilityInput {
 	/** Trusted computed change set for the boundary (checkpoint path). */
 	changeSet?: UltragoalChangeSet;
-	/** Current durable plan. */
-	totalGoals?: number;
-	completedGoals?: number;
+	/**
+	 * Durable aggregate shape: the number of goals the plan actually requires.
+	 * This is a property of the plan, not of how far it has progressed, so the
+	 * multi-goal risk signal cannot evaporate at the final goal of a multi-goal
+	 * run — which is precisely the aggregate boundary where risk is highest.
+	 */
+	requiredGoals?: number;
 	/** Open review blockers exist (review_blocked goals). */
 	hasOpenReviewBlockers?: boolean;
 	/** Newest joined cohort sourceHash recorded in the ledger. */
@@ -55,6 +59,28 @@ export interface UltragoalValidationApplicability {
 	selection: string[];
 }
 
+/**
+ * Substring markers for security-sensitive surfaces. A hand-maintained prefix
+ * list cannot be fail-closed: any new credential/auth file added anywhere in
+ * the workspace would silently grade as low-risk until someone remembered to
+ * extend the list. These markers classify by what a path *is* rather than
+ * where it happens to live.
+ */
+const SECURITY_SENSITIVE_PATH_MARKERS = [
+	"auth-storage",
+	"auth-broker",
+	"auth-config",
+	"oauth",
+	"credential",
+	"secure-token",
+	"api-key",
+	"apikey",
+	"secret",
+	"token-store",
+	"keychain",
+	"permission",
+] as const;
+
 const HIGH_RISK_PATH_PREFIXES = [
 	// Security/auth surfaces
 	"packages/coding-agent/src/session/auth-storage.ts",
@@ -63,6 +89,9 @@ const HIGH_RISK_PATH_PREFIXES = [
 	"packages/coding-agent/src/runtime-api-key.ts",
 	"packages/coding-agent/src/runtime-credential-selector.ts",
 	"packages/coding-agent/src/secrets",
+	"packages/ai/src/auth-storage.ts",
+	"packages/coding-agent/src/runtime-mcp/oauth-flow.ts",
+	"packages/coding-agent/src/commands/auth-broker.ts",
 	"crates/pi-natives/src",
 	"crates/git-daemon",
 	// Workflow enforcement surfaces must never grade their own weakening as low-risk.
@@ -96,6 +125,10 @@ export function isHighRiskChangePath(row: UltragoalChangeSetPath): boolean {
 	for (const candidate of candidates) {
 		for (const prefix of HIGH_RISK_PATH_PREFIXES) {
 			if (candidate === prefix || candidate.startsWith(`${prefix}/`)) return true;
+		}
+		const fileName = candidate.slice(candidate.lastIndexOf("/") + 1).toLowerCase();
+		for (const marker of SECURITY_SENSITIVE_PATH_MARKERS) {
+			if (fileName.includes(marker)) return true;
 		}
 	}
 	return false;
@@ -138,7 +171,9 @@ export function resolveUltragoalValidationApplicability(
 	const highRiskPaths = paths.filter(isHighRiskChangePath);
 	const migrationPaths = paths.filter(isMigrationChangePath);
 	const computerPaths = paths.filter(isComputerControlSurfaceChangePath);
-	const multiGoal = (input.totalGoals ?? 0) - (input.completedGoals ?? 0) > 1;
+	// Derived from the durable aggregate shape, never from remaining progress:
+	// a two-goal plan stays multi-goal on its final goal.
+	const multiGoal = (input.requiredGoals ?? 0) > 1;
 	const reasons: string[] = [];
 	if (!input.changeSet?.trusted) reasons.push("change-set-untrusted-or-missing");
 	if (input.changeSet?.captureIncomplete) reasons.push("capture-incomplete");
@@ -148,8 +183,8 @@ export function resolveUltragoalValidationApplicability(
 	if (highRiskPaths.length > 0) reasons.push("high-risk-paths");
 	if (migrationPaths.length > 0) reasons.push("migration-paths");
 	if (computerPaths.length > 0) reasons.push("computer-control-surface");
-	// Low-risk omission requires proof of exactly one outstanding goal.
-	if (input.totalGoals === undefined || input.completedGoals === undefined) reasons.push("progress-unknown");
+	// Low-risk omission requires proof that the plan is genuinely single-goal.
+	if (input.requiredGoals === undefined) reasons.push("progress-unknown");
 	const highRisk = reasons.length > 0;
 	const heavyweight = highRisk;
 	const lane = (applicable: boolean, why: string[]): { applicable: boolean; reasons: string[] } => ({

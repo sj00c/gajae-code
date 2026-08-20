@@ -159,6 +159,57 @@ describe("workflow recovery projection (#4560)", () => {
 		expect(projection?.nextAction).toEqual({ actionClass: "awaiting-approval", detail: "planning-stuck" });
 	});
 
+	it("resumes a planner-only run at intent reconciliation, not at consensus review", async () => {
+		// Regression for #4560 review P1-1: the manifest requires planner -> intent
+		// before Architect/Critic consensus. A compaction in that window previously
+		// projected run-plan-review, spending the expensive consensus lanes on a
+		// draft whose material intent was never reconciled.
+		const runDir = ralplanRunDir(tempDir.path(), "planner-only-run");
+		await Bun.write(path.join(runDir, "stage-01-planner.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(runDir, "index.jsonl"),
+			`${JSON.stringify({
+				stage: "planner",
+				stage_n: 1,
+				path: "stage-01-planner.md",
+				sha256: crypto.createHash("sha256").update(FINAL_PLAN).digest("hex"),
+			})}\n`,
+		);
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: "planner-only-run" }),
+		);
+		const projection = await projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID });
+		expect(projection?.nextAction.actionClass).toBe("reconcile-intent");
+		expect(projection?.nextAction.detail).toBe("planner-without-intent-receipt");
+	});
+
+	it("rejects a ralplan run reached through a symlinked ancestor directory", async () => {
+		// Regression for #4560 review P1-6: checking only the leaf run directory
+		// let a symlinked ancestor relocate the effective recovery root.
+		const outside = path.join(tempDir.path(), "outside", "evil-run");
+		await fs.mkdir(outside, { recursive: true });
+		await Bun.write(path.join(outside, "stage-01-final.md"), FINAL_PLAN);
+		await Bun.write(
+			path.join(outside, "index.jsonl"),
+			`${JSON.stringify({
+				stage: "final",
+				stage_n: 1,
+				path: "stage-01-final.md",
+				sha256: crypto.createHash("sha256").update(FINAL_PLAN).digest("hex"),
+			})}\n`,
+		);
+		const plansRoot = path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "plans");
+		await fs.mkdir(plansRoot, { recursive: true });
+		// The `ralplan` ancestor component itself is a symlink out of the tree.
+		await fs.symlink(path.join(tempDir.path(), "outside"), path.join(plansRoot, "ralplan"));
+		await Bun.write(
+			path.join(tempDir.path(), ".gjc", `_session-${SESSION_ID}`, "state", "ralplan-state.json"),
+			JSON.stringify({ run_id: "evil-run" }),
+		);
+		await expect(projectLatestRalplanRun({ cwd: tempDir.path(), sessionId: SESSION_ID })).resolves.toBeUndefined();
+	});
+
 	it("does not fall back to another run when ralplan mode state is tampered", async () => {
 		const runDir = ralplanRunDir(tempDir.path(), "valid-run");
 		await Bun.write(path.join(runDir, "stage-01-final.md"), FINAL_PLAN);
@@ -347,8 +398,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 	it("selects low risk for a single-goal trusted low-risk change set", () => {
 		const applicability = resolveUltragoalValidationApplicability({
 			changeSet: lowRiskChangeSet,
-			totalGoals: 1,
-			completedGoals: 0,
+			requiredGoals: 1,
 			authoritativeSourceHash: "sha256:current",
 		});
 		expect(applicability.riskClass).toBe("low");
@@ -364,8 +414,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 				...lowRiskChangeSet,
 				paths: [{ path: "packages/coding-agent/src/sdk/session.ts", status: "modified" as const }],
 			},
-			totalGoals: 1,
-			completedGoals: 0,
+			requiredGoals: 1,
 		});
 		expect(applicability.riskClass).toBe("high");
 		expect(applicability.heavyweight).toBe(true);
@@ -380,8 +429,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 				...lowRiskChangeSet,
 				paths: [{ path: "packages/coding-agent/src/tools/index.ts", status: "modified" as const }],
 			},
-			totalGoals: 1,
-			completedGoals: 0,
+			requiredGoals: 1,
 		});
 		expect(computer.riskClass).toBe("high");
 		const migration = resolveUltragoalValidationApplicability({
@@ -391,8 +439,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 					{ path: "packages/coding-agent/src/gjc-runtime/state-migrations/index.ts", status: "modified" as const },
 				],
 			},
-			totalGoals: 1,
-			completedGoals: 0,
+			requiredGoals: 1,
 		});
 		expect(migration.riskClass).toBe("high");
 		expect(
@@ -413,13 +460,12 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 	});
 
 	it("fails closed on missing/untrusted change set and multi-goal runs", () => {
-		const missing = resolveUltragoalValidationApplicability({ totalGoals: 1, completedGoals: 0 });
+		const missing = resolveUltragoalValidationApplicability({ requiredGoals: 1 });
 		expect(missing.riskClass).toBe("high");
 		expect(missing.selection.some(line => line.includes("change-set-untrusted-or-missing"))).toBe(true);
 		const multi = resolveUltragoalValidationApplicability({
 			changeSet: lowRiskChangeSet,
-			totalGoals: 3,
-			completedGoals: 1,
+			requiredGoals: 3,
 		});
 		expect(multi.riskClass).toBe("high");
 	});
@@ -427,8 +473,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 	it("permits unchanged-basis reuse only when the frozen hash matches and no blockers reopened", () => {
 		const unchanged = resolveUltragoalValidationApplicability({
 			changeSet: lowRiskChangeSet,
-			totalGoals: 1,
-			completedGoals: 0,
+			requiredGoals: 1,
 			latestCohortSourceHash: "sha256:abc",
 			currentSourceHash: "sha256:abc",
 			authoritativeSourceHash: "sha256:abc",
@@ -436,8 +481,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 		expect(unchanged.basisUnchanged).toBe(true);
 		const changed = resolveUltragoalValidationApplicability({
 			changeSet: lowRiskChangeSet,
-			totalGoals: 1,
-			completedGoals: 0,
+			requiredGoals: 1,
 			latestCohortSourceHash: "sha256:abc",
 			currentSourceHash: "sha256:xyz",
 			authoritativeSourceHash: "sha256:xyz",
@@ -445,8 +489,7 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 		expect(changed.basisUnchanged).toBe(false);
 		const blocked = resolveUltragoalValidationApplicability({
 			changeSet: lowRiskChangeSet,
-			totalGoals: 1,
-			completedGoals: 0,
+			requiredGoals: 1,
 			latestCohortSourceHash: "sha256:abc",
 			currentSourceHash: "sha256:abc",
 			authoritativeSourceHash: "sha256:abc",
@@ -454,6 +497,52 @@ describe("ultragoal validation applicability policy (#4560)", () => {
 		});
 		expect(blocked.basisUnchanged).toBe(false);
 		expect(blocked.riskClass).toBe("high");
+	});
+
+	it("keeps multi-goal runs high risk through the final goal of the aggregate", () => {
+		// Regression for #4560 review P1-2: deriving multi-goal from remaining
+		// goals made risk vanish at the last goal of a multi-goal run, which is
+		// exactly the aggregate boundary where risk is highest.
+		const finalGoalOfTwo = resolveUltragoalValidationApplicability({
+			changeSet: lowRiskChangeSet,
+			requiredGoals: 2,
+			authoritativeSourceHash: "sha256:abc",
+		});
+		expect(finalGoalOfTwo.riskClass).toBe("high");
+		expect(finalGoalOfTwo.selection.some(line => line.includes("multiple-outstanding-goals"))).toBe(true);
+		expect(finalGoalOfTwo.lanes.architect.applicable).toBe(true);
+		expect(finalGoalOfTwo.lanes["terminal-critic"].applicable).toBe(true);
+		const genuinelySingleGoal = resolveUltragoalValidationApplicability({
+			changeSet: lowRiskChangeSet,
+			requiredGoals: 1,
+			authoritativeSourceHash: "sha256:abc",
+		});
+		expect(genuinelySingleGoal.riskClass).toBe("low");
+	});
+
+	it("classifies credential and auth surfaces as high risk wherever they live", () => {
+		// Regression for #4560 review P1-4: a hand-maintained prefix list let real
+		// auth surfaces outside the listed directories grade as low risk.
+		for (const authPath of [
+			"packages/ai/src/auth-storage.ts",
+			"packages/coding-agent/src/runtime-mcp/oauth-flow.ts",
+			"packages/coding-agent/src/commands/auth-broker.ts",
+		]) {
+			expect(isHighRiskChangePath({ path: authPath, status: "modified" })).toBe(true);
+			const applicability = resolveUltragoalValidationApplicability({
+				changeSet: {
+					source: "checkpoint-git",
+					trusted: true,
+					paths: [{ path: authPath, status: "modified" }],
+				},
+				requiredGoals: 1,
+				authoritativeSourceHash: "sha256:abc",
+			});
+			expect(applicability.riskClass).toBe("high");
+			expect(applicability.selection.some(line => line.includes("high-risk-paths"))).toBe(true);
+		}
+		// A genuinely unrelated utility file stays low risk.
+		expect(isHighRiskChangePath({ path: "packages/utils/src/format.ts", status: "modified" })).toBe(false);
 	});
 
 	it("classifies high-risk and migration paths deterministically", () => {

@@ -173,6 +173,55 @@ describe("AgentSession workflow recovery continuation (#4560)", () => {
 		);
 	}
 
+	async function seedJoinedCohort(sourceHash: string): Promise<void> {
+		const dir = path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "ultragoal");
+		await Bun.write(
+			path.join(dir, "ledger.jsonl"),
+			`${JSON.stringify({
+				event: "goal_checkpointed",
+				status: "complete",
+				goalId: "G001",
+				eventId: "evt-1",
+				qualityGateJson: { iteration: { reviewCohort: { reviewGeneration: 2, sourceHash } } },
+			})}\n`,
+		);
+	}
+
+	async function seedUltragoalPlanWithBlockedGoal(): Promise<void> {
+		const dir = path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "ultragoal");
+		const now = new Date().toISOString();
+		await Bun.write(
+			path.join(dir, "goals.json"),
+			JSON.stringify({
+				version: 1,
+				brief: "b",
+				gjcGoalMode: "aggregate",
+				gjcObjective: "Ship the durable recovery contract",
+				goals: [
+					{
+						id: "G001",
+						title: "Implement",
+						objective: "Implement the contract",
+						status: "complete",
+						createdAt: now,
+						updatedAt: now,
+						evidence: "focused tests pass",
+					},
+					{
+						id: "G002",
+						title: "Resolve blockers",
+						objective: "Resolve final review blockers",
+						status: "review_blocked",
+						createdAt: now,
+						updatedAt: now,
+					},
+				],
+				createdAt: now,
+				updatedAt: now,
+			}),
+		);
+	}
+
 	it("continues from the structured workflow contract after compaction", async () => {
 		await seedActiveSkillState("active");
 		await seedUltragoalPlan();
@@ -222,15 +271,48 @@ describe("AgentSession workflow recovery continuation (#4560)", () => {
 		expect(JSON.stringify(promptSpy.mock.calls)).not.toContain("workflow-recovery");
 	});
 
-	it("resumes the exact ralplan review action after forced compaction", async () => {
+	it("resumes ralplan at intent reconciliation, not consensus, after forced compaction", async () => {
+		// #4560 review P1-1: a planner-only run must not resume into Architect/Critic
+		// consensus, because its material intent was never reconciled.
 		await seedActiveSkillState("planner", "ralplan");
 		await seedRalplanReview();
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		await compact("length");
 		const text = JSON.stringify(promptSpy.mock.calls);
 		expect(text).toContain("workflow-recovery");
-		expect(text).toContain("run-plan-review");
+		expect(text).toContain("reconcile-intent");
+		expect(text).not.toContain("run-plan-review");
 		expect(text).toContain("recovery projection");
+	});
+
+	it("preserves the joined cohort source identity across repeated compaction", async () => {
+		// #4560 forced-compaction matrix: repeated compaction during boundary review
+		// must keep projecting the same frozen source basis and the same next action,
+		// so a resumed run cannot silently review a different source.
+		await seedActiveSkillState("active");
+		await seedUltragoalPlan();
+		await seedJoinedCohort("sha256:frozen-basis-1");
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		await compact("length");
+		const first = JSON.stringify(promptSpy.mock.calls.at(-1));
+		expect(first).toContain("sha256:frozen-basis-1");
+		expect(first).toContain("continue-current-goal");
+		await compact("length");
+		const second = JSON.stringify(promptSpy.mock.calls.at(-1));
+		expect(second).toContain("sha256:frozen-basis-1");
+		expect(second).toContain("continue-current-goal");
+	});
+
+	it("resumes blocker resolution rather than re-review when blockers are open", async () => {
+		// #4560 forced-compaction matrix: blocker-fix/re-review window. Compaction
+		// here must resume at blocker resolution, not restart the review cohort.
+		await seedActiveSkillState("active");
+		await seedUltragoalPlanWithBlockedGoal();
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		await compact("length");
+		const text = JSON.stringify(promptSpy.mock.calls.at(-1));
+		expect(text).toContain("resolve-review-blockers");
+		expect(text).toContain("G002");
 	});
 
 	it("keeps the generic prompt when no durable workflow state exists", async () => {

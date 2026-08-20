@@ -267,6 +267,7 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 			return { source: "checkpoint-git", paths: [], captureIncomplete: true, trusted: true };
 		return { source: "checkpoint-git", paths: ciChangedPaths, trusted: true };
 	}
+	const captureWitness = await repositoryStateWitness(cwd);
 	const baseRef = await resolveGitBase(cwd);
 	const base = baseRef;
 	const mergeBase = await spawnText(["git", "merge-base", "HEAD", baseRef], { cwd, timeoutMs: 3000 });
@@ -307,6 +308,14 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 		untrackedPaths,
 		ciChangedPaths,
 	]);
+	// #4560: the name-status, diff, and untracked reads above are independent
+	// git invocations. A concurrent repository change between them yields a
+	// snapshot that never existed on disk, which would let completion be
+	// committed against a source basis nothing was actually reviewed at.
+	// Re-read the cheap consistency witness and mark the capture incomplete on
+	// drift so the boundary fails closed into the full heavyweight cohort.
+	const witness = await repositoryStateWitness(cwd);
+	const captureDrifted = witness === undefined || witness !== captureWitness;
 	return {
 		source: "checkpoint-git",
 		baseRef,
@@ -324,9 +333,25 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 			!committedDiff.ok ||
 			!unstagedDiff.ok ||
 			!stagedDiff.ok ||
+			captureDrifted ||
 			(untrackedPaths.length > 0 && !untrackedContentHash),
 		trusted: true,
 	};
+}
+
+/**
+ * A cheap witness of overall repository state (HEAD plus the porcelain status
+ * of every tracked and untracked change). Comparing it before and after a
+ * multi-command capture detects concurrent mutation without re-running the
+ * expensive diffs.
+ */
+async function repositoryStateWitness(cwd: string): Promise<string | undefined> {
+	const [head, status] = await Promise.all([
+		spawnText(["git", "rev-parse", "HEAD"], { cwd, timeoutMs: 3000 }),
+		spawnText(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd, timeoutMs: 5000 }),
+	]);
+	if (!head.ok || !status.ok) return undefined;
+	return `${head.stdout.trim()}\u0000${status.stdout}`;
 }
 
 export function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {

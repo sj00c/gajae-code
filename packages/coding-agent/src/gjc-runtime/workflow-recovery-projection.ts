@@ -15,6 +15,7 @@
  * thin projection rather than failing.
  */
 import * as crypto from "node:crypto";
+import { constants as nodeFsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { modeStatePath, sessionPlansDir } from "./session-layout";
@@ -125,11 +126,30 @@ function boundText(value: unknown, maxChars: number): string | undefined {
 	return trimmed.length > maxChars ? `${trimmed.slice(0, maxChars - 1)}…` : trimmed;
 }
 
-function sha256File(filePath: string): Promise<string | undefined> {
-	return fs
-		.readFile(filePath)
-		.then(buffer => `sha256:${crypto.createHash("sha256").update(buffer).digest("hex")}`)
-		.catch(() => undefined);
+/**
+ * Read an artifact exactly once and derive both its text and its digest from
+ * the same bytes. Reading for projection and reopening for hashing lets a
+ * concurrent replacement produce a digest over benign bytes while different
+ * bytes reach the continuation prompt, so the two must never be split.
+ * The handle is opened with `O_NOFOLLOW` and its identity is verified to be a
+ * regular file before any bytes are trusted.
+ */
+async function readArtifactWithDigest(filePath: string): Promise<{ text: string; sha256: string } | undefined> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(filePath, nodeFsConstants.O_RDONLY | nodeFsConstants.O_NOFOLLOW);
+		const stat = await handle.stat();
+		if (!stat.isFile()) return undefined;
+		const buffer = await handle.readFile();
+		return {
+			text: buffer.toString("utf8"),
+			sha256: `sha256:${crypto.createHash("sha256").update(buffer).digest("hex")}`,
+		};
+	} catch {
+		return undefined;
+	} finally {
+		await handle?.close().catch(() => {});
+	}
 }
 
 interface ParsedHeadingSection {
@@ -179,15 +199,42 @@ function findSectionExact(
 	return sections.find(section => normalized.has(section.title.toLowerCase()));
 }
 
-async function resolveRalplanArtifactPath(runDir: string, recordedPath: string): Promise<string | undefined> {
+/**
+ * Verify that every component of `child` below `root` is a real directory and
+ * not a symlink. Checking only the leaf is insufficient: a symlinked ancestor
+ * can relocate the effective root outside the expected tree while the leaf's
+ * relative-realpath check still succeeds.
+ */
+async function isSymlinkFreeDescent(root: string, child: string): Promise<boolean> {
+	const relative = path.relative(root, child);
+	if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
+	let current = root;
+	for (const segment of relative.split(path.sep).filter(Boolean)) {
+		current = path.join(current, segment);
+		const stat = await fs.lstat(current);
+		if (stat.isSymbolicLink()) return false;
+	}
+	return true;
+}
+
+async function resolveRalplanArtifactPath(
+	runDir: string,
+	recordedPath: string,
+	plansRoot: string,
+): Promise<string | undefined> {
 	const candidate = path.isAbsolute(recordedPath) ? recordedPath : path.resolve(runDir, recordedPath);
 	try {
+		// Anchor beneath a canonical, symlink-free session plans root so that no
+		// ancestor of the run directory can redirect recovery out of the tree.
+		const plansReal = await fs.realpath(plansRoot);
+		if (!(await isSymlinkFreeDescent(plansReal, path.resolve(runDir)))) return undefined;
 		const runStat = await fs.lstat(runDir);
 		if (!runStat.isDirectory() || runStat.isSymbolicLink()) return undefined;
+		if (!(await isSymlinkFreeDescent(path.resolve(runDir), candidate))) return undefined;
 		const [runReal, artifactReal] = await Promise.all([fs.realpath(runDir), fs.realpath(candidate)]);
 		const relative = path.relative(runReal, artifactReal);
 		if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
-		const stat = await fs.stat(artifactReal);
+		const stat = await fs.lstat(artifactReal);
 		return stat.isFile() ? artifactReal : undefined;
 	} catch {
 		return undefined;
@@ -238,7 +285,8 @@ async function projectRalplanRunInternal(
 	input: RalplanProjectionInput,
 	finalOnly: boolean,
 ): Promise<WorkflowRecoveryProjection | undefined> {
-	const runDir = path.join(sessionPlansDir(input.cwd, input.sessionId), "ralplan", input.runId);
+	const plansRoot = sessionPlansDir(input.cwd, input.sessionId);
+	const runDir = path.join(plansRoot, "ralplan", input.runId);
 	const rows: RalplanProjectionRow[] = [];
 	try {
 		const text = await fs.readFile(path.join(runDir, "index.jsonl"), "utf8");
@@ -260,14 +308,11 @@ async function projectRalplanRunInternal(
 		typeof artifactRow.sha256 !== "string"
 	)
 		return undefined;
-	const artifactPath = await resolveRalplanArtifactPath(runDir, artifactRow.path);
+	const artifactPath = await resolveRalplanArtifactPath(runDir, artifactRow.path, plansRoot);
 	if (!artifactPath) return undefined;
-	let markdown: string;
-	try {
-		markdown = await fs.readFile(artifactPath, "utf8");
-	} catch {
-		return undefined;
-	}
+	const artifact = await readArtifactWithDigest(artifactPath);
+	if (!artifact) return undefined;
+	const markdown = artifact.text;
 	const objective = objectiveFromMarkdown(markdown);
 	if (!objective) return undefined;
 	const sections = parseMarkdownSections(markdown);
@@ -292,8 +337,7 @@ async function projectRalplanRunInternal(
 		MAX_SCOPE_ITEMS,
 	).map(text => ({ kind: "accepted" as const, text }));
 	for (const text of nonGoals) scope.push({ kind: "non_goal" as const, text });
-	const sha256 = await sha256File(artifactPath);
-	if (!sha256) return undefined;
+	const sha256 = artifact.sha256;
 	const recorded = artifactRow.sha256.startsWith("sha256:") ? artifactRow.sha256 : `sha256:${artifactRow.sha256}`;
 	if (!/^sha256:[0-9a-f]{64}$/.test(recorded) || recorded !== sha256) return undefined;
 	const stage = typeof artifactRow.stage === "string" ? artifactRow.stage : "unknown";
@@ -309,6 +353,11 @@ async function projectRalplanRunInternal(
 			input.lastReviewVerdictLane === "critic" && input.lastReviewVerdict === "OKAY"
 				? { actionClass: "reconcile-intent" }
 				: { actionClass: "revise-plan" };
+	} else if (latestStage === "planner" || latestStage === "revision") {
+		// The manifest requires planner -> intent before Architect/Critic consensus.
+		// Resuming straight to review here would spend the expensive consensus lanes
+		// on a draft whose material intent was never reconciled.
+		nextAction = { actionClass: "reconcile-intent", detail: `${latestStage}-without-intent-receipt` };
 	} else {
 		nextAction = { actionClass: "run-plan-review" };
 	}
