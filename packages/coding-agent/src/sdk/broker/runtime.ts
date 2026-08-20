@@ -114,21 +114,32 @@ function regularFilesUnder(directory: string): string[] {
 
 /** Include source trees for local workspace dependencies resolved by source Bun launches. */
 function workspaceDependencyFiles(packageDirectory: string): string[] {
-	let manifest: { dependencies?: Record<string, unknown>; devDependencies?: Record<string, unknown> };
+	let manifest: {
+		dependencies?: Record<string, unknown>;
+		devDependencies?: Record<string, unknown>;
+		optionalDependencies?: Record<string, unknown>;
+	};
 	try {
 		manifest = JSON.parse(fs.readFileSync(path.join(packageDirectory, "package.json"), "utf8")) as typeof manifest;
 	} catch {
 		return [];
 	}
 	const workspaceRoot = path.dirname(packageDirectory);
-	const names = new Set([...Object.keys(manifest.dependencies ?? {}), ...Object.keys(manifest.devDependencies ?? {})]);
+	const names = new Set([
+		...Object.keys(manifest.dependencies ?? {}),
+		...Object.keys(manifest.devDependencies ?? {}),
+		...Object.keys(manifest.optionalDependencies ?? {}),
+	]);
 	const files: string[] = [];
 	for (const name of names) {
 		if (!name.startsWith("@gajae-code/")) continue;
 		const dependencyDirectory = path.join(workspaceRoot, name.slice("@gajae-code/".length));
 		const sourceDirectory = path.join(dependencyDirectory, "src");
-		if (!fs.existsSync(sourceDirectory)) continue;
-		files.push(path.join(dependencyDirectory, "package.json"), ...regularFilesUnder(sourceDirectory));
+		const nativeDirectory = path.join(dependencyDirectory, "native");
+		if (!fs.existsSync(dependencyDirectory)) continue;
+		files.push(path.join(dependencyDirectory, "package.json"));
+		if (fs.existsSync(sourceDirectory)) files.push(...regularFilesUnder(sourceDirectory));
+		if (fs.existsSync(nativeDirectory)) files.push(...regularFilesUnder(nativeDirectory));
 	}
 	return files;
 }

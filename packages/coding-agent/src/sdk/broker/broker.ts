@@ -57,12 +57,6 @@ type ResolvedBrokerSettings = {
 	resolveDirectoryMigration: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
 };
 
-let defaultPackageGeneration: string | undefined;
-function defaultBrokerPackageGeneration(): string {
-	if (defaultPackageGeneration === undefined) defaultPackageGeneration = resolveSdkPackageGeneration();
-	return defaultPackageGeneration;
-}
-
 export type BrokerErrorCode =
 	| "idempotency_conflict"
 	| "terminal_uncertain"
@@ -806,7 +800,7 @@ export class Broker {
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			agentDir: settings.agentDir,
-			packageGeneration: settings.packageGeneration ?? defaultBrokerPackageGeneration(),
+			packageGeneration: settings.packageGeneration ?? resolveSdkPackageGeneration(),
 			port: settings.port ?? 0,
 			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
 			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),

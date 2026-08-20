@@ -373,13 +373,13 @@ async function retireAndReadReplacement(
 	const expectedPackageGeneration = settings.expectedPackageGeneration;
 	if (expectedPackageGeneration === undefined) return stale;
 	await retireStaleBroker(settings.agentDir, stale, settings.heartbeatTtlMs);
+	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+	if (!replacement) return undefined;
 	const currentPackageGeneration = resolveSdkPackageGeneration();
 	if (currentPackageGeneration !== expectedPackageGeneration)
 		throw new Error(
 			`SDK broker package generation changed during retirement: expected ${expectedPackageGeneration}, resolved ${currentPackageGeneration}.`,
 		);
-	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-	if (!replacement) return undefined;
 	if (replacement.packageGeneration === currentPackageGeneration) return replacement;
 	throw staleBrokerRetirementUnverified(currentPackageGeneration, replacement.packageGeneration);
 }
