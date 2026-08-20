@@ -184,7 +184,7 @@ Register an already-running GJC session only after its endpoint is discoverable 
 }
 ```
 
-`gjc_coordinator_register_session` validates the session id and workdir allowlist, then verifies SDK endpoint discovery before writing coordinator state. Optional `tmux_session` and `tmux_target` fields are advisory process metadata only.
+`gjc_coordinator_register_session` validates the session id and workdir allowlist, verifies SDK endpoint discovery, and only re-registers a runtime that already has the persisted sidecar authority required for authenticated updates. Use `gjc_coordinator_start_session` for a new runtime. Optional `tmux_session` and `tmux_target` fields are advisory process metadata only.
 
 ### Send work as turns
 

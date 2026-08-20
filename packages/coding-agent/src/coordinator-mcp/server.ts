@@ -515,7 +515,7 @@ function toolSchema(name: CoordinatorToolName): {
 		return {
 			name,
 			description:
-				"Register an existing broker-indexed GJC session; tmux identifiers are advisory process metadata only.",
+				"Re-register a broker-indexed GJC session with an established sidecar authority; use start_session for a new runtime. Tmux identifiers are advisory process metadata only.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -6872,6 +6872,26 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					model: optionalString(args.model),
 					allow_mutation: true,
 				};
+				const binding = await exactBrokerSessionBinding(sessionId, cwd);
+				const priorSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+				const priorAuthority =
+					priorSession &&
+					priorSession.broker_workspace === binding.workspace &&
+					priorSession.endpoint_generation === binding.endpointGeneration &&
+					optionalString(priorSession.endpoint_incarnation) === binding.endpointIncarnation
+						? (priorSession.sidecar_verifier as { key_id: string; public_key: string } | undefined)
+						: undefined;
+				// An already-running SDK process cannot receive a newly minted private
+				// key. Register only a runtime that has already proven the authority it
+				// will use for sidecar updates; use start_session for a fresh runtime.
+				if (!priorAuthority)
+					return {
+						ok: false,
+						error: {
+							code: "runtime_authority_unavailable",
+							message: "The running session has no established sidecar authority. Start a new coordinator session.",
+						},
+					};
 				return await withToolIdempotency(
 					name,
 					idempotencyKey,
@@ -6880,15 +6900,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
 						if (creation.request.phase === "completed" && creation.request.safe_response)
 							return creation.request.safe_response;
-						const binding = await exactBrokerSessionBinding(sessionId, cwd);
-						const priorSession = asRecord(await readJsonFile(sessionFile(sessionId)));
-						const priorAuthority =
-							priorSession &&
-							priorSession.broker_workspace === binding.workspace &&
-							priorSession.endpoint_generation === binding.endpointGeneration &&
-							optionalString(priorSession.endpoint_incarnation) === binding.endpointIncarnation
-								? (priorSession.sidecar_verifier as { key_id: string; public_key: string } | undefined)
-								: undefined;
 						const session = normalizeSession({
 							session_id: sessionId,
 							cwd,
@@ -6900,7 +6911,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							broker_workspace: binding.workspace,
 							endpoint_generation: binding.endpointGeneration,
 							endpoint_incarnation: binding.endpointIncarnation,
-							sidecar_verifier: priorAuthority ?? creation.request.sidecar_verifier,
+							sidecar_verifier: priorAuthority,
 						});
 						const intent: CanonicalCreateIntentV1 = {
 							kind: "register",

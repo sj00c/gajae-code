@@ -598,6 +598,22 @@ async function patchTurnDelivery(
 }
 
 describe("Coordinator MCP canonical SDK controls", () => {
+	it("refuses to register a running session without an established sidecar authority", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await expect(
+			server.callTool("gjc_coordinator_register_session", {
+				session_id: "visible-session",
+				cwd: root,
+				idempotency_key: "unowned-runtime",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: false, error: { code: "runtime_authority_unavailable" } });
+		await expect(
+			Bun.file(path.join(coordinatorNamespace(root), "sessions", "visible-session.json")).exists(),
+		).resolves.toBe(false);
+	});
+
 	it("fails closed instead of reusing a sequence after a malformed journal line", async () => {
 		const root = await tempRoot();
 		const namespace = coordinatorNamespace(root);
