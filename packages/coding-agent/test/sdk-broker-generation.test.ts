@@ -150,17 +150,23 @@ describe("sdk broker package generation", () => {
 		const stale = staleBroker(dir);
 		try {
 			const published = await stale.start();
-			const expected = resolveSdkPackageGeneration();
+			const authority = resolveSdkPackageAuthority();
+			const expected = authority.generation;
 			expect(expected).not.toBe("stale-gen");
 			const discovery = await ensureBroker({ agentDir: dir, expectedPackageGeneration: expected });
 			// The replacement is a freshly spawned broker publishing the generation
 			// of the package tree this process would spawn.
 			expect(discovery.pid).not.toBe(published.pid);
 			expect(discovery.packageGeneration).toBe(expected);
+			expect(discovery.packageVersion).toBe(authority.packageVersion);
+			expect(discovery.installationIdentity).toBe(authority.installationIdentity);
 			// The stale broker no longer owns discovery.
 			const current = await readBrokerDiscovery(dir);
 			expect(current?.pid).toBe(discovery.pid);
 			expect(current?.incarnation).toBe(discovery.incarnation);
+			const immediate = await ensureBroker({ agentDir: dir, expectedPackageGeneration: expected });
+			expect(immediate.pid).toBe(discovery.pid);
+			expect(immediate.incarnation).toBe(discovery.incarnation);
 		} finally {
 			await cleanup(dir, stale);
 		}

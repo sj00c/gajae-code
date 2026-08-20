@@ -2480,9 +2480,11 @@ export class AcpAgent implements Agent {
 				? {}
 				: { expectedPackageGeneration: this.#expectedPackageGeneration }),
 		});
-		const authorityAfterEnsure = resolveSdkPackageAuthority({ force: true });
+		const authorityAfterEnsure =
+			this.#expectedPackageGeneration === undefined ? resolveSdkPackageAuthority({ force: true }) : undefined;
 		if (
 			this.#expectedPackageGeneration === undefined &&
+			authorityAfterEnsure !== undefined &&
 			(discovery.packageGeneration !== authorityAfterEnsure.generation ||
 				discovery.packageVersion !== authorityAfterEnsure.packageVersion ||
 				discovery.installationIdentity !== authorityAfterEnsure.installationIdentity)
@@ -2507,9 +2509,11 @@ export class AcpAgent implements Agent {
 		})();
 		try {
 			const connection = await pending;
-			const authorityBeforePublish = resolveSdkPackageAuthority({ force: true });
+			const authorityBeforePublish =
+				this.#expectedPackageGeneration === undefined ? resolveSdkPackageAuthority({ force: true }) : undefined;
 			if (
 				this.#expectedPackageGeneration === undefined &&
+				authorityBeforePublish !== undefined &&
 				(connection.packageGeneration !== authorityBeforePublish.generation ||
 					connection.packageVersion !== authorityBeforePublish.packageVersion ||
 					connection.installationIdentity !== authorityBeforePublish.installationIdentity)
