@@ -1472,34 +1472,245 @@ describe("launch worktree node_modules isolation (#4620)", () => {
 		expect(Object.keys(ownership)).toEqual(["@scope/app"]);
 	});
 
-	it("breaks an abandoned boundary lock but never a fresh one", async () => {
+	it("breaks an abandoned lease but never a heartbeating one, and releases only its own", async () => {
 		const repo = await createWorkspaceRepo("gjc-launch-worktree-lock-");
 		const launched = prepareLaunchWorktree(repo, ["--worktree", "boundary-lock"]);
 		const lockPath = path.join(launched.cwd, ".gjc-node-modules-boundary.lock");
+		const ownerPath = path.join(lockPath, "owner.json");
 		// The holder released its lock.
 		await expectEntryState(lockPath, "missing");
 
-		// A lock abandoned by a crashed launcher is broken and the launch proceeds.
+		// A lease whose heartbeat stopped belongs to a crashed launcher: it is
+		// broken and the launch proceeds.
 		await fs.mkdir(lockPath);
-		const stale = new Date(Date.now() - 120_000);
-		await fs.utimes(lockPath, stale, stale);
+		await Bun.write(ownerPath, JSON.stringify({ token: "dead-holder", heartbeat: Date.now() - 120_000 }));
 		const reused = prepareLaunchWorktree(repo, ["--worktree", "boundary-lock"]);
 		expect(reused.worktree.enabled && reused.worktree.reused).toBe(true);
 		await expectEntryState(lockPath, "missing");
 
-		// A fresh lock belongs to a live launch: the contender fails closed and
-		// leaves the held lock alone.
+		// A lease that is still being refreshed belongs to a live launch, however
+		// long it has been running: the contender must fail closed rather than
+		// steal it. Staleness is measured from the heartbeat, not from acquisition.
 		await fs.mkdir(lockPath);
+		await Bun.write(ownerPath, JSON.stringify({ token: "live-holder", heartbeat: Date.now() }));
 		try {
 			expect(() => prepareLaunchWorktree(repo, ["--worktree", "boundary-lock"])).toThrow(
 				/worktree_boundary_lock_busy/,
 			);
-			await expectEntryState(lockPath, "dir");
+			// The live holder's own token is untouched by the failed contender.
+			expect(JSON.parse(await Bun.file(ownerPath).text()).token).toBe("live-holder");
 		} finally {
 			await fs.rm(lockPath, { recursive: true, force: true });
 		}
 	}, 15_000);
 
+	it("does not remove a lock that was broken and re-acquired by another launch", async () => {
+		// Release must be owner-checked: a launcher whose lease was broken while it
+		// worked must not tear down the lock a different launch now holds, or two
+		// launches reconcile the same worktree concurrently.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-lock-steal-");
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "lock-steal"]);
+		const lockPath = path.join(launched.cwd, ".gjc-node-modules-boundary.lock");
+		const ownerPath = path.join(lockPath, "owner.json");
+
+		// Plant an abandoned lease so the next launch breaks it, then swap in a
+		// different live token the moment the boundary work begins \u2014 emulating a
+		// third launch acquiring after the break.
+		await fs.mkdir(lockPath);
+		await Bun.write(ownerPath, JSON.stringify({ token: "abandoned", heartbeat: Date.now() - 120_000 }));
+		const realScan = fsSync.readdirSync;
+		let swapped = false;
+		const spy = spyOn(fsSync, "readdirSync").mockImplementation(((p: fsSync.PathLike, opts?: unknown) => {
+			if (!swapped && String(p).includes("node_modules")) {
+				swapped = true;
+				fsSync.mkdirSync(lockPath, { recursive: true });
+				fsSync.writeFileSync(ownerPath, JSON.stringify({ token: "other-launch", heartbeat: Date.now() }));
+			}
+			return realScan(p as string, opts as never);
+		}) as unknown as typeof fsSync.readdirSync);
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "lock-steal"]);
+		} finally {
+			spy.mockRestore();
+		}
+		if (swapped) {
+			// The other launch's lease survives: release was owner-checked.
+			expect(JSON.parse(await Bun.file(ownerPath).text()).token).toBe("other-launch");
+			await fs.rm(lockPath, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("preserves a valid member link whose realpath is merely unreadable (EACCES)", async () => {
+		// tryRealpath's null means "resolves nowhere" and drives deletion. An
+		// EACCES/EIO must never be collapsed into that, or a perfectly valid link
+		// is destroyed on a permissions change or a network-mount hiccup.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-eacces-keep-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "eacces-keep"]);
+		const linkPath = path.join(first.cwd, "node_modules", "@scope", "app");
+		expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+
+		// Drop the member so reconciliation considers the recorded link stale,
+		// and make exactly that link's realpath fail with EACCES.
+		await fs.rm(path.join(first.cwd, "packages", "app"), { recursive: true });
+		const realRealpath = fsSync.realpathSync;
+		const spy = spyOn(fsSync, "realpathSync").mockImplementation(((p: fsSync.PathLike) => {
+			if (String(p) === linkPath) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			return realRealpath(p as string);
+		}) as unknown as typeof fsSync.realpathSync);
+		try {
+			try {
+				prepareLaunchWorktree(repo, ["--worktree", "eacces-keep"]);
+			} catch {
+				// Propagation is an acceptable outcome; silent deletion is not.
+			}
+		} finally {
+			spy.mockRestore();
+		}
+		const survived = await fs.lstat(linkPath).then(
+			s => s.isSymbolicLink(),
+			() => false,
+		);
+		expect(survived).toBe(true);
+	});
+
+	it("does not treat an unreadable source node_modules as absent", async () => {
+		// existsSync answers false for EACCES as well as ENOENT; taking the
+		// "no origin tree" branch there would build a boundary as though the
+		// source carried no install at all.
+		const repo = await createRepo("gjc-launch-worktree-src-eacces-");
+		const originModules = path.join(repo, "node_modules");
+		await fs.mkdir(path.join(originModules, "leftpad"), { recursive: true });
+		const realLstat = fsSync.lstatSync;
+		const spy = spyOn(fsSync, "lstatSync").mockImplementation(((p: fsSync.PathLike, o?: unknown) => {
+			if (String(p) === originModules) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			return realLstat(p as string, o as never);
+		}) as unknown as typeof fsSync.lstatSync);
+		try {
+			expect(() => prepareLaunchWorktree(repo, ["--worktree", "src-eacces"])).toThrow(/permission denied|EACCES/);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("adopts a launcher link missing from the manifest under an existing marker", async () => {
+		// A crash between installing a link and committing the manifest leaves a
+		// marker-owned boundary holding an unrecorded link. Without recovery that
+		// link is indistinguishable from a user entry and can never be corrected.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-adopt-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "adopt"]);
+		const modules = path.join(first.cwd, "node_modules");
+		await Bun.write(path.join(modules, ".gjc-node-modules-links.json"), "{}");
+		// Point the link somewhere stale so a correction is observable.
+		const linkPath = path.join(modules, "@scope", "app");
+		await fs.rm(linkPath);
+		await fs.symlink(path.join(first.cwd, "packages"), linkPath, "dir");
+
+		const reused = prepareLaunchWorktree(repo, ["--worktree", "adopt"]);
+		expect(await fs.realpath(path.join(reused.cwd, "node_modules", "@scope", "app"))).toBe(
+			path.join(reused.cwd, "packages", "app"),
+		);
+	});
+
+	it("discovers a declared workspace member reached through a directory symlink", async () => {
+		// Bun.Glob does not follow symlinks by default, so a declared member that
+		// is a directory symlink vanished from discovery, leaving an empty member
+		// set that still passed completeness -- isolation silently absent.
+		const repo = await createRepo("gjc-launch-worktree-symlink-member-");
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "real", "app"), { recursive: true });
+		await Bun.write(
+			path.join(repo, "real", "app", "package.json"),
+			JSON.stringify({ name: "@scope/app", version: "1.0.0" }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "packages"), { recursive: true });
+		await fs.symlink(path.join(repo, "real", "app"), path.join(repo, "packages", "app"), "dir");
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "symlinked member"], repo);
+
+		// The member must be discovered: either linked into the boundary, or the
+		// launch refuses. A silent empty member set presenting as success is the
+		// failure this pins.
+		let refused = false;
+		let launchedCwd = "";
+		try {
+			launchedCwd = prepareLaunchWorktree(repo, ["--worktree", "symlink-member"]).cwd;
+		} catch {
+			refused = true;
+		}
+		const discovered =
+			refused ||
+			(await fs.lstat(path.join(launchedCwd, "node_modules", "@scope", "app")).then(
+				() => true,
+				() => false,
+			));
+		expect(discovered).toBe(true);
+	});
+
+	it("reuses an unchanged member link instead of replacing it", async () => {
+		// Recreating an unchanged junction is destruction that buys nothing, and
+		// Windows rejects the replacement while the junction is in use. A reuse
+		// launch must perform no symlink write for an already-correct link.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-unchanged-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "unchanged"]);
+		const linkPath = path.join(first.cwd, "node_modules", "@scope", "app");
+		expect(await fs.realpath(linkPath)).toBe(path.join(first.cwd, "packages", "app"));
+
+		const spy = spyOn(fsSync, "symlinkSync");
+		try {
+			const reused = prepareLaunchWorktree(repo, ["--worktree", "unchanged"]);
+			expect(reused.worktree.enabled && reused.worktree.reused).toBe(true);
+			const rewroteMember = spy.mock.calls.some(call => String(call[1]).includes("@scope"));
+			expect(rewroteMember).toBe(false);
+		} finally {
+			spy.mockRestore();
+		}
+		expect(await fs.realpath(linkPath)).toBe(path.join(first.cwd, "packages", "app"));
+	});
+
+	it("never deletes through a boundary parent swapped to an outside symlink", async () => {
+		// Identity is proven against the recorded target, but the PARENT chain can
+		// be swapped afterwards; without a containment re-proof immediately before
+		// the delete, rmSync lands outside the worktree.
+		const repo = await createWorkspaceRepo("gjc-launch-worktree-escape-del-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "escape-del"]);
+		const modules = path.join(first.cwd, "node_modules");
+
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-outside-scope-"));
+		cleanupPaths.push(outside);
+		await Bun.write(path.join(outside, "app", "keep.txt"), "must survive\n");
+
+		// Make the member stale so reconciliation wants to delete @scope/app,
+		// then swap the @scope parent to resolve outside the worktree.
+		await fs.rm(path.join(first.cwd, "packages", "app"), { recursive: true });
+		await fs.rm(path.join(modules, "@scope"), { recursive: true, force: true });
+		await fs.symlink(outside, path.join(modules, "@scope"), "dir");
+
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", "escape-del"]);
+		} catch {
+			// Refusing is fine; deleting outside the boundary is not.
+		}
+		expect(await Bun.file(path.join(outside, "app", "keep.txt")).text()).toBe("must survive\n");
+	});
+
+	it("rejects a member manifest that is valid JSON but not an object", async () => {
+		const repo = await createRepo("gjc-launch-worktree-null-member-");
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({ name: "root", private: true, workspaces: ["packages/*"] }, null, "\t"),
+		);
+		await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+		await Bun.write(path.join(repo, "packages", "app", "package.json"), "null");
+		run("git", ["add", "-A"], repo);
+		run("git", ["commit", "-m", "null member"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "null-member"])).toThrow(
+			/worktree_workspace_member_invalid/,
+		);
+	});
 	it("reconciles the ownership map coherently across A→B→A member changes", async () => {
 		const repo = await createWorkspaceRepo("gjc-launch-worktree-aba-");
 		const first = prepareLaunchWorktree(repo, ["--worktree", "aba-reuse"]);

@@ -622,19 +622,39 @@ const NODE_MODULES_BOUNDARY_LOCK = ".gjc-node-modules-boundary.lock";
 const BOUNDARY_LOCK_WAIT_MS = 5_000;
 /** Age after which a leftover lock directory is treated as abandoned. */
 const BOUNDARY_LOCK_STALE_MS = 60_000;
+/**
+ * Lease refresh cadence. Well under {@link BOUNDARY_LOCK_STALE_MS} so a live
+ * holder's lease never ages into breakable territory between refreshes.
+ */
+const BOUNDARY_LOCK_HEARTBEAT_MS = 5_000;
+
+/** File inside the lock directory naming the holder that acquired the lease. */
+const BOUNDARY_LOCK_OWNER_FILE = "owner.json";
 
 /**
- * Runs `body` holding the worktree's boundary lock. A concurrent holder is
- * waited out briefly; a lock older than {@link BOUNDARY_LOCK_STALE_MS} belongs
- * to a crashed launcher and is broken. The lock directory is transient —
- * created on acquisition, removed on release — and never carries user data.
+ * Runs `body` holding the worktree's boundary lock.
+ *
+ * The lock is an owner-bound lease, not a bare directory. Each holder writes a
+ * unique token, and refreshes it while `body` runs so a slow-but-live launch is
+ * never mistaken for a crashed one. A lease is breakable only when its recorded
+ * token has stopped being refreshed for {@link BOUNDARY_LOCK_STALE_MS}, and the
+ * breaker removes only the exact token it observed — a token that changed under
+ * it means the holder is alive, so the break is abandoned. Release verifies the
+ * token too: an unconditional teardown would let a timed-out holder remove the
+ * lock a *different* launch had since acquired, running two reconciliations
+ * concurrently (#4626 review: ownerless lock).
  */
 function withBoundaryLock<T>(worktreePath: string, body: () => T): T {
 	const lockPath = path.join(worktreePath, NODE_MODULES_BOUNDARY_LOCK);
+	const ownerPath = path.join(lockPath, BOUNDARY_LOCK_OWNER_FILE);
+	const token = `${process.pid}-${crypto.randomUUID()}`;
 	const deadline = Date.now() + BOUNDARY_LOCK_WAIT_MS;
 	for (;;) {
 		try {
 			fs.mkdirSync(lockPath);
+			// Claim the lease before anyone can read it: an empty lock directory
+			// is indistinguishable from an abandoned one.
+			fs.writeFileSync(ownerPath, JSON.stringify({ token, heartbeat: Date.now() }), { flag: "wx" });
 			break;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -647,8 +667,15 @@ function withBoundaryLock<T>(worktreePath: string, body: () => T): T {
 						"name is occupied by an entry that is not a lock directory. Remove it and relaunch.",
 				);
 			}
-			if (stat !== null && Date.now() - stat.mtimeMs > BOUNDARY_LOCK_STALE_MS) {
-				fs.rmSync(lockPath, { recursive: true, force: true });
+			const holder = readBoundaryLockOwner(lockPath);
+			if (holder !== null && Date.now() - holder.heartbeat > BOUNDARY_LOCK_STALE_MS) {
+				// Break only the exact lease observed. Re-reading first closes the
+				// window where the holder refreshed, or released and a third launch
+				// acquired, between the staleness test and the removal.
+				const confirmed = readBoundaryLockOwner(lockPath);
+				if (confirmed !== null && confirmed.token === holder.token && confirmed.heartbeat === holder.heartbeat) {
+					fs.rmSync(lockPath, { recursive: true, force: true });
+				}
 				continue;
 			}
 			if (Date.now() >= deadline) {
@@ -661,11 +688,54 @@ function withBoundaryLock<T>(worktreePath: string, body: () => T): T {
 			Bun.sleepSync(25);
 		}
 	}
+	const heartbeat = setInterval(() => {
+		// Refresh only while this token still owns the lease; a broken-and-retaken
+		// lock must not be kept alive by its previous holder.
+		try {
+			const current = readBoundaryLockOwner(lockPath);
+			if (current?.token !== token) return;
+			fs.writeFileSync(ownerPath, JSON.stringify({ token, heartbeat: Date.now() }));
+		} catch {
+			// A refresh failure only risks the lease looking stale; the operation
+			// itself is still guarded by the token check on release.
+		}
+	}, BOUNDARY_LOCK_HEARTBEAT_MS);
+	// Never hold the process open on the refresh timer.
+	if (typeof heartbeat === "object" && heartbeat !== null && "unref" in heartbeat) heartbeat.unref();
 	try {
 		return body();
 	} finally {
-		fs.rmSync(lockPath, { recursive: true, force: true });
+		clearInterval(heartbeat);
+		// Release only our own lease: if it was broken and retaken, the directory
+		// now belongs to another launch and removing it would let two launches
+		// reconcile the same worktree at once.
+		const current = readBoundaryLockOwner(lockPath);
+		if (current === null || current.token === token) fs.rmSync(lockPath, { recursive: true, force: true });
 	}
+}
+
+/**
+ * Reads the lock's owner record, or null when the lease carries no readable
+ * token (absent, truncated mid-write, or malformed). A null record is treated
+ * as an unowned lock and becomes breakable on the staleness path.
+ */
+function readBoundaryLockOwner(lockPath: string): { token: string; heartbeat: number } | null {
+	let raw: string;
+	try {
+		raw = fs.readFileSync(path.join(lockPath, BOUNDARY_LOCK_OWNER_FILE), "utf8");
+	} catch {
+		return null;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return null;
+	}
+	if (typeof parsed !== "object" || parsed === null) return null;
+	const record = parsed as { token?: unknown; heartbeat?: unknown };
+	if (typeof record.token !== "string" || typeof record.heartbeat !== "number") return null;
+	return { token: record.token, heartbeat: record.heartbeat };
 }
 
 /** Package-name grammar accepted for boundary links (npm scope rules). */
@@ -741,9 +811,13 @@ function ensureReusableNodeModulesLocked(sourceRoot: string, worktreePath: strin
 			// does not isolate resolution: for a workspace repo it must also be a
 			// complete boundary for this commit, or missing members would resolve
 			// through an ancestor checkout (#4620).
-			const resolved = tryRealpath(target);
+			// This site deliberately treats "cannot resolve" and "resolves nowhere"
+			// alike: both are unproven, and the shared refusal below preserves the
+			// link either way. `unresolvedOrNull` keeps that collapse local instead
+			// of weakening tryRealpath, whose null drives deletions elsewhere.
+			const resolved = unresolvedOrNull(target);
 			if (resolved !== null) {
-				const sourceModules = tryRealpath(path.join(sourceRoot, "node_modules"));
+				const sourceModules = unresolvedOrNull(path.join(sourceRoot, "node_modules"));
 				const isSourceModules = sourceModules !== null && sameFileSystemPath(resolved, sourceModules, sourceRoot);
 				if (!isSourceModules) {
 					const declaration = readWorkspaceDeclaration(worktreePath);
@@ -817,14 +891,18 @@ function ensureReusableNodeModulesLocked(sourceRoot: string, worktreePath: strin
 	// hoists and partial installs encode ownership outside the link scan).
 	const declaration = readWorkspaceDeclaration(worktreePath);
 	const source = path.join(sourceRoot, "node_modules");
-	if (declaration || !fs.existsSync(source) || nodeModulesLinksInto(source, sourceRoot)) {
+	// `existsSync` answers false for an unreadable path as well as an absent one,
+	// which would take the "no origin tree" branch on `EACCES` and build a
+	// boundary as though the source had no install (#4626 review). `tryLstat`
+	// distinguishes them: null only for ENOENT, propagate otherwise.
+	const sourceStat = tryLstat(source);
+	if (declaration || sourceStat === null || nodeModulesLinksInto(source, sourceRoot)) {
 		createWorkspaceSelfLinkBoundary(worktreePath);
 		return "missing";
 	}
 	// A node_modules root symlinked outside the repo belongs to another
 	// checkout's install graph (nested repo in a parent workspace); its entries
 	// resolve that parent's live sources, so it is never shared either.
-	const sourceStat = fs.lstatSync(source);
 	if (sourceStat.isSymbolicLink()) {
 		createWorkspaceSelfLinkBoundary(worktreePath);
 		return "missing";
@@ -915,10 +993,52 @@ function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
 	}
 
 	// A launcher boundary replaces a launcher boundary; it is never created over
-	// a user-owned install (no marker).
-	if (!markerOwned && fs.existsSync(modules)) return;
+	// a user-owned install (no marker). A directory that appeared since the
+	// marker probe (a package manager installing concurrently) is NOT accepted
+	// as success: it is re-entered through the same unmarked-boundary validation
+	// as any user-owned tree, so an install still in flight can never be reported
+	// as a complete boundary (#4626 review: mid-flight creation).
+	if (!markerOwned && tryLstat(modules) !== null) {
+		if (!isCompleteResolutionBoundary(worktreePath, modules, declaration)) {
+			throw new Error(
+				`worktree_node_modules_boundary_incomplete:${JSON.stringify(shortenPath(modules))} — a node_modules ` +
+					"directory appeared in this worktree while GJC was preparing its isolation boundary and does not " +
+					"resolve every declared workspace member, so missing members would resolve through an ancestor " +
+					"checkout. Let the install finish and relaunch, or remove the directory to let GJC create its " +
+					"boundary.",
+			);
+		}
+		return;
+	}
 	fs.mkdirSync(modules, { recursive: true });
+	// Claim ownership BEFORE installing any link. A crash between the first link
+	// and the marker would otherwise leave an unmarked directory holding launcher
+	// links that no later launch can prove it owns; with the marker first, the
+	// worst interruption leaves a marker-owned partial boundary, which the
+	// completeness post-condition below detects and refuses (#4626 review:
+	// boundary is not crash-consistent).
+	if (!fs.existsSync(markerPath)) writeBoundaryMarker(markerPath);
 	const ownership = readBoundaryOwnership(modules);
+	// Recover ownership for links inside a marker-owned boundary that the
+	// manifest does not record. A crash between installing a link and committing
+	// the manifest leaves exactly that state; without recovery the link is
+	// indistinguishable from a user entry and is skipped forever, so a member
+	// pointing at a stale target could never be corrected (#4626 review: missing
+	// ownership under an existing marker). Inside a marker-owned directory every
+	// member link was installed by a launcher, so adopting one is sound.
+	if (markerOwned) {
+		for (const name of members.keys()) {
+			if (ownership.has(name)) continue;
+			const linkPath = path.join(modules, ...name.split("/"));
+			const stat = tryLstat(linkPath);
+			if (!stat?.isSymbolicLink()) continue;
+			// Record the link's CURRENT target, not the desired one: ownership is a
+			// claim about what is on disk, and the identity check below compares
+			// against it to decide whether the link still needs correcting.
+			const actual = tryRealpath(linkPath);
+			if (actual !== null) ownership.set(name, actual);
+		}
+	}
 	for (const [name, member] of members) {
 		const linkPath = path.join(modules, ...name.split("/"));
 		// Containment for a link destination is about the PATH inside node_modules
@@ -933,6 +1053,14 @@ function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
 		if (recorded !== undefined) {
 			if (!isRecordedLinkAtIdentity(linkPath, recorded)) {
 				ownership.delete(name);
+				continue;
+			}
+			// An unchanged link needs no write at all. Recreating it would replace a
+			// live junction on every reuse launch \u2014 destruction that buys nothing and
+			// that Windows rejects while the junction is in use (#4626 review:
+			// unchanged links are recreated, breaking Windows reuse).
+			if (isRecordedLinkAtIdentity(linkPath, member.dir)) {
+				ownership.set(name, member.dir);
 				continue;
 			}
 		} else if (tryLstat(linkPath)) continue;
@@ -955,7 +1083,6 @@ function createWorkspaceSelfLinkBoundary(worktreePath: string): void {
 	// completeness post-condition (#4626 review: split ownership maps).
 	reconcileBoundaryLinks(modules, members, ownership);
 	writeBoundaryOwnership(modules, ownership);
-	if (!fs.existsSync(markerPath)) writeBoundaryMarker(markerPath);
 	// Post-condition: the boundary we just reconciled must actually resolve
 	// every declared member. A crash, ENOSPC, or interruption in any earlier
 	// step could have left a marker-owned partial boundary; this launch would
@@ -996,7 +1123,18 @@ function scanWorkspaceMemberManifests(worktreePath: string, declaration: Workspa
 				}
 				continue;
 			}
-			for (const match of glob.scanSync({ cwd: worktreePath, dot: false, onlyFiles: true })) {
+			// `followSymlinks` defaults to false, which hides a declared member
+			// reached through a directory symlink (`packages/app -> ../elsewhere`).
+			// A silently empty member set still passes boundary construction and
+			// completeness, so the worktree would launch with no isolation at all
+			// (#4626 review). Enumerate through symlinks; members resolving outside
+			// the worktree are rejected downstream by assertCanonicalInside.
+			for (const match of glob.scanSync({
+				cwd: worktreePath,
+				dot: false,
+				onlyFiles: true,
+				followSymlinks: true,
+			})) {
 				// Installed dependency manifests are never workspace members: a
 				// recursive pattern (`packages/**`, `**`) would otherwise match
 				// `node_modules/**/package.json` and link or reject installed
@@ -1082,6 +1220,17 @@ function reconcileBoundaryLinks(
 	for (const name of [...ownership.keys()]) {
 		if (members.has(name)) continue;
 		const linkPath = path.join(modules, ...name.split("/"));
+		// Re-prove containment immediately before deleting. Identity was checked
+		// against the recorded target, but the PARENT chain can have been swapped
+		// to an outside symlink since (`node_modules/@scope` \u2014> elsewhere), in
+		// which case the path to delete is no longer inside the boundary and
+		// `rmSync` would remove an external entry (#4626 review: stale-link
+		// deletion can escape the boundary). A path that cannot be proven inside
+		// is left untouched and simply unrecorded.
+		if (!isDeletablePathInsideBoundary(modules, linkPath)) {
+			ownership.delete(name);
+			continue;
+		}
 		const recorded = ownership.get(name);
 		if (recorded !== undefined && isRecordedLinkAtIdentity(linkPath, recorded)) {
 			fs.rmSync(linkPath, { force: true });
@@ -1093,6 +1242,27 @@ function reconcileBoundaryLinks(
 		}
 		ownership.delete(name);
 	}
+}
+
+/**
+ * True when every parent directory between `modules` and `candidate` resolves
+ * inside the boundary, so deleting `candidate` cannot reach outside it.
+ *
+ * The candidate itself is deliberately not resolved: a member entry is a symlink
+ * whose target legitimately points elsewhere in the worktree, and `rmSync`
+ * removes the link rather than following it. Only the path used to reach it must
+ * be contained.
+ */
+function isDeletablePathInsideBoundary(modules: string, candidate: string): boolean {
+	const modulesReal = tryRealpath(modules);
+	if (modulesReal === null) return false;
+	const parentReal = tryRealpath(path.dirname(candidate));
+	if (parentReal === null) return false;
+	if (!isInsideOrEqualRealCaseAware(modulesReal, parentReal, modulesReal)) return false;
+	// The final component must be a plain name, never a traversal step that
+	// would land outside once joined.
+	const base = path.basename(candidate);
+	return base !== "" && base !== "." && base !== "..";
 }
 
 /**
@@ -1434,14 +1604,32 @@ function readMemberManifest(manifestPath: string, declaringFile: string): { name
 				`${JSON.stringify(declaringFile)} — the isolation boundary cannot skip an unreadable member.`,
 		);
 	}
+	let parsed: unknown;
 	try {
-		return JSON.parse(raw) as { name?: string };
+		parsed = JSON.parse(raw);
 	} catch {
 		throw new Error(
 			`worktree_workspace_member_invalid:${JSON.stringify(shortenPath(manifestPath))} declared by ` +
 				`${JSON.stringify(declaringFile)} — the isolation boundary cannot skip a malformed member manifest.`,
 		);
 	}
+	// Valid JSON that is not an object (`null`, an array, a bare string) would
+	// otherwise reach a raw `.name` access and surface as a TypeError instead of
+	// the manifest diagnostic (#4626 review).
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error(
+			`worktree_workspace_member_invalid:${JSON.stringify(shortenPath(manifestPath))} declared by ` +
+				`${JSON.stringify(declaringFile)} — a member manifest must be a JSON object.`,
+		);
+	}
+	const record = parsed as { name?: unknown };
+	if (record.name !== undefined && typeof record.name !== "string") {
+		throw new Error(
+			`worktree_workspace_member_invalid:${JSON.stringify(shortenPath(manifestPath))} declared by ` +
+				`${JSON.stringify(declaringFile)} — the member "name" field must be a string.`,
+		);
+	}
+	return { name: record.name };
 }
 
 /** True when a workspace glob pattern stays inside the worktree (no absolute or traversal segments). */
@@ -1546,12 +1734,38 @@ function tryLstat(target: string): fs.Stats | null {
 	}
 }
 
-/** `realpath` that returns null instead of throwing when resolution fails. */
-function tryRealpath(target: string): string | null {
+/**
+ * `realpath` that returns null for ANY resolution failure.
+ *
+ * Only for callers whose null branch is a refusal that preserves the entry, not
+ * a deletion: there, an unreadable path and a dangling one are handled
+ * identically, and the caller reports the unproven state itself.
+ */
+function unresolvedOrNull(target: string): string | null {
 	try {
 		return fs.realpathSync(target);
 	} catch {
 		return null;
+	}
+}
+
+/**
+ * `realpath` that returns null only when the path provably resolves nowhere.
+ *
+ * `null` means "resolves nowhere" and callers act on it — including by deleting
+ * the entry. Collapsing every failure to null would make an `EACCES` from a
+ * permissions change, or an `EIO` from a network mount hiccup, indistinguishable
+ * from a dangling link and delete a perfectly valid one (#4626 review). Only
+ * the errnos that prove non-resolution ({@link BROKEN_LINK_CODES}) yield null;
+ * everything else propagates, because an unreadable path cannot be proven
+ * absent.
+ */
+function tryRealpath(target: string): string | null {
+	try {
+		return fs.realpathSync(target);
+	} catch (error) {
+		if (BROKEN_LINK_CODES.has((error as NodeJS.ErrnoException).code ?? "")) return null;
+		throw error;
 	}
 }
 
