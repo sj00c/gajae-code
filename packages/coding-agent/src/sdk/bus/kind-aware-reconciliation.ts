@@ -76,7 +76,7 @@ export interface KindAwareReconciliation {
 		content?: unknown,
 	): Promise<void>;
 	/** Replace an exhausted deadline failure with an active, non-definite record. */
-	markUncertain(kind: ReconciliationKind, correlation: PromptCorrelation): Promise<void>;
+	markUncertain(kind: ReconciliationKind, correlation: PromptCorrelation, isCurrent?: () => boolean): Promise<void>;
 	peekPendingOutcome(kind: ReconciliationKind, correlation: PromptCorrelation): SdkPromptTerminalOutcome | undefined;
 	lookup(
 		kind: ReconciliationKind,
@@ -440,8 +440,13 @@ export function createKindAwareReconciliation(
 		});
 	};
 
-	const markUncertain = async (kind: ReconciliationKind, correlation: PromptCorrelation) => {
+	const markUncertain = async (
+		kind: ReconciliationKind,
+		correlation: PromptCorrelation,
+		isCurrent?: () => boolean,
+	) => {
 		await queueMutation(candidate => {
+			if (isCurrent !== undefined && !isCurrent()) return { value: undefined, changed: false };
 			const record = candidate.get(keyOf(kind, correlation));
 			if (!record || record.kind !== kind) return { value: undefined, changed: false };
 			const wasDeadlineFailure = record.status === "failed" && record.error?.code === "prompt_deadline_exceeded";

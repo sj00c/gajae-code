@@ -192,6 +192,24 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.clearAll();
 	}, 15_000);
 
+	test("a real agent_end that fails beyond budget never remains a definite deadline failure", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		state.noteTransitionFailures = Number.MAX_SAFE_INTEGER;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-real-exhausted", turnId: "turn-real-exhausted" };
+		manager.onAccepted(correlation);
+		manager.noteTerminalTransition(correlation);
+		await Bun.sleep(6_800);
+		expect(state.uncertainCalls).toBe(1);
+		expect(state.status).toBe("uncertain");
+		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
+	}, 15_000);
+
 	test("fresh progress during a suspended claim cancels this expiry instead of firing exceeded", async () => {
 		// Exact-head review P2: expiry finalization must be generation-aware after
 		// every awaited operation. Deliver attributable progress while the claim

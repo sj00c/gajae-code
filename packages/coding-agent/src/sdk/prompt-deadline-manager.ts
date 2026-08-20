@@ -178,9 +178,14 @@ export class PromptDeadlineManager {
 		this.#clearTimer(key);
 		if (attempts > MAX_EXPIRY_RETRIES) {
 			const correlation = this.#correlations.get(key);
+			const lease = this.#leases.get(key);
+			const generation = lease?.generation;
 			if (correlation && typeof this.#reconciliation.markUncertain === "function") {
 				void this.#reconciliation
-					.markUncertain("prompt", correlation)
+					.markUncertain("prompt", correlation, () => {
+						const current = this.#leases.get(key);
+						return current === lease && current?.generation === generation;
+					})
 					.then(() => this.clear(correlation))
 					.catch(() => undefined);
 			}

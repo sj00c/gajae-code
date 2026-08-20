@@ -446,7 +446,7 @@ export interface InvocationReconciliation {
 		outcome?: { kind: string; code: string; message: string; provenance?: string },
 		isCurrent?: () => boolean,
 	): Promise<void>;
-	markUncertain(kind: InvocationKind, correlation: InvocationCorrelation): Promise<void>;
+	markUncertain(kind: InvocationKind, correlation: InvocationCorrelation, isCurrent?: () => boolean): Promise<void>;
 }
 
 export function createInvocationReconciliation(
@@ -840,7 +840,8 @@ export function createInvocationReconciliation(
 				if (pendingFinalizations.get(recordKey) === pending) pendingFinalizations.delete(recordKey);
 			}
 		},
-		async markUncertain(kind, correlation) {
+		async markUncertain(kind, correlation, isCurrent) {
+			if (isCurrent !== undefined && !isCurrent()) return;
 			const recordKey = key(kind, correlation);
 			const record = records.get(recordKey);
 			if (!record || record.kind !== kind) return;
@@ -850,6 +851,7 @@ export function createInvocationReconciliation(
 				status: record.startedAt === undefined ? "accepted" : "in_flight",
 				revision: ++mutationRevision,
 			};
+			if (isCurrent !== undefined && !isCurrent()) return;
 			delete next.terminalAt;
 			delete next.error;
 			delete (next as unknown as { outcome?: unknown }).outcome;

@@ -112,8 +112,13 @@ describe("SDK prompt terminal arbiter", () => {
 		const reloaded = createKindAwareReconciliation({ store, now: () => 200 });
 		await reloaded.hydrateFromStore();
 		expect(reloaded.lookup("prompt", correlation)).toMatchObject({ status: "accepted" });
-		await reloaded.noteTransition("prompt", correlation, { type: "agent_end" });
-		expect(reloaded.lookup("prompt", correlation)).toMatchObject({ status: "terminal_ok" });
+		expect(store.snapshot()).toMatchObject([{ deadlineRecoveryPending: true }]);
+		// No synthetic deadline failure survives restart; a later real agent_end may
+		// converge this explicitly non-definite row without a manual repair step.
+		expect(reloaded.lookup("prompt", correlation)).not.toMatchObject({
+			status: "failed",
+			error: { code: "prompt_deadline_exceeded" },
+		});
 	});
 
 	test("claims the first pending outcome without exposing it as terminal", async () => {
