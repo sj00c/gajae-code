@@ -1494,12 +1494,12 @@ describe("SDK session index", () => {
 				await reader.refreshIfChanged();
 			}
 		}
-		if (!collided) {
-			// This filesystem reports high-resolution timestamps, so the collision
-			// is not reproducible here and there is nothing to fence.
-			expect(await reader.refreshIfChanged()).toBe(true);
-			return;
-		}
+		// Deterministic evidence (#4730 review): the inode-difference branch must
+		// actually have been the only distinguishing signal. If this filesystem
+		// reports timestamps fine-grained enough that a same-size rename-replace
+		// is never metadata-identical, say so explicitly instead of silently
+		// passing through a generic path that proves nothing.
+		expect(collided).toBe(true);
 		// Only the inode changed. The cheap path must still report a change and
 		// fully replay the replacement snapshot.
 		expect(await reader.refreshIfChanged()).toBe(true);

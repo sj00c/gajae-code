@@ -64,14 +64,15 @@ export interface SessionAttachment {
 	 * Idempotent provider-lease heartbeat send that skips the pre-send authority
 	 * reconcile (#4689).
 	 *
-	 * This is a required member, not an optional capability: an implementation
-	 * that silently fell back to `send()` would restore the 5s heartbeat-forced
-	 * locked rescan this fix exists to remove, so the contract fails closed at
-	 * the type level instead. Implementors are versioned by the Telegram serving
-	 * epoch (88) and the Discord/Slack daemon generations (66/69), which force
-	 * replacement of any pre-#4689 owner rather than letting it keep serving.
+	 * Optional so existing exported-capability implementations (including
+	 * consumer-provided `resolveAttachment` callbacks on the Discord/Slack daemon
+	 * options) stay source- and runtime-compatible (#4730 review). It is NOT a
+	 * fail-open fallback: a caller that finds it absent must fail closed rather
+	 * than route the heartbeat through `send()`, which would restore the 5s
+	 * heartbeat-forced locked rescan this fix exists to remove. Router-owned
+	 * attachments always provide it.
 	 */
-	sendMaintenance(leaseId: string): unknown;
+	sendMaintenance?(leaseId: string): unknown;
 	/** Revoke this exact capability after provider admission or replay fails closed. */
 	retire?(): Promise<void>;
 }
@@ -792,10 +793,19 @@ export class SessionRouter {
 
 	async #reconcile(runEpoch: number, deferReplay = false, force = false): Promise<void> {
 		if (!this.#running(runEpoch)) return;
-		// Idle-poll fast path (#4689): an unchanged index is proven with two
-		// stats instead of a locked full re-parse on every 2s tick; any committed
-		// append changes the stamp and forces the exact reload below.
-		const changed = await this.#index.refreshIfChanged();
+		// Idle-poll fast path (#4689) is for TIMER TICKS ONLY. A forced pass backs
+		// a dispatch, adoption, explicit reconcile, or start, and must serialize
+		// against the index lock: the unlocked stamp cut cannot order itself
+		// against a writer that commits an unregister/re-registration between the
+		// stat and the listSessions()/request() below, which would let a forced
+		// request go out through a no-longer-authoritative attachment (#4730
+		// review). Forced passes therefore take the locked authority read.
+		let changed: boolean;
+		if (force) {
+			await this.#index.open();
+			await this.#index.refresh();
+			changed = true;
+		} else changed = await this.#index.refreshIfChanged();
 		if (!this.#running(runEpoch)) return;
 		// Idle gate (#4689), timer ticks ONLY: dispatch, adoption, explicit
 		// reconcile, and start pass force=true and keep the exact locked
@@ -1141,7 +1151,22 @@ export class SessionRouter {
 			 * shape is fixed here so no command traffic can take this path;
 			 * dispatch keeps using send().
 			 */
-			sendMaintenance: (leaseId: string) => {
+			sendMaintenance: async (leaseId: string) => {
+				if (!attached || !this.#attachmentPublished(attached))
+					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+				// Renewal must fail closed against durable authority (#4730 review):
+				// the idle path can defer full projection to the 30s sweep, so an
+				// endpoint replaced in that window would otherwise keep receiving
+				// lease renewals. This reads the endpoint record only -- it never
+				// re-enters the locked index rescan the 5s heartbeat existed to avoid.
+				const endpoint = await this.#readEndpoint(attached.indexed);
+				if (
+					!endpoint ||
+					endpoint.url !== attached.endpoint.url ||
+					endpoint.token !== attached.endpoint.token ||
+					endpoint.pid !== attached.pid
+				)
+					throw new SessionRouterError("pre_send", "SDK session endpoint authority changed before lease renewal.");
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(this.#prepareFrame(attached, { type: "provider_heartbeat", leaseId }));

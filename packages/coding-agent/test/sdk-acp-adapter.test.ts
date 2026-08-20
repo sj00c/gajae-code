@@ -75,6 +75,8 @@ type RouterHarness = {
 	requests: Record<string, unknown>[];
 	requestOptions: ({ timeoutMs?: number } | undefined)[];
 	sent: Record<string, unknown>[];
+	/** Lease ids observed on the maintenance capability (#4689 heartbeat route). */
+	maintenance: string[];
 	setCurrent: (current: boolean) => void;
 };
 
@@ -84,6 +86,7 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 	const requests: Record<string, unknown>[] = [];
 	const requestOptions: ({ timeoutMs?: number } | undefined)[] = [];
 	const sent: Record<string, unknown>[] = [];
+	const maintenance: string[] = [];
 	const attachment: SessionAttachment = {
 		sessionId: "session-1",
 		connectionId: "router-connection-1",
@@ -93,7 +96,9 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 			sent.push(frame);
 			return await options.send?.(frame);
 		},
-		sendMaintenance: () => {},
+		sendMaintenance: leaseId => {
+			maintenance.push(leaseId);
+		},
 	};
 	const router = {
 		request: async (
@@ -115,7 +120,7 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 			return { ok: true, result: { accepted: true } };
 		},
 	};
-	return { router, attachment, requests, requestOptions, sent, setCurrent: value => (current = value) };
+	return { router, attachment, requests, requestOptions, sent, maintenance, setCurrent: value => (current = value) };
 }
 
 const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
@@ -126,6 +131,62 @@ const waitFor = async (predicate: () => boolean, label: string): Promise<void> =
 	}
 	throw new Error(`Timed out waiting for ${label}`);
 };
+
+test("ACP lease heartbeats take the maintenance route, never the reconciling send path (#4689)", async () => {
+	// The 5s lease heartbeat was one of the two timers that forced a locked
+	// authority reconcile per attached session. A regression back to send() (or
+	// to a full reconcile) must fail here, not just in the index-level tests.
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [] }],
+		heartbeatMs: 5,
+	});
+	await adapter.start();
+	try {
+		// A real registered provider lease must exist for a heartbeat to be sent.
+		const registered = harness.requests.filter(frame => frame.type === "register_provider");
+		expect(registered.length).toBeGreaterThan(0);
+
+		const sentBefore = harness.sent.length;
+		const requestsBefore = harness.requests.length;
+		await waitFor(() => harness.maintenance.length >= 2, "two lease heartbeats on the maintenance route");
+
+		// Every heartbeat carried a real lease id...
+		expect(harness.maintenance.every(leaseId => typeof leaseId === "string" && leaseId.length > 0)).toBe(true);
+		// ...and none of them went through the reconciling send() path or emitted
+		// any additional router request traffic.
+		expect(harness.sent.length).toBe(sentBefore);
+		expect(harness.requests.length).toBe(requestsBefore);
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP lease heartbeats stop once the attachment is no longer current (#4689)", async () => {
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [] }],
+		heartbeatMs: 5,
+	});
+	await adapter.start();
+	try {
+		await waitFor(() => harness.maintenance.length >= 1, "a first lease heartbeat");
+		harness.setCurrent(false);
+		const afterStale = harness.maintenance.length;
+		await Bun.sleep(60);
+		// A stale attachment is a quiet no-op: no further heartbeats, and the
+		// adapter must not escalate it into reconnect/command traffic.
+		expect(harness.maintenance.length).toBe(afterStale);
+	} finally {
+		await adapter.close();
+	}
+});
 
 test("ACP abort keeps the one-shot reply deadline while other session commands take the session budget", async () => {
 	const harness = createRouterHarness();

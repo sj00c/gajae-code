@@ -585,6 +585,14 @@ export class AcpSdkAdapter {
 			);
 		const attachment = this.#attachment;
 		if (!attachment?.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+		// Fail closed when the capability is absent (#4730 review). Falling back to
+		// send() would put the 5s heartbeat back on the locked authority reconcile,
+		// which is the exact idle cost this fix removes.
+		if (typeof attachment.sendMaintenance !== "function")
+			throw new SessionRouterError(
+				"pre_send",
+				"SDK session attachment does not support provider-lease maintenance heartbeats.",
+			);
 		await Promise.resolve(attachment.sendMaintenance(leaseId));
 	}
 

@@ -1794,11 +1794,25 @@ describe("SessionRouter dispatch authority", () => {
 				expect(reconcileCount).toBeGreaterThan(before);
 			}
 			expect(reconcileCount).toBe(baselineReconciles + 3);
-			// The polling path must never drive the locked full re-parse, and
-			// the idle gate skips the projection body on unchanged ticks.
+			// The polling path must never re-open the index, and the idle gate must
+			// skip the projection body on unchanged ticks: three ticks cost exactly
+			// three stamp checks and no extra listSessions() projection. (The first
+			// tick's stamp reports changed once, which legitimately runs one body.)
 			expect(calls.open).toBe(baseline.open);
-			expect(calls.listSessions).toBe(baseline.listSessions);
 			expect(calls.refreshIfChanged).toBe(baseline.refreshIfChanged + 3);
+			expect(calls.listSessions).toBe(baseline.listSessions + 2);
+			// Now that the stamp reports unchanged, further ticks must add ZERO
+			// locked reads and ZERO projections: the gated tick is stat-only.
+			const gated = { ...calls };
+			for (let i = 0; i < 3; i++) {
+				const before = reconcileCount;
+				tick!();
+				for (let spins = 0; spins < 500 && reconcileCount <= before; spins++) await Bun.sleep(1);
+			}
+			expect(calls.refreshIfChanged).toBe(gated.refreshIfChanged + 3);
+			expect(calls.open).toBe(gated.open);
+			expect(calls.refresh).toBe(gated.refresh);
+			expect(calls.listSessions).toBe(gated.listSessions);
 			// Prompt dispatch forces the exact body even on an unchanged index
 			// (authority revalidation is never gated), and still settles fast.
 			const beforeRequest = { ...calls };
@@ -1890,6 +1904,91 @@ describe("SessionRouter dispatch authority", () => {
 			expect(listSessionsCalls).toBeGreaterThan(baseline);
 		} finally {
 			await router.stop();
+		}
+	});
+	test("idle sweep retires an attachment whose row goes dead or stale (#4689 review)", async () => {
+		// The sweep exists so time-driven transitions are still detected once the
+		// 2s tick stopped projecting. Proving the body ran is not enough: the row
+		// must actually be retired. Drive dead-PID and not-live transitions on an
+		// otherwise unchanged index and assert the attachment is dropped.
+		for (const transition of ["dead-pid", "not-live"] as const) {
+			const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4689-retire-"));
+			tempDirs.push(repo);
+			const agentDir = path.join(repo, ".gjc", "agent");
+			const stateRoot = path.join(repo, ".gjc", "state");
+			const endpointDir = path.join(stateRoot, "sdk");
+			await fsPromises.mkdir(endpointDir, { recursive: true });
+			const sessionId = "retire";
+			const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+			await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://retire.test", token: "v1", pid: 42 }));
+			let tick: (() => void) | undefined;
+			let reconcileCount = 0;
+			// An unchanged index: only the row's liveness/pid changes, exactly the
+			// class of transition the removed per-tick projection used to catch.
+			let degraded = false;
+			const index = {
+				open: async () => {},
+				refresh: async () => {},
+				refreshIfChanged: async () => false,
+				get indexSeq() {
+					return 1;
+				},
+				listSessions: () => ({
+					indexSeq: 1,
+					sessions: [
+						{
+							sessionId,
+							locator: { repo, stateRoot },
+							endpointGeneration: 1,
+							// A pid that cannot be alive stands in for a dead host.
+							pid: degraded && transition === "dead-pid" ? 0x7ffffffe : 42,
+							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
+							live: !(degraded && transition === "not-live"),
+							indexSeq: 1,
+							ambiguous: false,
+							terminal: false,
+						},
+					],
+					warnings: [],
+				}),
+			} as unknown as SessionIndex;
+			const router = new SessionRouter({
+				agentDir,
+				deps: {
+					createIndex: () => index,
+					createClient: async () => ({
+						onFrame: () => () => {},
+						request: async () => ({ events: [] }),
+						close: async () => {},
+						send: () => {},
+						sendMaintenance: () => {},
+					}),
+					onReconciled: () => {
+						reconcileCount++;
+					},
+					setInterval: ((callback: () => void) => {
+						tick = callback;
+						return 0;
+					}) as unknown as typeof setInterval,
+					clearInterval: (() => {}) as unknown as typeof clearInterval,
+					// Sweep every tick so the transition is timer-driven, not change-driven.
+					idleSweepMs: 0,
+				},
+			});
+			try {
+				await router.start();
+				expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
+				degraded = true;
+				for (let i = 0; i < 3 && router.attachment(sessionId) != null; i++) {
+					const before = reconcileCount;
+					tick!();
+					for (let spins = 0; spins < 500 && reconcileCount <= before; spins++) await Bun.sleep(1);
+				}
+				// The sweep must have retired it, with the index never reporting a change.
+				expect(router.attachment(sessionId) ?? undefined).toBeUndefined();
+			} finally {
+				await router.stop();
+			}
 		}
 	});
 	test("a dispatch queued behind an idle tick escalates it to the exact body (#4689 review)", async () => {
@@ -2113,7 +2212,7 @@ describe("SessionRouter dispatch authority", () => {
 			const attachment = router.attachment(sessionId);
 			expect(attachment?.isCurrent()).toBe(true);
 			const baseline = refreshIfChangedCalls;
-			attachment!.sendMaintenance("lease-9");
+			await attachment!.sendMaintenance?.("lease-9");
 			// Exactly the heartbeat frame shape — no command traffic can take this
 			// path — and no reconcile was triggered.
 			expect(sent).toEqual([

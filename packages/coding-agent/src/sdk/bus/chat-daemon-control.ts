@@ -132,8 +132,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * would retain the old hot polling loop, so replacement is required.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 66,
-	slack: 69,
+	discord: 67,
+	slack: 70,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

@@ -167,7 +167,12 @@ const auditFor = (agentDir: string) => path.join(dirFor(agentDir), "index-audit.
 interface SessionIndexFileStamp {
 	readonly exists: boolean;
 	readonly size: number;
-	readonly ino: number;
+	/**
+	 * Kept as `bigint` so a 64-bit inode / Windows file id above
+	 * `Number.MAX_SAFE_INTEGER` cannot collapse onto another id and make a real
+	 * replacement read as unchanged (#4730 review).
+	 */
+	readonly ino: bigint;
 	readonly mtimeMs: number;
 	readonly ctimeMs: number;
 }
@@ -177,11 +182,17 @@ interface SessionIndexChangeStamp {
 }
 async function statIndexFile(file: string): Promise<SessionIndexFileStamp> {
 	try {
-		const stat = await fs.stat(file);
-		return { exists: true, size: stat.size, ino: Number(stat.ino), mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
+		const stat = await fs.stat(file, { bigint: true });
+		return {
+			exists: true,
+			size: Number(stat.size),
+			ino: stat.ino,
+			mtimeMs: Number(stat.mtimeMs),
+			ctimeMs: Number(stat.ctimeMs),
+		};
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT")
-			return { exists: false, size: 0, ino: 0, mtimeMs: 0, ctimeMs: 0 };
+			return { exists: false, size: 0, ino: 0n, mtimeMs: 0, ctimeMs: 0 };
 		throw error;
 	}
 }
