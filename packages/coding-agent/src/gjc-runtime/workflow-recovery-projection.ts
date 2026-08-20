@@ -182,6 +182,8 @@ function findSectionExact(
 async function resolveRalplanArtifactPath(runDir: string, recordedPath: string): Promise<string | undefined> {
 	const candidate = path.isAbsolute(recordedPath) ? recordedPath : path.resolve(runDir, recordedPath);
 	try {
+		const runStat = await fs.lstat(runDir);
+		if (!runStat.isDirectory() || runStat.isSymbolicLink()) return undefined;
 		const [runReal, artifactReal] = await Promise.all([fs.realpath(runDir), fs.realpath(candidate)]);
 		const relative = path.relative(runReal, artifactReal);
 		if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	isHighRiskChangePath,
@@ -95,6 +96,23 @@ describe("workflow recovery projection (#4560)", () => {
 				projectRalplanFinalRun({ cwd: tempDir.path(), sessionId: SESSION_ID, runId }),
 			).resolves.toBeUndefined();
 		}
+	});
+
+	it("rejects a symlinked ralplan run directory", async () => {
+		const outsideRunDir = path.join(tempDir.path(), "outside-ralplan-run");
+		await fs.mkdir(outsideRunDir, { recursive: true });
+		await fs.mkdir(path.dirname(ralplanRunDir(tempDir.path(), "symlinked-run")), { recursive: true });
+		await Bun.write(path.join(outsideRunDir, "stage-01-final.md"), FINAL_PLAN);
+		const digest = crypto.createHash("sha256").update(FINAL_PLAN).digest("hex");
+		await Bun.write(
+			path.join(outsideRunDir, "index.jsonl"),
+			`${JSON.stringify({ stage: "final", stage_n: 1, path: "stage-01-final.md", sha256: digest })}\n`,
+		);
+		await fs.symlink(outsideRunDir, ralplanRunDir(tempDir.path(), "symlinked-run"));
+
+		await expect(
+			projectRalplanFinalRun({ cwd: tempDir.path(), sessionId: SESSION_ID, runId: "symlinked-run" }),
+		).resolves.toBeUndefined();
 	});
 
 	it("uses the durable active ralplan run and skips unfinished legacy candidates", async () => {
