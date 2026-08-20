@@ -461,6 +461,16 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
  */
 export function maybeStageNodeModulesAddon(ctx, errors) {
 	if (!ctx.stageFromNodeModules) return null;
+	const versionedDir = typeof ctx.versionedDir === "string" ? ctx.versionedDir : null;
+	const addonFilenames = Array.isArray(ctx.addonFilenames) ? ctx.addonFilenames : [];
+	const optionalPackageNativeDirs = Array.isArray(ctx.optionalPackageNativeDirs)
+		? ctx.optionalPackageNativeDirs.filter(directory => typeof directory === "string")
+		: [];
+	const nativeDir = typeof ctx.nativeDir === "string" ? ctx.nativeDir : null;
+	if (!versionedDir || addonFilenames.length === 0 || (!nativeDir && optionalPackageNativeDirs.length === 0)) {
+		errors.push("staged addon context is incomplete");
+		return null;
+	}
 
 	let stagedPath = null;
 	const rejectFilename = filename => {
@@ -484,9 +494,9 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 			fs.rmSync(temporaryPath, { force: true });
 		}
 	};
-	const sourceDirs = [...ctx.optionalPackageNativeDirs, ctx.nativeDir];
-	for (const filename of ctx.addonFilenames) {
-		const targetPath = path.join(ctx.versionedDir, filename);
+	const sourceDirs = [...optionalPackageNativeDirs, ...(nativeDir ? [nativeDir] : [])];
+	for (const filename of addonFilenames) {
+		const targetPath = path.join(versionedDir, filename);
 		const sourcePath = sourceDirs.map(sourceDir => path.join(sourceDir, filename)).find(candidate => fs.existsSync(candidate));
 
 		if (fs.existsSync(targetPath)) {
@@ -499,7 +509,7 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 				errors.push(`staged addon drift (${filename}): cached bytes differ from the current package artifact`);
 				rejectFilename(filename);
 				try {
-					const refreshPath = path.join(ctx.versionedDir, `.refresh-${addonContentDigest(sourcePath)}-${filename}`);
+					const refreshPath = path.join(versionedDir, `.refresh-${addonContentDigest(sourcePath)}-${filename}`);
 					const refreshed = refreshAddon(sourcePath, refreshPath);
 					ctx.candidates = [refreshed, ...(ctx.candidates ?? [])].filter(
 						(candidate, index, all) => all.indexOf(candidate) === index,
@@ -518,7 +528,7 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 		if (!sourcePath) continue;
 
 		try {
-			fs.mkdirSync(ctx.versionedDir, { recursive: true });
+			fs.mkdirSync(versionedDir, { recursive: true });
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			errors.push(`staged addon dir: ${message}`);

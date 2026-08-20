@@ -184,6 +184,17 @@ describe("windows native addon staging", () => {
 		}
 	});
 
+	it("fails closed when staged loading receives an incomplete context", () => {
+		const errors: string[] = [];
+		expect(
+			maybeStageNodeModulesAddon(
+				{ isCompiledBinary: false, platformTag: "win32-x64", stageFromNodeModules: true },
+				errors,
+			),
+		).toBeNull();
+		expect(errors).toEqual(["staged addon context is incomplete"]);
+	});
+
 	it("removes drifted staged candidates before native loading", async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-load-"));
 		const nativeDir = path.join(root, "native");

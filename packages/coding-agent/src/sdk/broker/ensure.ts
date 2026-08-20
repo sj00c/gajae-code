@@ -525,9 +525,12 @@ async function retireAndReadReplacement(
 		);
 	const currentAuthorityAfterRetirement = resolveSdkPackageAuthority({ force: true });
 	if (
-		replacement.packageGeneration === currentPackageGeneration &&
-		replacement.packageVersion === currentAuthorityAfterRetirement.packageVersion &&
-		replacement.installationIdentity === currentAuthorityAfterRetirement.installationIdentity
+		matchesExpectedPackageGeneration(
+			replacement,
+			currentPackageGeneration,
+			currentAuthorityAfterRetirement.packageVersion,
+			currentAuthorityAfterRetirement.installationIdentity,
+		)
 	)
 		return replacement;
 	throw staleBrokerRetirementUnverified(currentPackageGeneration, replacement.packageGeneration);
