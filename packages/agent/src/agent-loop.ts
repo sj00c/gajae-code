@@ -18,7 +18,6 @@ import {
 	type ToolChoice,
 	type ToolResultMessage,
 	type TSchema,
-	transferProviderSafetyStop,
 	transportFailureFacts,
 	type UserMessage,
 	validateToolArguments,
@@ -356,6 +355,20 @@ function managedTransportFailure(failure: unknown) {
 	return facts && typeof facts === "object" ? transportFailureFacts(facts) : undefined;
 }
 
+// AI owns provider-originated authority. The agent loop owns authority for
+// the rebuilt message objects it creates; this second WeakSet is deliberately
+// module-private so a public AI consumer cannot transfer authority to an
+// arbitrary destination. A destination is marked only while this managed
+// runtime is rebuilding a source that AI authenticated.
+const managedProviderSafetyStops = new WeakSet<object>();
+
+function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
+	return (
+		isProviderSafetyStopAuthenticated(value) ||
+		(typeof value === "object" && value !== null && managedProviderSafetyStops.has(value))
+	);
+}
+
 function managedRetryableFailure(failure: unknown): boolean {
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
@@ -367,7 +380,7 @@ function managedRetryableFailure(failure: unknown): boolean {
 	if (
 		managedProperty(failure, "stopReason") === "error" &&
 		managedProperty(failure, "errorKind") === "provider_safety_stop" &&
-		isProviderSafetyStopAuthenticated(failure)
+		isManagedProviderSafetyStopAuthenticated(failure)
 	) {
 		return false;
 	}
@@ -410,7 +423,7 @@ function sanitizeProviderSafetyStopProvenance(message: AssistantMessage): void {
 	if (
 		message.stopReason === "error" &&
 		message.errorKind === "provider_safety_stop" &&
-		!isProviderSafetyStopAuthenticated(message)
+		!isManagedProviderSafetyStopAuthenticated(message)
 	) {
 		delete message.errorKind;
 	}
@@ -1265,10 +1278,10 @@ function managedAssistantShell(
 		...(typeof errorStatus === "number" && Number.isFinite(errorStatus) ? { errorStatus } : {}),
 	};
 	// The closed-literal copy above is fed by the stream-exit provenance
-	// sanitize, so an unauthenticated label never reaches here; carry the
-	// adapter-minted authority across the rebuild so downstream gates (the
-	// discard decision and session policy) can re-verify identity (#4777).
-	if (errorKind) transferProviderSafetyStop(value, rebuilt);
+	// sanitize, so an unauthenticated label never reaches here. Mark the
+	// runtime-owned destination only when this source is already authenticated;
+	// no public AI API can perform this transfer (#4777 review).
+	if (errorKind && isManagedProviderSafetyStopAuthenticated(value)) managedProviderSafetyStops.add(rebuilt);
 	return rebuilt;
 }
 
