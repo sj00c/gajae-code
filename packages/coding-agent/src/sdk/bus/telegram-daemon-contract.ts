@@ -273,12 +273,12 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * reaction settlement for Telegram notification delivery (#4528).
  * Generation 169 delivers every ring-positioned session event live through the
  * bounded, capability-gated directed subscriber leg used by replay.
- * Generation 171 replaces the embedded SessionRouter attachment authority with
- * the direct-attachment router (#4530 owner contract A). A live generation-170
+ * Generation 172 replaces the embedded SessionRouter attachment authority with
+ * the direct-attachment router (#4530 owner contract A). A live pre-cutover
  * daemon still runs the removed broker-index attachment machinery, so it cannot
  * keep serving across this cutover and must be replaced on upgrade.
  */
-export const DAEMON_GENERATION = 171;
+export const DAEMON_GENERATION = 172;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

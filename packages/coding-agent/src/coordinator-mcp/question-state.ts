@@ -349,7 +349,8 @@ async function readJson<T>(file: string): Promise<T | null> {
 		return JSON.parse(await fs.readFile(file, "utf8")) as T;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw new Error("state_corrupt");
+		if (error instanceof SyntaxError) throw new Error("state_corrupt");
+		throw error;
 	}
 }
 function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespaceId: string, sessionId: string): void {

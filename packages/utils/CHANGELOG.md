@@ -9,10 +9,20 @@
 - The handled-error fingerprint dedupe set now evicts the coldest entry at its 256-entry cap (LRU) instead of permanently rejecting new fingerprints, so a long-lived process keeps recording newly seen failure classes; a still-hot class remains deduped.
 
 ### Added
+- `getMCPConfigPath("user", cwd, agentDir?)` accepts the agent directory that holds the user scope, resolved through the same `agentSubdir` path as the other agent-directory files, so a caller working on behalf of a session whose agent directory differs from the process-wide one names that session's `mcp.json` (#4767).
 - `recordHandledError` captures non-fatal errors that were caught and handled, into a store parallel to the fatal one (`gjc-error.log`, `gjc-error-events.jsonl`, `gjc-error-index.json`) reachable via the new `getHandledErrorLogPath` / `getHandledErrorEventsPath` / `getHandledErrorIndexPath` resolvers. Separate files rather than a shared cap, because handled errors are high-volume and would otherwise evict the rare fatal records. Only an `Error` with a non-empty stack is recorded -- without a stack the v1 fingerprint degrades to `<no-app-frame>` and unrelated failures would collapse into one group. A fingerprint is recorded at most once while it stays hot; the dedupe set is bounded at 256 entries with LRU eviction, so a tool failing in a loop cannot flood the store and a long-lived process never goes blind to new failure classes. `writeCrashRecord` now returns the written record instead of appending the journal event itself, so the fatal path keeps its one-write latch while the handled path stays unlatched; record format, `redactCrashSecrets` scrubbing, and marker emission are unchanged and shared.
 - The crash event journal carries five event kinds; the new `relayed` kind records that a signature was accepted by a configured crash upstream (`fingerprint`, `at`, the represented record id, and a locally generated 32-hex `eventId` sent upstream — it is generated here, not returned by the upstream). It serializes through the same bounded single-line path as every other event and parses under the same strictness — a malformed fingerprint, record id, non-lowercase-hex event id, or out-of-range timestamp yields `undefined` rather than a partially populated event.
 - `getTrustedAgentFile()` joins a filename under the provenance-checked agent directory and never follows `XDG_STATE_HOME`, so automatic crash relay cannot read a checkout-controlled XDG state root.
 - New `sanitizeHeaderComponent()` helper strips everything outside printable ASCII from a value destined for an HTTP header, so runtime-derived components (Android kernel release names embed non-ASCII like `Minimal™`) can never make `Headers`/`fetch` throw.
+
+## [0.14.2] - 2026-08-20
+
+### Added
+- Crash journal and postmortem support for the opt-in upstream relay: relayed-upstream transitions are journaled and indexed, with bounded queues and LRU-bounded handled-error dedupe.
+
+### Fixed
+- Postmortem tests no longer write into the real crash store; they isolate into a fresh store per run.
+- Rotating agent environment credentials reload correctly and rotation writes are hardened against partial reads.
 
 ## [0.14.1] - 2026-08-18
 

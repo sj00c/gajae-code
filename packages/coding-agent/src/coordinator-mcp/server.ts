@@ -6055,6 +6055,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						const reportPath = path.join(namespaceDir, "reports", `${reportId}.json`);
 						await writeJsonFile(reportPath, report);
 						await appendCoordinatorEvent(namespaceDir, {
+							...(sessionId == null ? { stableId: `report-written:${reportId}` } : {}),
 							kind: "report.written",
 							sessionId,
 							turnId: typeof args.turn_id === "string" ? args.turn_id : null,

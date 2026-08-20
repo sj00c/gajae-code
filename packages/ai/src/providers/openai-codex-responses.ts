@@ -116,6 +116,23 @@ const CODEX_WEBSOCKET_IDLE_TIMEOUT_MS = 300000;
 const CODEX_WEBSOCKET_RETRY_BUDGET = CODEX_MAX_RETRIES;
 const CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX = "Codex websocket transport error";
 const CODEX_PREVIOUS_RESPONSE_STALE_CODES = new Set(["previous_response_not_found", "codex_previous_response_stale"]);
+// Some Codex deployments reject a stale continuation anchor with a generic
+// `invalid_request_error` code and name the anchor only in the message
+// (`Invalid \`previous_response_id\`.`). Match the canonical request-field token
+// with a stale qualifier on either side, so the anchor is cleared and the turn
+// retried with full context instead of killing the session.
+//
+// Deliberately requires the `previous_response_id` field token rather than prose
+// like "previous response ... ID": a deterministic history fault such as
+// `Previous response's tool call ID is malformed.` must stay fatal, since
+// replaying it re-sends the same offending item.
+const CODEX_PREVIOUS_RESPONSE_ID_TOKEN = String.raw`previous[ _-]response[ _-]id`;
+const CODEX_ANCHOR_STALE_QUALIFIER = String.raw`invalid|expired|unknown|stale|not[ _-]?found|no longer`;
+const CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE = new RegExp(
+	`(?:${CODEX_ANCHOR_STALE_QUALIFIER})[^\\n]{0,48}?${CODEX_PREVIOUS_RESPONSE_ID_TOKEN}` +
+		`|${CODEX_PREVIOUS_RESPONSE_ID_TOKEN}[^\\n]{0,48}?(?:${CODEX_ANCHOR_STALE_QUALIFIER})`,
+	"i",
+);
 const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
 const CODEX_NON_RETRYABLE_EVENT_CODES = new Set([
 	"invalid_function_parameters",
@@ -186,6 +203,8 @@ interface CodexInitialTransport {
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 	toolChoiceFallbackApplied?: boolean;
+	/** Whether the dispatched request actually carried a `previous_response_id` anchor. */
+	sentPreviousResponseId?: boolean;
 }
 type CodexEventItem = ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | ResponseCustomToolCall;
 type CodexThinkingBlock = ThinkingContent & { summaryBuffer: string; rawBuffer: string; summaryStarted: boolean };
@@ -289,6 +308,20 @@ interface CodexStreamRuntime {
 	websocketStreamRetries: number;
 	providerRetryAttempt: number;
 	toolChoiceFallbackAttempted: boolean;
+	/**
+	 * Stale-anchor recovery is one-shot. Once the anchor is cleared the replay no
+	 * longer carries `previous_response_id`, so a repeated rejection is a real
+	 * fault and must surface instead of replaying full context up to five times.
+	 */
+	previousResponseRecoveryAttempted: boolean;
+	/**
+	 * Whether the in-flight request actually carried a `previous_response_id`.
+	 * Anchor recovery is only meaningful when it did: a rejection naming the field
+	 * on an anchor-free request (`previous_response_id is required`) is a real
+	 * validation fault, and clearing session state plus resending the identical
+	 * body would destroy valid metadata to no effect.
+	 */
+	sentPreviousResponseId: boolean;
 	sseRequestBodyOverride?: RequestBody;
 	sawTerminalEvent: boolean;
 	canSafelyReplayWebsocketOverSse: boolean;
@@ -831,8 +864,10 @@ async function openCodexWebSocketTransport(
 	eventStream: AsyncGenerator<Record<string, unknown>>;
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
+	sentPreviousResponseId: boolean;
 }> {
 	const websocketRequest = buildCodexWebSocketRequest(requestContext.transformedBody, websocketState);
+	const sentPreviousResponseId = typeof websocketRequest.previous_response_id === "string";
 	const websocketHeaders = createCodexHeaders(
 		requestContext.requestHeaders,
 		requestContext.accountId,
@@ -850,6 +885,7 @@ async function openCodexWebSocketTransport(
 		sentTurnStateHeader: websocketHeaders.has(X_CODEX_TURN_STATE_HEADER),
 		sentModelsEtagHeader: websocketHeaders.has(X_MODELS_ETAG_HEADER),
 		requestType: websocketRequest.type,
+		sentPreviousResponseId,
 		retry,
 		retryBudget: getCodexWebSocketRetryBudget(options),
 	});
@@ -862,7 +898,7 @@ async function openCodexWebSocketTransport(
 		options,
 		requestSetup.firstEventTimeoutMs,
 	);
-	return { eventStream, requestBodyForState, transport: "websocket" };
+	return { eventStream, requestBodyForState, transport: "websocket", sentPreviousResponseId };
 }
 
 async function openCodexSseTransport(
@@ -927,6 +963,7 @@ async function reopenCodexWebSocketRuntimeStream(
 		runtime.eventStream = next.eventStream;
 		runtime.requestBodyForState = next.requestBodyForState;
 		runtime.transport = next.transport;
+		runtime.sentPreviousResponseId = next.sentPreviousResponseId === true;
 		state.lastTransport = next.transport;
 	} catch (error) {
 		const wsError = error instanceof Error ? error : new Error(String(error));
@@ -959,6 +996,8 @@ async function reopenCodexSseRuntimeStream(
 	runtime.eventStream = next.eventStream;
 	runtime.requestBodyForState = next.requestBodyForState;
 	runtime.transport = next.transport;
+	// SSE never attaches `previous_response_id`; only buildCodexWebSocketRequest does.
+	runtime.sentPreviousResponseId = false;
 	if (state) {
 		state.lastTransport = next.transport;
 	}
@@ -970,6 +1009,7 @@ function createCodexStreamRuntime(initial: {
 	transport: CodexTransport;
 	websocketState?: CodexWebSocketSessionState;
 	toolChoiceFallbackApplied?: boolean;
+	sentPreviousResponseId?: boolean;
 }): CodexStreamRuntime {
 	return {
 		eventStream: initial.eventStream,
@@ -982,6 +1022,8 @@ function createCodexStreamRuntime(initial: {
 		websocketStreamRetries: 0,
 		providerRetryAttempt: 0,
 		toolChoiceFallbackAttempted: initial.toolChoiceFallbackApplied === true,
+		previousResponseRecoveryAttempted: false,
+		sentPreviousResponseId: initial.sentPreviousResponseId === true,
 		sseRequestBodyOverride: initial.toolChoiceFallbackApplied
 			? structuredCloneJSON(initial.requestBodyForState)
 			: undefined,
@@ -1716,6 +1758,7 @@ async function tryRetryWithoutForcedToolChoice(
 	runtime.requestBodyForState = next.requestBodyForState;
 	runtime.sseRequestBodyOverride = next.requestBodyForState;
 	runtime.transport = next.transport;
+	runtime.sentPreviousResponseId = false;
 	if (websocketState) {
 		websocketState.lastTransport = next.transport;
 	}
@@ -1807,11 +1850,11 @@ async function tryReconnectCodexWebSocketOnConnectionLimit(
 }
 
 function isCodexPreviousResponseNotFound(error: unknown): boolean {
-	return (
-		error instanceof CodexProviderStreamError &&
-		typeof error.code === "string" &&
-		CODEX_PREVIOUS_RESPONSE_STALE_CODES.has(error.code)
-	);
+	if (!(error instanceof CodexProviderStreamError)) return false;
+	if (typeof error.code === "string" && CODEX_PREVIOUS_RESPONSE_STALE_CODES.has(error.code)) return true;
+	// Raw provider message only — `error.message` carries appended `code=` metadata
+	// that would supply the stale qualifier the provider never sent.
+	return CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE.test(error.providerMessage);
 }
 
 async function tryRecoverCodexPreviousResponseNotFound(
@@ -1822,6 +1865,12 @@ async function tryRecoverCodexPreviousResponseNotFound(
 	const websocketState = context.requestContext.websocketState;
 	if (
 		!isCodexPreviousResponseNotFound(error) ||
+		// An anchor rejection is only actionable when this request actually sent one.
+		// `previous_response_id is required` on an anchor-free request is a genuine
+		// validation fault: clearing session metadata and resending the identical
+		// body cannot fix it.
+		!runtime.sentPreviousResponseId ||
+		runtime.previousResponseRecoveryAttempted ||
 		!websocketState ||
 		context.options?.fallbackManaged ||
 		runtime.transport !== "websocket" ||
@@ -1833,6 +1882,7 @@ async function tryRecoverCodexPreviousResponseNotFound(
 	}
 
 	runtime.providerRetryAttempt += 1;
+	runtime.previousResponseRecoveryAttempted = true;
 	resetCodexWebSocketAppendState(websocketState);
 	resetCodexSessionMetadata(websocketState);
 	runtime.currentItem = null;
@@ -3079,12 +3129,20 @@ function getCodexEventErrorMessage(rawEvent: Record<string, unknown>): string {
 class CodexProviderStreamError extends Error {
 	readonly retryable: boolean;
 	readonly code?: string;
+	/**
+	 * Provider-supplied message, before display formatting appends `code=`/`status=`
+	 * metadata. Classification must read this, never `message`: the formatted string
+	 * mixes the code into the prose and would let `code=invalid_request_error`
+	 * satisfy a message pattern the provider never actually sent.
+	 */
+	readonly providerMessage: string;
 
-	constructor(message: string, retryable: boolean, code?: string) {
+	constructor(message: string, retryable: boolean, code: string | undefined, providerMessage: string) {
 		super(message);
 		this.name = "CodexProviderStreamError";
 		this.retryable = retryable;
 		this.code = code;
+		this.providerMessage = providerMessage;
 	}
 }
 
@@ -3110,7 +3168,12 @@ function createCodexProviderStreamError(rawEvent: Record<string, unknown>): Code
 		typeof rawEvent.type === "string" && rawEvent.type === "error"
 			? formatCodexErrorEvent(rawEvent, code, message)
 			: (formatCodexFailure(rawEvent) ?? "Codex response failed");
-	return new CodexProviderStreamError(formattedMessage, isRetryableCodexFailureEvent(rawEvent), code || undefined);
+	return new CodexProviderStreamError(
+		formattedMessage,
+		isRetryableCodexFailureEvent(rawEvent),
+		code || undefined,
+		message,
+	);
 }
 
 function isRetryableCodexProviderError(error: unknown): boolean {

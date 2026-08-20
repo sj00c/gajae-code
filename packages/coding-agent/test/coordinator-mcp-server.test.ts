@@ -1756,6 +1756,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		await expect(server.callTool("gjc_coordinator_read_coordination_status")).resolves.toMatchObject({
 			summary: { reports: 1 },
 		});
+		const events = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0 });
+		expect(
+			(events.events as Array<Record<string, unknown>>).filter(event => event.kind === "report.written"),
+		).toHaveLength(1);
 	});
 	it("fails closed when a same-generation successor has a different endpoint incarnation", async () => {
 		const root = await tempRoot();

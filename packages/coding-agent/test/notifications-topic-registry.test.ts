@@ -787,10 +787,10 @@ test("publishes exact durable authority generation 171 at serving epoch 87", () 
 	// monotonic reaction settlement for Telegram notification delivery (#4528).
 	// Generation 169: delivers every ring-positioned session event live through
 	// the bounded, capability-gated directed subscriber leg used by replay.
-	// Generation 171: the embedded SessionRouter attachment authority is replaced
-	// by the direct-attachment router (#4530), so a live generation-170 daemon
-	// still running the removed machinery cannot serve across the cutover.
-	expect(DAEMON_GENERATION).toBe(171);
+	// Generation 172: the embedded SessionRouter attachment authority is replaced
+	// by the direct-attachment router (#4530), so a live pre-cutover daemon still
+	// running the removed machinery cannot serve across the cutover.
+	expect(DAEMON_GENERATION).toBe(172);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {
