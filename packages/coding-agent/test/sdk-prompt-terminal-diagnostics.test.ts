@@ -314,8 +314,9 @@ isolatedSdkHostTest(
 			);
 			await handlers.get("agent_end")?.(cancelled, sessionContext);
 			await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "cancelled prompt terminal");
-			const lifecycle = frames.filter(frame => frame.type === "agent_failed" || frame.type === "agent_end");
-			expect(lifecycle.map(frame => frame.type)).toEqual(["agent_failed", "agent_end"]);
+			expect(frames.find(frame => frame.type === "agent_failed")).toMatchObject({
+				error: { code: "aborted", message: "Prompt submission failed." },
+			});
 
 			// A user interrupt is intent, not an undiagnosable defect, so it must not
 			// pollute the operator log with an error for every cancel.
