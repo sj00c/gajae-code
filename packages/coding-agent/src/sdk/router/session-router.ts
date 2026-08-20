@@ -204,6 +204,12 @@ type AttachedSession = {
 	readonly cursor: { seq: number };
 	published: boolean;
 	frameTail: Promise<void>;
+	/**
+	 * Replay runs here, not on `frameTail`. A stalled provider publication must not be
+	 * able to hold the catch-up replay hostage: the barrier (`replaying`) preserves
+	 * ordering, so the two tails can progress independently (#4527).
+	 */
+	readyTail: Promise<void>;
 	disposed: boolean;
 	barrierFailed: boolean;
 	replaying: boolean;
@@ -366,7 +372,12 @@ export class SessionRouter {
 	}
 
 	async #joinAttachmentTails(): Promise<void> {
-		await Promise.all([...this.#sessions.values()].map(attached => attached.frameTail.catch(() => undefined)));
+		await Promise.all(
+			[...this.#sessions.values()].flatMap(attached => [
+				attached.readyTail.catch(() => undefined),
+				attached.frameTail.catch(() => undefined),
+			]),
+		);
 	}
 
 	/** Attaches the currently indexed live sessions and keeps watching for changes. */
@@ -747,13 +758,29 @@ export class SessionRouter {
 				await this.#retire(existing, "removed");
 				continue;
 			}
+			if (session.endpointMtimeMs === undefined || session.pid === undefined) {
+				if (existing && !existing.disposed) await this.#retire(existing, "replaced");
+				continue;
+			}
+			const endpoint = await this.#readEndpoint(session);
 			if (existing && !existing.disposed)
+				// `replaced_same_generation` is reserved for a *rotation in place*: the generation
+				// did not move but the endpoint identity did (pid, endpoint mtime, URL or token).
+				// Predecessor route retirement is destructive to in-flight provider effects, so a
+				// same-generation rebuild that keeps the identical endpoint identity — a barrier
+				// rebuild after a refused publication — must report plain `replaced` and leave the
+				// undelivered effect current for re-service.
 				await this.#retire(
 					existing,
-					existing.generation === session.endpointGeneration ? "replaced_same_generation" : "replaced",
+					existing.generation === session.endpointGeneration &&
+						endpoint != null &&
+						(existing.endpoint.url !== endpoint.url ||
+							existing.endpoint.token !== endpoint.token ||
+							existing.pid !== session.pid ||
+							existing.endpointMtimeMs !== session.endpointMtimeMs)
+						? "replaced_same_generation"
+						: "replaced",
 				);
-			if (session.endpointMtimeMs === undefined || session.pid === undefined) continue;
-			const endpoint = await this.#readEndpoint(session);
 			if (!this.#running(runEpoch) || !endpoint) continue;
 			try {
 				await this.#attachDirect({
@@ -878,11 +905,14 @@ export class SessionRouter {
 		const disposeReconnect = client.onReconnect?.(() => {
 			const current = attached;
 			if (!current || current.disposed) return;
-			// The provider handshake is re-run before the catch-up replay, and both
-			// are serialized on the attachment's frame tail so live frames emitted
-			// during the reconnect land behind the replay. A rejecting handshake
+			// The provider handshake is re-run before the catch-up replay, and both run on
+			// the isolated ready tail. The barrier is raised synchronously here so live frames
+			// emitted during the reconnect are held and ordered behind the replay without a
+			// stalled publication delaying the replay request itself. A rejecting handshake
 			// revokes the attachment, exactly like initial publication.
-			current.frameTail = current.frameTail
+			current.replaying = true;
+			current.held ??= [];
+			current.readyTail = current.readyTail
 				.catch(() => undefined)
 				.then(async () => {
 					if (current.disposed || this.#sessions.get(input.sessionId) !== current) return;
@@ -926,6 +956,7 @@ export class SessionRouter {
 			cursor: { seq: resumeSeq },
 			published: false,
 			frameTail: Promise.resolve(),
+			readyTail: Promise.resolve(),
 			disposed: false,
 			barrierFailed: false,
 			replaying: false,
@@ -968,12 +999,16 @@ export class SessionRouter {
 			throw error;
 		}
 		attached.published = true;
-		// Initial event_replay is serialized on the attachment's own frame tail so
-		// live frames land behind it. Publication does not await that tail: start()
-		// still joins it for bootstrap callers, while periodic scan/request stay
-		// off the wedged-replay path (#4527).
-		attached.frameTail = attached.frameTail.then(() => this.#replayAttached(attached));
-		void attached.frameTail;
+		// Raise the barrier synchronously: every live frame from this point is held for the
+		// replay to order, even though the replay itself runs on the isolated ready tail.
+		attached.replaying = true;
+		attached.held ??= [];
+		// Initial event_replay runs on the attachment's ready tail, not its frame tail, so a
+		// stalled in-flight publication cannot delay the catch-up request. Publication does
+		// not await it: start() still joins it for bootstrap callers, while periodic
+		// scan/request stay off the wedged-replay path (#4527).
+		attached.readyTail = attached.readyTail.catch(() => undefined).then(() => this.#replayAttached(attached));
+		void attached.readyTail;
 		return capability;
 	}
 
@@ -1044,8 +1079,14 @@ export class SessionRouter {
 					);
 					return;
 				}
+				// Only sequenced frames this attachment owns can recover a conceded sequence.
+				// Unsequenced traffic (seq 0) and the replay answer itself are not evidence that
+				// live delivery carried anything, so they must not inflate the recovered count
+				// or be re-published as if they filled the gap.
 				const recovered = held
-					.filter(entry => entry.seq <= gap.toSeq && entry.frame.type !== "event_replay_result")
+					.filter(
+						entry => entry.seq > sinceSeq && entry.seq <= gap.toSeq && entry.frame.type !== "event_replay_result",
+					)
 					.sort((left, right) => left.seq - right.seq);
 				const carried = held.filter(entry => entry.seq > gap.toSeq);
 				held.splice(0, held.length, ...carried);
@@ -1055,8 +1096,14 @@ export class SessionRouter {
 					`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
 				);
 				for (const entry of recovered) this.#rememberRecoveredFrame(attached, entry.seq, entry.frame);
-				if (!(await this.#deliverRecoveredFrames(attached))) return;
+				const recoveredDelivered = await this.#deliverRecoveredFrames(attached);
+				// The conceded range is gone from the host and can never be re-served, so the
+				// cursor moves past it even when publishing a recovered copy was refused. A
+				// refusal is already retained by #failDelivery for re-service from the recovered
+				// store; leaving the cursor below the concession would make every later replay
+				// concede the same range again instead of making progress.
 				if (gap.toSeq > attached.cursor.seq) attached.cursor.seq = gap.toSeq;
+				if (!recoveredDelivered) return;
 			}
 			for (const event of events) {
 				if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached)
@@ -1115,7 +1162,13 @@ export class SessionRouter {
 		}
 	}
 
-	async #deliverFrame(attached: AttachedSession, frame: Record<string, unknown>): Promise<void> {
+	/**
+	 * `force` re-serves a sequence the cursor has already passed. It is used only for a
+	 * frame retained by a refused publication whose sequence a retention concession has
+	 * since carried the cursor over: the host can no longer serve it, so the retained copy
+	 * is the last surviving evidence of the event and the cursor check must not drop it.
+	 */
+	async #deliverFrame(attached: AttachedSession, frame: Record<string, unknown>, force = false): Promise<void> {
 		if (attached.disposed || attached.barrierFailed || this.#sessions.get(attached.sessionId) !== attached) return;
 		if (!attached.published) return;
 		const correlated = this.#correlateFrame(frame);
@@ -1126,6 +1179,7 @@ export class SessionRouter {
 		if (seq !== undefined) {
 			if (correlated.generation === undefined && readGeneration(frame.generation) === undefined) return;
 			if (
+				!force &&
 				seq <= attached.cursor.seq &&
 				(correlated.generation === undefined || correlated.generation === attached.generation)
 			)
@@ -1208,12 +1262,19 @@ export class SessionRouter {
 	async #deliverRecoveredFrames(attached: AttachedSession): Promise<boolean> {
 		const pending = this.#recoveredFrames.get(attached.sessionId);
 		if (!pending || pending.generation !== attached.generation) return true;
+		const undelivered = this.#undelivered.get(attached.sessionId);
 		for (const item of [...pending.frames]) {
-			if (item.seq <= attached.cursor.seq) {
+			// A frame below the cursor is normally already accounted for. The exception is the
+			// sequence a refused publication is still retaining: a conceded retention gap moves
+			// the cursor over a range the host can no longer serve, so dropping the retained
+			// copy here would lose the only surviving evidence of that event.
+			const retained =
+				undelivered !== undefined && undelivered.generation === attached.generation && undelivered.seq === item.seq;
+			if (item.seq <= attached.cursor.seq && !retained) {
 				this.#removeRecoveredFrame(attached.sessionId, attached.generation, item.seq);
 				continue;
 			}
-			await this.#deliverFrame(attached, item.frame);
+			await this.#deliverFrame(attached, item.frame, retained && item.seq <= attached.cursor.seq);
 			if (attached.barrierFailed || attached.disposed) return false;
 		}
 		return true;
