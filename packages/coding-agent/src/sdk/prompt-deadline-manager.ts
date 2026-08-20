@@ -180,7 +180,8 @@ export class PromptDeadlineManager {
 		this.#expiryRetries.set(key, attempts);
 		this.#clearTimer(key);
 		if (attempts > MAX_EXPIRY_RETRIES) {
-			this.#recoverUncertainty(key);
+			const lease = this.#leases.get(key);
+			if (lease) this.#recoverUncertainty(key, lease, lease.generation);
 			return;
 		}
 		const timer = setTimeout(() => void this.#onDeadline(key), EXPIRY_RETRY_DELAY_MS);
@@ -188,11 +189,16 @@ export class PromptDeadlineManager {
 		this.#timers.set(key, timer);
 	}
 
-	#recoverUncertainty(key: string): void {
+	#recoverUncertainty(key: string, lease: PromptDeadlineLease, generation: number): void {
 		const correlation = this.#correlations.get(key);
-		const lease = this.#leases.get(key);
-		const generation = lease?.generation;
-		if (!correlation || !lease || typeof this.#reconciliation.markUncertain !== "function") return;
+		const current = this.#leases.get(key);
+		if (
+			!correlation ||
+			current !== lease ||
+			current.generation !== generation ||
+			typeof this.#reconciliation.markUncertain !== "function"
+		)
+			return;
 		const attempts = (this.#uncertaintyRetries.get(key) ?? 0) + 1;
 		this.#uncertaintyRetries.set(key, attempts);
 		void this.#reconciliation
@@ -207,7 +213,10 @@ export class PromptDeadlineManager {
 			.catch(() => {
 				if (attempts >= MAX_UNCERTAINTY_RETRIES) return;
 				this.#clearTimer(key);
-				const timer = setTimeout(() => this.#recoverUncertainty(key), UNCERTAINTY_RETRY_DELAY_MS);
+				const timer = setTimeout(
+					() => this.#recoverUncertainty(key, lease, generation),
+					UNCERTAINTY_RETRY_DELAY_MS,
+				);
 				(timer as unknown as { unref?: () => void }).unref?.();
 				this.#timers.set(key, timer);
 			});
