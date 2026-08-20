@@ -9,9 +9,9 @@ import type { Rule } from "../../src/capability/rule";
 import { ruleCapability } from "../../src/capability/rule";
 import type { Settings } from "../../src/capability/settings";
 import { settingsCapability } from "../../src/capability/settings";
-import { slashCommandCapability } from "../../src/capability/slash-command";
 import type { Skill } from "../../src/capability/skill";
 import { skillCapability } from "../../src/capability/skill";
+import { slashCommandCapability } from "../../src/capability/slash-command";
 import type { SystemPrompt } from "../../src/capability/system-prompt";
 import { systemPromptCapability } from "../../src/capability/system-prompt";
 import type { CapabilityResult } from "../../src/capability/types";
@@ -126,9 +126,9 @@ describe("native user scope under GJC_CODING_AGENT_DIR", () => {
 			loadExplicit<{ name: string; content: string }>(slashCommandCapability.id),
 		]);
 
-		expect(settings.items.some(item => item.level === "user" && item.path === path.join(agentDir, "config.yml"))).toBe(
-			true,
-		);
+		expect(
+			settings.items.some(item => item.level === "user" && item.path === path.join(agentDir, "config.yml")),
+		).toBe(true);
 		expect(context.items.map(item => item.content)).toEqual(["profile agents\n"]);
 		expect(commands.items.map(item => item.name)).toEqual(["profile"]);
 	});
