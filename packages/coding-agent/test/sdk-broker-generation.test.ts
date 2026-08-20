@@ -230,6 +230,42 @@ describe("sdk broker package generation", () => {
 		).toBe(false);
 	});
 
+	it("does not signal a newer broker when the caller generation is stale", async () => {
+		const dir = await temp();
+		const authority = resolveSdkPackageAuthority();
+		const signalRoot = vi.fn(() => true);
+		const fromPid = vi
+			.spyOn(nativeProcessBindings().Process, "fromPid")
+			.mockReturnValue({ incarnation: brokerProcessIncarnation(process.pid), signalRoot } as never);
+		try {
+			const incarnation = brokerProcessIncarnation(process.pid);
+			expect(incarnation).toBeString();
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "newer-broker-generation",
+				packageVersion: `${Number(authority.packageVersion.split(".")[0]) + 1}.0.0`,
+				installationIdentity: authority.installationIdentity,
+				ownerId: "newer-broker",
+				pid: process.pid,
+				incarnation: incarnation!,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "newer-broker-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			await expect(
+				ensureBroker({ agentDir: dir, expectedPackageGeneration: "older-caller-generation" }),
+			).rejects.toThrow("changed before retirement");
+			expect(signalRoot).not.toHaveBeenCalled();
+		} finally {
+			fromPid.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("refuses to signal a substituted process incarnation", () => {
 		const processRef = {
 			incarnation: "darwin:1700000000:999999",
