@@ -291,6 +291,49 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.clearAll();
 	}, 15_000);
 
+	test("stale uncertainty rejection does not retry after progress renews the lease", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		state.finalizeFailures = Number.MAX_SAFE_INTEGER;
+		state.uncertainFailures = 1;
+		const recoveryStarted = Promise.withResolvers<void>();
+		const recoveryRelease = Promise.withResolvers<void>();
+		state.uncertainStarted = () => recoveryStarted.resolve();
+		state.uncertainRelease = recoveryRelease.promise;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-progress-reject", turnId: "turn-progress-reject" };
+		manager.onAccepted(correlation);
+		await Bun.sleep(6_800);
+		await recoveryStarted.promise;
+		manager.onProgress(correlation);
+		recoveryRelease.resolve();
+		await Bun.sleep(1_200);
+		expect(state.uncertainCalls).toBe(1);
+		expect(manager.has(correlation)).toBe(true);
+		manager.clearAll();
+	}, 15_000);
+
+	test("all bounded uncertainty writes fail with explicit recovery ownership retained", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		state.finalizeFailures = Number.MAX_SAFE_INTEGER;
+		state.uncertainFailures = Number.MAX_SAFE_INTEGER;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-recovery-pending", turnId: "turn-recovery-pending" };
+		manager.onAccepted(correlation);
+		await Bun.sleep(9_200);
+		expect(state.uncertainCalls).toBe(3);
+		expect(manager.has(correlation)).toBe(true);
+		expect(manager.hasRecoveryPending(correlation)).toBe(true);
+		manager.clearAll();
+	}, 15_000);
+
 	test("fresh progress during a suspended claim cancels this expiry instead of firing exceeded", async () => {
 		// Exact-head review P2: expiry finalization must be generation-aware after
 		// every awaited operation. Deliver attributable progress while the claim

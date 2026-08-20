@@ -33,6 +33,7 @@ export class PromptDeadlineManager {
 	readonly #reconciliation: DeadlineReconciliation;
 	readonly #expiryRetries = new Map<string, number>();
 	readonly #uncertaintyRetries = new Map<string, number>();
+	readonly #uncertaintyRecoveryPending = new Set<string>();
 	readonly #expiring = new Set<string>();
 	readonly #pendingTerminalTransitions = new Set<string>();
 	readonly #getLeaseMs: () => number;
@@ -180,8 +181,9 @@ export class PromptDeadlineManager {
 		this.#expiryRetries.set(key, attempts);
 		this.#clearTimer(key);
 		if (attempts > MAX_EXPIRY_RETRIES) {
+			const correlation = this.#correlations.get(key);
 			const lease = this.#leases.get(key);
-			if (lease) this.#recoverUncertainty(key, lease, lease.generation);
+			if (correlation && lease) this.#recoverUncertainty(key, correlation, lease, lease.generation);
 			return;
 		}
 		const timer = setTimeout(() => void this.#onDeadline(key), EXPIRY_RETRY_DELAY_MS);
@@ -189,8 +191,12 @@ export class PromptDeadlineManager {
 		this.#timers.set(key, timer);
 	}
 
-	#recoverUncertainty(key: string, lease: PromptDeadlineLease, generation: number): void {
-		const correlation = this.#correlations.get(key);
+	#recoverUncertainty(
+		key: string,
+		correlation: InvocationCorrelation,
+		lease: PromptDeadlineLease,
+		generation: number,
+	): void {
 		const current = this.#leases.get(key);
 		if (
 			!correlation ||
@@ -211,10 +217,16 @@ export class PromptDeadlineManager {
 				if (current === lease && current.generation === generation) this.clear(correlation);
 			})
 			.catch(() => {
-				if (attempts >= MAX_UNCERTAINTY_RETRIES) return;
+				if (attempts >= MAX_UNCERTAINTY_RETRIES) {
+					// Keep an explicit in-memory recovery state. A later real agent_end
+					// can still reconcile the retained lease; never silently downgrade to
+					// an inert lease after all bounded uncertainty writes fail.
+					this.#uncertaintyRecoveryPending.add(key);
+					return;
+				}
 				this.#clearTimer(key);
 				const timer = setTimeout(
-					() => this.#recoverUncertainty(key, lease, generation),
+					() => this.#recoverUncertainty(key, correlation, lease, generation),
 					UNCERTAINTY_RETRY_DELAY_MS,
 				);
 				(timer as unknown as { unref?: () => void }).unref?.();
@@ -229,6 +241,8 @@ export class PromptDeadlineManager {
 		const lease = createPromptDeadlineLease({ now, leaseMs: this.#getLeaseMs(), maxMs: this.#getMaxMs() });
 		this.#leases.set(key, lease);
 		this.#correlations.set(key, correlation);
+		this.#uncertaintyRetries.delete(key);
+		this.#uncertaintyRecoveryPending.delete(key);
 		this.#schedule(key);
 	}
 
@@ -236,6 +250,7 @@ export class PromptDeadlineManager {
 		const key = leaseKey(correlation);
 		const lease = this.#leases.get(key);
 		if (!lease) return;
+		this.#uncertaintyRetries.delete(key);
 		const beforeDeadline = promptDeadlineAt(lease);
 		recordAttributableProgress(lease, now);
 		const afterDeadline = promptDeadlineAt(lease);
@@ -264,6 +279,7 @@ export class PromptDeadlineManager {
 		this.#correlations.delete(key);
 		this.#expiryRetries.delete(key);
 		this.#uncertaintyRetries.delete(key);
+		this.#uncertaintyRecoveryPending.delete(key);
 		this.#expiring.delete(key);
 		this.#pendingTerminalTransitions.delete(key);
 	}
@@ -274,6 +290,7 @@ export class PromptDeadlineManager {
 		this.#correlations.clear();
 		this.#expiryRetries.clear();
 		this.#uncertaintyRetries.clear();
+		this.#uncertaintyRecoveryPending.clear();
 		this.#expiring.clear();
 		this.#pendingTerminalTransitions.clear();
 	}
@@ -292,5 +309,10 @@ export class PromptDeadlineManager {
 	/** Whether expiry has fenced this correlation from late run adoption. */
 	isExpiring(correlation: InvocationCorrelation): boolean {
 		return this.#expiring.has(leaseKey(correlation));
+	}
+
+	/** Whether bounded uncertainty writes exhausted with recovery ownership retained. */
+	hasRecoveryPending(correlation: InvocationCorrelation): boolean {
+		return this.#uncertaintyRecoveryPending.has(leaseKey(correlation));
 	}
 }
