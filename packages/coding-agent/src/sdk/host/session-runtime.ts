@@ -479,7 +479,9 @@ export function createInvocationReconciliation(
 		string,
 		{
 			finalizedRecord: InvocationRecord;
-			completion: PromiseWithResolvers<void>;
+			commit: PromiseWithResolvers<void>;
+			upgrades: Set<PromiseWithResolvers<void>>;
+			errors: unknown[];
 		}
 	>();
 	const persist = async (): Promise<void> => {
@@ -643,36 +645,47 @@ export function createInvocationReconciliation(
 			if (!record) return;
 			const pending = pendingFinalizations.get(recordKey);
 			if (pending?.finalizedRecord === record) {
+				const upgrade = Promise.withResolvers<void>();
+				pending.upgrades.add(upgrade);
+				let upgradeError: unknown;
 				try {
-					await pending.completion.promise;
-				} catch {
-					// The deadline write failed; continue against the restored record
-					// so a real lifecycle event is never swallowed.
-				}
-				const current = records.get(recordKey);
-				if (frame.type === "agent_end" && current === pending.finalizedRecord) {
-					// A real lifecycle end that arrived during deadline finalization is
-					// stronger evidence than the synthetic deadline outcome. Upgrade the
-					// durable terminal instead of treating the event as a duplicate.
-					const upgraded = {
-						...current,
-						revision: ++mutationRevision,
-						status: "terminal_ok" as const,
-					};
-					records.set(recordKey, upgraded);
 					try {
-						await persist();
-					} catch (error) {
-						// Restore the durable deadline record identity so the lifecycle
-						// caller retains ownership and retries instead of clearing the
-						// lease after a contradictory in-memory success.
-						if (records.get(recordKey) === upgraded) records.set(recordKey, current);
-						throw error;
+						await pending.commit.promise;
+					} catch {
+						// The deadline write failed; continue against the restored record
+						// so a real lifecycle event is never swallowed.
 					}
-					return;
+					const current = records.get(recordKey);
+					if (frame.type === "agent_end" && current === pending.finalizedRecord) {
+						// A real lifecycle end that arrived during deadline finalization is
+						// stronger evidence than the synthetic deadline outcome. Upgrade the
+						// durable terminal instead of treating the event as a duplicate.
+						const upgraded = {
+							...current,
+							revision: ++mutationRevision,
+							status: "terminal_ok" as const,
+						};
+						records.set(recordKey, upgraded);
+						try {
+							await persist();
+						} catch (error) {
+							// Restore the durable deadline record identity so the lifecycle
+							// caller retains ownership and retries instead of clearing the
+							// lease after a contradictory in-memory success.
+							if (records.get(recordKey) === upgraded) records.set(recordKey, current);
+							upgradeError = error;
+							pending.errors.push(error);
+							throw error;
+						}
+						return;
+					}
+					record = current;
+					if (!record) return;
+				} finally {
+					pending.upgrades.delete(upgrade);
+					if (upgradeError === undefined) upgrade.resolve();
+					else upgrade.reject(upgradeError);
 				}
-				record = current;
-				if (!record) return;
 			}
 			if (record.terminalAt !== undefined) {
 				if (frame.type === "agent_end" && record.error?.code === "prompt_deadline_exceeded") {
@@ -791,12 +804,20 @@ export function createInvocationReconciliation(
 			}
 			(finalizedRecord as unknown as Record<string, unknown>).pendingOutcome = undefined;
 			if (isCurrent !== undefined && !isCurrent()) return;
-			const completion = Promise.withResolvers<void>();
-			const pending = { finalizedRecord, completion };
+			const commit = Promise.withResolvers<void>();
+			const pending = {
+				finalizedRecord,
+				commit,
+				upgrades: new Set<PromiseWithResolvers<void>>(),
+				errors: [] as unknown[],
+			};
 			pendingFinalizations.set(recordKey, pending);
 			records.set(recordKey, finalizedRecord);
 			try {
 				await persist();
+				commit.resolve();
+				await Promise.allSettled([...pending.upgrades].map(upgrade => upgrade.promise));
+				if (pending.errors.length > 0) throw pending.errors[0];
 				if (isCurrent !== undefined && !isCurrent()) {
 					const current = records.get(recordKey);
 					if (current === finalizedRecord) {
@@ -807,11 +828,10 @@ export function createInvocationReconciliation(
 			} catch (error) {
 				const current = records.get(recordKey);
 				if (current === finalizedRecord) records.set(recordKey, previousRecord);
-				completion.reject(error);
+				commit.reject(error);
 				throw error;
 			} finally {
 				if (pendingFinalizations.get(recordKey) === pending) pendingFinalizations.delete(recordKey);
-				completion.resolve();
 			}
 		},
 	};

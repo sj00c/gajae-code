@@ -278,6 +278,60 @@ test("failed agent_end upgrade persistence retains the deadline record for retry
 	expect(reloaded.lookup("prompt", { clientRef: "upgrade-failure-ref" })).toMatchObject({ status: "terminal_ok" });
 });
 
+test("pending finalize waits for a failed agent_end upgrade before resolving", async () => {
+	let records: unknown[] = [];
+	let writes = 0;
+	const finalizeStarted = Promise.withResolvers<void>();
+	const releaseFinalize = Promise.withResolvers<void>();
+	const store = {
+		path: null,
+		load: async () => records,
+		transact: async (mutator: (current: never[]) => never[]) => {
+			writes += 1;
+			const candidate = mutator(records as never);
+			if (writes === 2) {
+				finalizeStarted.resolve();
+				await releaseFinalize.promise;
+			}
+			if (writes === 3) throw new Error("pending upgrade persist failed");
+			records = candidate;
+		},
+	} as never;
+	const reconciliation = createInvocationReconciliation({ store });
+	const correlation = { commandId: "pending-upgrade-command", turnId: "pending-upgrade-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "pending-upgrade-ref");
+	const deadline = reconciliation.finalizeOutcome("prompt", correlation, {
+		kind: "failed",
+		code: "prompt_deadline_exceeded",
+		message: "deadline",
+	});
+	await finalizeStarted.promise;
+	const terminal = reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+	releaseFinalize.resolve();
+	const [deadlineError, terminalError] = await Promise.all([
+		deadline.then(
+			() => undefined,
+			error => error,
+		),
+		terminal.then(
+			() => undefined,
+			error => error,
+		),
+	]);
+	expect(deadlineError).toMatchObject({ message: "pending upgrade persist failed" });
+	expect(terminalError).toMatchObject({ message: "pending upgrade persist failed" });
+	const stale = createInvocationReconciliation({ store });
+	await stale.hydrate();
+	expect(stale.lookup("prompt", { clientRef: "pending-upgrade-ref" })).toMatchObject({
+		status: "failed",
+		error: { code: "prompt_deadline_exceeded" },
+	});
+	await reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+	const repaired = createInvocationReconciliation({ store });
+	await repaired.hydrate();
+	expect(repaired.lookup("prompt", { clientRef: "pending-upgrade-ref" })).toMatchObject({ status: "terminal_ok" });
+});
+
 test("a reason attached after a prompt settled is never replaced by a later failure", async () => {
 	const reconciliation = createInvocationReconciliation();
 	const correlation = { commandId: "late-reason-command", turnId: "late-reason-turn" };
