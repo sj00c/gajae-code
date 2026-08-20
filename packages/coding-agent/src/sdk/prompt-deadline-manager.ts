@@ -102,49 +102,58 @@ export class PromptDeadlineManager {
 			message: "Prompt deadline exceeded.",
 			provenance: "deadline",
 		};
-		let terminallyConfirmed = false;
 		try {
 			await this.#reconciliation.claimPendingOutcome("prompt", correlation, outcome);
 		} catch {
 			// claim may fail if already claimed (e.g., cancellation won); ignore.
 		}
-		const currentAfterClaim = this.#leases.get(key);
-		if (
-			currentAfterClaim !== lease ||
-			currentAfterClaim.generation !== generation ||
-			this.#now() < promptDeadlineAt(currentAfterClaim)
-		) {
-			this.#expiring.delete(key);
-			this.#expiryRetries.delete(key);
-			if (currentAfterClaim) this.#schedule(key);
-			return;
-		}
+		// Re-verify the captured lease is still authoritative after the claim
+		// await (exact-head review P2): fresh attributable progress during the
+		// claim must cancel this expiry instance instead of surfacing an exceeded
+		// outcome for a prompt that is demonstrably alive.
+		if (this.#backOffIfSuperseded(key, lease, generation)) return;
 		try {
 			await this.#reconciliation.finalizeOutcome("prompt", correlation, outcome);
-			terminallyConfirmed = true;
 		} catch {
 			// Do not infer durable confirmation from an in-memory lookup after a
 			// failed write. The accepted lease and ownership stay recoverable until
 			// a later retry observes a successful finalization.
-		}
-		if (terminallyConfirmed) {
-			// Retire pending ownership ONLY after durable terminal confirmation
-			// (#4668 review P1): retiring earlier strands an accepted/in-flight
-			// invocation without an owner, retry, or deadline recovery path.
-			try {
-				this.#onExpired?.(correlation);
-			} catch {}
-			this.#expiryRetries.delete(key);
-			this.clear(correlation);
+			this.#retry(key);
 			return;
 		}
-		// Durable terminal work did not land: retain the lease and pending
-		// ownership and retry the reconciliation boundedly (#4668 review P1).
-		// Once the retry budget is exhausted the explicit uncertain-outcome path
-		// keeps ownership in place (the next lifecycle boundary can still adopt
-		// and terminalize it) and parks the lease without a timer; any later
-		// attributable progress reschedules the deadline check via onProgress.
-		this.#retry(key);
+		// Finalization is generation-aware too (exact-head review P2): progress
+		// observed during the finalize await renews the lease past its deadline,
+		// so this expiry pass must not retire the now-live invocation's pending
+		// ownership even though the finalize write landed.
+		if (this.#backOffIfSuperseded(key, lease, generation)) return;
+		// Retire pending ownership ONLY after durable terminal confirmation with
+		// no superseding progress (#4668 review P1): retiring earlier strands an
+		// accepted/in-flight invocation without an owner, retry, or deadline
+		// recovery path.
+		try {
+			this.#onExpired?.(correlation);
+		} catch {}
+		this.#expiryRetries.delete(key);
+		this.clear(correlation);
+	}
+
+	/**
+	 * After an awaited reconciliation call, verify the captured lease is still
+	 * authoritative. Fresh attributable progress during the await advances the
+	 * lease generation and its deadline; when superseded, cancel this expiry
+	 * instance (release the expiration fence, clear any retry budget, and
+	 * reschedule the deadline) and report it so the caller stops. A cleared or
+	 * re-accepted lease is stale by identity too.
+	 */
+	#backOffIfSuperseded(key: string, lease: PromptDeadlineLease, generation: number): boolean {
+		const current = this.#leases.get(key);
+		if (current !== lease || current.generation !== generation || this.#now() < promptDeadlineAt(current)) {
+			this.#expiring.delete(key);
+			this.#expiryRetries.delete(key);
+			if (current) this.#schedule(key);
+			return true;
+		}
+		return false;
 	}
 
 	#retry(key: string): void {

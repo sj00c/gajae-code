@@ -14,6 +14,8 @@ interface FakeReconciliation {
 	finalizeCalls: number;
 	claimStarted?: () => void;
 	claimRelease?: Promise<void>;
+	finalizeStarted?: () => void;
+	finalizeRelease?: Promise<void>;
 	/** When set, a failing finalize still leaves the durable record terminal (lost race). */
 	terminalOnFailure?: boolean;
 }
@@ -37,6 +39,8 @@ function fakeReconciliation(): {
 			},
 			finalizeOutcome: async () => {
 				state.finalizeCalls += 1;
+				state.finalizeStarted?.();
+				if (state.finalizeRelease) await state.finalizeRelease;
 				if (state.finalizeCalls <= state.finalizeFailures) {
 					// Race simulation: a normal terminal transition won while the
 					// expiry finalize was in flight — the record IS terminal, the
@@ -148,4 +152,84 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		expect(state.finalizeCalls).toBe(callsAfterPark);
 		manager.clearAll();
 	}, 15_000);
+
+	test("fresh progress during a suspended claim cancels this expiry instead of firing exceeded", async () => {
+		// Exact-head review P2: expiry finalization must be generation-aware after
+		// every awaited operation. Deliver attributable progress while the claim
+		// await is suspended; the expiry must back off rather than surface
+		// prompt_deadline_exceeded for a prompt that is demonstrably alive.
+		let now = 0;
+		const claimStarted = Promise.withResolvers<void>();
+		const claimGate = Promise.withResolvers<void>();
+		const { reconciliation, state } = fakeReconciliation();
+		state.claimStarted = () => claimStarted.resolve();
+		state.claimRelease = claimGate.promise;
+		let expired = 0;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "cmd-claim-progress", turnId: "turn-claim-progress" };
+		now = 0;
+		manager.onAccepted(correlation);
+		// Advance the fake clock past the deadline so the pending timer drives expiry.
+		now = 1_000;
+		await claimStarted.promise; // expiry is suspended inside claimPendingOutcome
+		expect(manager.isExpiring(correlation)).toBe(true);
+		// Fresh attributable progress renews the lease while the claim is in flight.
+		now = 2_000;
+		manager.onAttributableEvent(correlation, "tool_execution_start", now);
+		claimGate.resolve();
+		await Bun.sleep(30);
+		// The renewed lease supersedes the in-flight expiry: no exceeded outcome,
+		// the lease survives, and the fence is released.
+		expect(expired).toBe(0);
+		expect(manager.isExpiring(correlation)).toBe(false);
+		expect(manager.has(correlation)).toBe(true);
+		expect(manager.deadlineAt(correlation)).toBe(2_020);
+		manager.clearAll();
+	});
+
+	test("fresh progress during a suspended finalize cancels this expiry instead of firing exceeded", async () => {
+		// Same generation-aware guarantee but on the finalize await, which previously
+		// retired ownership and cleared the lease unconditionally after a durable
+		// write. Progress during finalize must keep the invoked prompt alive.
+		let now = 0;
+		const finalizeStarted = Promise.withResolvers<void>();
+		const finalizeGate = Promise.withResolvers<void>();
+		const { reconciliation, state } = fakeReconciliation();
+		state.finalizeStarted = () => finalizeStarted.resolve();
+		state.finalizeRelease = finalizeGate.promise;
+		let expired = 0;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "cmd-finalize-progress", turnId: "turn-finalize-progress" };
+		now = 0;
+		manager.onAccepted(correlation);
+		now = 1_000;
+		await finalizeStarted.promise; // expiry is suspended inside finalizeOutcome
+		expect(manager.isExpiring(correlation)).toBe(true);
+		// Fresh attributable progress renews the lease while the finalize is in flight.
+		now = 2_000;
+		manager.onAttributableEvent(correlation, "tool_execution_start", now);
+		finalizeGate.resolve();
+		await Bun.sleep(30);
+		expect(expired).toBe(0);
+		expect(manager.isExpiring(correlation)).toBe(false);
+		expect(manager.has(correlation)).toBe(true);
+		expect(manager.deadlineAt(correlation)).toBe(2_020);
+		manager.clearAll();
+	});
 });

@@ -7193,6 +7193,7 @@ export class AgentSession {
 						type: "agent_end",
 						messages: event.messages,
 						stopReason: event.stopReason,
+						maintenanceOutcome: event.maintenanceOutcome,
 					},
 					undefined,
 					deliveryScope,

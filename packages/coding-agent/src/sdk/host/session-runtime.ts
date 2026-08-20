@@ -2636,6 +2636,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		type: "agent_start" | "agent_end" | "agent_failed",
 		ctx: ExtensionContext,
 		failureCause?: unknown,
+		maintenanceOutcome?: string,
 	): Promise<void> => {
 		const current = active;
 		if (!current) return;
@@ -2703,6 +2704,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// ring/broadcast (review thread P2). Reconciliation or event failure is
 		// recorded as observed=false, never rethrown into the api handler.
 		let observed = true;
+		const failedTransitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		try {
 			for (const invocation of transitions) {
 				try {
@@ -2726,6 +2728,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// shared-run batch. The failed record remains leased/repairable
 					// and the publication is marked unobserved for terminal callers.
 					observed = false;
+					failedTransitions.push(invocation);
 				}
 			}
 			try {
@@ -2736,7 +2739,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		} catch {
 			observed = false;
 		}
+		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") return;
 		if (type === "agent_end") {
+			if (failedTransitions.length > 0) {
+				// Durable terminalization failed. Keep the recovery-owned batch and
+				// its deadline leases alive so the deadline manager can replay a real
+				// agent_end instead of clearing into a stale synthetic failure.
+				current.lifecycleActive = false;
+				current.activeInvocation = failedTransitions[0];
+				current.drainedInvocations = failedTransitions;
+				const resolvers = terminalPublicationCapture.resolvers;
+				terminalPublicationCapture.resolvers = undefined;
+				for (const resolve of resolvers ?? []) resolve(observed);
+				return;
+			}
 			if (current.openLifecycleBatches.length > 0) current.openLifecycleBatches.shift();
 			for (const invocation of transitions)
 				if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
@@ -2751,7 +2767,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 	};
 	api.on("agent_start", async (_event, ctx) => await emitLifecycle("agent_start", ctx));
-	api.on("agent_end", async (_event, ctx) => await emitLifecycle("agent_end", ctx));
+	api.on(
+		"agent_end",
+		async (event, ctx) =>
+			await emitLifecycle(
+				"agent_end",
+				ctx,
+				undefined,
+				event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+			),
+	);
 	api.on("agent_failed", async (event, ctx) => emitLifecycle("agent_failed", ctx, event.error));
 	api.on("turn_start", async (_event, ctx) => {
 		const current = active;
@@ -2896,7 +2921,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// promotion/agent_start instead, so a prompt waiting behind a
 				// legitimately long turn never false-fires. The agent_start
 				// re-entry in emitLifecycle is a no-op for an existing lease.
-				if (kind === "prompt" && startsOwnTurn) deadlineManager.onAccepted(correlation);
+				if (kind === "prompt") deadlineManager.onAccepted(correlation);
 			},
 			steerReconciliation,
 			(kind, correlation, connectionId, promotion) => {
