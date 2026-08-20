@@ -1375,9 +1375,9 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/natives/test/path-identity-posix.test.ts");
 	});
-	test("prompt-deadline-lease changes select the behavioral lease suite", () => {
+	test("prompt-deadline-lease changes select the production deadline manager suite", () => {
 		const tasks = targeted(["packages/coding-agent/src/sdk/prompt-deadline-lease.ts"]);
-		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-prompt-deadline-lease.test.ts");
+		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts");
 	});
 	test("clean core changes select the clean script test alongside root tooling fallback", () => {
 		const keys = targeted(["scripts/clean-core.ts"]).map(task => task.key);
