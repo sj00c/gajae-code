@@ -29,6 +29,7 @@ import {
 	getAgentDbPath,
 	getAgentDir,
 	getProjectDir,
+	getTrustedHomeDir,
 	logger,
 	postmortem,
 	prompt,
@@ -2026,6 +2027,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// (review thread P1). For a top-level session this equals the
 			// session id.
 			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
+			getSessionHome: () => getTrustedHomeDir(),
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
@@ -2033,6 +2035,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getActiveSkillPhase: () => session?.getActiveSkillPhase(),
 			getDeepInterviewAskStage: () => session?.getDeepInterviewAskStage(),
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
+			getSessionAgentDir: () => agentDir,
 			get model() {
 				return agent?.state.model ?? model;
 			},

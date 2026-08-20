@@ -224,6 +224,8 @@ export interface ToolSession {
 	waitForUserSteering?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/** Get the trusted home directory used for this session's discovery context. */
+	getSessionHome?: () => string;
 	/** Get credential-selection session identity. */
 	getCredentialSessionId?: () => string | null;
 	/** Scope-held MCP facade for mcp:// resolution. */

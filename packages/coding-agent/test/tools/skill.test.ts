@@ -231,6 +231,8 @@ describe("SkillTool", () => {
 			unrelated = await makeSkill("unrelated", "Unrelated body.");
 			const captured: CapturedSend[] = [];
 			const session = createSession(cwd, [unrelated], captured, { settings: runtimeSkillSettings() });
+			session.getSessionHome = () => home;
+			session.getSessionAgentDir = () => path.join(home, ".gjc", "agent");
 
 			const tool = SkillTool.createIf(session);
 			expect(tool).not.toBeNull();
@@ -243,6 +245,8 @@ describe("SkillTool", () => {
 			const preloadedTool = SkillTool.createIf(
 				createSession(cwd, [unrelated, preloaded], preloadedCaptured, {
 					settings: runtimeSkillSettings(),
+					getSessionHome: () => home,
+					getSessionAgentDir: () => path.join(home, ".gjc", "agent"),
 				}),
 			);
 			expect(preloadedTool).not.toBeNull();
@@ -292,7 +296,18 @@ describe("SkillTool", () => {
 			);
 			const captured: CapturedSend[] = [];
 			loaded = await makeSkill("loaded", "Loaded");
-			const tool = SkillTool.createIf(createSession(cwd, [loaded], captured, { settings: runtimeSkillSettings() }))!;
+			const tool = SkillTool.createIf(
+				createSession(cwd, [loaded], captured, {
+					settings: runtimeSkillSettings(),
+					getSessionHome: () => home,
+					getSessionAgentDir: () =>
+						process.env.GJC_CONFIG_DIR === ".configured-gjc"
+							? path.join(home, ".configured-gjc", "agent")
+							: process.env.PI_CONFIG_DIR === ".configured-pi"
+								? path.join(home, ".configured-pi", "agent")
+								: path.join(home, ".gjc", "agent"),
+				}),
+			)!;
 			const defaultResult = await tool.execute("call-default-canonical", { name: "default-canonical" });
 			expect(captured.at(-1)?.message.content).toContain("Default canonical body.");
 			expect(defaultResult.details?.path).toBe(defaultCanonicalPath);

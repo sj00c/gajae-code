@@ -41,12 +41,17 @@ ${body}
 }
 
 function createSession(cwd: string, overrides: Partial<ToolSession> = {}): ToolSession {
+	const testHome = process.env.HOME?.startsWith(os.tmpdir())
+		? process.env.HOME
+		: path.join(os.tmpdir(), "gjc-skill-discovery-empty-home");
 	return {
 		cwd,
 		hasUI: false,
 		skills: [],
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		getSessionHome: () => testHome,
+		getSessionAgentDir: () => path.join(testHome, ".gjc", "agent"),
 		settings: Settings.isolated({ "skill.enabled": true }),
 		...overrides,
 	};
@@ -109,7 +114,9 @@ describe("SkillDiscoveryTool", () => {
 			await makeSkill(path.join(home, ".gjc", "skills"), "user-helper", "User helper skill");
 			const settings = runtimeSkillSettings();
 
-			const tool = new SkillDiscoveryTool(createSession(cwd, { settings }));
+			const tool = new SkillDiscoveryTool(
+				createSession(cwd, { settings, getSessionAgentDir: () => path.join(home, ".gjc", "agent") }),
+			);
 			const result = await tool.execute("call", { source: "user" });
 			const details = result.details;
 			expect(details).toBeDefined();
@@ -150,10 +157,12 @@ describe("SkillDiscoveryTool", () => {
 			expect(sent).toHaveLength(0);
 
 			const userEnabled = runtimeSkillSettings({ "skills.enablePiProject": false });
-			const userDiscovery = await new SkillDiscoveryTool(createSession(cwd, { settings: userEnabled })).execute(
-				"call",
-				{ source: "user" },
-			);
+			const userDiscovery = await new SkillDiscoveryTool(
+				createSession(cwd, {
+					settings: userEnabled,
+					getSessionAgentDir: () => path.join(home, ".gjc", "agent"),
+				}),
+			).execute("call", { source: "user" });
 			expect(userDiscovery.details?.candidates).toEqual([
 				expect.objectContaining({ name: "home-helper", source: "user" }),
 			]);
@@ -329,12 +338,14 @@ describe("SkillDiscoveryTool", () => {
 			await makeSkill(path.join(home, ".decoy-pi-agent", "skills"), "pi-decoy", "PI decoy user skill");
 			await makeSkill(path.join(home, ".xdg-decoy", "gjc", "agent", "skills"), "xdg-decoy", "XDG decoy user skill");
 
-			const result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
-				"call",
-				{
-					source: "user",
-				},
-			);
+			const result = await new SkillDiscoveryTool(
+				createSession(cwd, {
+					settings: runtimeSkillSettings(),
+					getSessionAgentDir: () => path.join(home, "absolute-looking-gjc", "agent"),
+				}),
+			).execute("call", {
+				source: "user",
+			});
 			expect(result.details?.candidates).toEqual([
 				expect.objectContaining({
 					name: "historical",
@@ -345,7 +356,10 @@ describe("SkillDiscoveryTool", () => {
 			]);
 
 			const allSources = await new SkillDiscoveryTool(
-				createSession(cwd, { settings: runtimeSkillSettings() }),
+				createSession(cwd, {
+					settings: runtimeSkillSettings(),
+					getSessionAgentDir: () => path.join(home, "absolute-looking-gjc", "agent"),
+				}),
 			).execute("call", {});
 			expect(allSources.details?.candidates).toEqual([
 				expect.objectContaining({ name: "historical", source: "user" }),
@@ -385,24 +399,28 @@ describe("SkillDiscoveryTool", () => {
 				"Default canonical user skill",
 			);
 			await makeSkill(path.join(home, ".gjc", "skills"), "default-canonical", "Default legacy user skill");
-			let result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
-				"call",
-				{
-					source: "user",
-				},
-			);
+			let result = await new SkillDiscoveryTool(
+				createSession(cwd, {
+					settings: runtimeSkillSettings(),
+					getSessionAgentDir: () => path.join(home, ".gjc", "agent"),
+				}),
+			).execute("call", {
+				source: "user",
+			});
 			expect(result.details?.candidates).toEqual([
 				expect.objectContaining({ name: "default-canonical", description: "Default canonical user skill" }),
 			]);
 
 			process.env.PI_CONFIG_DIR = ".pi-config";
 			await makeSkill(path.join(home, ".pi-config", "agent", "skills"), "pi-canonical", "PI canonical user skill");
-			result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
-				"call",
-				{
-					source: "user",
-				},
-			);
+			result = await new SkillDiscoveryTool(
+				createSession(cwd, {
+					settings: runtimeSkillSettings(),
+					getSessionAgentDir: () => path.join(home, ".pi-config", "agent"),
+				}),
+			).execute("call", {
+				source: "user",
+			});
 			expect(result.details?.candidates.map(candidate => candidate.name)).toEqual([
 				"default-canonical",
 				"pi-canonical",
@@ -487,21 +505,29 @@ describe("SkillDiscoveryTool", () => {
 			await makeSkill(skillsDir, "zulu", "Sort zulu", "Zulu body.");
 
 			const userOnly = await new SkillDiscoveryTool(
-				createSession(cwd, { settings: runtimeSkillSettings({ "skills.enablePiProject": false }) }),
+				createSession(cwd, {
+					settings: runtimeSkillSettings({ "skills.enablePiProject": false }),
+					getSessionAgentDir: () => path.join(home, ".gjc", "agent"),
+				}),
 			).execute("call", { query: "lower-only" });
 			expect(userOnly.details?.candidates).toEqual([
 				expect.objectContaining({ name: "alpha", path: userAlphaPath, source: "user" }),
 			]);
 
 			const dedupBeforeQuery = await new SkillDiscoveryTool(
-				createSession(cwd, { settings: runtimeSkillSettings() }),
+				createSession(cwd, {
+					settings: runtimeSkillSettings(),
+					getSessionAgentDir: () => path.join(home, ".gjc", "agent"),
+				}),
 			).execute("call", { query: "lower-only" });
 			expect(dedupBeforeQuery.details?.candidates).toEqual([]);
 
-			const result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
-				"call",
-				{ query: "sort", limit: 1 },
-			);
+			const result = await new SkillDiscoveryTool(
+				createSession(cwd, {
+					settings: runtimeSkillSettings(),
+					getSessionAgentDir: () => path.join(home, ".gjc", "agent"),
+				}),
+			).execute("call", { query: "sort", limit: 1 });
 			expect(result.details?.candidates).toEqual([
 				expect.objectContaining({ name: "alpha", description: "Sort alpha", path: alphaPath, source: "project" }),
 			]);
