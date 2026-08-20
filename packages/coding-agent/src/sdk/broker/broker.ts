@@ -36,13 +36,15 @@ import {
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
-import { resolveSdkPackageGeneration } from "./runtime";
+import { resolveSdkPackageAuthority } from "./runtime";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
 	agentDir: string;
 	packageGeneration?: string;
+	packageVersion?: string;
+	installationIdentity?: string;
 	port?: number;
 	heartbeatTtlMs?: number;
 	/** Broker-owned migration policy. Client lifecycle frames cannot select it. */
@@ -52,6 +54,8 @@ export interface BrokerSettings {
 type ResolvedBrokerSettings = {
 	agentDir: string;
 	packageGeneration: string;
+	packageVersion: string;
+	installationIdentity: string;
 	port: number;
 	heartbeatTtlMs: number;
 	resolveDirectoryMigration: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
@@ -798,9 +802,12 @@ export class Broker {
 	#resolveCompletion!: () => void;
 	#rejectCompletion!: (error: unknown) => void;
 	constructor(settings: BrokerSettings) {
+		const authority = resolveSdkPackageAuthority();
 		this.settings = {
 			agentDir: settings.agentDir,
-			packageGeneration: settings.packageGeneration ?? resolveSdkPackageGeneration(),
+			packageGeneration: settings.packageGeneration ?? authority.generation,
+			packageVersion: settings.packageVersion ?? authority.packageVersion,
+			installationIdentity: settings.installationIdentity ?? authority.installationIdentity,
 			port: settings.port ?? 0,
 			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
 			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),
@@ -1022,6 +1029,8 @@ export class Broker {
 				version: 1,
 				protocolVersion: 3,
 				packageGeneration: this.settings.packageGeneration,
+				packageVersion: this.settings.packageVersion,
+				installationIdentity: this.settings.installationIdentity,
 				ownerId: this.#owner,
 				pid: process.pid,
 				incarnation,

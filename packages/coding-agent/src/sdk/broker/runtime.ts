@@ -1,9 +1,16 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import packageJson from "../../../package.json" with { type: "json" };
 import internalSourceMarker from "./internal-source-marker-2178.txt" with { type: "file" };
 
 export type SdkInternalAction = "broker-internal" | "session-host-internal";
+
+export interface SdkPackageAuthority {
+	generation: string;
+	packageVersion: string;
+	installationIdentity: string;
+}
 
 export type SdkInternalSpawnCommand =
 	| {
@@ -18,6 +25,8 @@ export type SdkInternalSpawnCommand =
 			 * and must not be reused (see ensure.ts).
 			 */
 			generation: string;
+			packageVersion?: string;
+			installationIdentity?: string;
 	  }
 	| {
 			kind: "compiled";
@@ -26,6 +35,8 @@ export type SdkInternalSpawnCommand =
 			env: NodeJS.ProcessEnv;
 			cwd?: undefined;
 			generation: string;
+			packageVersion?: string;
+			installationIdentity?: string;
 	  };
 
 type EmbeddedFile = Blob | { name: string };
@@ -315,6 +326,8 @@ function sourceDescriptor(
 		env: internalEnvironment(options.environment ?? process.env, true),
 		cwd: canonicalBrokerDirectory,
 		generation: sdkPackageGeneration("bun-source", packageVersion, generationFiles),
+		packageVersion,
+		installationIdentity: canonicalPackageDirectory,
 	};
 }
 
@@ -339,6 +352,8 @@ function resolveSdkInternalSpawnCommandWithEvidence(
 			args: ["sdk", action],
 			env: internalEnvironment(options.environment ?? process.env, false),
 			generation: sdkPackageGeneration("compiled", "binary", [executable]),
+			packageVersion: packageJson.version,
+			installationIdentity: executable,
 		};
 	}
 	throw new Error("SDK internal launch refused: compiled-runtime marker evidence is inconsistent.");
@@ -352,6 +367,16 @@ export function resolveSdkInternalSpawnCommand(action: SdkInternalAction): SdkIn
 /** Resolve the current generation the production descriptor would publish, without spawning. */
 export function resolveSdkPackageGeneration(): string {
 	return resolveSdkInternalSpawnCommand("broker-internal").generation;
+}
+
+/** Resolve the ordered, installation-bound authority used before broker retirement. */
+export function resolveSdkPackageAuthority(): SdkPackageAuthority {
+	const command = resolveSdkInternalSpawnCommand("broker-internal");
+	return {
+		generation: command.generation,
+		packageVersion: command.packageVersion ?? packageJson.version,
+		installationIdentity: command.installationIdentity ?? command.file,
+	};
 }
 
 /** Test hook: injects runtime evidence without weakening the production marker authority. */

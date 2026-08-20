@@ -5,10 +5,35 @@ import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { Broker } from "../src/sdk/broker/broker";
 import { brokerProcessIncarnation, readBrokerDiscovery, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { brokerOwnerForTest, ensureBroker, signalExactBrokerForTest } from "../src/sdk/broker/ensure";
-import { resolveSdkInternalSpawnCommandForTest, resolveSdkPackageGeneration } from "../src/sdk/broker/runtime";
+import {
+	brokerOwnerForTest,
+	canRetireStaleBrokerForTest,
+	ensureBroker,
+	signalExactBrokerForTest,
+} from "../src/sdk/broker/ensure";
+import {
+	resolveSdkInternalSpawnCommandForTest,
+	resolveSdkPackageAuthority,
+	resolveSdkPackageGeneration,
+} from "../src/sdk/broker/runtime";
 
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-generation-"));
+
+function olderPackageVersion(version: string): string {
+	const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+	if (!match) throw new Error(`Test requires a stable package version, got ${version}`);
+	return `${match[1]}.${match[2]}.${Math.max(0, Number(match[3]) - 1)}`;
+}
+
+function staleBroker(agentDir: string): Broker {
+	const authority = resolveSdkPackageAuthority();
+	return new Broker({
+		agentDir,
+		packageGeneration: "stale-gen",
+		packageVersion: olderPackageVersion(authority.packageVersion),
+		installationIdentity: authority.installationIdentity,
+	});
+}
 
 async function cleanup(dir: string, broker?: Broker): Promise<void> {
 	await broker?.stop().catch(() => {});
@@ -76,7 +101,7 @@ describe("sdk broker package generation", () => {
 
 	it("retires a stale-generation broker and replaces it with a current one", async () => {
 		const dir = await temp();
-		const stale = new Broker({ agentDir: dir, packageGeneration: "stale-gen" });
+		const stale = staleBroker(dir);
 		try {
 			const published = await stale.start();
 			const expected = resolveSdkPackageGeneration();
@@ -97,7 +122,7 @@ describe("sdk broker package generation", () => {
 
 	it("does not reuse a stale broker when retirement cannot be proven", async () => {
 		const dir = await temp();
-		const stale = new Broker({ agentDir: dir, packageGeneration: "stale-gen" });
+		const stale = staleBroker(dir);
 		const stop = vi.spyOn(stale, "stop").mockResolvedValue(undefined);
 		try {
 			await stale.start();
@@ -113,7 +138,7 @@ describe("sdk broker package generation", () => {
 
 	it("does not satisfy a concurrent caller with a different generation", async () => {
 		const dir = await temp();
-		const stale = new Broker({ agentDir: dir, packageGeneration: "stale-gen" });
+		const stale = staleBroker(dir);
 		try {
 			await stale.start();
 			const expected = resolveSdkPackageGeneration();
@@ -170,9 +195,58 @@ describe("sdk broker package generation", () => {
 		}
 	});
 
+	it("retires only a strictly older broker from the same installation", () => {
+		const authority = resolveSdkPackageAuthority();
+		const base = {
+			version: 1 as const,
+			protocolVersion: 3 as const,
+			packageGeneration: "older-generation",
+			packageVersion: olderPackageVersion(authority.packageVersion),
+			installationIdentity: authority.installationIdentity,
+			ownerId: "authority-test",
+			pid: 1,
+			incarnation: "linux:1",
+			host: "127.0.0.1" as const,
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "authority-test-token",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		};
+
+		expect(canRetireStaleBrokerForTest(base, authority)).toBe(true);
+		expect(canRetireStaleBrokerForTest({ ...base, packageVersion: authority.packageVersion }, authority)).toBe(false);
+		expect(
+			canRetireStaleBrokerForTest(
+				{ ...base, packageVersion: `${Number(authority.packageVersion.split(".")[0]) + 1}.0.0` },
+				authority,
+			),
+		).toBe(false);
+		expect(
+			canRetireStaleBrokerForTest(
+				{ ...base, installationIdentity: `${authority.installationIdentity}-other` },
+				authority,
+			),
+		).toBe(false);
+	});
+
+	it("refuses to signal a substituted process incarnation", () => {
+		const processRef = {
+			incarnation: "darwin:1700000000:999999",
+			signalRoot: vi.fn(() => true),
+		};
+		const fromPid = vi.spyOn(nativeProcessBindings().Process, "fromPid").mockReturnValue(processRef as never);
+		try {
+			expect(signalExactBrokerForTest(4_242, "darwin:1700000000:123456")).toBe(false);
+			expect(processRef.signalRoot).not.toHaveBeenCalled();
+		} finally {
+			fromPid.mockRestore();
+		}
+	});
+
 	it("serializes concurrent stale-broker retirements into one replacement", async () => {
 		const dir = await temp();
-		const stale = new Broker({ agentDir: dir, packageGeneration: "stale-gen" });
+		const stale = staleBroker(dir);
 		try {
 			const published = await stale.start();
 			const expected = resolveSdkPackageGeneration();

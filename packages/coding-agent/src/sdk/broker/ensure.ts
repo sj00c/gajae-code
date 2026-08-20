@@ -7,7 +7,12 @@ import path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { SdkClient } from "../client/client";
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
-import { resolveSdkInternalSpawnCommand, resolveSdkPackageGeneration, type SdkInternalSpawnCommand } from "./runtime";
+import {
+	resolveSdkInternalSpawnCommand,
+	resolveSdkPackageAuthority,
+	type SdkInternalSpawnCommand,
+	type SdkPackageAuthority,
+} from "./runtime";
 import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
 export interface EnsureBrokerSettings {
 	agentDir: string;
@@ -25,6 +30,10 @@ export interface EnsureBrokerSettings {
 	 * fresh broker is spawned. Omitted: ensureBroker resolves the current generation.
 	 */
 	expectedPackageGeneration?: string;
+	/** Ordered package identity captured with the expected generation. */
+	expectedPackageVersion?: string;
+	/** Canonical installation identity captured with the expected generation. */
+	expectedInstallationIdentity?: string;
 }
 
 const DISCOVERY_TIMEOUT_MS = 10_000;
@@ -312,9 +321,46 @@ function signalExactBroker(pid: number, incarnation: string): boolean {
 		const signal = os.constants.signals.SIGTERM;
 		if (signal === undefined) return false;
 		return processRef.signalRoot(signal);
-	} catch {
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException | undefined)?.code;
+		if (code === "EACCES" || code === "EIO") throw error;
 		return false;
 	}
+}
+
+function comparePackageVersions(left: string, right: string): number | undefined {
+	const parse = (value: string): { numbers: [number, number, number]; prerelease: string | undefined } | undefined => {
+		const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(value);
+		if (!match) return undefined;
+		return { numbers: [Number(match[1]), Number(match[2]), Number(match[3])], prerelease: match[4] };
+	};
+	const leftParsed = parse(left);
+	const rightParsed = parse(right);
+	if (!leftParsed || !rightParsed) return undefined;
+	for (let index = 0; index < leftParsed.numbers.length; index++) {
+		if (leftParsed.numbers[index] !== rightParsed.numbers[index])
+			return leftParsed.numbers[index] < rightParsed.numbers[index] ? -1 : 1;
+	}
+	if (leftParsed.prerelease === rightParsed.prerelease) return 0;
+	if (leftParsed.prerelease === undefined) return 1;
+	if (rightParsed.prerelease === undefined) return -1;
+	return leftParsed.prerelease < rightParsed.prerelease ? -1 : 1;
+}
+
+function canRetireStaleBroker(stale: BrokerDiscovery, authority: SdkPackageAuthority): boolean {
+	if (!stale.packageVersion || !stale.installationIdentity) return false;
+	if (stale.installationIdentity !== authority.installationIdentity) return false;
+	return comparePackageVersions(stale.packageVersion, authority.packageVersion) === -1;
+}
+
+function sameBrokerIdentity(left: BrokerDiscovery, right: BrokerDiscovery): boolean {
+	return (
+		left.pid === right.pid &&
+		left.incarnation === right.incarnation &&
+		left.ownerId === right.ownerId &&
+		left.token === right.token &&
+		left.url === right.url
+	);
 }
 
 /**
@@ -324,7 +370,15 @@ function signalExactBroker(pid: number, incarnation: string): boolean {
  * SIGTERM instead. Retirement is best-effort, but a mismatched discovery that
  * remains published is never returned to a lifecycle caller.
  */
-async function retireStaleBroker(agentDir: string, stale: BrokerDiscovery, heartbeatTtlMs?: number): Promise<boolean> {
+async function retireStaleBroker(
+	agentDir: string,
+	stale: BrokerDiscovery,
+	expectedPackageGeneration: string,
+	heartbeatTtlMs?: number,
+): Promise<boolean> {
+	const preflightAuthority = resolveSdkPackageAuthority();
+	if (preflightAuthority.generation !== expectedPackageGeneration) return false;
+	if (!canRetireStaleBroker(stale, preflightAuthority)) return false;
 	try {
 		const client = await SdkClient.connect(stale.url, stale.token, {
 			timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
@@ -337,7 +391,14 @@ async function retireStaleBroker(agentDir: string, stale: BrokerDiscovery, heart
 		}
 	} catch {
 		// RPC unreachable or unknown_operation (broker predates the shutdown op):
-		// signal the published identity only when the pid still proves it.
+		// Re-read both installation authority and the publication identity immediately
+		// before signaling. A replacement or package mutation must never be targeted.
+		const currentAuthority = resolveSdkPackageAuthority();
+		if (currentAuthority.generation !== expectedPackageGeneration) return false;
+		if (!canRetireStaleBroker(stale, currentAuthority)) return false;
+		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
+		if (!current) return true;
+		if (!sameBrokerIdentity(current, stale)) return true;
 		signalExactBroker(stale.pid, stale.incarnation);
 	}
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
@@ -371,10 +432,23 @@ async function retireAndReadReplacement(
 ): Promise<BrokerDiscovery | undefined> {
 	const expectedPackageGeneration = settings.expectedPackageGeneration;
 	if (expectedPackageGeneration === undefined) return stale;
-	await retireStaleBroker(settings.agentDir, stale, settings.heartbeatTtlMs);
+	const authority = resolveSdkPackageAuthority();
+	if (authority.generation !== expectedPackageGeneration)
+		throw new Error(
+			`SDK broker package generation changed before retirement: expected ${expectedPackageGeneration}, resolved ${authority.generation}.`,
+		);
+	if (
+		(settings.expectedPackageVersion !== undefined && settings.expectedPackageVersion !== authority.packageVersion) ||
+		(settings.expectedInstallationIdentity !== undefined &&
+			settings.expectedInstallationIdentity !== authority.installationIdentity)
+	)
+		throw new Error("SDK broker package installation identity changed before retirement.");
+	if (!canRetireStaleBroker(stale, authority))
+		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
+	await retireStaleBroker(settings.agentDir, stale, expectedPackageGeneration, settings.heartbeatTtlMs);
 	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 	if (!replacement) return undefined;
-	const currentPackageGeneration = resolveSdkPackageGeneration();
+	const currentPackageGeneration = resolveSdkPackageAuthority().generation;
 	if (currentPackageGeneration !== expectedPackageGeneration)
 		throw new Error(
 			`SDK broker package generation changed during retirement: expected ${expectedPackageGeneration}, resolved ${currentPackageGeneration}.`,
@@ -539,8 +613,13 @@ function startEnsure(settings: EnsureBrokerSettings, initiator: EnsureInitiator)
 }
 
 function normalizeEnsureSettings(settings: EnsureBrokerSettings): EnsureBrokerSettings {
-	if (settings.expectedPackageGeneration !== undefined) return settings;
-	return { ...settings, expectedPackageGeneration: resolveSdkPackageGeneration() };
+	const authority = resolveSdkPackageAuthority();
+	return {
+		...settings,
+		expectedPackageGeneration: settings.expectedPackageGeneration ?? authority.generation,
+		expectedPackageVersion: settings.expectedPackageVersion ?? authority.packageVersion,
+		expectedInstallationIdentity: settings.expectedInstallationIdentity ?? authority.installationIdentity,
+	};
 }
 
 /** Starts the detached broker entrypoint when discovery has no live owner. */
@@ -615,6 +694,10 @@ export function brokerOwnerForTest(agentDir: string): BrokerOwner | undefined {
 /** Test hook: exercise the identity-fenced stale-broker signal fallback. */
 export function signalExactBrokerForTest(pid: number, incarnation: string): boolean {
 	return signalExactBroker(pid, incarnation);
+}
+/** Test hook: validates ordered same-install retirement authority. */
+export function canRetireStaleBrokerForTest(stale: BrokerDiscovery, authority: SdkPackageAuthority): boolean {
+	return canRetireStaleBroker(stale, authority);
 }
 /** Test hook: drives the detached-broker reap on a controllable child surface. */
 export function reapSpawnedBrokerForTest(child: ChildProcess, timing: ReapTiming = DEFAULT_REAP_TIMING): Promise<void> {

@@ -336,6 +336,10 @@ export interface BrokerDiscovery {
 	version: typeof SDK_STATE_VERSION;
 	protocolVersion: 3;
 	packageGeneration: string;
+	/** Ordered package identity used to authorize stale retirement. */
+	packageVersion?: string;
+	/** Canonical install identity; equal installs may retire older versions only. */
+	installationIdentity?: string;
 	ownerId: string;
 	pid: number;
 	incarnation: string;
