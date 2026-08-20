@@ -19217,6 +19217,12 @@ export class SessionManager {
 		await this.flush();
 		await this.#closePersistWriter();
 		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
+		// Lifecycle invariant: a staged session must carry exactly one attempt root through
+		// commit. An adopted staging manager whose attempt id differs from the staged
+		// publication means a second root was adopted over the first, orphaning it from cleanup.
+		const adoptedAttemptId = this.#adoptedArtifactManager?.getAttemptId();
+		if (adoptedAttemptId !== undefined && adoptedAttemptId !== staged.attemptId)
+			throw new Error("Staged session artifact root does not match the staged attempt.");
 		const parentArtifacts =
 			this.#stagedArtifactParent ??
 			new ArtifactManager(
@@ -19383,6 +19389,12 @@ export class SessionManager {
 		// staging or artifacts would strand that transcript with dangling references.
 		if (staged.preservedUnproven) return;
 		const cleanupErrors: Error[] = [];
+		// Same single-root invariant as commitStaged: fail closed when a second staging
+		// root was adopted over the publication's own attempt root.
+		const discardAdoptedAttemptId = this.#adoptedArtifactManager?.getAttemptId();
+		if (discardAdoptedAttemptId !== undefined && discardAdoptedAttemptId !== staged.attemptId) {
+			cleanupErrors.push(new Error("Staged session artifact root does not match the staged attempt."));
+		}
 		const captureCleanupError = (error: unknown): void => {
 			const normalized = toError(error);
 			if (normalized.message !== "not_found" && !isAuthorizedPendingCleanup(normalized))

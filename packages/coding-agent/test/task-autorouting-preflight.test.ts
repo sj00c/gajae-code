@@ -1146,4 +1146,27 @@ describe("managed staged publication certainty", () => {
 		expect(stagedArtifactId).toBeDefined();
 		expect(artifactTree).toContain(Buffer.from("candidate-owned-artifact").toString("base64"));
 	});
+
+	it("fails closed when a second attempt root is adopted over the staged publication", async () => {
+		const ctx = await createHarnessContext(true);
+		const manager = await openStagedCandidate(ctx, "attempt-double-root");
+		manager.appendSessionInit({ systemPrompt: "test", task: "double-root", tools: [] });
+		// Simulate the double-adoption the executor guard now prevents: a staging root
+		// for a different attempt replaces the publication's own root.
+		const foreignStaging = ctx.parentArtifacts.createAttemptStaging("attempt-foreign");
+		manager.adoptArtifactManager(foreignStaging, ctx.parentArtifacts);
+		await expect(manager.commitStagedNestedManaged()).rejects.toThrow(/does not match the staged attempt/);
+		// The pre-fence discard path must fail closed the same way (surfaced through its
+		// AggregateError cleanup wrapper) instead of silently skipping cleanup.
+		await expect(manager.discardStaged()).rejects.toThrow(/Staged session cleanup failed/);
+	});
+
+	it("commits and discards cleanly when exactly one attempt root stays adopted", async () => {
+		const ctx = await createHarnessContext(true);
+		const manager = await openStagedCandidate(ctx, "attempt-single-root");
+		manager.appendSessionInit({ systemPrompt: "test", task: "single-root", tools: [] });
+		await manager.discardStaged();
+		const stagingTree = await snapshotTree(ctx.stagingRoot);
+		expect(stagingTree).not.toContain("attempt-single-root.jsonl");
+	});
 });

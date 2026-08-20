@@ -1827,7 +1827,11 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			openedSessionManager = sessionManager;
 			if (options.parentArtifactManager && !options.preflightProbe && !options.preflightDurable) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
-			} else if (options.preflightDurable) {
+			} else if (options.preflightDurable && !options.managedPersistence) {
+				// Only the unmanaged durable preflight adopts its attempt staging here. With
+				// managedPersistence the session came from openStagedSession(), which already
+				// adopted exactly one task-scoped attempt root; adopting a second instance over
+				// the same root would leave the first unreachable from commit/discard.
 				const attemptId = options.autoroutingAttemptId ?? id;
 				const parentArtifacts =
 					options.parentArtifactManager ??
