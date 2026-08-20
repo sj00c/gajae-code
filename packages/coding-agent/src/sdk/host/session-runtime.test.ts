@@ -2701,6 +2701,37 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+	test("an unpromoted follow-up does not acquire a deadline lease", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-unpromoted-followup-"));
+		try {
+			let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
+			const harness = await invocationHarness("unpromoted-followup", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 25 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					promoted = (options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined)
+						?.onQueuedPromoted;
+				},
+			});
+			const accepted = await harness.control("turn.follow_up", { text: "queued" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await Bun.sleep(100);
+			expect((await harness.query("turn.prompt_status", ids)).result?.status).not.toBe("failed");
+			promoted?.({ startsOwnRun: true });
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 	test("a prompt queued as steer while streaming is not terminalized before the turn runs", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-prompt-while-busy-"));
 		try {

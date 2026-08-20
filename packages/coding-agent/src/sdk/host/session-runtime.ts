@@ -443,6 +443,7 @@ export interface InvocationReconciliation {
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
 		outcome?: { kind: string; code: string; message: string; provenance?: string },
+		isCurrent?: () => boolean,
 	): Promise<void>;
 }
 
@@ -472,9 +473,9 @@ export function createInvocationReconciliation(
 			? path.join(options.stateRoot, ".sdk-reconciliation", `${options.sessionId}.json`)
 			: undefined;
 	let persistenceChain: Promise<void> = Promise.resolve();
-	const persist = async (): Promise<void> => {
+	const persist = async (snapshot: readonly InvocationRecord[] = [...records.values()]): Promise<void> => {
 		if (store) {
-			await store.transact(() => [...records.values()]);
+			await store.transact(() => [...snapshot]);
 			return;
 		}
 		if (!reconciliationFile) return;
@@ -484,7 +485,7 @@ export function createInvocationReconciliation(
 			await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 			await fs.writeFile(
 				temporary,
-				JSON.stringify({ version: 1, sessionId: options.sessionId, records: [...records.values()] }),
+				JSON.stringify({ version: 1, sessionId: options.sessionId, records: [...snapshot] }),
 				{ encoding: "utf8", mode: 0o600 },
 			);
 			await fs.chmod(temporary, 0o600);
@@ -684,21 +685,34 @@ export function createInvocationReconciliation(
 			await persist();
 			return outcome;
 		},
-		async finalizeOutcome(kind, correlation, outcome) {
+		async finalizeOutcome(kind, correlation, outcome, isCurrent) {
 			const record = records.get(key(kind, correlation));
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return;
 			const finalOutcome = (outcome ??
 				(record as unknown as { pendingOutcome?: { kind: string; code: string; message: string } })
 					.pendingOutcome) as { kind: string; code: string; message: string } | undefined;
-			record.terminalAt = Date.now();
+			const previousRecord = { ...record };
+			const finalizedRecord: InvocationRecord = { ...record, terminalAt: Date.now() };
 			if (finalOutcome?.kind === "failed") {
-				record.status = "failed";
-				record.error = { code: finalOutcome.code, message: finalOutcome.message };
+				finalizedRecord.status = "failed";
+				finalizedRecord.error = { code: finalOutcome.code, message: finalOutcome.message };
 			} else {
-				record.status = "terminal_ok";
+				finalizedRecord.status = "terminal_ok";
 			}
-			(record as unknown as Record<string, unknown>).pendingOutcome = undefined;
-			await persist();
+			(finalizedRecord as unknown as Record<string, unknown>).pendingOutcome = undefined;
+			if (isCurrent !== undefined && !isCurrent()) return;
+			const snapshot = [...records.values()].map(candidate => (candidate === record ? finalizedRecord : candidate));
+			try {
+				await persist(snapshot);
+			} catch (error) {
+				if (records.get(key(kind, correlation)) === record) records.set(key(kind, correlation), previousRecord);
+				throw error;
+			}
+			if (isCurrent !== undefined && !isCurrent()) {
+				if (records.get(key(kind, correlation)) === record) await persist([...records.values()]);
+				return;
+			}
+			if (records.get(key(kind, correlation)) === record) records.set(key(kind, correlation), finalizedRecord);
 		},
 	};
 }
@@ -2933,7 +2947,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// promotion/agent_start instead, so a prompt waiting behind a
 				// legitimately long turn never false-fires. The agent_start
 				// re-entry in emitLifecycle is a no-op for an existing lease.
-				if (kind === "prompt") deadlineManager.onAccepted(correlation);
+				if (startsOwnTurn && kind === "prompt") deadlineManager.onAccepted(correlation);
 			},
 			steerReconciliation,
 			(kind, correlation, connectionId, promotion) => {

@@ -147,7 +147,7 @@ describe("SDK prompt terminal arbiter", () => {
 
 		const { reconciliation } = await accepted();
 		await reconciliation.claimPendingOutcome("prompt", correlation, failed("prompt_failed"));
-		await reconciliation.finalizeOutcome("prompt", correlation, undefined, {
+		await reconciliation.finalizeOutcome("prompt", correlation, undefined, undefined, {
 			code: "overridden",
 			message: "override",
 		});

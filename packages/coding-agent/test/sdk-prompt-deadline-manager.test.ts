@@ -16,6 +16,7 @@ interface FakeReconciliation {
 	claimRelease?: Promise<void>;
 	finalizeStarted?: () => void;
 	finalizeRelease?: Promise<void>;
+
 	/** When set, a failing finalize still leaves the durable record terminal (lost race). */
 	terminalOnFailure?: boolean;
 }
@@ -24,7 +25,12 @@ function fakeReconciliation(): {
 	reconciliation: {
 		lookup: () => { status: string };
 		claimPendingOutcome: () => Promise<void>;
-		finalizeOutcome: () => Promise<void>;
+		finalizeOutcome: (
+			_kind: string,
+			_correlation: unknown,
+			_outcome: unknown,
+			isCurrent?: () => boolean,
+		) => Promise<void>;
 	};
 	state: FakeReconciliation;
 } {
@@ -37,16 +43,25 @@ function fakeReconciliation(): {
 				state.claimStarted?.();
 				if (state.claimRelease) await state.claimRelease;
 			},
-			finalizeOutcome: async () => {
+			finalizeOutcome: async (_kind, _correlation, _outcome, isCurrent?: () => boolean) => {
 				state.finalizeCalls += 1;
 				state.finalizeStarted?.();
+				const previousStatus = state.status;
+				state.status = "failed";
 				if (state.finalizeRelease) await state.finalizeRelease;
 				if (state.finalizeCalls <= state.finalizeFailures) {
+					// Production stages the terminal mutation before persistence and
+					// restores the prior record when the durable write fails.
+					state.status = previousStatus;
 					// Race simulation: a normal terminal transition won while the
 					// expiry finalize was in flight — the record IS terminal, the
 					// finalize call itself throws.
 					if (state.terminalOnFailure) state.status = "terminal_ok";
 					throw new Error("durable write failed");
+				}
+				if (isCurrent !== undefined && !isCurrent()) {
+					state.status = previousStatus;
+					return;
 				}
 				state.status = "failed";
 			},
@@ -227,6 +242,7 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		finalizeGate.resolve();
 		await Bun.sleep(30);
 		expect(expired).toBe(0);
+		expect(state.status).not.toBe("failed");
 		expect(manager.isExpiring(correlation)).toBe(false);
 		expect(manager.has(correlation)).toBe(true);
 		expect(manager.deadlineAt(correlation)).toBe(2_020);

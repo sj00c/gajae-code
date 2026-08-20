@@ -113,7 +113,10 @@ export class PromptDeadlineManager {
 		// outcome for a prompt that is demonstrably alive.
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
 		try {
-			await this.#reconciliation.finalizeOutcome("prompt", correlation, outcome);
+			await this.#reconciliation.finalizeOutcome("prompt", correlation, outcome, () => {
+				const current = this.#leases.get(key);
+				return current === lease && current.generation === generation;
+			});
 		} catch {
 			// Do not infer durable confirmation from an in-memory lookup after a
 			// failed write. The accepted lease and ownership stay recoverable until
