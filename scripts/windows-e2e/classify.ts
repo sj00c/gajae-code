@@ -85,9 +85,22 @@ export type AttemptVerdict =
 	| { verdict: "harness-defect"; detail: string }
 	| { verdict: "unbuildable"; detail: string };
 
+/**
+ * Removes ANSI color sequences and joins wrapped error lines (pwsh 7 adds a
+ * `     | ` gutter, Windows PowerShell 5.1 wraps bare) so a message matches no
+ * matter how the host wrapped it.
+ */
+export function plainText(text: string): string {
+	return text
+		.replace(/\u001b\[[0-9;]*m/g, "")
+		.replace(/\r?\n\s*\|\s*/g, " ")
+		.replace(/\s+/g, " ");
+}
+
 export function signatureOf(text: string, rules: SignatureRule[]): string | null {
+	const plain = plainText(text);
 	for (const rule of rules) {
-		if (new RegExp(rule.pattern, "i").test(text)) return rule.id;
+		if (new RegExp(rule.pattern, "i").test(plain)) return rule.id;
 	}
 	return null;
 }

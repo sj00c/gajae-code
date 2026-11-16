@@ -21,18 +21,23 @@ $Repo = "Yeachan-Heo/gajae-code"
 $Scenario = $env:E2E_SCENARIO
 $ShellName = $env:E2E_SHELL
 $Attempt = [int]$env:E2E_ATTEMPT
+# Only logs go to RUNNER_TEMP. Everything gjc touches uses the documented
+# defaults (%LOCALAPPDATA%\gjc, %USERPROFILE%\.gjc\agent) on the profile
+# volume: RUNNER_TEMP lives on D: whose inherited ACL (Authenticated Users)
+# is a runner-specific condition, not something a user install sees. Each
+# matrix job is a fresh VM, so the defaults are already isolated.
 $OutDir = Join-Path $env:RUNNER_TEMP "e2e-out"
-$Work = Join-Path $env:RUNNER_TEMP "e2e-work"
-$InstallDir = Join-Path $Work "install"
-$AgentDir = Join-Path $Work "agent"
+$Work = Join-Path $env:USERPROFILE "e2e-work"
+$InstallDir = Join-Path $env:LOCALAPPDATA "gjc"
+$AgentDir = Join-Path $env:USERPROFILE ".gjc\agent"
 $GjcExe = Join-Path $InstallDir "gjc.exe"
-New-Item -ItemType Directory -Force -Path $OutDir, $Work, $InstallDir, $AgentDir | Out-Null
-
-# Every gjc and installer child inherits these. GJC_INSTALL_DIR keeps the
-# install out of %LOCALAPPDATA%; GJC_CODING_AGENT_DIR isolates agent state.
-$env:GJC_INSTALL_DIR = $InstallDir
-$env:GJC_CODING_AGENT_DIR = $AgentDir
+New-Item -ItemType Directory -Force -Path $OutDir, $Work | Out-Null
+Remove-Item Env:GJC_INSTALL_DIR -ErrorAction SilentlyContinue
+Remove-Item Env:GJC_CODING_AGENT_DIR -ErrorAction SilentlyContinue
 $env:GITHUB_TOKEN = $env:GH_TOKEN
+# Plain error text: pwsh 7 honors NO_COLOR, so installer errors are not
+# split by ANSI sequences.
+$env:NO_COLOR = "1"
 
 $Obs = [ordered]@{
     schema = "gjc.windows-e2e.observation.v1"
@@ -399,12 +404,9 @@ try {
         "L3" {
             # The legacy host-unqualified broker.lock must come from a real
             # pre-#6720 binary (v0.18.11), never a hand-written file.
-            $legacyDir = Join-Path $Work "legacy"
-            New-Item -ItemType Directory -Force -Path $legacyDir | Out-Null
-            $savedInstall = $env:GJC_INSTALL_DIR
+            $legacyDir = Join-Path $env:LOCALAPPDATA "gjc-legacy"
             $env:GJC_INSTALL_DIR = $legacyDir
-            $r = Invoke-Installer "install-legacy" "v0.18.11"
-            $env:GJC_INSTALL_DIR = $savedInstall
+            try { $r = Invoke-Installer "install-legacy" "v0.18.11" } finally { Remove-Item Env:GJC_INSTALL_DIR -ErrorAction SilentlyContinue }
             if ($r.exit_code -ne 0) { throw "precondition: installing legacy v0.18.11 failed" }
             $legacyExe = Join-Path $legacyDir "gjc.exe"
             Add-Binary "legacy" "pub:v0.18.11" $legacyExe

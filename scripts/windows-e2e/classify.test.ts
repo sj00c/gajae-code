@@ -53,6 +53,23 @@ describe("classifyAttempt", () => {
 		expect(result).toMatchObject({ verdict: "red", signature: "target_changed" });
 	});
 
+	test("PowerShell-wrapped, colored error text still matches its signature", () => {
+		const wrapped =
+			"\u001b[31;1mThe process cannot access the file 'gjc.exe' because it is being used by another\u001b[0m\r\n\u001b[36;1m     | \u001b[31;1mprocess.";
+		expect(classifyAttempt(obs({ steps: [step("update", 1, wrapped)] }), oracles)).toMatchObject({ signature: "sharing_violation" });
+		const ps51 = "Copy-Item : The process cannot access the file 'gjc.exe' because it is being used by \r\nanother process.";
+		expect(classifyAttempt(obs({ steps: [step("update", 1, ps51)] }), oracles)).toMatchObject({ signature: "sharing_violation" });
+	});
+
+	test("gc's missing tmux provider alone does not fail the lock scenario, a lock error still does", () => {
+		const l4 = (gcText: string) =>
+			obs({ scenario: "L4", lock_observed: true, steps: [step("config-set-r1-1", 0), step("gc-r1", 1, gcText)] });
+		expect(classifyAttempt(l4('"message": "gjc_tmux_provider_unavailable — GJC searched"'), oracles).verdict).toBe("green");
+		expect(classifyAttempt(l4("EBADF: bad file descriptor; gjc_tmux_provider_unavailable"), oracles)).toMatchObject({
+			signature: "ebadf",
+		});
+	});
+
 	test("unknown failure falls back to an exit-code signature; timeout is red, not a harness defect", () => {
 		expect(classifyAttempt(obs({ steps: [step("update", 3, "boom")] }), oracles)).toMatchObject({ signature: "exit:3:update" });
 		expect(classifyAttempt(obs({ steps: [step("update", null, "", true)] }), oracles)).toMatchObject({

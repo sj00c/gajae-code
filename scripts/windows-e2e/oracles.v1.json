@@ -15,7 +15,10 @@
 		{ "id": "broker_lock_refused_public", "pattern": "\"code\"\\s*:\\s*\"lock_refused\"|broker_unavailable" },
 		{ "id": "operation_failed", "pattern": "operation_failed" },
 		{ "id": "lock_acquire_timeout", "pattern": "acquire_timeout|Failed to acquire lock for .* after" },
-		{ "id": "lock_unavailable", "pattern": "lock_unavailable" }
+		{ "id": "lock_unavailable", "pattern": "lock_unavailable" },
+		{ "id": "orphan_transition", "pattern": "orphan_transition" },
+		{ "id": "ebadf", "pattern": "EBADF" },
+		{ "id": "tmux_provider_unavailable", "pattern": "gjc_tmux_provider_unavailable" }
 	],
 	"scenarios": {
 		"U1": {
@@ -77,10 +80,10 @@
 		"L4": {
 			"title": "`gjc gc --prune` concurrent with 10x `gjc config set` x 10 rounds",
 			"checkStepPrefixes": ["config-set-", "gc-"],
-			"allowedFailureSignatures": ["lock_acquire_timeout"],
+			"allowedFailureSignatures": ["lock_acquire_timeout", "tmux_provider_unavailable"],
 			"requireLockObserved": true,
 			"forbidCrashLog": true,
-			"declaredRed": "any other failure or a crash log"
+			"declaredRed": "any other failure or a crash log. `gjc gc` exits 1 on stock Windows only because no tmux provider exists; that store error is outside this lock scenario and allowed when it is the only error"
 		},
 		"I1": {
 			"title": "installer killed after its download temp appears, then re-run",
