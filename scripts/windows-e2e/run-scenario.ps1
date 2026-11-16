@@ -114,9 +114,9 @@ function Complete-Logged($Handle, [int]$TimeoutSec, [string]$Kind = "step") {
     return $record
 }
 
-function Invoke-Logged([string]$Name, [string]$File, [string[]]$Arguments, [int]$TimeoutSec = 600, [string]$Kind = "step") {
+function Invoke-Logged([string]$Name, [string]$File, [string[]]$Arguments, [int]$TimeoutSec = 600, [string]$Kind = "step", [string]$WorkingDirectory = $Work) {
     $before = Get-Sha256 $GjcExe
-    $h = Start-Logged $Name $File $Arguments
+    $h = Start-Logged $Name $File $Arguments $WorkingDirectory
     $r = Complete-Logged $h $TimeoutSec $Kind
     $r["gjc_sha256_before"] = $before
     return $r
@@ -144,12 +144,27 @@ function Get-ShellExe([string]$Name) {
     return (Get-Command pwsh.exe).Source
 }
 
+# A powershell.exe child started from pwsh inherits pwsh 7's PSModulePath and
+# then cannot autoload its own core modules (Get-FileHash is "not recognized").
+# Users start the installer from a fresh Windows PowerShell, so give the child
+# the machine/user module path it would have there.
+function Use-ShellModulePath([scriptblock]$Body) {
+    if ($ShellName -ne "powershell") { return & $Body }
+    $saved = $env:PSModulePath
+    $parts = @(
+        [Environment]::GetEnvironmentVariable("PSModulePath", "User"),
+        [Environment]::GetEnvironmentVariable("PSModulePath", "Machine")
+    ) | Where-Object { $_ }
+    $env:PSModulePath = ($parts -join ";")
+    try { return & $Body } finally { $env:PSModulePath = $saved }
+}
+
 function Invoke-Installer([string]$Name, [string]$Tag, [int]$TimeoutSec = 600) {
-    return Invoke-Logged $Name (Get-ShellExe $ShellName) @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script:Installer, "-Binary", "-Ref", $Tag) $TimeoutSec "installer"
+    return Use-ShellModulePath { Invoke-Logged $Name (Get-ShellExe $ShellName) @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script:Installer, "-Binary", "-Ref", $Tag) $TimeoutSec "installer" }
 }
 
 function Start-Installer([string]$Name, [string]$Tag) {
-    return Start-Logged $Name (Get-ShellExe $ShellName) @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script:Installer, "-Binary", "-Ref", $Tag)
+    return Use-ShellModulePath { Start-Logged $Name (Get-ShellExe $ShellName) @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script:Installer, "-Binary", "-Ref", $Tag) }
 }
 
 function Get-GjcVersion {
@@ -180,8 +195,9 @@ function Read-ActivationPhase {
 }
 
 function Get-DirSnapshot([string]$Dir) {
-    if (-not (Test-Path -LiteralPath $Dir)) { return @() }
-    return @(Get-ChildItem -Force -LiteralPath $Dir | ForEach-Object {
+    # Leading comma: a one-entry directory must still serialize as a JSON array.
+    if (-not (Test-Path -LiteralPath $Dir)) { return ,@() }
+    return ,@(Get-ChildItem -Force -LiteralPath $Dir | ForEach-Object {
         [ordered]@{ name = $_.Name; dir = $_.PSIsContainer; length = if ($_.PSIsContainer) { $null } else { $_.Length } }
     })
 }
@@ -245,9 +261,15 @@ function Resolve-Tags {
 
 # Installs prev_tag with the pinned installer and, for updater=fork, places
 # the fork build over gjc.exe by copy (recorded as `copy-placed`).
-function Initialize-Executor([string]$StepName = "install-prev") {
+function Initialize-Executor([string]$StepName = "install-prev", [bool]$FailureIsProductOutcome = $false) {
     $r = Invoke-Installer $StepName $env:E2E_PREV_TAG
-    if ($r.exit_code -ne 0) { throw "precondition: installing $($env:E2E_PREV_TAG) failed (exit $($r.exit_code))" }
+    if ($r.exit_code -ne 0) {
+        # A failed reinstall after an interrupted update is the documented
+        # recovery failing: the oracle judges it. Only the first install is a
+        # precondition.
+        if ($FailureIsProductOutcome) { return $false }
+        throw "precondition: installing $($env:E2E_PREV_TAG) failed (exit $($r.exit_code))"
+    }
     Add-Binary "installed" "pub:$($env:E2E_PREV_TAG)" $GjcExe
     if ($env:E2E_UPDATER -eq "fork") {
         $fork = Join-Path $env:RUNNER_TEMP "fork\gjc-windows-x64.exe"
@@ -261,6 +283,7 @@ function Initialize-Executor([string]$StepName = "install-prev") {
         $Obs.updater_build = "pub:$($env:E2E_PREV_TAG)"
     }
     Add-Binary "updater" $Obs.updater_build $GjcExe
+    return $true
 }
 
 function Get-UpdateArgs {
@@ -298,9 +321,13 @@ function Invoke-Concurrent([string]$Prefix, [int]$Count, [string[]]$Arguments, [
     $seen = New-Object System.Collections.Generic.HashSet[string]
     $deadline = (Get-Date).AddSeconds(240)
     while ((Get-Date) -lt $deadline -and @($handles | Where-Object { -not $_.Process.HasExited }).Count -gt 0) {
-        if (Test-Path -LiteralPath $WatchDir) {
-            Get-ChildItem -Recurse -Directory -Force -ErrorAction SilentlyContinue -LiteralPath $WatchDir -Filter "*.lock" | ForEach-Object { [void]$seen.Add($_.FullName.Substring($WatchDir.Length)) }
-        }
+        # Lock directories appear and vanish while being enumerated; a race
+        # here is expected and must not abort the scenario.
+        try {
+            if (Test-Path -LiteralPath $WatchDir) {
+                Get-ChildItem -Recurse -Directory -Force -ErrorAction SilentlyContinue -LiteralPath $WatchDir -Filter "*.lock" | ForEach-Object { [void]$seen.Add($_.FullName.Substring($WatchDir.Length)) }
+            }
+        } catch {}
         Start-Sleep -Milliseconds 5
     }
     foreach ($h in $handles) { [void](Complete-Logged $h 30 "lock-driver") }
@@ -310,7 +337,7 @@ function Invoke-Concurrent([string]$Prefix, [int]$Count, [string[]]$Arguments, [
 
 function Initialize-CurrentGjc {
     # Lock scenarios run the executor under test directly (no update).
-    Initialize-Executor
+    [void](Initialize-Executor)
 }
 
 $script:Installer = $null
@@ -321,17 +348,16 @@ try {
 
     switch ($Scenario) {
         "U1" {
-            Initialize-Executor
+            [void](Initialize-Executor)
             [void](Finish-Update "update")
         }
         "U2" {
-            Initialize-Executor
+            [void](Initialize-Executor)
             Start-UpdateUntilRecord "update-killed"
-            Initialize-Executor "reinstall-prev"
-            [void](Finish-Update "update")
+            if (Initialize-Executor "reinstall-prev" $true) { [void](Finish-Update "update") }
         }
         "U3" {
-            Initialize-Executor
+            [void](Initialize-Executor)
             $holder = Start-Logged "holder-broker" $GjcExe @("sdk", "broker", "run")
             Start-Sleep -Seconds 5
             if ($holder.Process.HasExited) {
@@ -345,7 +371,7 @@ try {
             }
         }
         "U4" {
-            Initialize-Executor
+            [void](Initialize-Executor)
             Start-UpdateUntilRecord "update-killed"
             [void](Finish-Update "update")
         }
@@ -389,12 +415,16 @@ try {
             if (-not $seen) { throw "precondition: legacy broker never created sdk/broker.lock/owner.json" }
             $Obs["legacy_owner"] = Get-Content -Raw (Join-Path $lockDir "owner.json")
             Initialize-CurrentGjc
+            # `sdk session list` scopes to a Git repository.
+            $proj = Join-Path $Work "project"
+            New-Item -ItemType Directory -Force -Path $proj | Out-Null
+            & git -C $proj init -q 2>&1 | Out-Null
             # Case a: legacy broker still alive (upgrade while it runs).
-            [void](Invoke-Logged "sdk-list-legacy-alive" $GjcExe @("sdk", "session", "list", "--json") 180 "lock-driver")
+            [void](Invoke-Logged "sdk-list-legacy-alive" $GjcExe @("sdk", "session", "list", "--json") 180 "lock-driver" $proj)
             # Case b: legacy broker killed, its lock left behind.
             Stop-Tree $legacyBroker
             [void](Complete-Logged $legacyBroker 15 "holder")
-            [void](Invoke-Logged "sdk-list-legacy-dead" $GjcExe @("sdk", "session", "list", "--json") 180 "lock-driver")
+            [void](Invoke-Logged "sdk-list-legacy-dead" $GjcExe @("sdk", "session", "list", "--json") 180 "lock-driver" $proj)
             $Obs.lock_observed = $true
             [void]$Obs.lock_observations.Add("\sdk\broker.lock")
         }
@@ -446,7 +476,7 @@ try {
         default { throw "unknown scenario $Scenario" }
     }
 } catch {
-    $Obs.harness_error = "$($_.Exception.Message)"
+    $Obs.harness_error = "$($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber)"
 } finally {
     try { $Obs.snapshots.after = Get-StateSnapshot } catch {}
     try { $Obs.final = Get-FinalState } catch { if (-not $Obs.harness_error) { $Obs.harness_error = "final-state: $($_.Exception.Message)" } }

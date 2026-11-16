@@ -240,12 +240,27 @@ export function summarize(entries: Array<{ obs: Observation; result: AttemptVerd
 	return summaries.sort((a, b) => a.axis.localeCompare(b.axis));
 }
 
+/** PowerShell's ConvertTo-Json writes a one-element array as a bare object and an empty one as null. */
+function asArray<T>(value: T | T[] | null | undefined): T[] {
+	if (value === null || value === undefined) return [];
+	return Array.isArray(value) ? value : [value];
+}
+
+export function normalizeObservation(raw: Observation): Observation {
+	const obs: Observation = { ...raw, steps: asArray(raw.steps) };
+	if (raw.state_files !== undefined) obs.state_files = asArray(raw.state_files);
+	if (raw.final) {
+		obs.final = { ...raw.final, install_dir: asArray(raw.final.install_dir), crash_logs: asArray(raw.final.crash_logs) };
+	}
+	return obs;
+}
+
 async function collectObservations(dir: string): Promise<Observation[]> {
 	const out: Observation[] = [];
 	for await (const file of new Bun.Glob("**/*.json").scan({ cwd: dir, absolute: true })) {
 		const parsed: unknown = await Bun.file(file).json();
 		if (typeof parsed === "object" && parsed !== null && (parsed as { schema?: unknown }).schema === "gjc.windows-e2e.observation.v1") {
-			out.push(parsed as Observation);
+			out.push(normalizeObservation(parsed as Observation));
 		}
 	}
 	return out;

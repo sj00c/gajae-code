@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
-import { classifyAttempt, detectionBound, type Observation, type Oracles, summarize } from "./classify";
+import { classifyAttempt, detectionBound, normalizeObservation, type Observation, type Oracles, summarize } from "./classify";
 
 const oracles = (await Bun.file(path.join(import.meta.dir, "oracles.v1.json")).json()) as Oracles;
 
@@ -129,6 +129,17 @@ describe("classifyAttempt", () => {
 			});
 		expect(classifyAttempt(i3(0, 1), oracles).verdict).toBe("green");
 		expect(classifyAttempt(i3(1, 1), oracles)).toMatchObject({ verdict: "red", signature: "all-steps-failed" });
+	});
+});
+
+describe("normalizeObservation", () => {
+	test("accepts PowerShell's collapsed one-element and empty arrays", () => {
+		const raw = obs({}) as unknown as Record<string, unknown>;
+		raw.final = { version: "0.21.0", install_dir: { name: ".gjc.bak.1", dir: false }, activation_phase: "none", crash_logs: null };
+		const normalized = normalizeObservation(raw as unknown as Observation);
+		expect(normalized.final?.install_dir).toEqual([{ name: ".gjc.bak.1", dir: false }]);
+		expect(normalized.final?.crash_logs).toEqual([]);
+		expect(classifyAttempt(normalized, oracles)).toMatchObject({ signature: "leftover-files" });
 	});
 });
 

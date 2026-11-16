@@ -27,12 +27,12 @@
 		},
 		"U2": {
 			"title": "update killed at activation record creation, reinstall, update",
-			"checkSteps": ["update"],
+			"checkSteps": ["reinstall-prev", "update"],
 			"requireExpectedVersion": true,
 			"requireCleanInstallDir": true,
 			"markerRequired": true,
 			"countedPostKillPhases": ["staged", "pending_activation"],
-			"declaredRed": "target_changed, activation_requires_reconciliation, or any failure of the final update"
+			"declaredRed": "the documented reinstall refuses (e.g. installer_lock_refused), or target_changed / activation_requires_reconciliation / any failure of the final update"
 		},
 		"U3": {
 			"title": "update while a gjc process (sdk broker) runs from the install",
