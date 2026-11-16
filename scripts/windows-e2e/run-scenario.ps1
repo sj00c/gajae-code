@@ -288,6 +288,10 @@ function Initialize-Executor([string]$StepName = "install-prev", [bool]$FailureI
         $Obs.updater_build = "pub:$($env:E2E_PREV_TAG)"
     }
     Add-Binary "updater" $Obs.updater_build $GjcExe
+    # One sequential start extracts the embedded native addon, so concurrent
+    # lock drivers measure the lock under test rather than cold-start
+    # extraction (a separate behavior, outside this catalog).
+    [void](Invoke-Logged "warmup" $GjcExe @("--version") 120 "warmup")
     return $true
 }
 
