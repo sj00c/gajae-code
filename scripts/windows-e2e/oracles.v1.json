@@ -1,0 +1,110 @@
+{
+	"schema": "gjc.windows-e2e.oracles.v1",
+	"note": "Fixed before any Phase B dispatch and acknowledged at checkpoint G-A. Changing anything here re-enters G-A.",
+	"leftoverPatterns": ["^\\.gjc\\.download\\.", "^\\.gjc\\.bak\\.", "^\\.gjc-update-", "^\\.gjc-install\\.lock$"],
+	"terminalActivationPhases": ["none", "verified", "rolled_back"],
+	"signatures": [
+		{ "id": "target_changed", "pattern": "target_changed" },
+		{ "id": "activation_requires_reconciliation", "pattern": "activation_transaction_requires_reconciliation" },
+		{ "id": "owner_mismatch", "pattern": "owner_mismatch" },
+		{ "id": "acl_present", "pattern": "acl_present" },
+		{ "id": "access_denied", "pattern": "access_denied|Access to the path .* is denied|Access is denied" },
+		{ "id": "sharing_violation", "pattern": "sharing_violation|being used by another process" },
+		{ "id": "publish_target_exists", "pattern": "Cannot create a file when that file already exists" },
+		{ "id": "installer_lock_refused", "pattern": "Another GJC installer is already running" },
+		{ "id": "broker_lock_refused_public", "pattern": "\"code\"\\s*:\\s*\"lock_refused\"|broker_unavailable" },
+		{ "id": "operation_failed", "pattern": "operation_failed" },
+		{ "id": "lock_acquire_timeout", "pattern": "acquire_timeout|Failed to acquire lock for .* after" },
+		{ "id": "lock_unavailable", "pattern": "lock_unavailable" }
+	],
+	"scenarios": {
+		"U1": {
+			"title": "clean update",
+			"checkSteps": ["update"],
+			"requireExpectedVersion": true,
+			"requireCleanInstallDir": true,
+			"declaredRed": "any non-zero exit or timeout of the update step, or a violated common condition"
+		},
+		"U2": {
+			"title": "update killed at activation record creation, reinstall, update",
+			"checkSteps": ["update"],
+			"requireExpectedVersion": true,
+			"requireCleanInstallDir": true,
+			"markerRequired": true,
+			"countedPostKillPhases": ["staged", "pending_activation"],
+			"declaredRed": "target_changed, activation_requires_reconciliation, or any failure of the final update"
+		},
+		"U3": {
+			"title": "update while a gjc process (sdk broker) runs from the install",
+			"checkSteps": ["update"],
+			"requireExpectedVersion": true,
+			"requireCleanInstallDir": true,
+			"declaredRed": "publish failure or a violated common condition after the holder exits"
+		},
+		"U4": {
+			"title": "update killed at activation record creation, update again without reinstall",
+			"checkSteps": ["update"],
+			"requireExpectedVersion": true,
+			"requireCleanInstallDir": true,
+			"markerRequired": true,
+			"countedPostKillPhases": ["staged", "pending_activation"],
+			"declaredRed": "the stale record permanently blocks update (reconciliation error)"
+		},
+		"L1": {
+			"title": "10 concurrent `gjc config set` x 20 rounds (file-lock via atomic-yaml-patch)",
+			"checkStepPrefixes": ["config-set-"],
+			"allowedFailureSignatures": ["lock_acquire_timeout"],
+			"requireLockObserved": true,
+			"forbidCrashLog": true,
+			"declaredRed": "access_denied, operation_failed, any other failure, or a crash log"
+		},
+		"L2": {
+			"title": "10 concurrent `gjc state ralplan write` x 20 rounds on one session",
+			"checkStepPrefixes": ["state-write-"],
+			"allowedFailureSignatures": [],
+			"requireLockObserved": true,
+			"requireStateParses": true,
+			"forbidCrashLog": true,
+			"declaredRed": "any failed write, an unparsable state file, or a crash log"
+		},
+		"L3": {
+			"title": "legacy host-unqualified broker.lock from real v0.18.11, then `gjc sdk session list`",
+			"checkSteps": ["sdk-list-legacy-alive", "sdk-list-legacy-dead"],
+			"allowedFailureSignatures": ["broker_lock_refused_public"],
+			"forbidCrashLog": true,
+			"declaredRed": "operation_failed, any other failure, or a crash log"
+		},
+		"L4": {
+			"title": "`gjc gc --prune` concurrent with 10x `gjc config set` x 10 rounds",
+			"checkStepPrefixes": ["config-set-", "gc-"],
+			"allowedFailureSignatures": ["lock_acquire_timeout"],
+			"requireLockObserved": true,
+			"forbidCrashLog": true,
+			"declaredRed": "any other failure or a crash log"
+		},
+		"I1": {
+			"title": "installer killed after its download temp appears, then re-run",
+			"checkSteps": ["installer-rerun"],
+			"requireExpectedVersion": true,
+			"requireCleanInstallDir": true,
+			"markerRequired": true,
+			"declaredRed": "the re-run refuses (installer_lock_refused): the user must remove the lock by hand"
+		},
+		"I2": {
+			"title": "installer replaces gjc.exe while a gjc process runs from it (PS 5.1 and 7)",
+			"checkSteps": ["install-target"],
+			"requireExpectedVersion": true,
+			"requireCleanInstallDir": true,
+			"declaredRed": "publish failure (publish_target_exists, sharing_violation) or a lost binary"
+		},
+		"I3": {
+			"title": "two installers started concurrently",
+			"checkSteps": ["installer-a", "installer-b"],
+			"allowedFailureSignatures": ["installer_lock_refused"],
+			"maxAllowedFailures": 1,
+			"requireExpectedVersion": true,
+			"requireCleanInstallDir": true,
+			"declaredRed": "both fail, or a lock is left behind"
+		}
+	}
+}
