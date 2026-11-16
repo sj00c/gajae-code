@@ -288,10 +288,13 @@ function Initialize-Executor([string]$StepName = "install-prev", [bool]$FailureI
         $Obs.updater_build = "pub:$($env:E2E_PREV_TAG)"
     }
     Add-Binary "updater" $Obs.updater_build $GjcExe
-    # One sequential start extracts the embedded native addon, so concurrent
-    # lock drivers measure the lock under test rather than cold-start
-    # extraction (a separate behavior, outside this catalog).
-    [void](Invoke-Logged "warmup" $GjcExe @("--version") 120 "warmup")
+    # One sequential start of a natives-loading command extracts the embedded
+    # addon, so concurrent lock drivers measure the lock under test rather
+    # than cold-start extraction (outside this catalog). `--version` returns
+    # before natives load, so it cannot serve; `config get` loads them on the
+    # same path the L drivers use. The extracted addon is recorded.
+    [void](Invoke-Logged "warmup" $GjcExe @("config", "get", "telemetry.enabled") 120 "warmup")
+    $Obs["natives_after_warmup"] = @(Get-ChildItem -Recurse -File -Force -ErrorAction SilentlyContinue -LiteralPath (Join-Path $env:USERPROFILE ".gjc\natives") -Filter "*.node" | ForEach-Object { $_.FullName.Substring($env:USERPROFILE.Length) })
     return $true
 }
 
