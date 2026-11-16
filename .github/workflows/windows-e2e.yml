@@ -1,0 +1,207 @@
+# Windows update / installer / lock E2E harness.
+#
+# Runs real published binaries, the published installer and (optionally) a
+# win32 binary built from `build_ref` on stock GitHub-hosted windows-latest
+# runners. One matrix job == one fresh VM == one (scenario, attempt), so
+# scenarios cannot leak state into each other. The harness never publishes,
+# never uses secrets beyond the read-only GITHUB_TOKEN, and refuses to run
+# outside GitHub Actions.
+name: Windows update E2E
+
+on:
+   workflow_dispatch:
+      inputs:
+         build_ref:
+            description: "Commit SHA to build gjc-windows-x64.exe from, or 'none'"
+            required: true
+            default: none
+         updater:
+            description: "Executor binary: 'pub:<tag>' (published) or 'fork' (built from build_ref)"
+            required: true
+            default: pub:latest
+         prev_tag:
+            description: "Tag installed before the scenario starts (e.g. v0.20.0)"
+            required: true
+         target:
+            description: "Expected version after update: 'stable' (latest stable) or 'nightly'"
+            required: true
+            default: stable
+         scenarios:
+            description: "Comma-separated scenario ids (U1,U2,U3,U4,L1,L2,L3,L4,I1,I2,I3)"
+            required: true
+            default: U1
+         repeat:
+            description: "Attempts per scenario (one VM each)"
+            required: true
+            default: "1"
+         installer:
+            description: "'pinned' (installer_rev from main) or 'checkout' (install.ps1 at build_ref)"
+            required: true
+            default: pinned
+         installer_rev:
+            description: "Commit of the documented installer (scripts/install.ps1 on main)"
+            required: true
+         installer_sha256:
+            description: "Expected sha256 of install.ps1 at installer_rev"
+            required: true
+   workflow_call:
+      inputs:
+         build_ref: { type: string, required: true }
+         updater: { type: string, required: true }
+         prev_tag: { type: string, required: true }
+         target: { type: string, required: true }
+         scenarios: { type: string, required: true }
+         repeat: { type: string, required: true }
+         installer: { type: string, required: true }
+         installer_rev: { type: string, required: true }
+         installer_sha256: { type: string, required: true }
+
+permissions:
+   contents: read
+
+jobs:
+   plan:
+      runs-on: ubuntu-22.04
+      outputs:
+         matrix: ${{ steps.plan.outputs.matrix }}
+      steps:
+         - id: plan
+           shell: bash
+           env:
+              SCENARIOS: ${{ inputs.scenarios }}
+              REPEAT: ${{ inputs.repeat }}
+           run: |
+              set -euo pipefail
+              node -e '
+                const ids = process.env.SCENARIOS.split(",").map(s => s.trim()).filter(Boolean);
+                const known = new Set(["U1","U2","U3","U4","L1","L2","L3","L4","I1","I2","I3"]);
+                for (const id of ids) if (!known.has(id)) { console.error(`unknown scenario ${id}`); process.exit(1); }
+                const repeat = Number.parseInt(process.env.REPEAT, 10);
+                if (!Number.isInteger(repeat) || repeat < 1 || repeat > 30) { console.error("repeat must be 1..30"); process.exit(1); }
+                const include = [];
+                for (const scenario of ids) {
+                  const shells = scenario === "I2" ? ["powershell", "pwsh"] : ["pwsh"];
+                  for (const shell of shells) for (let attempt = 1; attempt <= repeat; attempt++) include.push({ scenario, shell, attempt });
+                }
+                require("fs").appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`);
+              '
+
+   build-win32:
+      if: ${{ inputs.build_ref != 'none' }}
+      runs-on: windows-latest
+      timeout-minutes: 90
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+           with:
+              ref: ${{ inputs.build_ref }}
+         - uses: ./.github/actions/build-native
+           with:
+              hash: ${{ inputs.build_ref }}
+              platform: win32
+              arch: x64
+              variant: baseline
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - run: bun install --frozen-lockfile
+         - name: Download native addon
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              pattern: pi-natives-win32-x64*
+              path: packages/natives/native
+              merge-multiple: true
+         - name: Rebuild the diagnostic artifact provenance record
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
+         - name: Build gjc-windows-x64.exe
+           env:
+              RELEASE_TARGETS: win32-x64
+           run: bun run ci:release:build-binaries
+         - name: Upload fork build
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: fork-gjc-windows-x64
+              path: packages/coding-agent/binaries/gjc-windows-x64.exe
+              retention-days: 30
+
+   scenario:
+      needs: [plan, build-win32]
+      if: ${{ always() && needs.plan.result == 'success' && (needs.build-win32.result == 'success' || needs.build-win32.result == 'skipped') }}
+      runs-on: windows-latest
+      timeout-minutes: 30
+      strategy:
+         fail-fast: false
+         matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+      name: ${{ matrix.scenario }}-${{ matrix.shell }}-${{ matrix.attempt }}
+      env:
+         GH_TOKEN: ${{ github.token }}
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+           with:
+              # The harness scripts come from the dispatching ref; the product
+              # code under test comes from published releases or build_ref.
+              path: harness
+         - name: Checkout build_ref installer
+           if: ${{ inputs.installer == 'checkout' }}
+           uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+           with:
+              ref: ${{ inputs.build_ref }}
+              path: product
+              sparse-checkout: scripts/install.ps1
+              sparse-checkout-cone-mode: false
+         - name: Download fork build
+           if: ${{ inputs.build_ref != 'none' }}
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: fork-gjc-windows-x64
+              path: ${{ runner.temp }}/fork
+         - name: Run scenario
+           shell: pwsh
+           env:
+              E2E_SCENARIO: ${{ matrix.scenario }}
+              E2E_SHELL: ${{ matrix.shell }}
+              E2E_ATTEMPT: ${{ matrix.attempt }}
+              E2E_BUILD_REF: ${{ inputs.build_ref }}
+              E2E_UPDATER: ${{ inputs.updater }}
+              E2E_PREV_TAG: ${{ inputs.prev_tag }}
+              E2E_TARGET: ${{ inputs.target }}
+              E2E_INSTALLER: ${{ inputs.installer }}
+              E2E_INSTALLER_REV: ${{ inputs.installer_rev }}
+              E2E_INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+              E2E_RUN_ID: ${{ github.run_id }}
+           run: ./harness/scripts/windows-e2e/run-scenario.ps1
+         - name: Upload observation
+           if: ${{ always() }}
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: obs-${{ matrix.scenario }}-${{ matrix.shell }}-${{ matrix.attempt }}
+              path: ${{ runner.temp }}/e2e-out
+              retention-days: 30
+
+   classify:
+      needs: [scenario]
+      if: ${{ always() && needs.scenario.result != 'skipped' }}
+      runs-on: ubuntu-22.04
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              pattern: obs-*
+              path: ${{ runner.temp }}/obs
+              merge-multiple: true
+         - name: Classify
+           run: bun scripts/windows-e2e/classify.ts --oracles scripts/windows-e2e/oracles.v1.json --out "${{ runner.temp }}/verdicts" "${{ runner.temp }}/obs" >> "$GITHUB_STEP_SUMMARY"
+         - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: verdicts
+              path: ${{ runner.temp }}/verdicts
+              retention-days: 30
