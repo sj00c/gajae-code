@@ -4,6 +4,7 @@
 	"leftoverPatterns": ["^\\.gjc\\.download\\.", "^\\.gjc\\.bak\\.", "^\\.gjc-update-", "^\\.gjc-install\\.lock$"],
 	"terminalActivationPhases": ["none", "verified", "rolled_back"],
 	"signatures": [
+		{ "id": "native_addon_extract_failed", "pattern": "Failed to load pi_natives native addon" },
 		{ "id": "target_changed", "pattern": "target_changed" },
 		{ "id": "activation_requires_reconciliation", "pattern": "activation_transaction_requires_reconciliation" },
 		{ "id": "owner_mismatch", "pattern": "owner_mismatch" },
