@@ -148,6 +148,27 @@ describe("deep-interview ask clarification contract", () => {
 		expect(skill).toContain("bypasses Step 2b′ auto-answer, Step 2b″ free-text refine, Step 2c ambiguity scoring");
 		expect(skill).toContain("must not be recorded as a round answer");
 	});
+
+	it("uses a typed Other reply to form the next ask instead of repeating the question", () => {
+		const start = skill.indexOf("**A typed `Other` reply is the user's answer: use it to form the next `ask`.**");
+		const end = skill.indexOf("### Step 2b′: Auto-Answer Opted-Out Questions");
+		expect(start).toBeGreaterThan(-1);
+		expect(end).toBeGreaterThan(start);
+		const rules = skill.slice(start, end);
+		expect(rules).toMatch(/A question, an objection, or "I don't understand this"[^\n]*this is not a round answer/);
+		expect(rules).toMatch(/Delegation[^\n]*run Step 2b′ auto-answer\. Do not ask the question again/);
+		expect(rules).toContain("never treat the listed options as the only valid replies");
+		expect(rules).toMatch(
+			/Round 0 and intent-review questions[^\n]*a typed reply never counts as the confirmation or the approval/,
+		);
+		expect(rules).toMatch(
+			/The reply still decides what you ask next[^\n]*present the revised proposal for confirmation/,
+		);
+		expect(rules).toContain("the new question must differ because the reply changed it");
+		expect(rules).toContain("The verbatim re-ask applies only to the `clarificationQuestion` return above");
+		expect(skill).toContain("A typed `Other` reply to the confirmation is itself the missing text or correction");
+		expect(skill).toContain("Do not re-confirm the same answer more than twice");
+	});
 });
 
 describe("deep-interview ouroboros ooo-interview parity port", () => {

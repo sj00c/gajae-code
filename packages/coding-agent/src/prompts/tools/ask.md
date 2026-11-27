@@ -21,6 +21,7 @@ Asks user when you need clarification or input during task execution.
 - **Default to action.** Resolve ambiguity yourself using repo conventions, existing patterns, and reasonable defaults. Exhaust existing sources (code, configs, docs, history) before asking. Only ask when options have materially different tradeoffs the user must decide.
 - **If multiple choices are acceptable**, pick the most conservative/standard option and proceed; state the choice.
 - **Do NOT include the automatic custom-input control or labels that imitate it** such as "Other (type your own)", "Other (specify)", "type your own", "custom input", or "직접 입력" — UI automatically adds "Other (type your own)" to every question. A plain domain value such as "Other" is allowed when it is a genuine answer, not a request for free text. To collect free text, ask for it in the question body and rely on the automatic Other/custom-input control instead of adding a fake option.
+- **A typed reply is an answer, even when it matches no option.** Use it: answer it if it is a question, apply it if it is an answer or a correction. NEVER ask the same question again unchanged or tell the user to pick from the list; the tool rejects an identical re-ask after a typed reply.
 </critical>
 
 <examples>

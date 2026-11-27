@@ -185,6 +185,13 @@ const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = Number.MAX_SAFE_INTEGER;
 const DEEP_INTERVIEW_RECORDER_AWAIT_TIMEOUT_MS = 250;
 export const MAX_EMPTY_CUSTOM_ATTEMPTS = 3;
 const EMPTY_CUSTOM_RETRY_MESSAGE = "Custom input cannot be empty. Enter text or cancel the ask.";
+const UNCHANGED_REASK_AFTER_TYPED_REPLY =
+	"The user already replied to this exact question with typed text (see the previous ask result). Asking it again unchanged ignores that reply. Use the reply first: if it was a question or an objection, answer it; if it was an answer or a correction, apply it. Then ask a question whose wording or options reflect it.";
+
+/** Identity of what the user was shown: the question text and its option labels. */
+function askQuestionSignature(question: { question: string; options: Array<{ label: string }> }): string {
+	return JSON.stringify([question.question, question.options.map(option => option.label)]);
+}
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -848,6 +855,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	 */
 	readonly displaySafeEscapedArgFields = ["questions.question", "questions.options.label"] as const;
 	readonly loadMode = "discoverable";
+	/** Questions of the previous ask call that the user answered by typing instead of picking an option. */
+	#typedReplySignatures = new Set<string>();
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(askDescription);
 	}
@@ -1100,6 +1109,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				{ type: "toolCall", id: _toolCallId, name: this.name, arguments: params },
 			),
 		);
+		// A typed reply is the user's answer even when it matches no option. Re-asking
+		// the identical question discards it and leaves the user stuck in the same prompt.
+		if (params.questions.some(question => this.#typedReplySignatures.has(askQuestionSignature(question))))
+			throw new ToolError(UNCHANGED_REASK_AFTER_TYPED_REPLY);
 		let activeRemoteReceipt: AskRemoteReceipt | undefined;
 		let activeRemoteRequest: AskAnswerRequest | undefined;
 		let remoteGeneration = 0;
@@ -1903,6 +1916,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				executionGateId,
 				executionPresentation,
 			);
+			this.#typedReplySignatures = new Set(customInput === undefined ? [] : [askQuestionSignature(q)]);
 			const details: AskToolDetails = {
 				question: q.question,
 				options: optionLabels,
@@ -2018,6 +2032,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			};
 		});
 
+		this.#typedReplySignatures = new Set(
+			params.questions
+				.filter((_, index) => results[index]?.customInput !== undefined)
+				.map(question => askQuestionSignature(question)),
+		);
 		const details: AskToolDetails = { results };
 		for (const [index, result] of results.entries())
 			await this.#recordDeepInterviewExecutionApproval(

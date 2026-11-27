@@ -5258,3 +5258,66 @@ describe("AskTool Round-0 intent recovery", () => {
 		expect(recorder).not.toHaveBeenCalled();
 	});
 });
+
+describe("ask after a typed reply", () => {
+	const proceed = { id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] };
+
+	function typedReplyContext(reply: string): AgentToolContext {
+		return createContext({ select: async () => "Other (type your own)", editor: async () => reply });
+	}
+
+	it("refuses to ask the identical question again after the user typed a reply", async () => {
+		const tool = new AskTool(createSession());
+		const first = await tool.execute(
+			"call-1",
+			{ questions: [proceed] },
+			undefined,
+			undefined,
+			typedReplyContext("what does proceed do?"),
+		);
+		expect(first.details?.customInput).toBe("what does proceed do?");
+
+		const select = vi.fn(async () => "yes");
+		await expect(
+			tool.execute("call-2", { questions: [proceed] }, undefined, undefined, createContext({ select })),
+		).rejects.toThrow("already replied to this exact question with typed text");
+		expect(select).not.toHaveBeenCalled();
+	});
+
+	it("accepts the next ask once its wording or options reflect the typed reply", async () => {
+		const tool = new AskTool(createSession());
+		await tool.execute(
+			"call-1",
+			{ questions: [proceed] },
+			undefined,
+			undefined,
+			typedReplyContext("only the docs part"),
+		);
+
+		const reworded = await tool.execute(
+			"call-2",
+			{ questions: [{ ...proceed, question: "Proceed with only the docs part?" }] },
+			undefined,
+			undefined,
+			createContext({ select: async () => "yes" }),
+		);
+		expect(reworded.details?.selectedOptions).toEqual(["yes"]);
+
+		const newOption = await tool.execute(
+			"call-3",
+			{ questions: [{ ...proceed, options: [...proceed.options, { label: "docs only" }] }] },
+			undefined,
+			undefined,
+			createContext({ select: async () => "docs only" }),
+		);
+		expect(newOption.details?.selectedOptions).toEqual(["docs only"]);
+	});
+
+	it("still allows repeating a question the user answered by picking an option", async () => {
+		const tool = new AskTool(createSession());
+		const pick = createContext({ select: async () => "no" });
+		await tool.execute("call-1", { questions: [proceed] }, undefined, undefined, pick);
+		const again = await tool.execute("call-2", { questions: [proceed] }, undefined, undefined, pick);
+		expect(again.details?.selectedOptions).toEqual(["no"]);
+	});
+});

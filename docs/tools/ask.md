@@ -82,6 +82,7 @@ While deep-interview state is in `current_phase: "interviewing"`, calls contain 
 - Abort signal during input: converted to `ToolAbortError("Ask input was cancelled")`.
 - Remote answer source closes the ask: throws `ToolAbortError("Ask was cancelled by the remote client")`.
 - `GJC_ASK_ANSWER_DEADLINE_MS` expires with no answer: throws `ToolAbortError("Ask was aborted: no answer was received within Ns of the headless ask answer deadline")`.
+- Unchanged re-ask after a typed reply: when the previous `ask` call was answered with `Other` text, a call that repeats that question with the same text and option labels throws a `ToolError` before any prompt opens. The block lasts until an `ask` call that does not repeat it completes; a question answered by picking an option can be repeated.
 - Invalid inputs throw before opening a selector, registering an answer source, or emitting a gate, including direct execution calls. Empty question arrays, blank question bodies, missing active-interview metadata, and multiple active-interview questions are rejected with actionable validation errors.
 
 ## Notes
